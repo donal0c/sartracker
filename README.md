@@ -303,25 +303,6 @@ Your QGIS project contains:
 
 ---
 
-## 🤝 Team Information
-
-**Developed for:** Kerry Mountain Rescue Team (KMRT)
-**Client Contact:** Eamon O'Connor
-**Traccar Server:** http://kmrtsar.eu or 109.76.170.87:8082
-**Network:** Zerotier VPN (spotty mobile connection from van)
-
----
-
-## 📞 Support
-
-**For issues or questions:**
-1. Check this README first
-2. Check **TODO.md** for known limitations
-3. Contact your team's technical lead
-4. Create an issue on GitHub: https://github.com/YOUR_USERNAME/sartracker/issues
-
----
-
 ## 🏔️ About SAR Tracker
 
 This plugin transforms QGIS into a dedicated Search & Rescue operations console. It's designed to be simple enough for any team member to use during stressful SAR situations while providing professional-grade mapping and tracking capabilities.
@@ -331,7 +312,6 @@ This plugin transforms QGIS into a dedicated Search & Rescue operations console.
 - Works with current CSV workflow (database coming later)
 - Reliable in poor network conditions
 - Cross-platform (Windows, Mac, Linux)
-- Built by mountain rescue, for mountain rescue
 
 ---
 
