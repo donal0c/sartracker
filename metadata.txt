@@ -6,7 +6,7 @@
 name=sartracker
 qgisMinimumVersion=3.0
 description=SAR Tracking Console for QGIS
-version=0.2
+version=0.3
 author=Donal O' Callaghan
 email=ocallaghandonal2@gmail.com
 
@@ -44,4 +44,7 @@ Category of the plugin: Raster, Vector, Database or Web
 
 # If the plugin can run on QGIS Server.
 server=False
+
+# Qt6 compatibility
+supportsQt6=yes
 

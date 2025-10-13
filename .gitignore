@@ -50,8 +50,8 @@ mountain.png
 *.sqlite
 *.sqlite3
 
-# Compiled resources (will be regenerated)
-resources.py
+# Compiled resources (included in repo for distribution)
+# resources.py
 
 # Distribution / packaging
 build/
