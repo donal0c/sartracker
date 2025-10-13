@@ -5,7 +5,8 @@
 Transform QGIS into a dedicated SAR operations console for real-time tracking of rescue personnel during search missions.
 
 ![Phase 1 & 2 Complete](https://img.shields.io/badge/Phase%201%20%26%202-Complete-success)
-![QGIS 3.40+](https://img.shields.io/badge/QGIS-3.40%2B-blue)
+![QGIS 3.0+](https://img.shields.io/badge/QGIS-3.0%2B-blue)
+![Qt5/Qt6](https://img.shields.io/badge/Qt5%2FQt6-Compatible-brightgreen)
 ![License](https://img.shields.io/badge/License-GPL--2.0-green)
 
 ---
@@ -14,9 +15,10 @@ Transform QGIS into a dedicated SAR operations console for real-time tracking of
 
 ### Prerequisites
 
-- **QGIS 3.40 or later** installed on your computer
+- **QGIS 3.0 or later** installed on your computer
   - Download from: https://qgis.org/download/
   - Works on Windows, Mac, and Linux
+  - Compatible with both Qt5 and Qt6 versions of QGIS
 
 ---
 
@@ -239,6 +241,13 @@ Your QGIS project contains:
 - This is normal - coordinates update as you move your mouse
 - If stuck, try clicking on the map canvas first
 
+### Error: "Plugin does not support QT6 versions of QGIS"
+
+This has been fixed in version 0.3+. Make sure you have the latest version:
+1. Pull the latest code: `git pull`
+2. Or re-download the plugin from GitHub
+3. Restart QGIS after updating
+
 ---
 
 ## 📋 Current Features (Phase 1 & 2 Complete)
@@ -335,6 +344,6 @@ https://claude.com/claude-code
 
 ---
 
-**Version:** 1.0 (Phase 1 & 2 Complete)
+**Version:** 0.3 (Phase 1 & 2 Complete)
 **Last Updated:** October 13, 2025
 **Status:** Production Ready ✅
