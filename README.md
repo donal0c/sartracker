@@ -272,7 +272,7 @@ Your QGIS project contains:
 
 ## 🔮 Coming Soon (Phase 3 & 4)
 
-### Phase 3: CalTopo-Inspired Tools
+### Phase 3: Advanced Mapping Tools
 - Line Tool - Draw simple lines
 - Bearing Line Tool - Line from point with bearing
 - Sector Tool - Draw wedge/pie shapes
