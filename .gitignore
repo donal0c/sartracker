@@ -1,0 +1,70 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.claude/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+*.log
+
+# QGIS Plugin Builder files
+pb_tool.cfg
+Makefile
+scripts/
+help/
+i18n/
+
+# Test data and fixtures
+From_Eamon/
+test/
+fixtures/
+test_import.py
+
+# Large image files (keep only icon.png)
+*.jpg
+*.jpeg
+LayersSAR.png
+current_system.png
+proposed_system.png
+mountain.png
+—Pngtree—*.png
+
+# Database files (if you generate any)
+*.db
+*.sqlite
+*.sqlite3
+
+# Compiled resources (will be regenerated)
+resources.py
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.zip
+
+# Development tools
+pylintrc
+plugin_upload.py
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+.cache/

@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/plugins/sartracker" >
+        <file>icon.png</file>
+    </qresource>
+</RCC>
