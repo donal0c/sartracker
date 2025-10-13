@@ -68,3 +68,9 @@ plugin_upload.py
 *.bak
 *.swp
 .cache/
+
+# Other files
+TODO.md
+SAR_QGIS_Plugin_Technical_Specification.md
+SAR_QGIS_Plugin_Claude_Spec.md
+cleanup.sh
