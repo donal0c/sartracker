@@ -21,7 +21,7 @@
  *                                                                         *
  ***************************************************************************/
 """
-from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, Qt, QTimer
+from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton
 from qgis.core import (
@@ -33,6 +33,9 @@ from qgis.core import (
 from .resources import *
 import os.path
 import traceback
+
+# Import Qt5/Qt6 compatible constants
+from .utils.qt_compat import RightDockWidgetArea
 
 # Import our SAR tracking components
 try:
@@ -215,7 +218,7 @@ class sartracker:
 
         # Initialize SAR Panel
         self.sar_panel = SARPanel(self.iface.mainWindow())
-        self.iface.addDockWidget(Qt.RightDockWidgetArea, self.sar_panel)
+        self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
         self.sar_panel.hide()  # Hidden by default
 
         # Connect SAR Panel signals

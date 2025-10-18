@@ -10,10 +10,16 @@ from qgis.PyQt.QtWidgets import (
     QPushButton, QLabel, QListWidget, QListWidgetItem,
     QGroupBox, QSpinBox, QCheckBox, QFileDialog, QLineEdit
 )
-from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
+from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor
 from datetime import datetime
 from typing import Optional, List, Dict
+
+# Import Qt5/Qt6 compatible constants
+from ..utils.qt_compat import (
+    LeftDockWidgetArea, RightDockWidgetArea,
+    Checked
+)
 
 
 class SARPanel(QDockWidget):
@@ -44,7 +50,7 @@ class SARPanel(QDockWidget):
     def __init__(self, parent=None):
         super().__init__("SAR Tracking", parent)
         
-        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
         
         # State
         self.mission_active = False
@@ -304,7 +310,7 @@ class SARPanel(QDockWidget):
     
     def _on_auto_refresh_toggled(self, state):
         """Handle auto-refresh checkbox toggle."""
-        self.auto_refresh_enabled = (state == Qt.Checked)
+        self.auto_refresh_enabled = (state == Checked)
         
         if self.auto_refresh_enabled:
             interval_ms = self.refresh_interval_spin.value() * 1000
@@ -404,7 +410,7 @@ class SARPanel(QDockWidget):
 
     def _on_autosave_toggled(self, state):
         """Handle auto-save checkbox toggle."""
-        self.autosave_enabled = (state == Qt.Checked)
+        self.autosave_enabled = (state == Checked)
 
         if self.autosave_enabled:
             interval_ms = self.autosave_interval_spin.value() * 60 * 1000  # Convert minutes to ms
