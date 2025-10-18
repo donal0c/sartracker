@@ -67,7 +67,8 @@ class sartracker:
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
         # initialize locale
-        locale = QSettings().value('locale/userLocale')[0:2]
+        locale_value = QSettings().value('locale/userLocale')
+        locale = locale_value[0:2] if locale_value else 'en'
         locale_path = os.path.join(
             self.plugin_dir,
             'i18n',
