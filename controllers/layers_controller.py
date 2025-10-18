@@ -13,7 +13,6 @@ from qgis.core import (
     QgsPalLayerSettings, QgsVectorLayerSimpleLabeling,
     QgsTextFormat, QgsTextBufferSettings
 )
-from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 from typing import List, Dict
 from collections import defaultdict
@@ -148,12 +147,12 @@ class LayersController:
         # Add fields
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("device_id", QVariant.String),
-            QgsField("name", QVariant.String),
-            QgsField("timestamp", QVariant.String),
-            QgsField("altitude", QVariant.Double),
-            QgsField("speed", QVariant.Double),
-            QgsField("battery", QVariant.Double)
+            QgsField("device_id", 10),  # String
+            QgsField("name", 10),  # String
+            QgsField("timestamp", 10),  # String
+            QgsField("altitude", 6),  # Double
+            QgsField("speed", 6),  # Double
+            QgsField("battery", 6)  # Double
         ])
         layer.updateFields()
 
@@ -316,8 +315,8 @@ class LayersController:
 
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("device_id", QVariant.String),
-            QgsField("name", QVariant.String)
+            QgsField("device_id", 10),  # String
+            QgsField("name", 10)  # String
         ])
         layer.updateFields()
 
@@ -375,16 +374,16 @@ class LayersController:
         # Add fields
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("id", QVariant.Int),
-            QgsField("name", QVariant.String),
-            QgsField("poi_type", QVariant.String),
-            QgsField("description", QVariant.String),
-            QgsField("lat", QVariant.Double),
-            QgsField("lon", QVariant.Double),
-            QgsField("irish_grid_e", QVariant.Double),
-            QgsField("irish_grid_n", QVariant.Double),
-            QgsField("color", QVariant.String),
-            QgsField("created", QVariant.String)
+            QgsField("id", 2),  # Int
+            QgsField("name", 10),  # String
+            QgsField("poi_type", 10),  # String
+            QgsField("description", 10),  # String
+            QgsField("lat", 6),  # Double
+            QgsField("lon", 6),  # Double
+            QgsField("irish_grid_e", 6),  # Double
+            QgsField("irish_grid_n", 6),  # Double
+            QgsField("color", 10),  # String
+            QgsField("created", 10)  # String
         ])
         layer.updateFields()
 
@@ -416,15 +415,15 @@ class LayersController:
         # Add fields
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("id", QVariant.Int),
-            QgsField("name", QVariant.String),
-            QgsField("description", QVariant.String),
-            QgsField("lat", QVariant.Double),
-            QgsField("lon", QVariant.Double),
-            QgsField("irish_grid_e", QVariant.Double),
-            QgsField("irish_grid_n", QVariant.Double),
-            QgsField("condition", QVariant.String),
-            QgsField("created", QVariant.String)
+            QgsField("id", 2),  # Int
+            QgsField("name", 10),  # String
+            QgsField("description", 10),  # String
+            QgsField("lat", 6),  # Double
+            QgsField("lon", 6),  # Double
+            QgsField("irish_grid_e", 6),  # Double
+            QgsField("irish_grid_n", 6),  # Double
+            QgsField("condition", 10),  # String
+            QgsField("created", 10)  # String
         ])
         layer.updateFields()
 
