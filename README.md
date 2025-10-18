@@ -279,6 +279,124 @@ This has been fixed in version 0.3+. Make sure you have the latest version:
 
 ---
 
+---
+
+## ⚙️ Qt5/Qt6 Compatibility
+
+**IMPORTANT: This plugin supports both Qt5 and Qt6 versions of QGIS.**
+
+### Compatibility Strategy
+
+The plugin uses a **centralized compatibility module** (`utils/qt_compat.py`) that automatically detects the Qt version at runtime and provides the correct enum constants.
+
+### Key Compatibility Patterns
+
+When developing new features for Phase 3+, **always follow these patterns**:
+
+#### ✅ **DO: Use the Compat Module for Qt Enums**
+```python
+# CORRECT - Works in both Qt5 and Qt6
+from utils.qt_compat import CrossCursor, LeftDockWidgetArea, Checked
+
+self.setCursor(QCursor(CrossCursor))
+self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
+if state == Checked:
+    # ...
+```
+
+#### ❌ **DON'T: Use Qt Enums Directly**
+```python
+# WRONG - Breaks in Qt6
+from qgis.PyQt.QtCore import Qt
+
+self.setCursor(QCursor(Qt.CrossCursor))  # Qt6: AttributeError
+self.setAllowedAreas(Qt.LeftDockWidgetArea)  # Qt6: AttributeError
+if state == Qt.Checked:  # Qt6: AttributeError
+```
+
+#### ✅ **DO: Use Integer Constants for QgsField Types**
+```python
+# CORRECT - Works in both Qt5 and Qt6
+QgsField("name", 10),     # String
+QgsField("value", 6),     # Double
+QgsField("count", 2),     # Int
+```
+
+#### ❌ **DON'T: Use QVariant Type Enums**
+```python
+# WRONG - QVariant enums removed in Qt6
+QgsField("name", QVariant.String)   # Qt6: AttributeError
+QgsField("value", QVariant.Double)  # Qt6: AttributeError
+```
+
+#### ✅ **DO: Handle QSettings Return Values Safely**
+```python
+# CORRECT - Explicit type conversion
+value = QSettings().value('some/key')
+if value:
+    result = str(value)  # Ensure it's a string
+else:
+    result = 'default'
+```
+
+#### ❌ **DON'T: Assume QSettings Returns Specific Types**
+```python
+# WRONG - Qt6 may return different types
+value = QSettings().value('some/key')
+result = value[0:2]  # Could crash if value is None or not string
+```
+
+### Covered Enum Categories
+
+The compat module (`utils/qt_compat.py`) provides **52 constants** across these categories:
+- **DockWidgetArea** (6): LeftDockWidgetArea, RightDockWidgetArea, etc.
+- **CheckState** (3): Checked, Unchecked, PartiallyChecked
+- **CursorShape** (16): CrossCursor, ArrowCursor, PointingHandCursor, etc.
+- **AlignmentFlag** (8): AlignLeft, AlignCenter, AlignTop, etc.
+- **MouseButton** (6): LeftButton, RightButton, MiddleButton, etc.
+- **Key** (7): Key_Return, Key_Escape, Key_Delete, etc.
+- **Orientation** (2): Horizontal, Vertical
+- **WindowType** (4): Widget, Window, Dialog, Popup
+
+### Testing Checklist for New Features
+
+Before committing new code, verify:
+- [ ] No direct `Qt.SomeEnum` usage (use compat module)
+- [ ] No `QVariant.Type` usage (use integer constants)
+- [ ] No assumptions about QSettings return types
+- [ ] All imports use `qgis.PyQt` (not `PyQt5` or `PyQt6`)
+- [ ] Test on both Qt5 and Qt6 if possible
+
+### Common Qt6 Breaking Changes
+
+| Qt5 Pattern | Qt6 Pattern | Solution |
+|------------|-------------|----------|
+| `Qt.CrossCursor` | `Qt.CursorShape.CrossCursor` | Use compat module |
+| `Qt.Checked` | `Qt.CheckState.Checked` | Use compat module |
+| `QVariant.String` | Removed | Use integer `10` |
+| `QVariant.Int` | Removed | Use integer `2` |
+| `QVariant.Double` | Removed | Use integer `6` |
+| `.exec_()` | `.exec()` | Both work (backward compatible) |
+
+### If You Need a New Enum
+
+If Phase 3+ requires a Qt enum not in the compat module:
+
+1. Add it to `utils/qt_compat.py`:
+```python
+# In the appropriate section
+if QT_VERSION == 6:
+    NewEnum = Qt.EnumClass.NewEnum
+else:  # Qt5
+    NewEnum = Qt.NewEnum
+```
+
+2. Add to `__all__` export list
+
+3. Import from compat module in your code
+
+---
+
 ## 🔮 Coming Soon (Phase 3 & 4)
 
 ### Phase 3: Advanced Mapping Tools
