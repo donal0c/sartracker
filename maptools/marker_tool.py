@@ -11,6 +11,15 @@ from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QCursor
 from qgis.PyQt.QtCore import Qt
 
+# Qt5/Qt6 compatibility
+try:
+    # Try PyQt6 style first (Qt.CursorShape.CrossCursor)
+    _test = Qt.CursorShape.CrossCursor
+    CROSS_CURSOR = Qt.CursorShape.CrossCursor
+except AttributeError:
+    # Fall back to PyQt5 style (Qt.CrossCursor)
+    CROSS_CURSOR = Qt.CrossCursor
+
 
 class MarkerMapTool(QgsMapTool):
     """
@@ -31,7 +40,7 @@ class MarkerMapTool(QgsMapTool):
         """
         super().__init__(canvas)
         self.canvas = canvas
-        self.setCursor(QCursor(Qt.CrossCursor))
+        self.setCursor(QCursor(CROSS_CURSOR))
         
         # Setup coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -80,7 +89,7 @@ class MarkerMapTool(QgsMapTool):
     def activate(self):
         """Called when tool is activated."""
         super().activate()
-        self.canvas.setCursor(QCursor(Qt.CrossCursor))
+        self.canvas.setCursor(QCursor(CROSS_CURSOR))
     
     def deactivate(self):
         """Called when tool is deactivated."""

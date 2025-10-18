@@ -14,6 +14,15 @@ from qgis.PyQt.QtCore import pyqtSignal, Qt
 from qgis.PyQt.QtGui import QCursor, QColor
 from math import atan2, degrees
 
+# Qt5/Qt6 compatibility
+try:
+    # Try PyQt6 style first (Qt.CursorShape.CrossCursor)
+    _test = Qt.CursorShape.CrossCursor
+    CROSS_CURSOR = Qt.CursorShape.CrossCursor
+except AttributeError:
+    # Fall back to PyQt5 style (Qt.CrossCursor)
+    CROSS_CURSOR = Qt.CrossCursor
+
 
 class MeasureTool(QgsMapTool):
     """
@@ -35,7 +44,7 @@ class MeasureTool(QgsMapTool):
         """
         super().__init__(canvas)
         self.canvas = canvas
-        self.setCursor(QCursor(Qt.CrossCursor))
+        self.setCursor(QCursor(CROSS_CURSOR))
 
         # Measurement state
         self.first_point = None
@@ -142,7 +151,7 @@ class MeasureTool(QgsMapTool):
     def activate(self):
         """Called when tool is activated."""
         super().activate()
-        self.canvas.setCursor(QCursor(Qt.CrossCursor))
+        self.canvas.setCursor(QCursor(CROSS_CURSOR))
         self.first_point = None
         self.second_point = None
         self.rubber_band.reset(QgsWkbTypes.LineGeometry)
