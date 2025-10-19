@@ -8,6 +8,8 @@ from .sector_tool import SearchSectorTool
 from .base_drawing_tool import BaseDrawingTool
 from .tool_registry import ToolRegistry
 from .line_tool import LineTool
+from .bearing_tool import BearingTool
+from .polygon_tool import PolygonTool
 
 __all__ = [
     'MarkerMapTool',
@@ -16,5 +18,7 @@ __all__ = [
     'SearchSectorTool',
     'BaseDrawingTool',
     'ToolRegistry',
-    'LineTool'
+    'LineTool',
+    'BearingTool',
+    'PolygonTool'
 ]

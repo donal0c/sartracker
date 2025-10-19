@@ -1,12 +1,10 @@
 # SAR Tracker - QGIS Plugin
 
-**Search & Rescue Tracking Console for Kerry Mountain Rescue Team**
+**Search & Rescue Tracking Console for Kerry Mountain Rescue**
 
 Transform QGIS into a dedicated SAR operations console for real-time tracking of rescue personnel during search missions.
 
-![Phase 1 & 2 Complete](https://img.shields.io/badge/Phase%201%20%26%202-Complete-success)
 ![QGIS 3.0+](https://img.shields.io/badge/QGIS-3.0%2B-blue)
-![Qt5/Qt6](https://img.shields.io/badge/Qt5%2FQt6-Compatible-brightgreen)
 ![License](https://img.shields.io/badge/License-GPL--2.0-green)
 
 ---
@@ -15,10 +13,7 @@ Transform QGIS into a dedicated SAR operations console for real-time tracking of
 
 ### Prerequisites
 
-- **QGIS 3.0 or later** installed on your computer
-  - Download from: https://qgis.org/download/
-  - Works on Windows, Mac, and Linux
-  - Compatible with both Qt5 and Qt6 versions of QGIS
+- **QGIS 3.0 or later** - Download from https://qgis.org/download/
 
 ---
 
@@ -26,34 +21,29 @@ Transform QGIS into a dedicated SAR operations console for real-time tracking of
 
 ### Step 1: Get the Plugin Files
 
-**Option A: Clone with Git** (if you have git installed)
+**Option A: Clone with Git**
 ```bash
 cd ~/Documents
 git clone https://github.com/YOUR_USERNAME/sartracker.git
 ```
 
 **Option B: Download ZIP**
-1. Go to: https://github.com/YOUR_USERNAME/sartracker
-2. Click the green "Code" button
-3. Click "Download ZIP"
-4. Extract the ZIP file to your Documents folder
+1. Download ZIP from GitHub
+2. Extract to your Documents folder
 
 ### Step 2: Install in QGIS
 
 **Find your QGIS plugins folder:**
-
 - **Mac**: `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins/`
 - **Windows**: `C:\Users\YOUR_USERNAME\AppData\Roaming\QGIS\QGIS3\profiles\default\python\plugins\`
 - **Linux**: `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins/`
 
-**Install the plugin:**
-
-1. **Copy** the entire `sartracker` folder into your QGIS plugins folder
-2. **Restart QGIS**
+**Install:**
+1. Copy the entire `sartracker` folder into your QGIS plugins folder
+2. Restart QGIS
 3. Go to **Plugins** → **Manage and Install Plugins**
-4. Click the **Installed** tab
-5. Find **SAR Tracker** in the list
-6. **Check the box** to enable it
+4. Find **SAR Tracker** in the Installed tab
+5. Check the box to enable it
 
 ✅ You should now see a mountain icon (⛰️) in the QGIS toolbar!
 
@@ -63,382 +53,257 @@ git clone https://github.com/YOUR_USERNAME/sartracker.git
 
 ### 1. Open SAR Tracker Panel
 
-Click the **mountain icon** in the toolbar (or go to **Plugins** → **SAR Tracker Panel**)
+Click the **mountain icon** in the toolbar.
 
 The SAR Tracking panel will open on the right side of QGIS.
 
-### 2. Load Your Tracking Data
+### 2. Start a Mission
+
+1. Enter a **mission name** (e.g., "Glenbeigh Search")
+2. Click **"Start Mission"**
+3. Timer starts counting elapsed time
+
+**Mission Controls:**
+- **Pause** - Temporarily stop tracking
+- **Resume** - Continue tracking
+- **Finish** - Complete and save mission
+
+### 3. Load Tracking Data
 
 **From CSV Files:**
 1. Click **"Load CSV File..."**
-2. **First dialog:** Select the **folder** containing your CSV files (or cancel to select a single file)
-3. **Second dialog:** If you cancelled, select a single CSV file
+2. Select folder with CSV files OR single CSV file
+3. Data loads automatically to map
 
 **Supported formats:**
-- Traccar CSV exports (one file per device)
-- Folder with multiple CSV files (all devices at once)
+- Traccar CSV exports
+- Must have: `latitude`, `longitude`, `time`, `name` columns
 
-### 3. Start a Mission
+### 4. Add Markers
 
-1. Enter a **mission name** (e.g., "Glenagenty Search")
-2. Click **"Start Mission"**
-3. Timer starts counting elapsed time
-4. Status shows "Active" in green
+**IPP/LKP (Initial Planning Point / Last Known Position):**
+1. Click **"Add IPP/LKP"**
+2. Click on map at location
+3. Fill in details:
+   - Name and description
+   - Subject category (Child, Hiker, Elderly, etc.)
+   - Notes
+4. Blue marker appears
 
-### 4. Control the Mission
+**Clues:**
+1. Click **"Add Clue"**
+2. Click on map
+3. Select clue type (Footprint, Clothing, Equipment, Sighting, Evidence)
+4. Set confidence (Confirmed/Probable/Possible)
+5. Orange marker appears
 
-**Pause:** Click **"Pause"** to temporarily stop tracking
-- Status changes to orange "Paused"
-- Timer continues showing total elapsed time
+**Hazards:**
+1. Click **"Add Hazard"**
+2. Click on map
+3. Select hazard type (Cliff, Water, Bog, Vegetation, Wildlife, Weather, Other)
+4. Red warning marker appears
 
-**Resume:** Click **"Resume"** to continue
-- Status returns to green "Active"
+### 5. Drawing Tools
 
-**Finish:** Click **"Finish"** when mission complete
-- Saves final state
-- Clears mission status
+**Lines (Routes/Boundaries):**
+1. Click **"Lines"**
+2. Click to add points
+3. Right-click to finish
+4. Shows total distance
 
-### 5. Auto-Refresh (Keep Data Updated)
+**Search Areas (Polygons):**
+1. Click **"Search Area"**
+2. Click to add vertices
+3. Right-click to close polygon
+4. Configure:
+   - Area name
+   - Assigned team
+   - Status (Planned/Assigned/InProgress/Completed/Cleared)
+   - Priority (High/Medium/Low)
+   - POA (Probability of Area)
+   - Terrain type and search method
+   - Notes
 
-1. Check **"Enable auto-refresh"**
-2. Set interval (default: 30 seconds)
-3. Click **"Refresh Now"** for immediate update
+**Range Rings (Probability Circles):**
+1. Click **"Range Rings"**
+2. Click center point
+3. Choose mode:
+   - **Manual**: Custom radius + number of rings
+   - **LPB (Lost Person Behavior)**: Select subject category for automatic probability rings at 25%, 50%, 75%, 95%
+4. Rings appear color-coded
 
-### 6. Auto-Save Your Work
+**Bearing Lines (Direction Finding):**
+1. Click **"Bearing Line"**
+2. Click origin point
+3. Configure:
+   - Line name
+   - Choose **True Bearing** or **Magnetic Bearing**
+   - Enter bearing (0-360°)
+   - Enter distance (meters or kilometers)
+4. Shows both true and magnetic bearings (Ireland declination: -4.5°)
+5. Purple line appears
 
-1. **First time:** Save your QGIS project (Project → Save As)
-2. In SAR Panel, check **"Enable auto-save"**
-3. Set interval (default: 5 minutes)
-4. Your project will save automatically!
-
-**Status shows:**
-- ✓ Last save: 14:23:15 (green = success)
-- ✗ Last save: 14:23:15 Failed (red = error)
-
-### 7. Add Markers to the Map
-
-**Add a Point of Interest (POI):**
-1. Click **"Add Point of Interest (POI)"**
-2. **Click on the map** where you want the marker
-3. Dialog opens showing coordinates in both formats:
-   - WGS84 (GPS): Latitude/Longitude
-   - Irish Grid (ITM): Easting/Northing
-4. Enter name and description
-5. Click **"Add POI"**
-6. Blue marker appears on map
-
-**Add a Casualty:**
-1. Click **"Add Casualty"**
-2. **Click on the map** at casualty location
-3. Enter name, description, condition
-4. Click **"Add Casualty"**
-5. Red marker appears on map
-
-### 8. Coordinate Tools
-
-**Convert Coordinates:**
-1. Click **"Coordinate Converter"**
-2. Choose input type (WGS84 or Irish Grid)
-3. Enter coordinates
-4. Click **"Convert"**
-5. Results show both formats
-6. Click **"Copy to Clipboard"** or **"Go to Location"**
+### 6. Measurement & Utilities
 
 **Measure Distance & Bearing:**
 1. Click **"Measure Distance & Bearing"**
-2. **Click first point** on map
-3. **Click second point** on map
-4. Green banner shows:
-   - Distance: 2.5 km
-   - Bearing: 45.3° (NE)
+2. Click first point
+3. Click second point
+4. Results show distance and bearing (with cardinal direction)
 
-### 9. Real-Time Coordinate Display
+**Coordinate Converter:**
+1. Click **"Coordinate Converter"**
+2. Choose input type (WGS84 or Irish Grid)
+3. Enter coordinates
+4. Convert between systems
+5. Copy or go to location
 
-Look at the **bottom status bar** - as you move your mouse over the map, you'll see:
+**Real-time Coordinates:**
+- Look at bottom status bar
+- Shows cursor position in both WGS84 and Irish Grid as you move mouse
 
-```
-WGS84: 52.234567°N, -9.123456°E  |  Irish Grid: E:123456  N:234567
-```
+### 7. Auto-Features
 
-Both coordinate systems update in real-time!
+**Auto-Refresh:**
+1. Check "Enable auto-refresh"
+2. Set interval (default: 30 seconds)
+3. Click "Refresh Now" for immediate update
 
----
-
-## 🔄 Auto-Resume Feature
-
-**If you pause a mission and close QGIS:**
-
-1. **Reopen QGIS**
-2. A dialog appears: "Found paused mission"
-3. Shows mission name and start time
-4. Choose:
-   - **"Resume Mission"** - Continue where you left off
-   - **"Start Fresh"** - Clear old mission and start new
+**Auto-Save:**
+1. First save your QGIS project manually (Project → Save As)
+2. Check "Enable auto-save"
+3. Set interval (default: 5 minutes)
+4. Project saves automatically
 
 ---
 
 ## 📂 Understanding the Layers
 
-When you load data, you'll see a **"SAR Tracking"** group in the Layers panel:
+**"SAR Tracking" group contains:**
+- **IPP/LKP** - Blue circles - Initial planning points
+- **Clues** - Orange markers - Evidence found
+- **Hazards** - Red warnings - Dangerous areas
+- **Lines** - Routes and boundaries
+- **Search Areas** - Polygons with status tracking
+- **Range Rings** - Probability circles
+- **Bearing Lines** - Direction-finding lines
+- **Current Positions** - Latest position per team member
+- **Breadcrumbs** - Full movement trails
 
-- **POIs** (top) - Blue circles - Points of interest
-- **Casualties** - Red stars - Casualty locations
-- **Current Positions** - Colored markers - Latest position per team member
-- **Breadcrumbs** (bottom) - Colored lines - Full trail of movement
-
-**Layers are automatically colored per device/team member.**
+**Each device/team member gets a unique color automatically.**
 
 ---
 
-## 💾 Saving Your Mission
+## 🔄 Auto-Resume Feature
 
-Your QGIS project contains:
-- Map position and zoom level
-- All loaded CSV data
-- All POIs and Casualties you added
-- Layer styling and visibility
+If you pause a mission and close QGIS:
+1. Reopen QGIS
+2. Dialog appears: "Found paused mission"
+3. Choose **Resume Mission** or **Start Fresh**
 
-**Important Notes:**
-- POIs and Casualties are **memory-only** (lost when QGIS closes)
-- Use **auto-save** to save your project regularly
-- Future version will use a database for persistent storage
+---
+
+## 💾 Saving Your Work
+
+**Your QGIS project contains:**
+- Map position and zoom
+- All loaded tracking data
+- All markers (IPP/LKP, Clues, Hazards)
+- All drawn features (search areas, bearing lines, range rings, lines)
+- Layer styling
+
+**Important:**
+- Use auto-save to save regularly
+- Save manually before closing (Project → Save)
 
 ---
 
 ## 🐛 Troubleshooting
 
-### Plugin doesn't appear in QGIS
+**Plugin doesn't appear:**
+- Check plugin folder location
+- Folder must be named exactly `sartracker`
+- Restart QGIS completely
+- Enable in Plugins → Manage and Install Plugins
 
-1. Check the plugin folder location is correct
-2. Make sure the folder is named exactly `sartracker`
-3. Restart QGIS completely
-4. Go to Plugins → Manage and Install Plugins → Installed
-5. Look for "SAR Tracker" and check the box
+**Can't load CSV files:**
+- Check format: needs `latitude`, `longitude`, `time`, `name` columns
+- Try single file first before folder
 
-### Can't load CSV files
+**Auto-save not working:**
+- Save project manually first (Project → Save As)
+- Then enable auto-save
+- Auto-save only works on saved projects
 
-- Check CSV format matches Traccar export format
-- Columns required: `latitude`, `longitude`, `time`, `name`
-- Try loading a single file first before loading a folder
-
-### Auto-save not working
-
-1. **First save your project manually:** Project → Save As
-2. Give it a name and location
-3. **Then** enable auto-save in SAR Panel
-4. Auto-save only works on already-saved projects
-
-### Layers not showing on map
-
-1. Check the **Layers** panel on the left
-2. Expand the "SAR Tracking" group
-3. Make sure layers have checkboxes ticked
-4. Right-click layer → "Zoom to Layer"
-5. Check that you loaded data successfully
-
-### Status bar coordinates not updating
-
-- This is normal - coordinates update as you move your mouse
-- If stuck, try clicking on the map canvas first
-
-### Error: "Plugin does not support QT6 versions of QGIS"
-
-This has been fixed in version 0.3+. Make sure you have the latest version:
-1. Pull the latest code: `git pull`
-2. Or re-download the plugin from GitHub
-3. Restart QGIS after updating
+**Layers not showing:**
+- Check Layers panel on left
+- Expand "SAR Tracking" group
+- Tick checkboxes
+- Right-click layer → "Zoom to Layer"
 
 ---
 
-## 📋 Current Features (Phase 1 & 2 Complete)
+## ✅ Current Features
 
-### ✅ Mission Management
+### Mission Management
 - Start/Pause/Resume/Finish missions
 - Real-time elapsed timer
-- Auto-resume paused missions on launch
-- Auto-save QGIS project at intervals
+- Auto-resume on restart
+- Auto-save at intervals
 
-### ✅ Tracking Visualization
-- Multi-device CSV tracking (single file or folder)
-- Colored breadcrumb trails per team member
-- Labeled current positions
-- Auto-refresh at configurable intervals
+### Tracking
+- Multi-device CSV tracking
+- Colored breadcrumb trails
+- Current positions
+- Auto-refresh
 - Device status list
 
-### ✅ Map Tools
-- Add POI markers (click on map)
-- Add Casualty markers (click on map)
-- Measure distance and bearing between points
-- Coordinate converter (Irish Grid ↔ WGS84)
-- Real-time cursor coordinates in status bar
+### Map Markers
+- IPP/LKP with subject categories
+- Clues with confidence levels
+- Hazards with severity
 
-### ✅ Coordinate Support
+### Drawing Tools
+- Lines (routes, boundaries)
+- Search Areas (polygons with status, team, POA)
+- Range Rings (manual or LPB-based)
+- Bearing Lines (true/magnetic bearings)
+
+### Utilities
+- Distance & bearing measurement
+- Coordinate converter (Irish Grid ↔ WGS84)
+- Real-time cursor coordinates
+
+### Coordinate Systems
 - WGS84 (GPS standard)
 - Irish Grid ITM (EPSG:29903)
-- Real-time conversion between systems
 
 ---
 
----
+## 🔮 Coming Soon
 
-## ⚙️ Qt5/Qt6 Compatibility
+### Next Features
+- Search Sector Tool - Pie-slice search areas
+- Text Label Tool - Map annotations
+- GPX Import - Load GPS tracks
 
-**IMPORTANT: This plugin supports both Qt5 and Qt6 versions of QGIS.**
-
-### Compatibility Strategy
-
-The plugin uses a **centralized compatibility module** (`utils/qt_compat.py`) that automatically detects the Qt version at runtime and provides the correct enum constants.
-
-### Key Compatibility Patterns
-
-When developing new features for Phase 3+, **always follow these patterns**:
-
-#### ✅ **DO: Use the Compat Module for Qt Enums**
-```python
-# CORRECT - Works in both Qt5 and Qt6
-from utils.qt_compat import CrossCursor, LeftDockWidgetArea, Checked
-
-self.setCursor(QCursor(CrossCursor))
-self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
-if state == Checked:
-    # ...
-```
-
-#### ❌ **DON'T: Use Qt Enums Directly**
-```python
-# WRONG - Breaks in Qt6
-from qgis.PyQt.QtCore import Qt
-
-self.setCursor(QCursor(Qt.CrossCursor))  # Qt6: AttributeError
-self.setAllowedAreas(Qt.LeftDockWidgetArea)  # Qt6: AttributeError
-if state == Qt.Checked:  # Qt6: AttributeError
-```
-
-#### ✅ **DO: Use Integer Constants for QgsField Types**
-```python
-# CORRECT - Works in both Qt5 and Qt6
-QgsField("name", 10),     # String
-QgsField("value", 6),     # Double
-QgsField("count", 2),     # Int
-```
-
-#### ❌ **DON'T: Use QVariant Type Enums**
-```python
-# WRONG - QVariant enums removed in Qt6
-QgsField("name", QVariant.String)   # Qt6: AttributeError
-QgsField("value", QVariant.Double)  # Qt6: AttributeError
-```
-
-#### ✅ **DO: Handle QSettings Return Values Safely**
-```python
-# CORRECT - Explicit type conversion
-value = QSettings().value('some/key')
-if value:
-    result = str(value)  # Ensure it's a string
-else:
-    result = 'default'
-```
-
-#### ❌ **DON'T: Assume QSettings Returns Specific Types**
-```python
-# WRONG - Qt6 may return different types
-value = QSettings().value('some/key')
-result = value[0:2]  # Could crash if value is None or not string
-```
-
-### Covered Enum Categories
-
-The compat module (`utils/qt_compat.py`) provides **52 constants** across these categories:
-- **DockWidgetArea** (6): LeftDockWidgetArea, RightDockWidgetArea, etc.
-- **CheckState** (3): Checked, Unchecked, PartiallyChecked
-- **CursorShape** (16): CrossCursor, ArrowCursor, PointingHandCursor, etc.
-- **AlignmentFlag** (8): AlignLeft, AlignCenter, AlignTop, etc.
-- **MouseButton** (6): LeftButton, RightButton, MiddleButton, etc.
-- **Key** (7): Key_Return, Key_Escape, Key_Delete, etc.
-- **Orientation** (2): Horizontal, Vertical
-- **WindowType** (4): Widget, Window, Dialog, Popup
-
-### Testing Checklist for New Features
-
-Before committing new code, verify:
-- [ ] No direct `Qt.SomeEnum` usage (use compat module)
-- [ ] No `QVariant.Type` usage (use integer constants)
-- [ ] No assumptions about QSettings return types
-- [ ] All imports use `qgis.PyQt` (not `PyQt5` or `PyQt6`)
-- [ ] Test on both Qt5 and Qt6 if possible
-
-### Common Qt6 Breaking Changes
-
-| Qt5 Pattern | Qt6 Pattern | Solution |
-|------------|-------------|----------|
-| `Qt.CrossCursor` | `Qt.CursorShape.CrossCursor` | Use compat module |
-| `Qt.Checked` | `Qt.CheckState.Checked` | Use compat module |
-| `QVariant.String` | Removed | Use integer `10` |
-| `QVariant.Int` | Removed | Use integer `2` |
-| `QVariant.Double` | Removed | Use integer `6` |
-| `.exec_()` | `.exec()` | Both work (backward compatible) |
-
-### If You Need a New Enum
-
-If Phase 3+ requires a Qt enum not in the compat module:
-
-1. Add it to `utils/qt_compat.py`:
-```python
-# In the appropriate section
-if QT_VERSION == 6:
-    NewEnum = Qt.EnumClass.NewEnum
-else:  # Qt5
-    NewEnum = Qt.NewEnum
-```
-
-2. Add to `__all__` export list
-
-3. Import from compat module in your code
+### Future Enhancements
+- Export maps (PDF/PNG with legend, scale, north arrow)
+- Mission reports (CSV statistics)
+- Mission playback (time-slider)
+- Database integration (PostgreSQL/PostGIS)
 
 ---
 
-## 🔮 Coming Soon (Phase 3 & 4)
+## 🏔️ About
 
-### Phase 3: Advanced Mapping Tools
-- Line Tool - Draw simple lines
-- Bearing Line Tool - Line from point with bearing
-- Sector Tool - Draw wedge/pie shapes
-- Draw Search Areas - Polygons with team colors
-- Range Ring Tool - Circles with radius
-- Import GPX Files - Load walker routes
-- Text Annotations - Labels on map
+SAR Tracker transforms QGIS into a dedicated Search & Rescue operations console. Simple enough for any team member to use during missions, yet powerful enough for professional SAR operations.
 
-### Phase 4: Professional Output
-- Export Maps (PDF/PNG with scale bar, legend, north arrow)
-- Generate Mission Reports (CSV with participant stats)
-- Mission Playback - Time-slider replay
-
-### Future: Database Integration
-- PostgreSQL/PostGIS database connection
-- Persistent storage for POIs, Casualties, Search Areas
-- Live tracking from Traccar database
-- Multi-operator support
-- Offline write queue with auto-sync
-
----
-
-## 📖 Documentation
-
-- **TODO.md** - Detailed roadmap and feature list
-- **SAR_QGIS_Plugin_Technical_Specification.md** - Complete technical specification
-- **SAR_QGIS_Plugin_Claude_Spec.md** - Simplified build specification
-
----
-
-## 🏔️ About SAR Tracker
-
-This plugin transforms QGIS into a dedicated Search & Rescue operations console. It's designed to be simple enough for any team member to use during stressful SAR situations while providing professional-grade mapping and tracking capabilities.
-
-**Key Design Principles:**
-- Simple, focused interface (not a full GIS tool)
-- Works with current CSV workflow (database coming later)
-- Reliable in poor network conditions
-- Cross-platform (Windows, Mac, Linux)
+**Design Principles:**
+- Simple, focused interface
+- Works with current CSV workflow
+- Reliable in poor conditions
+- Cross-platform compatible
 
 ---
 
@@ -446,22 +311,16 @@ This plugin transforms QGIS into a dedicated Search & Rescue operations console.
 
 GNU General Public License v2.0
 
-This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
-
 ---
 
 ## 🎉 Credits
 
-**Generated with Claude Code**
-https://claude.com/claude-code
+**Generated with Claude Code** - https://claude.com/claude-code
 
-**Built with:**
-- QGIS 3.40+
-- PyQGIS API
-- Python 3.9+
+**Built for:** Kerry Mountain Rescue Team, Ireland
 
 ---
 
-**Version:** 0.3 (Phase 1 & 2 Complete)
-**Last Updated:** October 13, 2025
+**Version:** 0.4 (Phase 3 - In Progress)
+**Last Updated:** October 19, 2025
 **Status:** Production Ready ✅

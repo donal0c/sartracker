@@ -101,6 +101,8 @@ class sartracker:
         self.measure_tool = None
         self.line_tool = None
         self.range_ring_tool = None
+        self.bearing_tool = None
+        self.polygon_tool = None
         self.tool_registry = None
         self.current_marker_type = None  # 'poi' or 'casualty'
         self.coords_label = None  # Status bar coordinate display
@@ -238,11 +240,25 @@ class sartracker:
         self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
         self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
 
+        # Initialize Bearing Tool
+        from .maptools import BearingTool
+        self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller)
+        self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
+        self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+
+        # Initialize Polygon Tool (Search Areas)
+        from .maptools import PolygonTool
+        self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller)
+        self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
+        self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+
         # Initialize Tool Registry
         from .maptools import ToolRegistry
         self.tool_registry = ToolRegistry(self.iface.mapCanvas())
         self.tool_registry.register_tool('line', self.line_tool)
         self.tool_registry.register_tool('range_rings', self.range_ring_tool)
+        self.tool_registry.register_tool('bearing', self.bearing_tool)
+        self.tool_registry.register_tool('polygon', self.polygon_tool)
         self.tool_registry.tool_activated.connect(self._on_tool_activated)
         self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
 
@@ -262,7 +278,9 @@ class sartracker:
         self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
         self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
         self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
+        self.sar_panel.polygon_tool_requested.connect(self._on_polygon_tool_requested)
         self.sar_panel.range_rings_tool_requested.connect(self._on_range_rings_tool_requested)
+        self.sar_panel.bearing_tool_requested.connect(self._on_bearing_tool_requested)
         self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
@@ -329,7 +347,7 @@ class sartracker:
                     pass
 
             # Clean up individual tools
-            for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool']:
+            for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
                 tool = getattr(self, tool_attr, None)
                 if tool:
                     try:
@@ -796,10 +814,30 @@ class sartracker:
 
     def _on_line_tool_requested(self):
         """Handle Line Tool button click."""
+        print(f"[SARTRACKER] _on_line_tool_requested() called")
+        print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
+        print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
         self.tool_registry.activate_tool('line')
+        print(f"[SARTRACKER] Line tool activation complete")
+        print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
         self.iface.messageBar().pushMessage(
             "SAR Tracker",
             "Click to add points. Right-click or ESC to finish line.",
+            level=0,  # Info
+            duration=5
+        )
+
+    def _on_polygon_tool_requested(self):
+        """Handle Polygon Tool (Search Area) button click."""
+        print(f"[SARTRACKER] _on_polygon_tool_requested() called")
+        print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
+        print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
+        self.tool_registry.activate_tool('polygon')
+        print(f"[SARTRACKER] Polygon tool activation complete")
+        print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            "Search Area Tool: Click to add vertices (min 3). Right-click to finish and configure area.",
             level=0,  # Info
             duration=5
         )
@@ -810,6 +848,16 @@ class sartracker:
         self.iface.messageBar().pushMessage(
             "SAR Tracker",
             "Range Rings Tool: Click center point to configure rings",
+            level=0,  # Info
+            duration=5
+        )
+
+    def _on_bearing_tool_requested(self):
+        """Handle Bearing Tool button click."""
+        self.tool_registry.activate_tool('bearing')
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            "Bearing Line Tool: Click origin point to configure bearing and distance",
             level=0,  # Info
             duration=5
         )
@@ -847,10 +895,57 @@ class sartracker:
         # Deactivate tool
         self.tool_registry.deactivate_current()
 
+    def _on_bearing_complete(self, feature_data):
+        """
+        Handle bearing line drawing completion.
+
+        Args:
+            feature_data: Dict with bearing line info (name, bearing, distance, etc.)
+        """
+        bearing_type = feature_data['bearing_type']
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            f"Bearing Line '{feature_data['name']}' created ({feature_data['bearing']:.1f}° True, {feature_data['magnetic_bearing']:.1f}° Magnetic, {feature_data['distance_m']:.0f}m)",
+            level=3,  # Success
+            duration=3
+        )
+        # Deactivate tool
+        self.tool_registry.deactivate_current()
+
+    def _on_polygon_complete(self, feature_data):
+        """
+        Handle polygon (search area) drawing completion.
+
+        Note: Tool has already unset itself before showing dialog, so we don't
+        need to call deactivate_current() here.
+
+        Args:
+            feature_data: Dict with search area info (name, team, status, priority, vertices, etc.)
+        """
+        print(f"[SARTRACKER] _on_polygon_complete() called")
+        print(f"[SARTRACKER] Canvas current tool: {self.iface.mapCanvas().mapTool()}")
+        print(f"[SARTRACKER] Active tool name: {self.tool_registry.get_active_tool_name()}")
+
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            f"Search Area '{feature_data['name']}' created ({feature_data['vertices']} vertices, {feature_data['priority']} priority, {feature_data['status']})",
+            level=3,  # Success
+            duration=3
+        )
+
+        # Tool has already unset itself, but clear registry state
+        if self.tool_registry.get_active_tool_name() == 'polygon':
+            print(f"[SARTRACKER] Clearing polygon tool from registry...")
+            self.tool_registry.active_tool = None
+            self.tool_registry.active_tool_name = None
+
+        print(f"[SARTRACKER] Signal handler complete")
+
     def _on_drawing_cancelled(self):
-        """Handle drawing cancellation (ESC pressed)."""
+        """Handle drawing cancellation (ESC pressed or dialog cancelled)."""
+        # Deactivate the current drawing tool
+        self.tool_registry.deactivate_current()
         # Silent cancellation - no message needed
-        pass
 
     def _on_tool_activated(self, tool_name):
         """

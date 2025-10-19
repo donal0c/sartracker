@@ -62,47 +62,84 @@ class ToolRegistry(QObject):
         Returns:
             bool: True if activated successfully, False if tool not found
         """
+        print(f"[REGISTRY] activate_tool('{name}') called")
+        print(f"[REGISTRY] Currently active tool: {self.active_tool_name}")
+        print(f"[REGISTRY] Canvas current tool: {self.canvas.mapTool()}")
+
         if name not in self.tools:
+            print(f"[REGISTRY] ERROR: Tool '{name}' not registered!")
             return False
 
         # Deactivate current tool if one is active
         if self.active_tool:
+            print(f"[REGISTRY] Deactivating current tool '{self.active_tool_name}'...")
             try:
                 # Explicitly deactivate the tool to ensure cleanup
                 if hasattr(self.active_tool, 'deactivate'):
                     self.active_tool.deactivate()
                 self.canvas.unsetMapTool(self.active_tool)
                 self.tool_deactivated.emit(self.active_tool_name)
+                print(f"[REGISTRY] Previous tool deactivated")
             except Exception as e:
-                print(f"Error deactivating tool {self.active_tool_name}: {e}")
+                print(f"[REGISTRY] ERROR deactivating tool {self.active_tool_name}: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Activate new tool
+        print(f"[REGISTRY] Activating new tool '{name}'...")
         self.active_tool = self.tools[name]
         self.active_tool_name = name
         try:
+            print(f"[REGISTRY] Calling canvas.setMapTool()...")
             self.canvas.setMapTool(self.active_tool)
+            print(f"[REGISTRY] canvas.setMapTool() complete")
+            print(f"[REGISTRY] Canvas current tool after set: {self.canvas.mapTool()}")
+            print(f"[REGISTRY] Emitting tool_activated signal...")
             self.tool_activated.emit(name)
+            print(f"[REGISTRY] Tool '{name}' activated successfully")
             return True
         except Exception as e:
-            print(f"Error activating tool {name}: {e}")
+            print(f"[REGISTRY] ERROR activating tool {name}: {e}")
+            import traceback
+            traceback.print_exc()
             self.active_tool = None
             self.active_tool_name = None
             return False
 
     def deactivate_current(self):
         """Deactivate the currently active tool."""
+        print(f"[REGISTRY] deactivate_current() called")
+        print(f"[REGISTRY] Active tool: {self.active_tool}")
+        print(f"[REGISTRY] Active tool name: {self.active_tool_name}")
+        print(f"[REGISTRY] Canvas current tool: {self.canvas.mapTool()}")
+
         if self.active_tool:
             try:
                 # Explicitly deactivate the tool to ensure cleanup
                 if hasattr(self.active_tool, 'deactivate'):
+                    print(f"[REGISTRY] Calling tool.deactivate()...")
                     self.active_tool.deactivate()
+                    print(f"[REGISTRY] tool.deactivate() complete")
+
+                print(f"[REGISTRY] Calling canvas.unsetMapTool()...")
                 self.canvas.unsetMapTool(self.active_tool)
+                print(f"[REGISTRY] canvas.unsetMapTool() complete")
+                print(f"[REGISTRY] Canvas current tool after unset: {self.canvas.mapTool()}")
+
+                print(f"[REGISTRY] Emitting tool_deactivated signal...")
                 self.tool_deactivated.emit(self.active_tool_name)
+                print(f"[REGISTRY] Signal emitted")
             except Exception as e:
-                print(f"Error deactivating current tool: {e}")
+                print(f"[REGISTRY] ERROR deactivating current tool: {e}")
+                import traceback
+                traceback.print_exc()
             finally:
+                print(f"[REGISTRY] Clearing active_tool references...")
                 self.active_tool = None
                 self.active_tool_name = None
+                print(f"[REGISTRY] deactivate_current() complete")
+        else:
+            print(f"[REGISTRY] No active tool to deactivate")
 
     def get_active_tool_name(self):
         """

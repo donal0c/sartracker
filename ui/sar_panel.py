@@ -46,7 +46,9 @@ class SARPanel(QDockWidget):
     add_casualty_requested = pyqtSignal()
     add_hazard_requested = pyqtSignal()
     line_tool_requested = pyqtSignal()
+    polygon_tool_requested = pyqtSignal()
     range_rings_tool_requested = pyqtSignal()
+    bearing_tool_requested = pyqtSignal()
     coordinate_converter_requested = pyqtSignal()
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
@@ -291,8 +293,9 @@ class SARPanel(QDockWidget):
         drawing_grid.addWidget(self.line_tool_button, 0, 0)
 
         self.search_area_button = QPushButton("Search Area")
-        self.search_area_button.setToolTip("Draw polygon search areas with status tracking")
-        self.search_area_button.setEnabled(False)  # Disabled until implemented
+        self.search_area_button.setToolTip("Draw polygon search areas with status tracking.\nClick to add vertices, right-click to finish (min 3 vertices).")
+        self.search_area_button.setEnabled(False)  # DISABLED - Implementation causes Qt event system issues
+        self.search_area_button.clicked.connect(self._on_polygon_tool)
         drawing_grid.addWidget(self.search_area_button, 0, 1)
 
         self.range_rings_button = QPushButton("Range Rings")
@@ -302,7 +305,7 @@ class SARPanel(QDockWidget):
 
         self.bearing_line_button = QPushButton("Bearing Line")
         self.bearing_line_button.setToolTip("Draw azimuth/bearing lines for direction finding")
-        self.bearing_line_button.setEnabled(False)  # Disabled until implemented
+        self.bearing_line_button.clicked.connect(self._on_bearing_tool)
         drawing_grid.addWidget(self.bearing_line_button, 1, 1)
 
         self.sector_button = QPushButton("Search Sector")
@@ -532,9 +535,17 @@ class SARPanel(QDockWidget):
         """Handle Line Tool button click."""
         self.line_tool_requested.emit()
 
+    def _on_polygon_tool(self):
+        """Handle Polygon Tool (Search Area) button click."""
+        self.polygon_tool_requested.emit()
+
     def _on_range_rings_tool(self):
         """Handle Range Rings Tool button click."""
         self.range_rings_tool_requested.emit()
+
+    def _on_bearing_tool(self):
+        """Handle Bearing Tool button click."""
+        self.bearing_tool_requested.emit()
 
     def set_active_tool(self, tool_name):
         """
