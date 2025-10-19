@@ -30,6 +30,7 @@ from qgis.core import (
     QgsPointXY, QgsDistanceArea, QgsProject, QgsLineSymbol,
     QgsMarkerSymbol
 )
+from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
@@ -91,13 +92,13 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),           # String - unique ID
-            QgsField("name", 10),         # String - line name
-            QgsField("description", 10),  # String - notes
-            QgsField("color", 10),        # String - hex color
-            QgsField("width", 2),         # Int - line width in pixels
-            QgsField("distance_m", 6),    # Double - length in meters
-            QgsField("created", 10),      # String - ISO timestamp
+            QgsField("id", QVariant.String),           # String - unique ID
+            QgsField("name", QVariant.String),         # String - line name
+            QgsField("description", QVariant.String),  # String - notes
+            QgsField("color", QVariant.String),        # String - hex color
+            QgsField("width", QVariant.Int),           # Int - line width in pixels
+            QgsField("distance_m", QVariant.Double),   # Double - length in meters
+            QgsField("created", QVariant.String),      # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -203,21 +204,21 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields with SAR-specific attributes
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),              # String - unique ID
-            QgsField("name", 10),            # String - area name
-            QgsField("team", 10),            # String - assigned team
-            QgsField("status", 10),          # String - Planned/Assigned/InProgress/Completed/Cleared
-            QgsField("priority", 10),        # String - High/Medium/Low
-            QgsField("area_sqkm", 6),        # Double - area in square km
-            QgsField("POA", 6),              # Double - Probability of Area (0-100)
-            QgsField("POD", 6),              # Double - Probability of Detection (0-100)
-            QgsField("terrain", 10),         # String - terrain type
-            QgsField("search_method", 10),   # String - search method
-            QgsField("color", 10),           # String - hex color
-            QgsField("start_time", 10),      # String - ISO timestamp
-            QgsField("end_time", 10),        # String - ISO timestamp
-            QgsField("notes", 10),           # String - additional notes
-            QgsField("created", 10),         # String - ISO timestamp
+            QgsField("id", QVariant.String),              # String - unique ID
+            QgsField("name", QVariant.String),            # String - area name
+            QgsField("team", QVariant.String),            # String - assigned team
+            QgsField("status", QVariant.String),          # String - Planned/Assigned/InProgress/Completed/Cleared
+            QgsField("priority", QVariant.String),        # String - High/Medium/Low
+            QgsField("area_sqkm", QVariant.Double),       # Double - area in square km
+            QgsField("POA", QVariant.Double),             # Double - Probability of Area (0-100)
+            QgsField("POD", QVariant.Double),             # Double - Probability of Detection (0-100)
+            QgsField("terrain", QVariant.String),         # String - terrain type
+            QgsField("search_method", QVariant.String),   # String - search method
+            QgsField("color", QVariant.String),           # String - hex color
+            QgsField("start_time", QVariant.String),      # String - ISO timestamp
+            QgsField("end_time", QVariant.String),        # String - ISO timestamp
+            QgsField("notes", QVariant.String),           # String - additional notes
+            QgsField("created", QVariant.String),         # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -341,16 +342,16 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),              # String - unique ID
-            QgsField("name", 10),            # String - ring name
-            QgsField("center_lat", 6),       # Double - center latitude
-            QgsField("center_lon", 6),       # Double - center longitude
-            QgsField("radius_m", 6),         # Double - radius in meters
-            QgsField("label", 10),           # String - display label
-            QgsField("color", 10),           # String - hex color
-            QgsField("lpb_category", 10),    # String - LPB category if applicable
-            QgsField("percentile", 2),       # Int - LPB percentile (25, 50, 75, 95)
-            QgsField("created", 10),         # String - ISO timestamp
+            QgsField("id", QVariant.String),              # String - unique ID
+            QgsField("name", QVariant.String),            # String - ring name
+            QgsField("center_lat", QVariant.Double),      # Double - center latitude
+            QgsField("center_lon", QVariant.Double),      # Double - center longitude
+            QgsField("radius_m", QVariant.Double),        # Double - radius in meters
+            QgsField("label", QVariant.String),           # String - display label
+            QgsField("color", QVariant.String),           # String - hex color
+            QgsField("lpb_category", QVariant.String),    # String - LPB category if applicable
+            QgsField("percentile", QVariant.Int),         # Int - LPB percentile (25, 50, 75, 95)
+            QgsField("created", QVariant.String),         # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -520,15 +521,15 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),              # String - unique ID
-            QgsField("name", 10),            # String - line name
-            QgsField("origin_lat", 6),       # Double - origin latitude
-            QgsField("origin_lon", 6),       # Double - origin longitude
-            QgsField("bearing", 6),          # Double - bearing in degrees (0-360)
-            QgsField("distance_m", 6),       # Double - line length in meters
-            QgsField("label", 10),           # String - display label
-            QgsField("color", 10),           # String - hex color
-            QgsField("created", 10),         # String - ISO timestamp
+            QgsField("id", QVariant.String),              # String - unique ID
+            QgsField("name", QVariant.String),            # String - line name
+            QgsField("origin_lat", QVariant.Double),      # Double - origin latitude
+            QgsField("origin_lon", QVariant.Double),      # Double - origin longitude
+            QgsField("bearing", QVariant.Double),         # Double - bearing in degrees (0-360)
+            QgsField("distance_m", QVariant.Double),      # Double - line length in meters
+            QgsField("label", QVariant.String),           # String - display label
+            QgsField("color", QVariant.String),           # String - hex color
+            QgsField("created", QVariant.String),         # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -674,17 +675,17 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),              # String - unique ID
-            QgsField("name", 10),            # String - sector name
-            QgsField("center_lat", 6),       # Double - center latitude
-            QgsField("center_lon", 6),       # Double - center longitude
-            QgsField("start_bearing", 6),    # Double - start bearing (degrees)
-            QgsField("end_bearing", 6),      # Double - end bearing (degrees)
-            QgsField("radius_m", 6),         # Double - radius in meters
-            QgsField("area_sqkm", 6),        # Double - area in square km
-            QgsField("priority", 10),        # String - High/Medium/Low
-            QgsField("color", 10),           # String - hex color
-            QgsField("created", 10),         # String - ISO timestamp
+            QgsField("id", QVariant.String),              # String - unique ID
+            QgsField("name", QVariant.String),            # String - sector name
+            QgsField("center_lat", QVariant.Double),      # Double - center latitude
+            QgsField("center_lon", QVariant.Double),      # Double - center longitude
+            QgsField("start_bearing", QVariant.Double),   # Double - start bearing (degrees)
+            QgsField("end_bearing", QVariant.Double),     # Double - end bearing (degrees)
+            QgsField("radius_m", QVariant.Double),        # Double - radius in meters
+            QgsField("area_sqkm", QVariant.Double),       # Double - area in square km
+            QgsField("priority", QVariant.String),        # String - High/Medium/Low
+            QgsField("color", QVariant.String),           # String - hex color
+            QgsField("created", QVariant.String),         # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -844,14 +845,14 @@ class DrawingLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),              # String - unique ID
-            QgsField("text", 10),            # String - label text
-            QgsField("lat", 6),              # Double - latitude
-            QgsField("lon", 6),              # Double - longitude
-            QgsField("font_size", 2),        # Int - font size
-            QgsField("color", 10),           # String - text color
-            QgsField("rotation", 6),         # Double - rotation angle
-            QgsField("created", 10),         # String - ISO timestamp
+            QgsField("id", QVariant.String),              # String - unique ID
+            QgsField("text", QVariant.String),            # String - label text
+            QgsField("lat", QVariant.Double),             # Double - latitude
+            QgsField("lon", QVariant.Double),             # Double - longitude
+            QgsField("font_size", QVariant.Int),          # Int - font size
+            QgsField("color", QVariant.String),           # String - text color
+            QgsField("rotation", QVariant.Double),        # Double - rotation angle
+            QgsField("created", QVariant.String),         # String - ISO timestamp
         ])
         layer.updateFields()
 

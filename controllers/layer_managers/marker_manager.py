@@ -16,6 +16,7 @@ from qgis.core import (
     QgsPointXY, QgsMarkerSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings
 )
+from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
@@ -71,7 +72,7 @@ class MarkerLayerManager(BaseLayerManager):
             return layers[0]
 
         # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
+        # Qt5/Qt6 Compatible: Using QVariant types
         layer = QgsVectorLayer(
             "Point?crs=EPSG:4326",
             self.IPP_LKP_LAYER_NAME,
@@ -80,15 +81,15 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),                # String - UUID
-            QgsField("name", 10),              # String - marker name
-            QgsField("subject_category", 10),  # String - subject type (Child, Hiker, etc.)
-            QgsField("description", 10),       # String - additional notes
-            QgsField("lat", 6),                # Double - WGS84 latitude
-            QgsField("lon", 6),                # Double - WGS84 longitude
-            QgsField("irish_grid_e", 6),       # Double - ITM easting
-            QgsField("irish_grid_n", 6),       # Double - ITM northing
-            QgsField("created", 10),           # String - ISO timestamp
+            QgsField("id", QVariant.String),                # String - UUID
+            QgsField("name", QVariant.String),              # String - marker name
+            QgsField("subject_category", QVariant.String),  # String - subject type (Child, Hiker, etc.)
+            QgsField("description", QVariant.String),       # String - additional notes
+            QgsField("lat", QVariant.Double),               # Double - WGS84 latitude
+            QgsField("lon", QVariant.Double),               # Double - WGS84 longitude
+            QgsField("irish_grid_e", QVariant.Double),      # Double - ITM easting
+            QgsField("irish_grid_n", QVariant.Double),      # Double - ITM northing
+            QgsField("created", QVariant.String),           # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -222,16 +223,16 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),           # String - UUID
-            QgsField("name", 10),         # String - clue name
-            QgsField("clue_type", 10),    # String - Footprint, Clothing, Witness Sighting, etc.
-            QgsField("confidence", 10),   # String - Confirmed, Probable, Possible
-            QgsField("description", 10),  # String - additional notes
-            QgsField("lat", 6),           # Double - WGS84 latitude
-            QgsField("lon", 6),           # Double - WGS84 longitude
-            QgsField("irish_grid_e", 6),  # Double - ITM easting
-            QgsField("irish_grid_n", 6),  # Double - ITM northing
-            QgsField("created", 10),      # String - ISO timestamp
+            QgsField("id", QVariant.String),           # String - UUID
+            QgsField("name", QVariant.String),         # String - clue name
+            QgsField("clue_type", QVariant.String),    # String - Footprint, Clothing, Witness Sighting, etc.
+            QgsField("confidence", QVariant.String),   # String - Confirmed, Probable, Possible
+            QgsField("description", QVariant.String),  # String - additional notes
+            QgsField("lat", QVariant.Double),          # Double - WGS84 latitude
+            QgsField("lon", QVariant.Double),          # Double - WGS84 longitude
+            QgsField("irish_grid_e", QVariant.Double), # Double - ITM easting
+            QgsField("irish_grid_n", QVariant.Double), # Double - ITM northing
+            QgsField("created", QVariant.String),      # String - ISO timestamp
         ])
         layer.updateFields()
 
@@ -368,16 +369,16 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add fields
         layer.dataProvider().addAttributes([
-            QgsField("id", 10),            # String - UUID
-            QgsField("name", 10),          # String - hazard name
-            QgsField("hazard_type", 10),   # String - Cliff, Water, Bog, etc.
-            QgsField("severity", 10),      # String - Critical, High, Medium, Low
-            QgsField("description", 10),   # String - additional notes
-            QgsField("lat", 6),            # Double - WGS84 latitude
-            QgsField("lon", 6),            # Double - WGS84 longitude
-            QgsField("irish_grid_e", 6),   # Double - ITM easting
-            QgsField("irish_grid_n", 6),   # Double - ITM northing
-            QgsField("created", 10),       # String - ISO timestamp
+            QgsField("id", QVariant.String),            # String - UUID
+            QgsField("name", QVariant.String),          # String - hazard name
+            QgsField("hazard_type", QVariant.String),   # String - Cliff, Water, Bog, etc.
+            QgsField("severity", QVariant.String),      # String - Critical, High, Medium, Low
+            QgsField("description", QVariant.String),   # String - additional notes
+            QgsField("lat", QVariant.Double),           # Double - WGS84 latitude
+            QgsField("lon", QVariant.Double),           # Double - WGS84 longitude
+            QgsField("irish_grid_e", QVariant.Double),  # Double - ITM easting
+            QgsField("irish_grid_n", QVariant.Double),  # Double - ITM northing
+            QgsField("created", QVariant.String),       # String - ISO timestamp
         ])
         layer.updateFields()
 

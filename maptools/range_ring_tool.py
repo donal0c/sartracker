@@ -19,7 +19,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message, DialogAccepted
 from ..utils.lpb_statistics import LPBStatistics
 
 from .base_drawing_tool import BaseDrawingTool
@@ -279,7 +279,7 @@ class RangeRingTool(BaseDrawingTool):
         # Use None as parent since canvas is not a QWidget
         dialog = RangeRingDialog(None)
 
-        if dialog_exec(dialog) == QDialog.Accepted and dialog.ring_data:
+        if dialog_exec(dialog) == DialogAccepted and dialog.ring_data:
             self._create_rings(dialog.ring_data)
         else:
             # User cancelled

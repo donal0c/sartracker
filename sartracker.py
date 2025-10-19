@@ -35,7 +35,7 @@ import os.path
 import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import RightDockWidgetArea, dialog_exec, push_message
+from .utils.qt_compat import RightDockWidgetArea, dialog_exec, push_message, DialogAccepted
 
 # Import our SAR tracking components
 try:
@@ -704,7 +704,7 @@ class sartracker:
         # Show dialog and wait for user
         result = dialog_exec(dialog)
 
-        if result == MarkerDialog.Accepted:
+        if result == DialogAccepted:
             # Get marker data from dialog
             marker_data = dialog.get_marker_data()
 
@@ -1129,7 +1129,7 @@ class sartracker:
             # Show dialog and handle result
             result = dialog_exec(dialog)
 
-            if result == QDialog.Accepted:
+            if result == DialogAccepted:
                 # Resume the mission
                 self.sar_panel.restore_mission_state(saved_state)
                 self.sar_panel.show()  # Show panel

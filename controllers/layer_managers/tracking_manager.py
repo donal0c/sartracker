@@ -18,6 +18,7 @@ from qgis.core import (
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings
 )
+from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
@@ -72,7 +73,7 @@ class TrackingLayerManager(BaseLayerManager):
             return layers[0]
 
         # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
+        # Qt5/Qt6 Compatible: Using QVariant types
         layer = QgsVectorLayer(
             "Point?crs=EPSG:4326",
             self.CURRENT_LAYER_NAME,
@@ -82,12 +83,12 @@ class TrackingLayerManager(BaseLayerManager):
         # Add fields
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("device_id", 10),  # String
-            QgsField("name", 10),       # String
-            QgsField("timestamp", 10),  # String
-            QgsField("altitude", 6),    # Double
-            QgsField("speed", 6),       # Double
-            QgsField("battery", 6)      # Double
+            QgsField("device_id", QVariant.String),  # String
+            QgsField("name", QVariant.String),       # String
+            QgsField("timestamp", QVariant.String),  # String
+            QgsField("altitude", QVariant.Double),   # Double
+            QgsField("speed", QVariant.Double),      # Double
+            QgsField("battery", QVariant.Double)     # Double
         ])
         layer.updateFields()
 
@@ -283,8 +284,8 @@ class TrackingLayerManager(BaseLayerManager):
 
         provider = layer.dataProvider()
         provider.addAttributes([
-            QgsField("device_id", 10),  # String
-            QgsField("name", 10)        # String
+            QgsField("device_id", QVariant.String),  # String
+            QgsField("name", QVariant.String)        # String
         ])
         layer.updateFields()
 

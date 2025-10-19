@@ -19,7 +19,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message, DialogAccepted
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -362,7 +362,7 @@ class BearingTool(BaseDrawingTool):
             # Use None as parent since canvas is not a QWidget
             dialog = BearingLineDialog(origin_wgs84.y(), origin_wgs84.x(), None)
 
-            if dialog_exec(dialog) == QDialog.Accepted and dialog.bearing_data:
+            if dialog_exec(dialog) == DialogAccepted and dialog.bearing_data:
                 self._create_bearing_line(origin_wgs84, dialog.bearing_data)
             else:
                 # User cancelled

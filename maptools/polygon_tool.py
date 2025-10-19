@@ -19,7 +19,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message, DialogAccepted
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -424,7 +424,7 @@ class PolygonTool(BaseDrawingTool):
         from qgis.PyQt.QtWidgets import QApplication
         QApplication.processEvents(QEventLoop.AllEvents, 100)
 
-        if result == QDialog.Accepted and dialog.area_data:
+        if result == DialogAccepted and dialog.area_data:
             # User accepted - create feature immediately
             self._create_search_area(points_wgs84, dialog.area_data)
         else:

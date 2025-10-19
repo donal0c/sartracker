@@ -198,6 +198,19 @@ else:  # Qt5
 
 
 # =============================================================================
+# QDialog result codes
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QDialog
+    DialogAccepted = QDialog.Accepted
+    DialogRejected = QDialog.Rejected
+except (AttributeError, ImportError):
+    # Fallback for cases where QDialog constants aren't available
+    DialogAccepted = 1
+    DialogRejected = 0
+
+
+# =============================================================================
 # Dialog exec compatibility
 # =============================================================================
 def dialog_exec(dialog):
@@ -285,6 +298,9 @@ __all__ = [
     # Functions
     'dialog_exec',
     'push_message',
+    # Dialog constants
+    'DialogAccepted',
+    'DialogRejected',
     # DockWidgetArea
     'LeftDockWidgetArea',
     'RightDockWidgetArea',
