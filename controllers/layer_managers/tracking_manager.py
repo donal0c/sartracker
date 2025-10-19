@@ -41,14 +41,19 @@ class TrackingLayerManager(BaseLayerManager):
     CURRENT_LAYER_NAME = "Current Positions"
     BREADCRUMBS_LAYER_NAME = "Breadcrumbs"
 
-    def __init__(self, iface):
+    def __init__(self, iface, shared_device_colors=None):
         """Initialize tracking layer manager."""
-        super().__init__(iface)
+        super().__init__(iface, shared_device_colors)
         self.first_load = True  # Track if this is first data load for auto-zoom
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
         return [self.CURRENT_LAYER_NAME, self.BREADCRUMBS_LAYER_NAME]
+
+    def reset_state(self):
+        """Reset manager state (called after clearing layers)."""
+        super().reset_state()
+        self.first_load = True  # Reset auto-zoom flag
 
     # =========================================================================
     # Current Positions Layer
@@ -115,8 +120,9 @@ class TrackingLayerManager(BaseLayerManager):
             try:
                 # Truncate is faster for clearing all features
                 layer.dataProvider().truncate()
-            except:
+            except (AttributeError, NotImplementedError, RuntimeError) as e:
                 # Fallback to deleteFeatures if truncate not supported
+                print(f"Truncate not available for {self.CURRENT_LAYER_NAME}, using deleteFeatures: {e}")
                 layer.deleteFeatures([f.id() for f in layer.getFeatures()])
 
         # Add new features
@@ -270,8 +276,9 @@ class TrackingLayerManager(BaseLayerManager):
             try:
                 # Truncate is faster for clearing all features
                 layer.dataProvider().truncate()
-            except:
+            except (AttributeError, NotImplementedError, RuntimeError) as e:
                 # Fallback to deleteFeatures if truncate not supported
+                print(f"Truncate not available for {self.BREADCRUMBS_LAYER_NAME}, using deleteFeatures: {e}")
                 layer.deleteFeatures([f.id() for f in layer.getFeatures()])
 
         # Group positions by device_id
@@ -307,10 +314,14 @@ class TrackingLayerManager(BaseLayerManager):
                         prev_time = datetime.fromisoformat(prev_ts)
                         curr_time = datetime.fromisoformat(curr_ts)
                         time_diff = (curr_time - prev_time).total_seconds() / 60
-                    except (ValueError, AttributeError) as e:
+                    except (ValueError, AttributeError, TypeError) as e:
                         # If timestamp parsing fails, assume no gap and continue segment
                         # This prevents crashes on malformed timestamps
-                        print(f"Warning: Could not parse timestamp: {e}")
+                        # Warn user via message bar (visible in QGIS UI)
+                        self.iface.messageBar().pushWarning(
+                            "Timestamp Parsing",
+                            f"Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment."
+                        )
                         time_diff = 0
 
                     if time_diff > time_gap_minutes:

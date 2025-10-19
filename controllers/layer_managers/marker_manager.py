@@ -38,9 +38,9 @@ class MarkerLayerManager(BaseLayerManager):
     CLUES_LAYER_NAME = "Clues"
     HAZARDS_LAYER_NAME = "Hazards"
 
-    def __init__(self, iface):
+    def __init__(self, iface, shared_device_colors=None):
         """Initialize marker layer manager."""
-        super().__init__(iface)
+        super().__init__(iface, shared_device_colors)
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -128,6 +128,26 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             str: UUID of added marker
         """
+        # Validate name (required)
+        if not name or not name.strip():
+            raise ValueError("Marker name cannot be empty")
+
+        # Validate coordinates
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
+
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}. Must be between -180 and 180")
+
+        # Validate optional Irish Grid coordinates if provided
+        if irish_grid_e is not None:
+            if not (0 <= irish_grid_e <= 1000000):
+                raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
+
+        if irish_grid_n is not None:
+            if not (0 <= irish_grid_n <= 1500000):
+                raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
         layer = self._get_or_create_ipp_lkp_layer()
 
         # Create feature
@@ -150,12 +170,28 @@ class MarkerLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
-        layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
+        # Add to layer with error handling
+        try:
+            layer.startEditing()
 
-        return marker_id
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.IPP_LKP_LAYER_NAME} layer")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit changes to {self.IPP_LKP_LAYER_NAME} layer: {', '.join(errors)}")
+
+            # Force immediate visual update
+            layer.triggerRepaint()
+
+            return marker_id
+
+        except Exception as e:
+            # Ensure layer is not left in editing state
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error adding {self.IPP_LKP_LAYER_NAME} marker '{name}': {str(e)}")
 
     # =========================================================================
     # Clues Layer (Evidence found during search)
@@ -237,6 +273,26 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             str: UUID of added clue
         """
+        # Validate name (required)
+        if not name or not name.strip():
+            raise ValueError("Marker name cannot be empty")
+
+        # Validate coordinates
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
+
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}. Must be between -180 and 180")
+
+        # Validate optional Irish Grid coordinates if provided
+        if irish_grid_e is not None:
+            if not (0 <= irish_grid_e <= 1000000):
+                raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
+
+        if irish_grid_n is not None:
+            if not (0 <= irish_grid_n <= 1500000):
+                raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
         layer = self._get_or_create_clues_layer()
 
         # Create feature
@@ -260,12 +316,28 @@ class MarkerLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
-        layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
+        # Add to layer with error handling
+        try:
+            layer.startEditing()
 
-        return marker_id
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.CLUES_LAYER_NAME} layer")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit changes to {self.CLUES_LAYER_NAME} layer: {', '.join(errors)}")
+
+            # Force immediate visual update
+            layer.triggerRepaint()
+
+            return marker_id
+
+        except Exception as e:
+            # Ensure layer is not left in editing state
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error adding {self.CLUES_LAYER_NAME} marker '{name}': {str(e)}")
 
     # =========================================================================
     # Hazards Layer (Safety warnings)
@@ -348,6 +420,26 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             str: UUID of added hazard
         """
+        # Validate name (required)
+        if not name or not name.strip():
+            raise ValueError("Marker name cannot be empty")
+
+        # Validate coordinates
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
+
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}. Must be between -180 and 180")
+
+        # Validate optional Irish Grid coordinates if provided
+        if irish_grid_e is not None:
+            if not (0 <= irish_grid_e <= 1000000):
+                raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
+
+        if irish_grid_n is not None:
+            if not (0 <= irish_grid_n <= 1500000):
+                raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
         layer = self._get_or_create_hazards_layer()
 
         # Create feature
@@ -371,12 +463,28 @@ class MarkerLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
-        layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
+        # Add to layer with error handling
+        try:
+            layer.startEditing()
 
-        return marker_id
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.HAZARDS_LAYER_NAME} layer")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit changes to {self.HAZARDS_LAYER_NAME} layer: {', '.join(errors)}")
+
+            # Force immediate visual update
+            layer.triggerRepaint()
+
+            return marker_id
+
+        except Exception as e:
+            # Ensure layer is not left in editing state
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error adding {self.HAZARDS_LAYER_NAME} marker '{name}': {str(e)}")
 
     # =========================================================================
     # Common Helper Methods

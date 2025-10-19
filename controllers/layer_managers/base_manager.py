@@ -30,19 +30,31 @@ class BaseLayerManager(ABC):
     # Layer group name - all SAR layers belong to this group
     LAYER_GROUP_NAME = "SAR Tracking"
 
-    def __init__(self, iface):
+    # Class-level shared device color cache for consistency across all managers
+    # This ensures the same device ID always gets the same color in all layers
+    _shared_device_colors = {}
+
+    def __init__(self, iface, shared_device_colors=None):
         """
         Initialize base manager.
 
         Args:
             iface: QGIS interface object
+            shared_device_colors: Optional shared dict for device colors.
+                                 If None, uses class-level shared dict.
         """
         self.iface = iface
         self.project = QgsProject.instance()
 
-        # Color management for devices (shared across managers if needed)
-        # Key: device_id, Value: QColor
-        self.device_colors = {}
+        # Validate project instance
+        if not self.project:
+            raise RuntimeError("QgsProject instance not available - cannot initialize manager")
+
+        # Use provided shared dict or fall back to class-level dict
+        if shared_device_colors is not None:
+            self.device_colors = shared_device_colors
+        else:
+            self.device_colors = self.__class__._shared_device_colors
 
     def get_or_create_layer_group(self):
         """
@@ -59,25 +71,43 @@ class BaseLayerManager(ABC):
 
     def _get_device_color(self, device_id: str) -> QColor:
         """
-        Get consistent color for a device.
+        Get consistent, deterministic color for a device.
 
-        Uses caching to ensure same device always gets same color.
-        Generates distinct colors avoiding very dark shades.
+        Uses device_id hash to ensure same device always gets same color
+        across sessions, restarts, and all layers. Generates distinct colors
+        avoiding very dark shades for visibility.
 
         Args:
             device_id: Device identifier string
 
         Returns:
-            QColor: Color for this device
+            QColor: Defensive copy of color for this device
+
+        Raises:
+            ValueError: If device_id is empty or invalid
         """
+        # Validate device_id
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("device_id must be a non-empty string")
+
+        if len(device_id) > 256:
+            raise ValueError("device_id exceeds maximum length of 256 characters")
+
         if device_id not in self.device_colors:
-            # Generate a distinct color (avoid very dark colors for visibility)
-            self.device_colors[device_id] = QColor(
-                random.randint(50, 255),
-                random.randint(50, 255),
-                random.randint(50, 255)
-            )
-        return self.device_colors[device_id]
+            # Use device_id hash for deterministic color generation
+            # This ensures same device always gets same color across sessions
+            hash_val = hash(device_id)
+
+            # Generate RGB values from hash (range 50-255 for visibility)
+            r = 50 + (abs(hash_val) % 206)
+            g = 50 + (abs(hash_val >> 8) % 206)
+            b = 50 + (abs(hash_val >> 16) % 206)
+
+            self.device_colors[device_id] = QColor(r, g, b)
+
+        # Return a defensive copy to prevent mutation
+        cached_color = self.device_colors[device_id]
+        return QColor(cached_color)
 
     def _add_layer_to_group(self, layer: QgsVectorLayer, position: int = 0):
         """
@@ -95,6 +125,26 @@ class BaseLayerManager(ABC):
 
         # Insert at specified position
         group.insertLayer(position, layer)
+
+    def reset_state(self):
+        """
+        Reset manager state (e.g., after clearing layers).
+
+        Derived classes should override this if they have additional state to reset,
+        and should call super().reset_state() in their implementation.
+        """
+        # Base implementation does nothing - device_colors are shared and managed by orchestrator
+        pass
+
+    def cleanup(self):
+        """
+        Clean up resources when manager is being destroyed.
+
+        Derived classes should call super().cleanup() if they override this.
+        """
+        # Clear project reference
+        self.project = None
+        self.iface = None
 
     @abstractmethod
     def get_managed_layer_names(self):

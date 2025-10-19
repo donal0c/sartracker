@@ -48,10 +48,14 @@ class LayersController:
         self.iface = iface
         self.project = QgsProject.instance()
 
-        # Initialize specialized managers
-        self.tracking = TrackingLayerManager(iface)
-        self.markers = MarkerLayerManager(iface)
-        self.drawings = DrawingLayerManager(iface)
+        # Shared device color registry for consistency across all layers
+        # Same device ID will always get same color in all layers
+        self._shared_device_colors = {}
+
+        # Initialize specialized managers with shared color registry
+        self.tracking = TrackingLayerManager(iface, self._shared_device_colors)
+        self.markers = MarkerLayerManager(iface, self._shared_device_colors)
+        self.drawings = DrawingLayerManager(iface, self._shared_device_colors)
 
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
@@ -311,13 +315,16 @@ class LayersController:
         """
         Remove all SAR tracking layers.
 
-        Clears the entire SAR Tracking group and all device colors.
+        Clears the entire SAR Tracking group and all device colors atomically.
         """
         group = self.project.layerTreeRoot().findGroup(self.LAYER_GROUP_NAME)
         if group:
             self.project.layerTreeRoot().removeChildNode(group)
 
-        # Clear cached device colors from all managers
-        self.tracking.device_colors.clear()
-        self.markers.device_colors.clear()
-        self.drawings.device_colors.clear()
+        # Clear shared device colors atomically
+        self._shared_device_colors.clear()
+
+        # Reset manager state (e.g., first_load flag in tracking manager)
+        self.tracking.reset_state()
+        self.markers.reset_state()
+        self.drawings.reset_state()

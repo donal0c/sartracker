@@ -47,9 +47,9 @@ class DrawingLayerManager(BaseLayerManager):
     SECTORS_LAYER_NAME = "Search Sectors"
     TEXT_LABELS_LAYER_NAME = "Text Labels"
 
-    def __init__(self, iface):
+    def __init__(self, iface, shared_device_colors=None):
         """Initialize drawing layer manager."""
-        super().__init__(iface)
+        super().__init__(iface, shared_device_colors)
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -379,7 +379,13 @@ class DrawingLayerManager(BaseLayerManager):
         # This accounts for Earth's oblate spheroid shape
         numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
         denominator = (a * cos_lat)**2 + (b * sin_lat)**2
-        earth_radius = math.sqrt(numerator / denominator)
+
+        # Prevent division by zero at poles
+        if denominator < 1e-10:
+            # At poles, use polar radius
+            earth_radius = b
+        else:
+            earth_radius = math.sqrt(numerator / denominator)
 
         # Create circle points using geodesic calculations
         for i in range(segments + 1):
@@ -525,7 +531,13 @@ class DrawingLayerManager(BaseLayerManager):
         sin_lat = math.sin(lat1)
         numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
         denominator = (a * cos_lat)**2 + (b * sin_lat)**2
-        earth_radius = math.sqrt(numerator / denominator)
+
+        # Prevent division by zero at poles
+        if denominator < 1e-10:
+            # At poles, use polar radius
+            earth_radius = b
+        else:
+            earth_radius = math.sqrt(numerator / denominator)
 
         # Angular distance
         angular_dist = distance_m / earth_radius
@@ -635,12 +647,34 @@ class DrawingLayerManager(BaseLayerManager):
         """
         layer = self._get_or_create_sectors_layer()
 
-        # Create sector geometry (simplified - create as polygon)
+        # Create sector geometry using proper WGS84 ellipsoid calculations
         # Create arc with 36 segments
         num_segments = 36
         angle_range = end_bearing - start_bearing
         if angle_range < 0:
             angle_range += 360
+
+        # WGS84 ellipsoid parameters (same as range rings and bearing lines)
+        a = 6378137.0  # Semi-major axis (equatorial radius) in meters
+        f = 1 / 298.257223563  # Flattening
+        b = a * (1 - f)  # Semi-minor axis (polar radius)
+
+        # Calculate Earth radius at center latitude
+        lat1 = math.radians(center_wgs84.y())
+        lon1 = math.radians(center_wgs84.x())
+        cos_lat = math.cos(lat1)
+        sin_lat = math.sin(lat1)
+
+        numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
+        denominator = (a * cos_lat)**2 + (b * sin_lat)**2
+
+        # Prevent division by zero at poles
+        if denominator < 1e-10:
+            earth_radius = b
+        else:
+            earth_radius = math.sqrt(numerator / denominator)
+
+        angular_dist = radius_m / earth_radius
 
         points = [center_wgs84]  # Start from center
 
@@ -648,11 +682,7 @@ class DrawingLayerManager(BaseLayerManager):
             angle = start_bearing + (angle_range * i / num_segments)
             angle_rad = math.radians(angle)
 
-            # Simplified coordinate calculation (could be improved with full ellipsoid)
-            lat1 = math.radians(center_wgs84.y())
-            lon1 = math.radians(center_wgs84.x())
-            angular_dist = radius_m / 6371000.0
-
+            # Calculate point using WGS84 ellipsoid
             lat2 = math.asin(math.sin(lat1) * math.cos(angular_dist) +
                             math.cos(lat1) * math.sin(angular_dist) * math.cos(angle_rad))
             lon2 = lon1 + math.atan2(math.sin(angle_rad) * math.sin(angular_dist) * math.cos(lat1),
