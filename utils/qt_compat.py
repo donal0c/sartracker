@@ -198,10 +198,93 @@ else:  # Qt5
 
 
 # =============================================================================
+# Dialog exec compatibility
+# =============================================================================
+def dialog_exec(dialog):
+    """
+    Execute a dialog in a Qt5/Qt6 compatible way.
+
+    In Qt5, dialogs use exec_() method.
+    In Qt6, dialogs use exec() method.
+
+    Args:
+        dialog: QDialog instance
+
+    Returns:
+        Dialog result code (QDialog.Accepted or QDialog.Rejected)
+
+    Example:
+        from utils.qt_compat import dialog_exec
+        result = dialog_exec(my_dialog)
+        if result == QDialog.Accepted:
+            ...
+    """
+    if QT_VERSION == 6:
+        return dialog.exec()
+    else:  # Qt5
+        return dialog.exec_()
+
+
+# =============================================================================
+# QGIS MessageBar compatibility
+# =============================================================================
+try:
+    from qgis.core import Qgis
+    HAS_QGIS = True
+except ImportError:
+    HAS_QGIS = False
+
+if HAS_QGIS:
+    # Try to detect if we're using the new Qgis.MessageLevel enum API
+    # (QGIS 3.16+) or the old integer-based API
+    try:
+        # Test if Qgis.MessageLevel exists and works
+        _test_level = Qgis.MessageLevel.Info
+        USE_MESSAGE_LEVEL_ENUM = True
+    except (AttributeError, TypeError):
+        # Older QGIS versions use integer levels directly
+        USE_MESSAGE_LEVEL_ENUM = False
+
+    def push_message(message_bar, title, message, level=0, duration=5):
+        """
+        Push a message to QGIS message bar in a version-compatible way.
+
+        Args:
+            message_bar: QgsMessageBar instance (from iface.messageBar())
+            title: str - Message title
+            message: str - Message text
+            level: int - Message level (0=Info, 1=Warning, 2=Critical, 3=Success)
+            duration: int - Duration in seconds (0 for indefinite)
+
+        Example:
+            from utils.qt_compat import push_message
+            push_message(self.iface.messageBar(), "Title", "Message", level=0)
+        """
+        # Map integer levels to Qgis.MessageLevel enum
+        level_map = {
+            0: Qgis.MessageLevel.Info if USE_MESSAGE_LEVEL_ENUM else Qgis.Info,
+            1: Qgis.MessageLevel.Warning if USE_MESSAGE_LEVEL_ENUM else Qgis.Warning,
+            2: Qgis.MessageLevel.Critical if USE_MESSAGE_LEVEL_ENUM else Qgis.Critical,
+            3: Qgis.MessageLevel.Success if USE_MESSAGE_LEVEL_ENUM else Qgis.Success,
+        }
+
+        qgis_level = level_map.get(level, level_map[0])
+        message_bar.pushMessage(title, message, qgis_level, duration)
+else:
+    # Fallback if QGIS is not available (shouldn't happen in a QGIS plugin)
+    def push_message(message_bar, title, message, level=0, duration=5):
+        """Fallback push_message when QGIS is not available."""
+        print(f"[{title}] {message}")
+
+
+# =============================================================================
 # Export all compatibility constants
 # =============================================================================
 __all__ = [
     'QT_VERSION',
+    # Functions
+    'dialog_exec',
+    'push_message',
     # DockWidgetArea
     'LeftDockWidgetArea',
     'RightDockWidgetArea',

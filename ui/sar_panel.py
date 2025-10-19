@@ -16,10 +16,10 @@ from qgis.PyQt.QtGui import QColor
 from datetime import datetime
 from typing import Optional, List, Dict
 
-# Import Qt5/Qt6 compatible constants
+# Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
-    Checked
+    Checked, push_message
 )
 
 
@@ -294,7 +294,7 @@ class SARPanel(QDockWidget):
 
         self.search_area_button = QPushButton("Search Area")
         self.search_area_button.setToolTip("Draw polygon search areas with status tracking.\nClick to add vertices, right-click to finish (min 3 vertices).")
-        self.search_area_button.setEnabled(False)  # DISABLED - Implementation causes Qt event system issues
+        self.search_area_button.setEnabled(False)  # DISABLED - Qt event loop freeze issue (see docs/COMPREHENSIVE_POLYGON_FREEZE_ANALYSIS.md)
         self.search_area_button.clicked.connect(self._on_polygon_tool)
         drawing_grid.addWidget(self.search_area_button, 0, 1)
 
@@ -676,11 +676,11 @@ class SARPanel(QDockWidget):
                 self.focus_mode_active = True
 
                 # Show message
-                from qgis.core import Qgis
-                iface.messageBar().pushMessage(
+                push_message(
+                    iface.messageBar(),
                     "Focus Mode",
                     f"Focus Mode enabled - {len(self.hidden_panels)} panels hidden. Click 'Exit Focus Mode' to restore.",
-                    level=Qgis.Info,
+                    level=0,  # Info
                     duration=3
                 )
 
@@ -699,22 +699,22 @@ class SARPanel(QDockWidget):
                 self.focus_mode_active = False
 
                 # Show message
-                from qgis.core import Qgis
-                iface.messageBar().pushMessage(
+                push_message(
+                    iface.messageBar(),
                     "Focus Mode",
                     f"Focus Mode disabled - {restored} panels restored.",
-                    level=Qgis.Info,
+                    level=0,  # Info
                     duration=2
                 )
 
         except Exception as e:
             # Fail gracefully - focus mode is optional
             print(f"Focus mode toggle failed: {e}")
-            from qgis.core import Qgis
             from qgis.utils import iface
-            iface.messageBar().pushMessage(
+            push_message(
+                iface.messageBar(),
                 "Focus Mode Error",
                 f"Could not toggle Focus Mode: {e}",
-                level=Qgis.Warning,
+                level=1,  # Warning
                 duration=3
             )

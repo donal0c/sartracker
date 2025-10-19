@@ -12,12 +12,12 @@ from qgis.core import (
     QgsWkbTypes, QgsDistanceArea
 )
 from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
-from qgis.PyQt.QtCore import pyqtSignal, QVariant
+from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QCursor, QColor
 import math
 
 # Import Qt5/Qt6 compatible constants
-from ..utils.qt_compat import CrossCursor
+from ..utils.qt_compat import CrossCursor, Key_Escape
 
 
 class SearchSectorTool(QgsMapTool):
@@ -423,6 +423,6 @@ class SearchSectorTool(QgsMapTool):
     def keyPressEvent(self, event):
         """Handle keyboard input."""
         # ESC key cancels current operation
-        if event.key() == 16777216:  # Qt.Key_Escape
+        if event.key() == Key_Escape:
             self.reset()
             event.ignore()  # Let QGIS also handle it

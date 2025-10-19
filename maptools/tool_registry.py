@@ -9,6 +9,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all Qt imports.
 """
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.gui import QgsMapToolPan
 
 
 class ToolRegistry(QObject):
@@ -20,6 +21,7 @@ class ToolRegistry(QObject):
     - Proper cleanup when switching tools
     - Tool state tracking
     - UI updates via signals
+    - Canvas remains responsive after tool deactivation
 
     Signals:
         tool_activated: Emitted when a tool is activated (tool_name: str)
@@ -29,18 +31,21 @@ class ToolRegistry(QObject):
     tool_activated = pyqtSignal(str)  # tool_name
     tool_deactivated = pyqtSignal(str)  # tool_name
 
-    def __init__(self, canvas):
+    def __init__(self, canvas, iface=None):
         """
         Initialize tool registry.
 
         Args:
             canvas: QGIS map canvas
+            iface: QGIS interface (optional, for accessing toolbar actions)
         """
         super().__init__()
         self.canvas = canvas
+        self.iface = iface
         self.tools = {}  # Dict of {tool_name: tool_instance}
         self.active_tool_name = None
         self.active_tool = None
+        self._pan_tool = None  # Cached pan tool for fallback
 
     def register_tool(self, name, tool_instance):
         """
@@ -78,6 +83,7 @@ class ToolRegistry(QObject):
                 if hasattr(self.active_tool, 'deactivate'):
                     self.active_tool.deactivate()
                 self.canvas.unsetMapTool(self.active_tool)
+                # Don't set pan tool here - we're about to set a new tool
                 self.tool_deactivated.emit(self.active_tool_name)
                 print(f"[REGISTRY] Previous tool deactivated")
             except Exception as e:
@@ -107,7 +113,7 @@ class ToolRegistry(QObject):
             return False
 
     def deactivate_current(self):
-        """Deactivate the currently active tool."""
+        """Deactivate the currently active tool and set default pan tool."""
         print(f"[REGISTRY] deactivate_current() called")
         print(f"[REGISTRY] Active tool: {self.active_tool}")
         print(f"[REGISTRY] Active tool name: {self.active_tool_name}")
@@ -126,6 +132,11 @@ class ToolRegistry(QObject):
                 print(f"[REGISTRY] canvas.unsetMapTool() complete")
                 print(f"[REGISTRY] Canvas current tool after unset: {self.canvas.mapTool()}")
 
+                # CRITICAL: Set pan tool to keep canvas responsive
+                print(f"[REGISTRY] Setting default pan tool...")
+                self._set_default_tool()
+                print(f"[REGISTRY] Canvas tool after setting default: {self.canvas.mapTool()}")
+
                 print(f"[REGISTRY] Emitting tool_deactivated signal...")
                 self.tool_deactivated.emit(self.active_tool_name)
                 print(f"[REGISTRY] Signal emitted")
@@ -140,6 +151,28 @@ class ToolRegistry(QObject):
                 print(f"[REGISTRY] deactivate_current() complete")
         else:
             print(f"[REGISTRY] No active tool to deactivate")
+
+    def _set_default_tool(self):
+        """
+        Set the default pan tool to keep canvas interactive.
+
+        After unsetMapTool(), the canvas has no active tool (None) which makes it
+        unresponsive to mouse events. This method ensures a pan tool is always active.
+        """
+        try:
+            # Option 1: Use iface action if available (preserves toolbar state)
+            if self.iface and hasattr(self.iface, 'actionPan'):
+                self.iface.actionPan().trigger()
+                print("[REGISTRY] Set default tool via iface.actionPan()")
+            else:
+                # Option 2: Create and set pan tool directly
+                if not self._pan_tool:
+                    self._pan_tool = QgsMapToolPan(self.canvas)
+                self.canvas.setMapTool(self._pan_tool)
+                print("[REGISTRY] Set default tool via QgsMapToolPan")
+        except Exception as e:
+            print(f"[REGISTRY] ERROR setting default tool: {e}")
+            # Even if setting pan tool fails, we've at least unset the previous tool
 
     def get_active_tool_name(self):
         """

@@ -34,8 +34,8 @@ from .resources import *
 import os.path
 import traceback
 
-# Import Qt5/Qt6 compatible constants
-from .utils.qt_compat import RightDockWidgetArea
+# Import Qt5/Qt6 compatible constants and functions
+from .utils.qt_compat import RightDockWidgetArea, dialog_exec, push_message
 
 # Import our SAR tracking components
 try:
@@ -254,7 +254,7 @@ class sartracker:
 
         # Initialize Tool Registry
         from .maptools import ToolRegistry
-        self.tool_registry = ToolRegistry(self.iface.mapCanvas())
+        self.tool_registry = ToolRegistry(self.iface.mapCanvas(), self.iface)
         self.tool_registry.register_tool('line', self.line_tool)
         self.tool_registry.register_tool('range_rings', self.range_ring_tool)
         self.tool_registry.register_tool('bearing', self.bearing_tool)
@@ -431,7 +431,8 @@ class sartracker:
     def _on_mission_started(self, mission_name):
         """Handle mission start."""
         print(f"Mission started: {mission_name}")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             f"Mission '{mission_name}' started",
             level=3,  # Success
@@ -441,7 +442,8 @@ class sartracker:
     def _on_mission_paused(self):
         """Handle mission pause."""
         print("Mission paused")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Mission paused",
             level=1,  # Warning
@@ -451,7 +453,8 @@ class sartracker:
     def _on_mission_resumed(self):
         """Handle mission resume."""
         print("Mission resumed")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Mission resumed",
             level=3,  # Success
@@ -461,7 +464,8 @@ class sartracker:
     def _on_mission_finished(self):
         """Handle mission finish."""
         print("Mission finished")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Mission finished",
             level=3,  # Success
@@ -471,7 +475,8 @@ class sartracker:
     def _on_refresh_data(self):
         """Handle data refresh request."""
         if not self.provider:
-            self.iface.messageBar().pushMessage(
+            push_message(
+                self.iface.messageBar(),
                 "SAR Tracker",
                 "No data source loaded. Please load a CSV file first.",
                 level=1,  # Warning
@@ -494,7 +499,8 @@ class sartracker:
             devices = self.provider.get_devices()
             self.sar_panel.update_devices(devices)
 
-            self.iface.messageBar().pushMessage(
+            push_message(
+                self.iface.messageBar(),
                 "SAR Tracker",
                 f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
                 level=3,  # Success
@@ -524,7 +530,8 @@ class sartracker:
                 return
 
             # Get tracking data
-            self.iface.messageBar().pushMessage(
+            push_message(
+                self.iface.messageBar(),
                 "SAR Tracker",
                 "Loading tracking data...",
                 level=0,  # Info
@@ -561,7 +568,8 @@ class sartracker:
                     "CSV file contains no valid tracking data."
                 )
             else:
-                self.iface.messageBar().pushMessage(
+                push_message(
+                    self.iface.messageBar(),
                     "SAR Tracker",
                     f"Loaded {len(current)} device(s), {len(breadcrumbs)} points",
                     level=3,  # Success
@@ -632,7 +640,8 @@ class sartracker:
 
         self.current_marker_type = 'ipp_lkp'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add IPP/LKP location",
             level=0,  # Info
@@ -647,7 +656,8 @@ class sartracker:
 
         self.current_marker_type = 'clue'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add Clue location",
             level=0,  # Info
@@ -662,7 +672,8 @@ class sartracker:
 
         self.current_marker_type = 'hazard'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add Hazard location",
             level=0,  # Info
@@ -691,7 +702,7 @@ class sartracker:
             dialog.ipp_lkp_radio.setChecked(True)
 
         # Show dialog and wait for user
-        result = dialog.exec_()
+        result = dialog_exec(dialog)
 
         if result == MarkerDialog.Accepted:
             # Get marker data from dialog
@@ -735,7 +746,8 @@ class sartracker:
                     )
                     marker_type_str = "Hazard"
 
-                self.iface.messageBar().pushMessage(
+                push_message(
+                    self.iface.messageBar(),
                     "SAR Tracker",
                     f"{marker_type_str} '{marker_data['name']}' added successfully",
                     level=3,  # Success
@@ -760,7 +772,7 @@ class sartracker:
         # Connect go_to_location signal
         dialog.go_to_location.connect(self._zoom_to_location)
 
-        dialog.exec_()
+        dialog_exec(dialog)
 
     def _zoom_to_location(self, lat, lon):
         """
@@ -805,7 +817,8 @@ class sartracker:
     def _on_measure_distance_requested(self):
         """Handle Measure Distance & Bearing button click."""
         self.iface.mapCanvas().setMapTool(self.measure_tool)
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Click two points on the map to measure distance and bearing",
             level=0,  # Info
@@ -820,7 +833,8 @@ class sartracker:
         self.tool_registry.activate_tool('line')
         print(f"[SARTRACKER] Line tool activation complete")
         print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Click to add points. Right-click or ESC to finish line.",
             level=0,  # Info
@@ -835,7 +849,8 @@ class sartracker:
         self.tool_registry.activate_tool('polygon')
         print(f"[SARTRACKER] Polygon tool activation complete")
         print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Search Area Tool: Click to add vertices (min 3). Right-click to finish and configure area.",
             level=0,  # Info
@@ -845,7 +860,8 @@ class sartracker:
     def _on_range_rings_tool_requested(self):
         """Handle Range Rings Tool button click."""
         self.tool_registry.activate_tool('range_rings')
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Range Rings Tool: Click center point to configure rings",
             level=0,  # Info
@@ -855,7 +871,8 @@ class sartracker:
     def _on_bearing_tool_requested(self):
         """Handle Bearing Tool button click."""
         self.tool_registry.activate_tool('bearing')
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             "Bearing Line Tool: Click origin point to configure bearing and distance",
             level=0,  # Info
@@ -869,7 +886,8 @@ class sartracker:
         Args:
             feature_data: Dict with line info (name, distance_m, points, etc.)
         """
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             f"Line '{feature_data['name']}' added ({feature_data['points']} points, {feature_data['distance_m']:.0f}m)",
             level=3,  # Success
@@ -886,7 +904,8 @@ class sartracker:
             feature_data: Dict with ring info (count, mode, center, etc.)
         """
         mode_str = "LPB-based" if feature_data['mode'] == 'lpb' else "Manual"
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             f"{mode_str} range rings created ({feature_data['count']} rings)",
             level=3,  # Success
@@ -903,7 +922,8 @@ class sartracker:
             feature_data: Dict with bearing line info (name, bearing, distance, etc.)
         """
         bearing_type = feature_data['bearing_type']
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             f"Bearing Line '{feature_data['name']}' created ({feature_data['bearing']:.1f}° True, {feature_data['magnetic_bearing']:.1f}° Magnetic, {feature_data['distance_m']:.0f}m)",
             level=3,  # Success
@@ -916,30 +936,19 @@ class sartracker:
         """
         Handle polygon (search area) drawing completion.
 
-        Note: Tool has already unset itself before showing dialog, so we don't
-        need to call deactivate_current() here.
-
         Args:
             feature_data: Dict with search area info (name, team, status, priority, vertices, etc.)
         """
-        print(f"[SARTRACKER] _on_polygon_complete() called")
-        print(f"[SARTRACKER] Canvas current tool: {self.iface.mapCanvas().mapTool()}")
-        print(f"[SARTRACKER] Active tool name: {self.tool_registry.get_active_tool_name()}")
-
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "SAR Tracker",
             f"Search Area '{feature_data['name']}' created ({feature_data['vertices']} vertices, {feature_data['priority']} priority, {feature_data['status']})",
             level=3,  # Success
             duration=3
         )
 
-        # Tool has already unset itself, but clear registry state
-        if self.tool_registry.get_active_tool_name() == 'polygon':
-            print(f"[SARTRACKER] Clearing polygon tool from registry...")
-            self.tool_registry.active_tool = None
-            self.tool_registry.active_tool_name = None
-
-        print(f"[SARTRACKER] Signal handler complete")
+        # Deactivate tool via registry (standard pattern, same as other tools)
+        self.tool_registry.deactivate_current()
 
     def _on_drawing_cancelled(self):
         """Handle drawing cancellation (ESC pressed or dialog cancelled)."""
@@ -991,7 +1000,8 @@ class sartracker:
         message = f"<b>Distance:</b> {distance_str}  •  <b>Bearing:</b> {bearing:.1f}° ({cardinal})"
 
         # Use message bar with longer duration
-        self.iface.messageBar().pushMessage(
+        push_message(
+            self.iface.messageBar(),
             "Measurement Result",
             message,
             level=3,  # Success (green)
@@ -1028,7 +1038,8 @@ class sartracker:
 
                 if success:
                     self.sar_panel.update_autosave_status(True)
-                    self.iface.messageBar().pushMessage(
+                    push_message(
+                        self.iface.messageBar(),
                         "SAR Tracker",
                         "Project saved successfully",
                         level=3,  # Success
@@ -1036,7 +1047,8 @@ class sartracker:
                     )
                 else:
                     self.sar_panel.update_autosave_status(False)
-                    self.iface.messageBar().pushMessage(
+                    push_message(
+                        self.iface.messageBar(),
                         "SAR Tracker",
                         "Failed to save project",
                         level=2,  # Warning
@@ -1056,7 +1068,8 @@ class sartracker:
 
                     if success:
                         self.sar_panel.update_autosave_status(True)
-                        self.iface.messageBar().pushMessage(
+                        push_message(
+                            self.iface.messageBar(),
                             "SAR Tracker",
                             f"Project saved to {file_path}",
                             level=3,  # Success
@@ -1114,13 +1127,14 @@ class sartracker:
             dialog.setLayout(layout)
 
             # Show dialog and handle result
-            result = dialog.exec_()
+            result = dialog_exec(dialog)
 
             if result == QDialog.Accepted:
                 # Resume the mission
                 self.sar_panel.restore_mission_state(saved_state)
                 self.sar_panel.show()  # Show panel
-                self.iface.messageBar().pushMessage(
+                push_message(
+                    self.iface.messageBar(),
                     "SAR Tracker",
                     f"Mission '{saved_state['name']}' resumed",
                     level=3,  # Success

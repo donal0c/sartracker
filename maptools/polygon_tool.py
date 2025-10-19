@@ -18,8 +18,8 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox, QFormLayout, QDoubleSpinBox, QMessageBox
 )
 
-# Import Qt5/Qt6 compatible constants
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape
+# Import Qt5/Qt6 compatible constants and functions
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -286,9 +286,7 @@ class PolygonTool(BaseDrawingTool):
         Args:
             event: QgsMapMouseEvent
         """
-        print(f"[POLYGON] canvasPressEvent() called!")
-        print(f"[POLYGON] Tool is_active: {self.is_active}")
-        print(f"[POLYGON] Canvas current tool: {self.canvas.mapTool()}")
+        print(f"[POLYGON TOOL] canvasPressEvent called! is_active={self.is_active}, canvas.mapTool()={self.canvas.mapTool()}")
 
         if event.button() == LeftButton:
             # Add vertex
@@ -300,15 +298,13 @@ class PolygonTool(BaseDrawingTool):
             self._update_rubber_band()
 
         elif event.button() == RightButton:
-            # Finish polygon - defer dialog to avoid nested event loop
-            # Validate minimum vertices first
+            # Finish polygon
             if len(self.points) < 3:
-                print(f"[POLYGON] Not enough points, cancelling")
                 self.cancel()
                 return
 
-            # Defer dialog display to next event loop iteration
-            QTimer.singleShot(0, self._finish_polygon_deferred)
+            # Show dialog directly (same pattern as range_ring and bearing tools)
+            self._finish_polygon()
 
     def canvasMoveEvent(self, event):
         """
@@ -400,62 +396,48 @@ class PolygonTool(BaseDrawingTool):
             print(f"Error calculating area: {e}")
             return 0.0
 
-    def _finish_polygon_deferred(self):
+    def _finish_polygon(self):
         """
-        Show dialog after event processing completes.
+        Complete polygon drawing and show configuration dialog.
 
-        This is called via QTimer.singleShot(0, ...) to defer dialog display
-        until after the current event (right-click) has finished processing.
-        This prevents nested event loop issues.
+        Follows the same pattern as range_ring and bearing tools:
+        - Tool remains active during dialog
+        - Signal handler deactivates tool after completion
         """
-        print(f"[POLYGON] _finish_polygon_deferred() called, points: {len(self.points)}")
-        print(f"[POLYGON] Tool is_active: {self.is_active}")
-        print(f"[POLYGON] Canvas current tool: {self.canvas.mapTool()}")
+        if len(self.points) < 3:
+            self.cancel()
+            return
 
-        # CRITICAL: Unset tool BEFORE showing modal dialog
-        # This prevents Qt event system corruption
-        print(f"[POLYGON] Unsetting tool before dialog...")
-        if self.canvas:
-            self.canvas.unsetMapTool(self)
-        print(f"[POLYGON] Canvas tool after unset: {self.canvas.mapTool()}")
+        # Transform to WGS84
+        points_wgs84 = [self.transform_to_wgs84(p) for p in self.points]
 
-        try:
-            # Transform to WGS84
-            points_wgs84 = [self.transform_to_wgs84(p) for p in self.points]
+        # Calculate area for dialog
+        area_sqkm = self._calculate_area(points_wgs84)
 
-            # Calculate area for dialog
-            area_sqkm = self._calculate_area(points_wgs84)
+        # Show dialog while tool is still active (same as range_ring/bearing)
+        dialog = SearchAreaDialog(area_sqkm, None)
 
-            print(f"[POLYGON] Opening dialog...")
-            # Now safe to show modal dialog - tool is no longer active
-            dialog = SearchAreaDialog(area_sqkm, None)
+        result = dialog_exec(dialog)
 
-            dialog_result = dialog.exec_()
-            print(f"[POLYGON] Dialog closed, result: {dialog_result}")
+        # CRITICAL: Force Qt to process all pending events from dialog
+        from qgis.PyQt.QtCore import QEventLoop
+        from qgis.PyQt.QtWidgets import QApplication
+        QApplication.processEvents(QEventLoop.AllEvents, 100)
 
-            if dialog_result == QDialog.Accepted and dialog.area_data:
-                # User accepted - create the feature
-                print(f"[POLYGON] User accepted, creating search area...")
-                self._create_search_area(points_wgs84, dialog.area_data)
-                print(f"[POLYGON] Search area created, signal emitted")
-            else:
-                # User cancelled - emit cancelled signal
-                print(f"[POLYGON] User cancelled, emitting cancelled signal")
-                self._cleanup_and_cancel()
+        if result == QDialog.Accepted and dialog.area_data:
+            # User accepted - create feature immediately
+            self._create_search_area(points_wgs84, dialog.area_data)
+        else:
+            # User cancelled
+            self.points = []
+            self.drawing_cancelled.emit()
 
-        except Exception as e:
-            print(f"[POLYGON] ERROR in _finish_polygon_deferred: {e}")
-            import traceback
-            traceback.print_exc()
-            self._cleanup_and_cancel()
+        # Clean up dialog explicitly
+        dialog.deleteLater()
 
-    def _cleanup_and_cancel(self):
-        """Clean up and emit cancellation."""
+        # Clean up state after dialog
         self.points = []
-        self.is_drawing = False
         self.clear_rubber_bands()
-        self.polygon_rubber_band = None
-        self.drawing_cancelled.emit()
 
     def _create_search_area(self, points_wgs84, area_data):
         """
@@ -499,7 +481,8 @@ class PolygonTool(BaseDrawingTool):
             try:
                 from qgis.utils import iface
                 if iface:
-                    iface.messageBar().pushMessage(
+                    push_message(
+                        iface.messageBar(),
                         "Error",
                         f"Failed to create search area: {str(e)}",
                         level=2,  # Warning
@@ -507,6 +490,11 @@ class PolygonTool(BaseDrawingTool):
                     )
             except:
                 pass  # iface not available
+
+        finally:
+            # Reset for next polygon (same as range_ring pattern)
+            self.points = []
+            self.clear_rubber_bands()
 
     def cancel(self):
         """Cancel the current drawing operation."""
