@@ -9,7 +9,8 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
 from abc import ABC, abstractmethod
-from qgis.core import QgsProject, QgsVectorLayer
+from typing import Dict, List, Optional
+from qgis.core import QgsProject, QgsVectorLayer, QgsLayerTreeGroup
 from qgis.PyQt.QtGui import QColor
 import random
 
@@ -32,14 +33,16 @@ class BaseLayerManager(ABC):
 
     # Class-level shared device color cache for consistency across all managers
     # This ensures the same device ID always gets the same color in all layers
+    # Thread safety: This plugin runs in Qt's main event loop (single-threaded).
+    # If future versions need multi-threading, this dict should be protected with locks.
     _shared_device_colors = {}
 
-    def __init__(self, iface, shared_device_colors=None):
+    def __init__(self, iface, shared_device_colors: Optional[Dict[str, QColor]] = None):
         """
         Initialize base manager.
 
         Args:
-            iface: QGIS interface object
+            iface: QGIS interface object (QgisInterface)
             shared_device_colors: Optional shared dict for device colors.
                                  If None, uses class-level shared dict.
         """
@@ -56,7 +59,7 @@ class BaseLayerManager(ABC):
         else:
             self.device_colors = self.__class__._shared_device_colors
 
-    def get_or_create_layer_group(self):
+    def get_or_create_layer_group(self) -> QgsLayerTreeGroup:
         """
         Get or create SAR Tracking layer group.
 
@@ -147,7 +150,7 @@ class BaseLayerManager(ABC):
         self.iface = None
 
     @abstractmethod
-    def get_managed_layer_names(self):
+    def get_managed_layer_names(self) -> List[str]:
         """
         Return list of layer names this manager handles.
 

@@ -16,10 +16,14 @@ that must be preserved EXACTLY for accuracy (<1m error requirement).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List
+from typing import List, Optional
 import math
 import uuid
+import logging
 from datetime import datetime
+
+# Set up logger for this module
+logger = logging.getLogger(__name__)
 
 from qgis.core import (
     QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
@@ -136,6 +140,8 @@ class DrawingLayerManager(BaseLayerManager):
             dist = distance_calc.measureLine(points_wgs84[i], points_wgs84[i + 1])
             total_distance += dist
 
+        logger.debug(f"Line '{name}': {len(points_wgs84)} points, total distance={total_distance:.2f}m")
+
         # Create feature
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPolylineXY(points_wgs84))
@@ -150,12 +156,26 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit line feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Line Creation Error",
+                f"Failed to add line '{name}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()
 
     # =========================================================================
@@ -250,6 +270,8 @@ class DrawingLayerManager(BaseLayerManager):
         area_sqm = distance_calc.measureArea(polygon_geom)
         area_sqkm = area_sqm / 1000000.0  # Convert to km²
 
+        logger.debug(f"Search area '{name}': {len(polygon_wgs84)} points, area={area_sqkm:.4f}km²")
+
         # Create feature
         feature = QgsFeature(layer.fields())
         feature.setGeometry(polygon_geom)
@@ -272,12 +294,26 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit search area feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Search Area Creation Error",
+                f"Failed to add search area '{name}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()
 
     # =========================================================================
@@ -384,8 +420,10 @@ class DrawingLayerManager(BaseLayerManager):
         if denominator < 1e-10:
             # At poles, use polar radius
             earth_radius = b
+            logger.debug(f"Range ring at pole (lat={center_wgs84.y():.6f}): using polar radius {earth_radius:.2f}m")
         else:
             earth_radius = math.sqrt(numerator / denominator)
+            logger.debug(f"Range ring: lat={center_wgs84.y():.6f}, radius_m={radius_m:.2f}, earth_radius={earth_radius:.2f}m")
 
         # Create circle points using geodesic calculations
         for i in range(segments + 1):
@@ -400,10 +438,11 @@ class DrawingLayerManager(BaseLayerManager):
             angular_distance = radius_m / earth_radius
 
             # Calculate destination point using haversine formula
-            lat2 = math.asin(
-                math.sin(lat_rad) * math.cos(angular_distance) +
-                math.cos(lat_rad) * math.sin(angular_distance) * math.cos(bearing_rad)
-            )
+            # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
+            sin_lat2 = (math.sin(lat_rad) * math.cos(angular_distance) +
+                       math.cos(lat_rad) * math.sin(angular_distance) * math.cos(bearing_rad))
+            sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
+            lat2 = math.asin(sin_lat2)
 
             lon2 = lon_rad + math.atan2(
                 math.sin(bearing_rad) * math.sin(angular_distance) * math.cos(lat_rad),
@@ -434,12 +473,26 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit range ring feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Range Ring Creation Error",
+                f"Failed to add range ring '{name}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()
 
     # =========================================================================
@@ -536,14 +589,19 @@ class DrawingLayerManager(BaseLayerManager):
         if denominator < 1e-10:
             # At poles, use polar radius
             earth_radius = b
+            logger.debug(f"Bearing line at pole (lat={origin_wgs84.y():.6f}): using polar radius {earth_radius:.2f}m")
         else:
             earth_radius = math.sqrt(numerator / denominator)
+            logger.debug(f"Bearing line: lat={origin_wgs84.y():.6f}, bearing={bearing:.1f}°, distance={distance_m:.2f}m, earth_radius={earth_radius:.2f}m")
 
         # Angular distance
         angular_dist = distance_m / earth_radius
 
-        lat2 = math.asin(math.sin(lat1) * math.cos(angular_dist) +
-                         math.cos(lat1) * math.sin(angular_dist) * math.cos(bearing_rad))
+        # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
+        sin_lat2 = (math.sin(lat1) * math.cos(angular_dist) +
+                   math.cos(lat1) * math.sin(angular_dist) * math.cos(bearing_rad))
+        sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
+        lat2 = math.asin(sin_lat2)
 
         lon2 = lon1 + math.atan2(math.sin(bearing_rad) * math.sin(angular_dist) * math.cos(lat1),
                                   math.cos(angular_dist) - math.sin(lat1) * math.sin(lat2))
@@ -569,12 +627,26 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit bearing line feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Bearing Line Creation Error",
+                f"Failed to add bearing line '{name}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()
 
     # =========================================================================
@@ -683,8 +755,12 @@ class DrawingLayerManager(BaseLayerManager):
             angle_rad = math.radians(angle)
 
             # Calculate point using WGS84 ellipsoid
-            lat2 = math.asin(math.sin(lat1) * math.cos(angular_dist) +
-                            math.cos(lat1) * math.sin(angular_dist) * math.cos(angle_rad))
+            # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
+            sin_lat2 = (math.sin(lat1) * math.cos(angular_dist) +
+                       math.cos(lat1) * math.sin(angular_dist) * math.cos(angle_rad))
+            sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
+            lat2 = math.asin(sin_lat2)
+
             lon2 = lon1 + math.atan2(math.sin(angle_rad) * math.sin(angular_dist) * math.cos(lat1),
                                      math.cos(angular_dist) - math.sin(lat1) * math.sin(lat2))
 
@@ -700,6 +776,8 @@ class DrawingLayerManager(BaseLayerManager):
         distance_calc.setEllipsoid('WGS84')
         area_sqm = distance_calc.measureArea(sector_geom)
         area_sqkm = area_sqm / 1000000.0
+
+        logger.debug(f"Sector '{name}': bearings {start_bearing:.1f}°-{end_bearing:.1f}°, radius={radius_m:.2f}m, area={area_sqkm:.4f}km²")
 
         # Create feature
         feature = QgsFeature(layer.fields())
@@ -719,12 +797,26 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit sector feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Sector Creation Error",
+                f"Failed to add sector '{name}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()
 
     # =========================================================================
@@ -805,10 +897,24 @@ class DrawingLayerManager(BaseLayerManager):
             datetime.now().isoformat()
         ])
 
-        # Add to layer
+        # Add to layer with proper resource cleanup
         layer.startEditing()
-        layer.addFeature(feature)
-        layer.commitChanges()
-        layer.triggerRepaint()
+        try:
+            layer.addFeature(feature)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit text label feature: {', '.join(errors)}")
+        except Exception as e:
+            layer.rollBack()
+            self.iface.messageBar().pushCritical(
+                "Text Label Creation Error",
+                f"Failed to add text label '{text}': {str(e)}"
+            )
+            raise
+        finally:
+            # Ensure layer is not left in edit mode
+            if layer.isEditable():
+                layer.rollBack()
 
+        layer.triggerRepaint()
         return feature.id()

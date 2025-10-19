@@ -14,8 +14,8 @@ actual layer management to specialized manager classes:
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Dict
-from qgis.core import QgsProject, QgsPointXY
+from typing import List, Dict, Optional
+from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 
 from .layer_managers.tracking_manager import TrackingLayerManager
 from .layer_managers.marker_manager import MarkerLayerManager
@@ -33,6 +33,22 @@ class LayersController:
     - TrackingLayerManager: Live device tracking (positions, breadcrumbs)
     - MarkerLayerManager: Static markers (IPP/LKP, clues, hazards)
     - DrawingLayerManager: Geometric features (lines, areas, rings, etc.)
+
+    Design Note - Return Value Consistency:
+    - Marker methods return str (UUID): Markers are persistent and need stable
+      identifiers that survive QGIS restarts and project reloads.
+    - Drawing methods return int (feature ID): Drawings are session-specific
+      and feature IDs are sufficient for in-session operations.
+    - Tracking methods return None: Position updates are bulk operations
+      that don't need individual feature tracking.
+    This intentional inconsistency reflects different use cases and persistence requirements.
+
+    Design Note - Parameter Validation:
+    - This orchestrator is a thin delegation layer that doesn't perform parameter validation.
+    - All validation is done in the specialized managers (TrackingLayerManager,
+      MarkerLayerManager, DrawingLayerManager).
+    - This avoids redundant validation overhead and keeps the orchestrator simple.
+    - Exceptions from managers propagate up with full context.
     """
 
     # Layer group name (shared across all managers)
@@ -44,18 +60,36 @@ class LayersController:
 
         Args:
             iface: QGIS interface object
+
+        Raises:
+            RuntimeError: If manager initialization fails
         """
         self.iface = iface
         self.project = QgsProject.instance()
+
+        if not self.project:
+            raise RuntimeError("QgsProject instance not available - cannot initialize LayersController")
 
         # Shared device color registry for consistency across all layers
         # Same device ID will always get same color in all layers
         self._shared_device_colors = {}
 
         # Initialize specialized managers with shared color registry
-        self.tracking = TrackingLayerManager(iface, self._shared_device_colors)
-        self.markers = MarkerLayerManager(iface, self._shared_device_colors)
-        self.drawings = DrawingLayerManager(iface, self._shared_device_colors)
+        # Managers must be initialized in this order (no dependencies between them currently)
+        try:
+            self.tracking = TrackingLayerManager(iface, self._shared_device_colors)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize TrackingLayerManager: {e}")
+
+        try:
+            self.markers = MarkerLayerManager(iface, self._shared_device_colors)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize MarkerLayerManager: {e}")
+
+        try:
+            self.drawings = DrawingLayerManager(iface, self._shared_device_colors)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize DrawingLayerManager: {e}")
 
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
@@ -67,7 +101,12 @@ class LayersController:
 
         Args:
             positions: List of position dicts from tracking provider
+
+        Raises:
+            ValueError: If position data is invalid (from manager)
+            RuntimeError: If layer operations fail (from manager)
         """
+        # Delegate to manager - exceptions propagate with proper context
         return self.tracking.update_current_positions(positions)
 
     def update_breadcrumbs(self, positions: List[Dict], time_gap_minutes: int = 5):
@@ -77,7 +116,12 @@ class LayersController:
         Args:
             positions: List of position dicts from tracking provider
             time_gap_minutes: Minutes gap to break trail into segments (default: 5)
+
+        Raises:
+            ValueError: If position data is invalid (from manager)
+            RuntimeError: If layer operations fail (from manager)
         """
+        # Delegate to manager - exceptions propagate with proper context
         return self.tracking.update_breadcrumbs(positions, time_gap_minutes)
 
     # =========================================================================
@@ -301,7 +345,7 @@ class LayersController:
     # Common Methods
     # =========================================================================
 
-    def get_or_create_layer_group(self):
+    def get_or_create_layer_group(self) -> QgsLayerTreeGroup:
         """
         Get or create SAR Tracking layer group.
 

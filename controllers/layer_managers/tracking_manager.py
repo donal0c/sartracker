@@ -8,7 +8,7 @@ Handles device position updates from tracking sources (e.g., Traccar).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional, Any
 from datetime import datetime
 from collections import defaultdict
 
@@ -107,7 +107,45 @@ class TrackingLayerManager(BaseLayerManager):
             positions: List of position dicts from tracking provider
                 Expected keys: device_id, name, ts, lat, lon,
                               altitude (optional), speed (optional), battery (optional)
+
+        Raises:
+            ValueError: If position data is invalid
         """
+        # Validate positions list
+        if not isinstance(positions, list):
+            raise ValueError("positions must be a list")
+
+        # Validate each position dict
+        for i, pos in enumerate(positions):
+            if not isinstance(pos, dict):
+                raise ValueError(f"Position {i} must be a dictionary")
+
+            # Validate required fields
+            required_fields = ['device_id', 'name', 'ts', 'lat', 'lon']
+            missing_fields = [field for field in required_fields if field not in pos]
+            if missing_fields:
+                raise ValueError(f"Position {i} missing required fields: {missing_fields}")
+
+            # Validate coordinates
+            try:
+                lat = float(pos['lat'])
+                lon = float(pos['lon'])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Position {i} has invalid lat/lon: {e}")
+
+            if not (-90 <= lat <= 90):
+                raise ValueError(f"Position {i} has invalid latitude: {lat} (must be -90 to 90)")
+
+            if not (-180 <= lon <= 180):
+                raise ValueError(f"Position {i} has invalid longitude: {lon} (must be -180 to 180)")
+
+            # Validate device_id and name are non-empty strings
+            if not pos['device_id'] or not isinstance(pos['device_id'], str):
+                raise ValueError(f"Position {i} has invalid device_id (must be non-empty string)")
+
+            if not pos['name'] or not isinstance(pos['name'], str):
+                raise ValueError(f"Position {i} has invalid name (must be non-empty string)")
+
         # Get or create layer
         layer = self._get_or_create_current_layer()
 
@@ -122,8 +160,9 @@ class TrackingLayerManager(BaseLayerManager):
                 layer.dataProvider().truncate()
             except (AttributeError, NotImplementedError, RuntimeError) as e:
                 # Fallback to deleteFeatures if truncate not supported
+                # Use allFeatureIds() to avoid loading feature objects into memory
                 print(f"Truncate not available for {self.CURRENT_LAYER_NAME}, using deleteFeatures: {e}")
-                layer.deleteFeatures([f.id() for f in layer.getFeatures()])
+                layer.deleteFeatures(layer.allFeatureIds())
 
         # Add new features
         for pos in positions:
@@ -264,7 +303,49 @@ class TrackingLayerManager(BaseLayerManager):
         Args:
             positions: List of position dicts from tracking provider
             time_gap_minutes: Minutes gap to break trail into segments (default: 5)
+
+        Raises:
+            ValueError: If position data is invalid
         """
+        # Validate positions list
+        if not isinstance(positions, list):
+            raise ValueError("positions must be a list")
+
+        # Validate each position dict (same validation as update_current_positions)
+        for i, pos in enumerate(positions):
+            if not isinstance(pos, dict):
+                raise ValueError(f"Position {i} must be a dictionary")
+
+            # Validate required fields
+            required_fields = ['device_id', 'name', 'ts', 'lat', 'lon']
+            missing_fields = [field for field in required_fields if field not in pos]
+            if missing_fields:
+                raise ValueError(f"Position {i} missing required fields: {missing_fields}")
+
+            # Validate coordinates
+            try:
+                lat = float(pos['lat'])
+                lon = float(pos['lon'])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Position {i} has invalid lat/lon: {e}")
+
+            if not (-90 <= lat <= 90):
+                raise ValueError(f"Position {i} has invalid latitude: {lat} (must be -90 to 90)")
+
+            if not (-180 <= lon <= 180):
+                raise ValueError(f"Position {i} has invalid longitude: {lon} (must be -180 to 180)")
+
+            # Validate device_id and name are non-empty strings
+            if not pos['device_id'] or not isinstance(pos['device_id'], str):
+                raise ValueError(f"Position {i} has invalid device_id (must be non-empty string)")
+
+            if not pos['name'] or not isinstance(pos['name'], str):
+                raise ValueError(f"Position {i} has invalid name (must be non-empty string)")
+
+        # Validate time_gap_minutes
+        if not isinstance(time_gap_minutes, (int, float)) or time_gap_minutes <= 0:
+            raise ValueError(f"time_gap_minutes must be a positive number, got: {time_gap_minutes}")
+
         # Get or create layer
         layer = self._get_or_create_breadcrumbs_layer()
 
@@ -278,8 +359,9 @@ class TrackingLayerManager(BaseLayerManager):
                 layer.dataProvider().truncate()
             except (AttributeError, NotImplementedError, RuntimeError) as e:
                 # Fallback to deleteFeatures if truncate not supported
+                # Use allFeatureIds() to avoid loading feature objects into memory
                 print(f"Truncate not available for {self.BREADCRUMBS_LAYER_NAME}, using deleteFeatures: {e}")
-                layer.deleteFeatures([f.id() for f in layer.getFeatures()])
+                layer.deleteFeatures(layer.allFeatureIds())
 
         # Group positions by device_id
         device_positions = defaultdict(list)

@@ -70,7 +70,25 @@ plugin_upload.py
 .cache/
 
 # Other files
+cleanup.sh
+
+# Documentation files (keep only README.md under version control)
 TODO.md
 SAR_QGIS_Plugin_Technical_Specification.md
 SAR_QGIS_Plugin_Claude_Spec.md
-cleanup.sh
+CODE_REVIEW_FINDINGS.md
+CRITICAL_FIXES_APPLIED.md
+CURRENT_STATUS.md
+README_HANDOFF.md
+PHASE3_PROGRESS.md
+REFACTORING_ANALYSIS.md
+REFACTORING_COMPLETE.md
+RESTRUCTURING_PLAN.md
+PHASE3_SPECIFICATION.md
+PHASE3_IMPLEMENTATION_PLAN.md
+MASTER_IMPLEMENTATION_PLAN.md
+RESEARCH_SUMMARY.md
+SAR_CRITICAL_FEATURES_CHECKLIST.md
+FUTURE_ENHANCEMENTS.md
+docs/*.md
+research/*.md
