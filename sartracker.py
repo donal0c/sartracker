@@ -67,11 +67,14 @@ class sartracker:
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
         # initialize locale
-        locale_value = QSettings().value('locale/userLocale')
-        if locale_value:
-            locale = str(locale_value)[0:2]
-        else:
-            locale = 'en'
+        try:
+            locale_value = QSettings().value('locale/userLocale')
+            if locale_value and str(locale_value):
+                locale = str(locale_value)[0:2]
+            else:
+                locale = 'en'
+        except Exception:
+            locale = 'en'  # Fallback to English if locale detection fails
         locale_path = os.path.join(
             self.plugin_dir,
             'i18n',
@@ -96,6 +99,9 @@ class sartracker:
         self.sar_panel = None
         self.marker_tool = None
         self.measure_tool = None
+        self.line_tool = None
+        self.range_ring_tool = None
+        self.tool_registry = None
         self.current_marker_type = None  # 'poi' or 'casualty'
         self.coords_label = None  # Status bar coordinate display
         self.last_coords_point = None  # Last mouse position (for throttling)
@@ -220,6 +226,26 @@ class sartracker:
         self.measure_tool = MeasureTool(self.iface.mapCanvas())
         self.measure_tool.measurement_complete.connect(self._on_measurement_complete)
 
+        # Initialize Line Tool
+        from .maptools import LineTool
+        self.line_tool = LineTool(self.iface.mapCanvas(), self.layers_controller)
+        self.line_tool.drawing_complete.connect(self._on_line_complete)
+        self.line_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+
+        # Initialize Range Ring Tool
+        from .maptools import RangeRingTool
+        self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller)
+        self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
+        self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+
+        # Initialize Tool Registry
+        from .maptools import ToolRegistry
+        self.tool_registry = ToolRegistry(self.iface.mapCanvas())
+        self.tool_registry.register_tool('line', self.line_tool)
+        self.tool_registry.register_tool('range_rings', self.range_ring_tool)
+        self.tool_registry.tool_activated.connect(self._on_tool_activated)
+        self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
+
         # Initialize SAR Panel
         self.sar_panel = SARPanel(self.iface.mainWindow())
         self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
@@ -234,6 +260,9 @@ class sartracker:
         self.sar_panel.csv_load_requested.connect(self._on_load_csv)
         self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
         self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
+        self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
+        self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
+        self.sar_panel.range_rings_tool_requested.connect(self._on_range_rings_tool_requested)
         self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
@@ -266,21 +295,112 @@ class sartracker:
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
-        for action in self.actions:
-            self.iface.removePluginMenu(
-                self.tr(u'&sartracker'),
-                action)
-            self.iface.removeToolBarIcon(action)
+        try:
+            # Remove menu items and toolbar icons
+            for action in self.actions:
+                self.iface.removePluginMenu(
+                    self.tr(u'&sartracker'),
+                    action)
+                self.iface.removeToolBarIcon(action)
 
-        # Stop coordinate update timer
-        if self.coords_update_timer:
-            self.coords_update_timer.stop()
-            self.coords_update_timer = None
+            # Stop coordinate update timer
+            if self.coords_update_timer:
+                try:
+                    self.coords_update_timer.stop()
+                    self.coords_update_timer.deleteLater()
+                except:
+                    pass
+                self.coords_update_timer = None
 
-        # Remove coordinate label from status bar
-        if self.coords_label:
-            self.iface.statusBarIface().removeWidget(self.coords_label)
-            self.coords_label = None
+            # Remove coordinate label from status bar
+            if self.coords_label:
+                try:
+                    self.iface.statusBarIface().removeWidget(self.coords_label)
+                    self.coords_label.deleteLater()
+                except:
+                    pass
+                self.coords_label = None
+
+            # Deactivate and clean up all map tools
+            if self.tool_registry:
+                try:
+                    self.tool_registry.deactivate_current()
+                except:
+                    pass
+
+            # Clean up individual tools
+            for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool']:
+                tool = getattr(self, tool_attr, None)
+                if tool:
+                    try:
+                        # Deactivate if it's the current tool
+                        if self.iface.mapCanvas().mapTool() == tool:
+                            self.iface.mapCanvas().unsetMapTool(tool)
+                        # Call deactivate method if exists
+                        if hasattr(tool, 'deactivate'):
+                            tool.deactivate()
+                        # Delete the tool
+                        tool.deleteLater()
+                    except:
+                        pass
+                    setattr(self, tool_attr, None)
+
+            # Clean up tool registry
+            if self.tool_registry:
+                try:
+                    self.tool_registry.deleteLater()
+                except:
+                    pass
+                self.tool_registry = None
+
+            # Disconnect and clean up SAR Panel
+            if self.sar_panel:
+                try:
+                    # Disconnect all signals
+                    self.sar_panel.mission_started.disconnect()
+                    self.sar_panel.mission_paused.disconnect()
+                    self.sar_panel.mission_resumed.disconnect()
+                    self.sar_panel.mission_finished.disconnect()
+                    self.sar_panel.refresh_requested.disconnect()
+                    self.sar_panel.csv_load_requested.disconnect()
+                    self.sar_panel.add_poi_requested.disconnect()
+                    self.sar_panel.add_casualty_requested.disconnect()
+                    self.sar_panel.add_hazard_requested.disconnect()
+                    self.sar_panel.line_tool_requested.disconnect()
+                    self.sar_panel.range_rings_tool_requested.disconnect()
+                    self.sar_panel.coordinate_converter_requested.disconnect()
+                    self.sar_panel.measure_distance_requested.disconnect()
+                    self.sar_panel.autosave_requested.disconnect()
+                except:
+                    pass  # Signals may not be connected
+
+                try:
+                    # Remove from dock widget area
+                    self.iface.removeDockWidget(self.sar_panel)
+                    # Delete the panel
+                    self.sar_panel.deleteLater()
+                except:
+                    pass
+                self.sar_panel = None
+
+            # Clean up layers controller
+            if self.layers_controller:
+                try:
+                    self.layers_controller = None
+                except:
+                    pass
+
+            # Clean up provider
+            if self.provider:
+                try:
+                    self.provider = None
+                except:
+                    pass
+
+        except Exception as e:
+            print(f"Error during plugin unload: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     def run(self):
@@ -487,23 +607,46 @@ class sartracker:
             pass
 
     def _on_add_poi_requested(self):
-        """Handle Add POI button click from SAR Panel."""
-        self.current_marker_type = 'poi'
+        """Handle Add IPP/LKP button click from SAR Panel."""
+        # Deactivate any drawing tools first
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        self.current_marker_type = 'ipp_lkp'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
         self.iface.messageBar().pushMessage(
             "SAR Tracker",
-            "Click on map to add POI location",
+            "Click on map to add IPP/LKP location",
             level=0,  # Info
             duration=3
         )
 
     def _on_add_casualty_requested(self):
-        """Handle Add Casualty button click from SAR Panel."""
-        self.current_marker_type = 'casualty'
+        """Handle Add Clue button click from SAR Panel."""
+        # Deactivate any drawing tools first
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        self.current_marker_type = 'clue'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
         self.iface.messageBar().pushMessage(
             "SAR Tracker",
-            "Click on map to add Casualty location",
+            "Click on map to add Clue location",
+            level=0,  # Info
+            duration=3
+        )
+
+    def _on_add_hazard_requested(self):
+        """Handle Add Hazard button click from SAR Panel."""
+        # Deactivate any drawing tools first
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        self.current_marker_type = 'hazard'
+        self.iface.mapCanvas().setMapTool(self.marker_tool)
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            "Click on map to add Hazard location",
             level=0,  # Info
             duration=3
         )
@@ -522,10 +665,12 @@ class sartracker:
         dialog = MarkerDialog(lat, lon, easting, northing, self.iface.mainWindow())
 
         # Pre-select marker type based on which button was clicked
-        if self.current_marker_type == 'casualty':
-            dialog.casualty_radio.setChecked(True)
+        if self.current_marker_type == 'clue':
+            dialog.clue_radio.setChecked(True)
+        elif self.current_marker_type == 'hazard':
+            dialog.hazard_radio.setChecked(True)
         else:
-            dialog.poi_radio.setChecked(True)
+            dialog.ipp_lkp_radio.setChecked(True)
 
         # Show dialog and wait for user
         result = dialog.exec_()
@@ -535,19 +680,19 @@ class sartracker:
             marker_data = dialog.get_marker_data()
 
             try:
-                # Add marker to map
-                if marker_data['type'] == 'poi':
+                # Add marker to map based on type
+                if marker_data['type'] == 'ipp_lkp':
                     marker_id = self.layers_controller.add_poi(
                         name=marker_data['name'],
                         lat=marker_data['lat'],
                         lon=marker_data['lon'],
-                        poi_type=marker_data.get('poi_type', ''),
+                        poi_type=marker_data.get('subject_category', ''),
                         irish_grid_e=marker_data['easting'],
                         irish_grid_n=marker_data['northing'],
                         description=marker_data['description']
                     )
-                    marker_type_str = "POI"
-                else:  # casualty
+                    marker_type_str = "IPP/LKP"
+                elif marker_data['type'] == 'clue':
                     marker_id = self.layers_controller.add_casualty(
                         name=marker_data['name'],
                         lat=marker_data['lat'],
@@ -555,9 +700,20 @@ class sartracker:
                         irish_grid_e=marker_data['easting'],
                         irish_grid_n=marker_data['northing'],
                         description=marker_data['description'],
-                        condition=marker_data.get('condition', '')
+                        condition=f"{marker_data.get('clue_type', '')} ({marker_data.get('confidence', '')})"
                     )
-                    marker_type_str = "Casualty"
+                    marker_type_str = "Clue"
+                else:  # hazard
+                    marker_id = self.layers_controller.add_casualty(
+                        name=marker_data['name'],
+                        lat=marker_data['lat'],
+                        lon=marker_data['lon'],
+                        irish_grid_e=marker_data['easting'],
+                        irish_grid_n=marker_data['northing'],
+                        description=marker_data['description'],
+                        condition=marker_data.get('hazard_type', '')
+                    )
+                    marker_type_str = "Hazard"
 
                 self.iface.messageBar().pushMessage(
                     "SAR Tracker",
@@ -635,6 +791,84 @@ class sartracker:
             level=0,  # Info
             duration=5
         )
+
+    def _on_line_tool_requested(self):
+        """Handle Line Tool button click."""
+        self.tool_registry.activate_tool('line')
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            "Click to add points. Right-click or ESC to finish line.",
+            level=0,  # Info
+            duration=5
+        )
+
+    def _on_range_rings_tool_requested(self):
+        """Handle Range Rings Tool button click."""
+        self.tool_registry.activate_tool('range_rings')
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            "Range Rings Tool: Click center point to configure rings",
+            level=0,  # Info
+            duration=5
+        )
+
+    def _on_line_complete(self, feature_data):
+        """
+        Handle line drawing completion.
+
+        Args:
+            feature_data: Dict with line info (name, distance_m, points, etc.)
+        """
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            f"Line '{feature_data['name']}' added ({feature_data['points']} points, {feature_data['distance_m']:.0f}m)",
+            level=3,  # Success
+            duration=3
+        )
+        # Deactivate tool
+        self.tool_registry.deactivate_current()
+
+    def _on_range_rings_complete(self, feature_data):
+        """
+        Handle range rings drawing completion.
+
+        Args:
+            feature_data: Dict with ring info (count, mode, center, etc.)
+        """
+        mode_str = "LPB-based" if feature_data['mode'] == 'lpb' else "Manual"
+        self.iface.messageBar().pushMessage(
+            "SAR Tracker",
+            f"{mode_str} range rings created ({feature_data['count']} rings)",
+            level=3,  # Success
+            duration=3
+        )
+        # Deactivate tool
+        self.tool_registry.deactivate_current()
+
+    def _on_drawing_cancelled(self):
+        """Handle drawing cancellation (ESC pressed)."""
+        # Silent cancellation - no message needed
+        pass
+
+    def _on_tool_activated(self, tool_name):
+        """
+        Update UI when drawing tool activated.
+
+        Args:
+            tool_name: Name of activated tool
+        """
+        if hasattr(self, 'sar_panel') and self.sar_panel:
+            self.sar_panel.set_active_tool(tool_name.title())
+
+    def _on_tool_deactivated(self, tool_name):
+        """
+        Update UI when drawing tool deactivated.
+
+        Args:
+            tool_name: Name of deactivated tool
+        """
+        if hasattr(self, 'sar_panel') and self.sar_panel:
+            self.sar_panel.set_active_tool("None")
 
     def _on_measurement_complete(self, distance_m, distance_km, bearing, point1, point2):
         """

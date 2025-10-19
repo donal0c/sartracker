@@ -6,9 +6,10 @@ Main docked control panel for SAR tracking operations.
 """
 
 from qgis.PyQt.QtWidgets import (
-    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
+    QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem,
-    QGroupBox, QSpinBox, QCheckBox, QFileDialog, QLineEdit
+    QGroupBox, QSpinBox, QCheckBox, QFileDialog, QLineEdit,
+    QScrollArea
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor
@@ -43,6 +44,9 @@ class SARPanel(QDockWidget):
     csv_load_requested = pyqtSignal(str)  # file_path
     add_poi_requested = pyqtSignal()
     add_casualty_requested = pyqtSignal()
+    add_hazard_requested = pyqtSignal()
+    line_tool_requested = pyqtSignal()
+    range_rings_tool_requested = pyqtSignal()
     coordinate_converter_requested = pyqtSignal()
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
@@ -59,6 +63,8 @@ class SARPanel(QDockWidget):
         self.auto_refresh_enabled = False
         self.autosave_enabled = False
         self.last_autosave_time = None
+        self.focus_mode_active = False
+        self.hidden_panels = []  # Track which panels we hid
 
         # Setup UI
         self._setup_ui()
@@ -82,7 +88,18 @@ class SARPanel(QDockWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
-        
+
+        # Focus Mode Toggle (at top)
+        focus_layout = QHBoxLayout()
+        self.focus_mode_button = QPushButton("Enter Focus Mode")
+        self.focus_mode_button.setToolTip(
+            "Hide other QGIS panels for cleaner workspace.\n"
+            "Press F11 for full-screen mode."
+        )
+        self.focus_mode_button.clicked.connect(self._toggle_focus_mode)
+        focus_layout.addWidget(self.focus_mode_button)
+        layout.addLayout(focus_layout)
+
         # Mission Info Section
         mission_group = QGroupBox("Mission")
         mission_layout = QVBoxLayout()
@@ -211,34 +228,133 @@ class SARPanel(QDockWidget):
         data_group.setLayout(data_layout)
         layout.addWidget(data_group)
 
-        # Map Tools Section
-        tools_group = QGroupBox("Map Tools")
-        tools_layout = QVBoxLayout()
+        # ========================================
+        # Markers & Clues Section
+        # ========================================
+        markers_group = QGroupBox("Markers & Clues")
+        markers_layout = QVBoxLayout()
 
-        self.add_poi_button = QPushButton("Add Point of Interest (POI)")
-        self.add_poi_button.clicked.connect(self._on_add_poi)
-        tools_layout.addWidget(self.add_poi_button)
+        # Use grid layout for compact 2-column arrangement
+        markers_grid = QGridLayout()
 
-        self.add_casualty_button = QPushButton("Add Casualty")
-        self.add_casualty_button.clicked.connect(self._on_add_casualty)
-        tools_layout.addWidget(self.add_casualty_button)
+        self.add_ipp_lkp_button = QPushButton("IPP/LKP")
+        self.add_ipp_lkp_button.setToolTip(
+            "Add Initial Planning Point / Last Known Position\n"
+            "The starting point for search planning where the\n"
+            "subject was last reliably seen or located."
+        )
+        self.add_ipp_lkp_button.clicked.connect(self._on_add_poi)
+        markers_grid.addWidget(self.add_ipp_lkp_button, 0, 0)
+
+        self.add_clue_button = QPushButton("Clue")
+        self.add_clue_button.setToolTip(
+            "Add evidence or clues found during search:\n"
+            "Footprints, clothing, equipment, witness sightings, etc."
+        )
+        self.add_clue_button.clicked.connect(self._on_add_casualty)
+        markers_grid.addWidget(self.add_clue_button, 0, 1)
+
+        self.add_hazard_button = QPushButton("Hazard")
+        self.add_hazard_button.setToolTip(
+            "Mark safety hazards on the map:\n"
+            "Cliffs, water hazards, bogs, dense vegetation, etc."
+        )
+        self.add_hazard_button.clicked.connect(self._on_add_hazard)
+        markers_grid.addWidget(self.add_hazard_button, 1, 0)
+
+        markers_layout.addLayout(markers_grid)
+        markers_group.setLayout(markers_layout)
+        layout.addWidget(markers_group)
+
+        # ========================================
+        # Drawing Tools Section
+        # ========================================
+        drawing_group = QGroupBox("Drawing Tools")
+        drawing_layout = QVBoxLayout()
+
+        # Active tool indicator
+        active_tool_layout = QHBoxLayout()
+        active_tool_layout.addWidget(QLabel("Active:"))
+        self.active_tool_label = QLabel("<i>None</i>")
+        self.active_tool_label.setStyleSheet("QLabel { color: #0066cc; font-weight: bold; }")
+        active_tool_layout.addWidget(self.active_tool_label)
+        active_tool_layout.addStretch()
+        drawing_layout.addLayout(active_tool_layout)
+
+        # Drawing tools grid (2 columns) - placeholders for now
+        drawing_grid = QGridLayout()
+
+        # Note: These will be implemented in Week 1 Days 2-5
+        self.line_tool_button = QPushButton("Line")
+        self.line_tool_button.setToolTip("Draw lines for routes, boundaries, or paths.\nClick to add points, right-click to finish.")
+        self.line_tool_button.clicked.connect(self._on_line_tool)
+        drawing_grid.addWidget(self.line_tool_button, 0, 0)
+
+        self.search_area_button = QPushButton("Search Area")
+        self.search_area_button.setToolTip("Draw polygon search areas with status tracking")
+        self.search_area_button.setEnabled(False)  # Disabled until implemented
+        drawing_grid.addWidget(self.search_area_button, 0, 1)
+
+        self.range_rings_button = QPushButton("Range Rings")
+        self.range_rings_button.setToolTip("Create distance circles (LPB-based or custom)")
+        self.range_rings_button.clicked.connect(self._on_range_rings_tool)
+        drawing_grid.addWidget(self.range_rings_button, 1, 0)
+
+        self.bearing_line_button = QPushButton("Bearing Line")
+        self.bearing_line_button.setToolTip("Draw azimuth/bearing lines for direction finding")
+        self.bearing_line_button.setEnabled(False)  # Disabled until implemented
+        drawing_grid.addWidget(self.bearing_line_button, 1, 1)
+
+        self.sector_button = QPushButton("Search Sector")
+        self.sector_button.setToolTip("Draw pie-slice sectors for search areas")
+        self.sector_button.setEnabled(False)  # Disabled until implemented
+        drawing_grid.addWidget(self.sector_button, 2, 0)
+
+        self.text_label_button = QPushButton("Text Label")
+        self.text_label_button.setToolTip("Add text annotations to the map")
+        self.text_label_button.setEnabled(False)  # Disabled until implemented
+        drawing_grid.addWidget(self.text_label_button, 2, 1)
+
+        self.gpx_import_button = QPushButton("Import GPX")
+        self.gpx_import_button.setToolTip("Import GPS tracks from GPX files")
+        self.gpx_import_button.setEnabled(False)  # Disabled until implemented
+        drawing_grid.addWidget(self.gpx_import_button, 3, 0, 1, 2)  # Full width
+
+        drawing_layout.addLayout(drawing_grid)
+        drawing_group.setLayout(drawing_layout)
+        layout.addWidget(drawing_group)
+
+        # ========================================
+        # Utilities Section
+        # ========================================
+        utilities_group = QGroupBox("Utilities")
+        utilities_layout = QVBoxLayout()
+
+        utilities_grid = QGridLayout()
 
         self.coord_converter_button = QPushButton("Coordinate Converter")
         self.coord_converter_button.clicked.connect(self._on_coordinate_converter)
-        tools_layout.addWidget(self.coord_converter_button)
+        utilities_grid.addWidget(self.coord_converter_button, 0, 0)
 
-        self.measure_button = QPushButton("Measure Distance & Bearing")
+        self.measure_button = QPushButton("Measure Distance")
         self.measure_button.clicked.connect(self._on_measure_distance)
-        tools_layout.addWidget(self.measure_button)
+        utilities_grid.addWidget(self.measure_button, 0, 1)
 
-        tools_group.setLayout(tools_layout)
-        layout.addWidget(tools_group)
+        utilities_layout.addLayout(utilities_grid)
+        utilities_group.setLayout(utilities_layout)
+        layout.addWidget(utilities_group)
 
         # Spacer
         layout.addStretch()
-        
+
         main_widget.setLayout(layout)
-        self.setWidget(main_widget)
+
+        # Wrap in scroll area so content is always accessible
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(main_widget)
+        scroll_area.setWidgetResizable(True)  # Important: makes content resize with panel
+
+        self.setWidget(scroll_area)
         
     def _on_start_mission(self):
         """Handle start mission button click."""
@@ -400,6 +516,10 @@ class SARPanel(QDockWidget):
         """Handle Add Casualty button click."""
         self.add_casualty_requested.emit()
 
+    def _on_add_hazard(self):
+        """Handle Add Hazard button click."""
+        self.add_hazard_requested.emit()
+
     def _on_coordinate_converter(self):
         """Handle Coordinate Converter button click."""
         self.coordinate_converter_requested.emit()
@@ -407,6 +527,26 @@ class SARPanel(QDockWidget):
     def _on_measure_distance(self):
         """Handle Measure Distance button click."""
         self.measure_distance_requested.emit()
+
+    def _on_line_tool(self):
+        """Handle Line Tool button click."""
+        self.line_tool_requested.emit()
+
+    def _on_range_rings_tool(self):
+        """Handle Range Rings Tool button click."""
+        self.range_rings_tool_requested.emit()
+
+    def set_active_tool(self, tool_name):
+        """
+        Update active tool indicator.
+
+        Args:
+            tool_name: Name of active tool (or "None")
+        """
+        if tool_name == "None":
+            self.active_tool_label.setText("<i>None</i>")
+        else:
+            self.active_tool_label.setText(f"<b>{tool_name}</b>")
 
     def _on_autosave_toggled(self, state):
         """Handle auto-save checkbox toggle."""
@@ -494,3 +634,76 @@ class SARPanel(QDockWidget):
         self.is_paused = True
         self.pause_button.setText("Resume")
         self._update_mission_status()
+
+    def _toggle_focus_mode(self):
+        """
+        Toggle Focus Mode - hide/show other QGIS panels.
+
+        Qt5/Qt6 Compatible: Uses standard Qt widget visibility methods.
+        """
+        try:
+            from qgis.utils import iface
+
+            if not self.focus_mode_active:
+                # Enter Focus Mode - hide other panels
+                self.hidden_panels = []
+
+                # Get main window and find all dock widgets
+                main_window = iface.mainWindow()
+                all_docks = main_window.findChildren(QDockWidget)
+
+                # Hide all dock widgets except SAR panel
+                for dock in all_docks:
+                    if dock != self and dock.isVisible():
+                        # Store reference to restore later
+                        self.hidden_panels.append(dock)
+                        dock.setVisible(False)
+
+                # Update button
+                self.focus_mode_button.setText("Exit Focus Mode")
+                self.focus_mode_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
+                self.focus_mode_active = True
+
+                # Show message
+                from qgis.core import Qgis
+                iface.messageBar().pushMessage(
+                    "Focus Mode",
+                    f"Focus Mode enabled - {len(self.hidden_panels)} panels hidden. Click 'Exit Focus Mode' to restore.",
+                    level=Qgis.Info,
+                    duration=3
+                )
+
+            else:
+                # Exit Focus Mode - restore panels
+                restored = 0
+                for panel in self.hidden_panels:
+                    panel.setVisible(True)
+                    restored += 1
+
+                self.hidden_panels = []
+
+                # Update button
+                self.focus_mode_button.setText("Enter Focus Mode")
+                self.focus_mode_button.setStyleSheet("")
+                self.focus_mode_active = False
+
+                # Show message
+                from qgis.core import Qgis
+                iface.messageBar().pushMessage(
+                    "Focus Mode",
+                    f"Focus Mode disabled - {restored} panels restored.",
+                    level=Qgis.Info,
+                    duration=2
+                )
+
+        except Exception as e:
+            # Fail gracefully - focus mode is optional
+            print(f"Focus mode toggle failed: {e}")
+            from qgis.core import Qgis
+            from qgis.utils import iface
+            iface.messageBar().pushMessage(
+                "Focus Mode Error",
+                f"Could not toggle Focus Mode: {e}",
+                level=Qgis.Warning,
+                duration=3
+            )

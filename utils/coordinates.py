@@ -67,15 +67,15 @@ class CoordinateConverter:
     def format_irish_grid(self, easting: float, northing: float) -> str:
         """
         Format Irish Grid coordinates as string.
-        
+
         Args:
             easting: Easting coordinate
             northing: Northing coordinate
-            
+
         Returns:
             Formatted string "E: 123456  N: 234567"
         """
-        return f"E: {int(easting)}  N: {int(northing)}"
+        return f"E: {easting:.0f}  N: {northing:.0f}"
 
     def format_wgs84(self, lat: float, lon: float) -> str:
         """

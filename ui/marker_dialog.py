@@ -2,7 +2,7 @@
 """
 Marker Dialog
 
-Dialog for adding/editing POI and Casualty markers.
+Dialog for adding/editing SAR markers: IPP/LKP, Clues, and Hazards.
 """
 
 from qgis.PyQt.QtWidgets import (
@@ -10,26 +10,30 @@ from qgis.PyQt.QtWidgets import (
     QPushButton, QLineEdit, QTextEdit, QComboBox,
     QLabel, QGroupBox, QRadioButton, QButtonGroup
 )
-from qgis.PyQt.QtCore import Qt
 
 
 class MarkerDialog(QDialog):
     """
-    Dialog for adding/editing markers (POI or Casualty).
-    
+    Dialog for adding/editing SAR markers.
+
+    Supports three marker types:
+    - IPP/LKP (Initial Planning Point / Last Known Position)
+    - Clue (Evidence, sightings, footprints, etc.)
+    - Hazard (Safety-critical warnings)
+
     Shows coordinates in both WGS84 and Irish Grid (ITM).
     """
-    
+
     def __init__(self, lat, lon, easting, northing, parent=None):
         super().__init__(parent)
-        
+
         self.lat = lat
         self.lon = lon
         self.easting = easting
         self.northing = northing
-        
-        self.marker_type = "poi"  # or "casualty"
-        
+
+        self.marker_type = "ipp_lkp"  # or "clue" or "hazard"
+
         self._setup_ui()
         
     def _setup_ui(self):
@@ -42,20 +46,38 @@ class MarkerDialog(QDialog):
         # Marker Type Selection
         type_group = QGroupBox("Marker Type")
         type_layout = QHBoxLayout()
-        
+
         self.type_button_group = QButtonGroup()
-        
-        self.poi_radio = QRadioButton("Point of Interest (POI)")
-        self.poi_radio.setChecked(True)
-        self.poi_radio.toggled.connect(self._on_type_changed)
-        self.type_button_group.addButton(self.poi_radio)
-        type_layout.addWidget(self.poi_radio)
-        
-        self.casualty_radio = QRadioButton("Casualty")
-        self.casualty_radio.toggled.connect(self._on_type_changed)
-        self.type_button_group.addButton(self.casualty_radio)
-        type_layout.addWidget(self.casualty_radio)
-        
+
+        self.ipp_lkp_radio = QRadioButton("IPP/LKP")
+        self.ipp_lkp_radio.setChecked(True)
+        self.ipp_lkp_radio.setToolTip(
+            "Initial Planning Point / Last Known Position\n"
+            "The starting point for search planning, typically where the\n"
+            "subject was last reliably seen or located."
+        )
+        self.ipp_lkp_radio.toggled.connect(self._on_type_changed)
+        self.type_button_group.addButton(self.ipp_lkp_radio)
+        type_layout.addWidget(self.ipp_lkp_radio)
+
+        self.clue_radio = QRadioButton("Clue")
+        self.clue_radio.setToolTip(
+            "Evidence or clues found during search:\n"
+            "Footprints, clothing, equipment, witness sightings, etc."
+        )
+        self.clue_radio.toggled.connect(self._on_type_changed)
+        self.type_button_group.addButton(self.clue_radio)
+        type_layout.addWidget(self.clue_radio)
+
+        self.hazard_radio = QRadioButton("Hazard")
+        self.hazard_radio.setToolTip(
+            "Safety hazard marking:\n"
+            "Cliffs, water hazards, bogs, dense vegetation, etc."
+        )
+        self.hazard_radio.toggled.connect(self._on_type_changed)
+        self.type_button_group.addButton(self.hazard_radio)
+        type_layout.addWidget(self.hazard_radio)
+
         type_group.setLayout(type_layout)
         layout.addWidget(type_group)
         
@@ -68,7 +90,7 @@ class MarkerDialog(QDialog):
         coords_layout.addRow("WGS84:", wgs84_label)
         
         # Irish Grid (ITM)
-        itm_label = QLabel(f"<b>E: {int(self.easting):,}  N: {int(self.northing):,}</b>")
+        itm_label = QLabel(f"<b>E: {self.easting:,.0f}  N: {self.northing:,.0f}</b>")
         coords_layout.addRow("Irish Grid (ITM):", itm_label)
         
         coords_group.setLayout(coords_layout)
@@ -82,33 +104,60 @@ class MarkerDialog(QDialog):
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Enter name...")
         details_layout.addRow("Name:*", self.name_input)
-        
-        # POI Type (only for POI)
-        self.poi_type_combo = QComboBox()
-        self.poi_type_combo.addItems([
-            "Base/Command Post",
-            "Vehicle",
-            "Landmark",
-            "Hazard",
-            "Water Source",
-            "Shelter",
+
+        # Subject Category (only for IPP/LKP)
+        self.subject_category_combo = QComboBox()
+        self.subject_category_combo.addItems([
+            "Child (1-3 years)",
+            "Child (4-6 years)",
+            "Child (7-12 years)",
+            "Hiker",
+            "Hunter",
+            "Elderly",
+            "Dementia Patient",
+            "Despondent",
+            "Autistic",
             "Other"
         ])
-        self.poi_type_row_label = QLabel("Type:")
-        details_layout.addRow(self.poi_type_row_label, self.poi_type_combo)
-        
-        # Casualty Condition (only for Casualty)
-        self.condition_combo = QComboBox()
-        self.condition_combo.addItems([
-            "Uninjured",
-            "Minor Injury",
-            "Serious Injury",
-            "Critical",
-            "Deceased",
-            "Unknown"
+        self.subject_category_label = QLabel("Subject Category:")
+        details_layout.addRow(self.subject_category_label, self.subject_category_combo)
+
+        # Clue Type (only for Clue)
+        self.clue_type_combo = QComboBox()
+        self.clue_type_combo.addItems([
+            "Footprint",
+            "Clothing",
+            "Equipment",
+            "Witness Sighting",
+            "Physical Evidence",
+            "Other"
         ])
-        self.condition_row_label = QLabel("Condition:")
-        details_layout.addRow(self.condition_row_label, self.condition_combo)
+        self.clue_type_label = QLabel("Clue Type:")
+        details_layout.addRow(self.clue_type_label, self.clue_type_combo)
+
+        # Confidence Level (only for Clue)
+        self.confidence_combo = QComboBox()
+        self.confidence_combo.addItems([
+            "Confirmed",
+            "Probable",
+            "Possible"
+        ])
+        self.confidence_label = QLabel("Confidence:")
+        details_layout.addRow(self.confidence_label, self.confidence_combo)
+
+        # Hazard Type (only for Hazard)
+        self.hazard_type_combo = QComboBox()
+        self.hazard_type_combo.addItems([
+            "Cliff/Drop-off",
+            "Water Hazard",
+            "Bog/Peatland",
+            "Dense Vegetation",
+            "Wildlife Danger",
+            "Weather Exposure",
+            "Other"
+        ])
+        self.hazard_type_label = QLabel("Hazard Type:")
+        details_layout.addRow(self.hazard_type_label, self.hazard_type_combo)
         
         # Description/Notes
         self.description_input = QTextEdit()
@@ -141,16 +190,33 @@ class MarkerDialog(QDialog):
         self._on_type_changed()
         
     def _on_type_changed(self):
-        """Handle marker type change."""
-        is_poi = self.poi_radio.isChecked()
-        self.marker_type = "poi" if is_poi else "casualty"
-        
+        """Handle marker type change - show/hide relevant fields."""
+        is_ipp_lkp = self.ipp_lkp_radio.isChecked()
+        is_clue = self.clue_radio.isChecked()
+        is_hazard = self.hazard_radio.isChecked()
+
+        # Update marker type
+        if is_ipp_lkp:
+            self.marker_type = "ipp_lkp"
+        elif is_clue:
+            self.marker_type = "clue"
+        else:
+            self.marker_type = "hazard"
+
         # Show/hide type-specific fields
-        self.poi_type_row_label.setVisible(is_poi)
-        self.poi_type_combo.setVisible(is_poi)
-        
-        self.condition_row_label.setVisible(not is_poi)
-        self.condition_combo.setVisible(not is_poi)
+        # IPP/LKP fields
+        self.subject_category_label.setVisible(is_ipp_lkp)
+        self.subject_category_combo.setVisible(is_ipp_lkp)
+
+        # Clue fields
+        self.clue_type_label.setVisible(is_clue)
+        self.clue_type_combo.setVisible(is_clue)
+        self.confidence_label.setVisible(is_clue)
+        self.confidence_combo.setVisible(is_clue)
+
+        # Hazard fields
+        self.hazard_type_label.setVisible(is_hazard)
+        self.hazard_type_combo.setVisible(is_hazard)
         
     def _on_save(self):
         """Validate and save."""
@@ -164,9 +230,9 @@ class MarkerDialog(QDialog):
     def get_marker_data(self):
         """
         Get marker data from dialog.
-        
+
         Returns:
-            Dict with marker details
+            Dict with marker details including type-specific fields
         """
         data = {
             'type': self.marker_type,
@@ -177,10 +243,14 @@ class MarkerDialog(QDialog):
             'easting': self.easting,
             'northing': self.northing
         }
-        
-        if self.marker_type == 'poi':
-            data['poi_type'] = self.poi_type_combo.currentText()
-        else:
-            data['condition'] = self.condition_combo.currentText()
-        
+
+        # Add type-specific fields
+        if self.marker_type == 'ipp_lkp':
+            data['subject_category'] = self.subject_category_combo.currentText()
+        elif self.marker_type == 'clue':
+            data['clue_type'] = self.clue_type_combo.currentText()
+            data['confidence'] = self.confidence_combo.currentText()
+        elif self.marker_type == 'hazard':
+            data['hazard_type'] = self.hazard_type_combo.currentText()
+
         return data
