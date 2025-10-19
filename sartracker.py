@@ -682,36 +682,38 @@ class sartracker:
             try:
                 # Add marker to map based on type
                 if marker_data['type'] == 'ipp_lkp':
-                    marker_id = self.layers_controller.add_poi(
+                    marker_id = self.layers_controller.add_ipp_lkp(
                         name=marker_data['name'],
                         lat=marker_data['lat'],
                         lon=marker_data['lon'],
-                        poi_type=marker_data.get('subject_category', ''),
+                        subject_category=marker_data.get('subject_category', ''),
+                        description=marker_data['description'],
                         irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
-                        description=marker_data['description']
+                        irish_grid_n=marker_data['northing']
                     )
                     marker_type_str = "IPP/LKP"
                 elif marker_data['type'] == 'clue':
-                    marker_id = self.layers_controller.add_casualty(
+                    marker_id = self.layers_controller.add_clue(
                         name=marker_data['name'],
                         lat=marker_data['lat'],
                         lon=marker_data['lon'],
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
+                        clue_type=marker_data.get('clue_type', ''),
+                        confidence=marker_data.get('confidence', 'Possible'),
                         description=marker_data['description'],
-                        condition=f"{marker_data.get('clue_type', '')} ({marker_data.get('confidence', '')})"
+                        irish_grid_e=marker_data['easting'],
+                        irish_grid_n=marker_data['northing']
                     )
                     marker_type_str = "Clue"
                 else:  # hazard
-                    marker_id = self.layers_controller.add_casualty(
+                    marker_id = self.layers_controller.add_hazard(
                         name=marker_data['name'],
                         lat=marker_data['lat'],
                         lon=marker_data['lon'],
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
+                        hazard_type=marker_data.get('hazard_type', ''),
+                        severity="Medium",  # Default severity
                         description=marker_data['description'],
-                        condition=marker_data.get('hazard_type', '')
+                        irish_grid_e=marker_data['easting'],
+                        irish_grid_n=marker_data['northing']
                     )
                     marker_type_str = "Hazard"
 
