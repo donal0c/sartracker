@@ -206,6 +206,17 @@ class sartracker:
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
 
+        # Version check
+        from qgis.core import Qgis
+        if Qgis.QGIS_VERSION_INT < 32800:  # 3.28.0
+            from .utils.notify import warning
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "This plugin is tested on QGIS 3.28-3.44. You have an older version - features may not work correctly.",
+                duration=8
+            )
+
         # Use absolute path to icon file
         icon_path = os.path.join(self.plugin_dir, 'icon.png')
         self.add_action(
@@ -213,6 +224,23 @@ class sartracker:
             text=self.tr(u'SAR Tracker Panel'),
             callback=self.run,
             parent=self.iface.mainWindow())
+
+        # Add separator for visual grouping
+        separator = QAction(self.iface.mainWindow())
+        separator.setSeparator(True)
+        self.iface.addPluginToMenu(self.menu, separator)
+
+        # Add Diagnostics menu item
+        self.diagnostics_action = QAction("Diagnostics", self.iface.mainWindow())
+        self.diagnostics_action.triggered.connect(self._show_diagnostics)
+        self.iface.addPluginToMenu(self.menu, self.diagnostics_action)
+        self.actions.append(self.diagnostics_action)
+
+        # Add Smoke Test menu item
+        self.smoketest_action = QAction("Run Smoke Test", self.iface.mainWindow())
+        self.smoketest_action.triggered.connect(self._run_smoke_test)
+        self.iface.addPluginToMenu(self.menu, self.smoketest_action)
+        self.actions.append(self.smoketest_action)
 
         # will be set False in run()
         self.first_start = True
@@ -310,6 +338,17 @@ class sartracker:
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
 
+    def _show_diagnostics(self):
+        """Show diagnostics dialog."""
+        from .ui.diagnostics_panel import DiagnosticsPanel
+        from .utils.qt_compat import dialog_exec
+        dialog = DiagnosticsPanel(self.iface.mainWindow())
+        dialog_exec(dialog)
+
+    def _run_smoke_test(self):
+        """Run smoke test."""
+        from .tools.smoketest import run_smoke_test
+        run_smoke_test(self.iface)
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""

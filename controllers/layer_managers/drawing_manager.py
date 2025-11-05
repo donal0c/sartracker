@@ -34,6 +34,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
+from ...utils.notify import error
 
 
 class DrawingLayerManager(BaseLayerManager):
@@ -166,7 +167,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit line feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Line Creation Error",
                 f"Failed to add line '{name}': {str(e)}"
             )
@@ -304,7 +306,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit search area feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Search Area Creation Error",
                 f"Failed to add search area '{name}': {str(e)}"
             )
@@ -483,7 +486,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit range ring feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Range Ring Creation Error",
                 f"Failed to add range ring '{name}': {str(e)}"
             )
@@ -637,7 +641,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit bearing line feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Bearing Line Creation Error",
                 f"Failed to add bearing line '{name}': {str(e)}"
             )
@@ -807,7 +812,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit sector feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Sector Creation Error",
                 f"Failed to add sector '{name}': {str(e)}"
             )
@@ -907,7 +913,8 @@ class DrawingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Failed to commit text label feature: {', '.join(errors)}")
         except Exception as e:
             layer.rollBack()
-            self.iface.messageBar().pushCritical(
+            error(
+                self.iface.messageBar(),
                 "Text Label Creation Error",
                 f"Failed to add text label '{text}': {str(e)}"
             )

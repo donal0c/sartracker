@@ -22,6 +22,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
+from ...utils.notify import warning
 
 
 class TrackingLayerManager(BaseLayerManager):
@@ -401,7 +402,8 @@ class TrackingLayerManager(BaseLayerManager):
                         # If timestamp parsing fails, assume no gap and continue segment
                         # This prevents crashes on malformed timestamps
                         # Warn user via message bar (visible in QGIS UI)
-                        self.iface.messageBar().pushWarning(
+                        warning(
+                            self.iface.messageBar(),
                             "Timestamp Parsing",
                             f"Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment."
                         )

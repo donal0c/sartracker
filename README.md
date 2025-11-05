@@ -4,7 +4,7 @@
 
 Transform QGIS into a dedicated SAR operations console for real-time tracking of rescue personnel during search missions.
 
-![QGIS 3.0+](https://img.shields.io/badge/QGIS-3.0%2B-blue)
+![QGIS 3.28+](https://img.shields.io/badge/QGIS-3.28%2B-blue)
 ![License](https://img.shields.io/badge/License-GPL--2.0-green)
 
 ---
@@ -13,7 +13,37 @@ Transform QGIS into a dedicated SAR operations console for real-time tracking of
 
 ### Prerequisites
 
-- **QGIS 3.0 or later** - Download from https://qgis.org/download/
+- **QGIS 3.28 or later** - Download from https://qgis.org/download/
+
+## Requirements
+
+- **QGIS Version:** 3.28 or newer
+- **Tested On:** QGIS 3.28 - 3.44 (both Qt5 and Qt6)
+- **Python:** 3.8+ (included with QGIS)
+- **Dependencies:** None (uses QGIS built-in libraries only)
+
+### Version Compatibility
+
+This plugin uses a compatibility layer to work across Qt5 and Qt6 versions of QGIS.
+If you encounter issues, use **Plugins → SAR Tracker → Diagnostics** to check your environment.
+
+**Known Compatible:**
+- QGIS 3.28 LTR (Qt5)
+- QGIS 3.34 LTR (Qt5)
+- QGIS 3.40 LTR (Qt6)
+- QGIS 3.44+ (Qt6)
+
+**Not Supported:**
+- QGIS 3.22 or earlier (may work but untested)
+- QGIS 2.x (will not work)
+
+### Diagnostics & Testing
+
+If you encounter issues:
+1. Go to **Plugins → SAR Tracker → Diagnostics**
+2. Screenshot the diagnostics panel
+3. Go to **Plugins → SAR Tracker → Run Smoke Test**
+4. Report any failures with screenshots
 
 ---
 
@@ -321,6 +351,6 @@ GNU General Public License v2.0
 
 ---
 
-**Version:** 0.4 (Phase 3 - In Progress)
-**Last Updated:** October 19, 2025
+**Version:** 0.3.1 (Qt5/Qt6 Compatible)
+**Last Updated:** November 5, 2025
 **Status:** Production Ready ✅

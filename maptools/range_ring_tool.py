@@ -19,8 +19,9 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message, DialogAccepted
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
 from ..utils.lpb_statistics import LPBStatistics
+from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -347,11 +348,10 @@ class RangeRingTool(BaseDrawingTool):
             try:
                 from qgis.utils import iface
                 if iface:
-                    push_message(
+                    error(
                         iface.messageBar(),
-                        "Error",
+                        "Range Ring Tool",
                         f"Failed to create range rings: {str(e)}",
-                        level=2,  # Warning
                         duration=5
                     )
             except:

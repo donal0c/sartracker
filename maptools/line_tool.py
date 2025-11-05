@@ -12,7 +12,8 @@ from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtGui import QColor
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, push_message
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape
+from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -195,11 +196,10 @@ class LineTool(BaseDrawingTool):
             try:
                 from qgis.utils import iface
                 if iface:
-                    push_message(
+                    error(
                         iface.messageBar(),
-                        "Error",
+                        "Line Tool",
                         f"Failed to save line: {str(e)}",
-                        level=2,  # Warning
                         duration=5
                     )
             except:

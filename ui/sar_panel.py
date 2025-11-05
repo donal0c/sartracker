@@ -19,8 +19,9 @@ from typing import Optional, List, Dict
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
-    Checked, push_message
+    Checked
 )
+from ..utils.notify import info, warning
 
 
 class SARPanel(QDockWidget):
@@ -676,11 +677,10 @@ class SARPanel(QDockWidget):
                 self.focus_mode_active = True
 
                 # Show message
-                push_message(
+                info(
                     iface.messageBar(),
                     "Focus Mode",
                     f"Focus Mode enabled - {len(self.hidden_panels)} panels hidden. Click 'Exit Focus Mode' to restore.",
-                    level=0,  # Info
                     duration=3
                 )
 
@@ -699,11 +699,10 @@ class SARPanel(QDockWidget):
                 self.focus_mode_active = False
 
                 # Show message
-                push_message(
+                info(
                     iface.messageBar(),
                     "Focus Mode",
                     f"Focus Mode disabled - {restored} panels restored.",
-                    level=0,  # Info
                     duration=2
                 )
 
@@ -711,10 +710,9 @@ class SARPanel(QDockWidget):
             # Fail gracefully - focus mode is optional
             print(f"Focus mode toggle failed: {e}")
             from qgis.utils import iface
-            push_message(
+            warning(
                 iface.messageBar(),
-                "Focus Mode Error",
-                f"Could not toggle Focus Mode: {e}",
-                level=1,  # Warning
+                "Focus Mode",
+                f"Error in focus mode: {e}",
                 duration=3
             )

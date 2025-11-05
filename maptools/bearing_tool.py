@@ -19,7 +19,8 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, push_message, DialogAccepted
+from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
+from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -423,11 +424,10 @@ class BearingTool(BaseDrawingTool):
             try:
                 from qgis.utils import iface
                 if iface:
-                    push_message(
+                    error(
                         iface.messageBar(),
-                        "Error",
+                        "Bearing Tool",
                         f"Failed to create bearing line: {str(e)}",
-                        level=2,  # Warning
                         duration=5
                     )
             except:
