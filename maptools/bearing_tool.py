@@ -189,6 +189,12 @@ class BearingLineDialog(QDialog):
 
         self.setLayout(layout)
 
+        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
+        from qgis.PyQt.QtWidgets import QApplication
+        layout.activate()
+        self.adjustSize()
+        QApplication.processEvents()
+
         # Connect signals
         self.true_bearing_radio.toggled.connect(self._on_bearing_type_changed)
         self.magnetic_bearing_radio.toggled.connect(self._on_bearing_type_changed)

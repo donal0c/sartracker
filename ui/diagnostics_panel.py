@@ -85,6 +85,11 @@ class DiagnosticsPanel(QDialog):
 
         self.setLayout(layout)
 
+        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
+        layout.activate()
+        self.adjustSize()
+        QApplication.processEvents()
+
     def _create_environment_section(self):
         """Create environment information section."""
         group = QGroupBox("Environment")

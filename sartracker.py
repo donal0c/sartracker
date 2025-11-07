@@ -35,7 +35,8 @@ import os.path
 import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import RightDockWidgetArea, dialog_exec, push_message, DialogAccepted
+from .utils.qt_compat import RightDockWidgetArea, dialog_exec, DialogAccepted
+from .utils.notify import info, warning, error, success
 
 # Import our SAR tracking components
 try:
@@ -209,7 +210,6 @@ class sartracker:
         # Version check
         from qgis.core import Qgis
         if Qgis.QGIS_VERSION_INT < 32800:  # 3.28.0
-            from .utils.notify import warning
             warning(
                 self.iface.messageBar(),
                 "SAR Tracker",
@@ -470,55 +470,50 @@ class sartracker:
     def _on_mission_started(self, mission_name):
         """Handle mission start."""
         print(f"Mission started: {mission_name}")
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             f"Mission '{mission_name}' started",
-            level=3,  # Success
             duration=3
         )
 
     def _on_mission_paused(self):
         """Handle mission pause."""
         print("Mission paused")
-        push_message(
+        warning(
             self.iface.messageBar(),
             "SAR Tracker",
             "Mission paused",
-            level=1,  # Warning
             duration=2
         )
 
     def _on_mission_resumed(self):
         """Handle mission resume."""
         print("Mission resumed")
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             "Mission resumed",
-            level=3,  # Success
             duration=2
         )
 
     def _on_mission_finished(self):
         """Handle mission finish."""
         print("Mission finished")
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             "Mission finished",
-            level=3,  # Success
             duration=3
         )
 
     def _on_refresh_data(self):
         """Handle data refresh request."""
         if not self.provider:
-            push_message(
+            warning(
                 self.iface.messageBar(),
                 "SAR Tracker",
                 "No data source loaded. Please load a CSV file first.",
-                level=1,  # Warning
                 duration=3
             )
             return
@@ -538,11 +533,10 @@ class sartracker:
             devices = self.provider.get_devices()
             self.sar_panel.update_devices(devices)
 
-            push_message(
+            success(
                 self.iface.messageBar(),
                 "SAR Tracker",
                 f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
-                level=3,  # Success
                 duration=2
             )
 
@@ -569,11 +563,10 @@ class sartracker:
                 return
 
             # Get tracking data
-            push_message(
+            info(
                 self.iface.messageBar(),
                 "SAR Tracker",
                 "Loading tracking data...",
-                level=0,  # Info
                 duration=2
             )
 
@@ -607,11 +600,10 @@ class sartracker:
                     "CSV file contains no valid tracking data."
                 )
             else:
-                push_message(
+                success(
                     self.iface.messageBar(),
                     "SAR Tracker",
                     f"Loaded {len(current)} device(s), {len(breadcrumbs)} points",
-                    level=3,  # Success
                     duration=3
                 )
 
@@ -679,11 +671,10 @@ class sartracker:
 
         self.current_marker_type = 'ipp_lkp'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add IPP/LKP location",
-            level=0,  # Info
             duration=3
         )
 
@@ -695,11 +686,10 @@ class sartracker:
 
         self.current_marker_type = 'clue'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add Clue location",
-            level=0,  # Info
             duration=3
         )
 
@@ -711,11 +701,10 @@ class sartracker:
 
         self.current_marker_type = 'hazard'
         self.iface.mapCanvas().setMapTool(self.marker_tool)
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Click on map to add Hazard location",
-            level=0,  # Info
             duration=3
         )
 
@@ -785,11 +774,10 @@ class sartracker:
                     )
                     marker_type_str = "Hazard"
 
-                push_message(
+                success(
                     self.iface.messageBar(),
                     "SAR Tracker",
                     f"{marker_type_str} '{marker_data['name']}' added successfully",
-                    level=3,  # Success
                     duration=3
                 )
 
@@ -856,11 +844,10 @@ class sartracker:
     def _on_measure_distance_requested(self):
         """Handle Measure Distance & Bearing button click."""
         self.iface.mapCanvas().setMapTool(self.measure_tool)
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Click two points on the map to measure distance and bearing",
-            level=0,  # Info
             duration=5
         )
 
@@ -872,11 +859,10 @@ class sartracker:
         self.tool_registry.activate_tool('line')
         print(f"[SARTRACKER] Line tool activation complete")
         print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Click to add points. Right-click or ESC to finish line.",
-            level=0,  # Info
             duration=5
         )
 
@@ -888,33 +874,30 @@ class sartracker:
         self.tool_registry.activate_tool('polygon')
         print(f"[SARTRACKER] Polygon tool activation complete")
         print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Search Area Tool: Click to add vertices (min 3). Right-click to finish and configure area.",
-            level=0,  # Info
             duration=5
         )
 
     def _on_range_rings_tool_requested(self):
         """Handle Range Rings Tool button click."""
         self.tool_registry.activate_tool('range_rings')
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Range Rings Tool: Click center point to configure rings",
-            level=0,  # Info
             duration=5
         )
 
     def _on_bearing_tool_requested(self):
         """Handle Bearing Tool button click."""
         self.tool_registry.activate_tool('bearing')
-        push_message(
+        info(
             self.iface.messageBar(),
             "SAR Tracker",
             "Bearing Line Tool: Click origin point to configure bearing and distance",
-            level=0,  # Info
             duration=5
         )
 
@@ -925,11 +908,10 @@ class sartracker:
         Args:
             feature_data: Dict with line info (name, distance_m, points, etc.)
         """
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             f"Line '{feature_data['name']}' added ({feature_data['points']} points, {feature_data['distance_m']:.0f}m)",
-            level=3,  # Success
             duration=3
         )
         # Deactivate tool
@@ -943,11 +925,10 @@ class sartracker:
             feature_data: Dict with ring info (count, mode, center, etc.)
         """
         mode_str = "LPB-based" if feature_data['mode'] == 'lpb' else "Manual"
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             f"{mode_str} range rings created ({feature_data['count']} rings)",
-            level=3,  # Success
             duration=3
         )
         # Deactivate tool
@@ -961,11 +942,10 @@ class sartracker:
             feature_data: Dict with bearing line info (name, bearing, distance, etc.)
         """
         bearing_type = feature_data['bearing_type']
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             f"Bearing Line '{feature_data['name']}' created ({feature_data['bearing']:.1f}° True, {feature_data['magnetic_bearing']:.1f}° Magnetic, {feature_data['distance_m']:.0f}m)",
-            level=3,  # Success
             duration=3
         )
         # Deactivate tool
@@ -978,11 +958,10 @@ class sartracker:
         Args:
             feature_data: Dict with search area info (name, team, status, priority, vertices, etc.)
         """
-        push_message(
+        success(
             self.iface.messageBar(),
             "SAR Tracker",
             f"Search Area '{feature_data['name']}' created ({feature_data['vertices']} vertices, {feature_data['priority']} priority, {feature_data['status']})",
-            level=3,  # Success
             duration=3
         )
 
@@ -1039,11 +1018,10 @@ class sartracker:
         message = f"<b>Distance:</b> {distance_str}  •  <b>Bearing:</b> {bearing:.1f}° ({cardinal})"
 
         # Use message bar with longer duration
-        push_message(
+        success(
             self.iface.messageBar(),
             "Measurement Result",
             message,
-            level=3,  # Success (green)
             duration=10
         )
 
@@ -1073,24 +1051,22 @@ class sartracker:
             # Check if project has a file path
             if project.fileName():
                 # Project already has a file, save it
-                success = project.write()
+                save_success = project.write()
 
-                if success:
+                if save_success:
                     self.sar_panel.update_autosave_status(True)
-                    push_message(
+                    success(
                         self.iface.messageBar(),
                         "SAR Tracker",
                         "Project saved successfully",
-                        level=3,  # Success
                         duration=2
                     )
                 else:
                     self.sar_panel.update_autosave_status(False)
-                    push_message(
+                    error(
                         self.iface.messageBar(),
                         "SAR Tracker",
                         "Failed to save project",
-                        level=2,  # Warning
                         duration=3
                     )
             else:
@@ -1103,15 +1079,14 @@ class sartracker:
                 )
 
                 if file_path:
-                    success = project.write(file_path)
+                    save_success = project.write(file_path)
 
-                    if success:
+                    if save_success:
                         self.sar_panel.update_autosave_status(True)
-                        push_message(
+                        success(
                             self.iface.messageBar(),
                             "SAR Tracker",
                             f"Project saved to {file_path}",
-                            level=3,  # Success
                             duration=3
                         )
                     else:
@@ -1172,11 +1147,10 @@ class sartracker:
                 # Resume the mission
                 self.sar_panel.restore_mission_state(saved_state)
                 self.sar_panel.show()  # Show panel
-                push_message(
+                success(
                     self.iface.messageBar(),
                     "SAR Tracker",
                     f"Mission '{saved_state['name']}' resumed",
-                    level=3,  # Success
                     duration=3
                 )
             else:

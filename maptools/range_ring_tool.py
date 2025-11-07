@@ -131,6 +131,12 @@ class RangeRingDialog(QDialog):
 
         self.setLayout(layout)
 
+        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
+        from qgis.PyQt.QtWidgets import QApplication
+        layout.activate()
+        self.adjustSize()
+        QApplication.processEvents()
+
         # Connect signals
         self.manual_radio.toggled.connect(self._on_mode_changed)
         self.lpb_radio.toggled.connect(self._on_mode_changed)
