@@ -6,18 +6,20 @@ Convert between Irish Grid (ITM) and WGS84 coordinates.
 """
 
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLineEdit, QLabel, QGroupBox, QRadioButton,
     QButtonGroup, QApplication
 )
 from qgis.PyQt.QtCore import Qt, pyqtSignal
+
+from ..utils.dialog_utils import BaseDialog
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsPointXY, QgsRectangle
 )
 
 
-class CoordinateConverterDialog(QDialog):
+class CoordinateConverterDialog(BaseDialog):
     """
     Dialog for converting coordinates between Irish Grid (ITM) and WGS84.
     """

@@ -201,6 +201,37 @@ class LayersController:
             irish_grid_e, irish_grid_n
         )
 
+    def add_casualty(self, name: str, lat: float, lon: float,
+                     condition: str = "", treatment: str = "",
+                     evacuation_priority: str = "",
+                     description: str = "", found_by: str = "",
+                     irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+        """
+        Add a casualty marker (found injured or deceased person).
+
+        CRITICAL: This is distinct from clues (evidence). Casualties trigger
+        medical response, evacuation, and legal documentation requirements.
+
+        Args:
+            name: Person identifier/name
+            lat: Latitude (WGS84 decimal degrees)
+            lon: Longitude (WGS84 decimal degrees)
+            condition: Condition (Injured, Deceased, Unresponsive, etc.)
+            treatment: First aid administered
+            evacuation_priority: Priority (Immediate, Urgent, Delayed, None Required)
+            description: Additional notes
+            found_by: Team member or device ID who found the casualty
+            irish_grid_e: Irish Grid (ITM) Easting (optional)
+            irish_grid_n: Irish Grid (ITM) Northing (optional)
+
+        Returns:
+            str: UUID of added casualty
+        """
+        return self.markers.add_casualty(
+            name, lat, lon, condition, treatment, evacuation_priority,
+            description, found_by, irish_grid_e, irish_grid_n
+        )
+
     # =========================================================================
     # Drawing Methods (delegate to drawing manager)
     # =========================================================================

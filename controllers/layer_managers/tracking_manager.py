@@ -22,7 +22,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
-from ...utils.notify import warning
+from ...utils.notify import warning, error
 
 
 class TrackingLayerManager(BaseLayerManager):
@@ -151,43 +151,94 @@ class TrackingLayerManager(BaseLayerManager):
         # Get or create layer
         layer = self._get_or_create_current_layer()
 
-        # Clear existing features efficiently
-        layer.startEditing()
-
-        # Use dataProvider().truncate() for better performance with many features
-        # This is faster than iterating through all features to delete them
-        if layer.featureCount() > 0:
-            try:
-                # Truncate is faster for clearing all features
-                layer.dataProvider().truncate()
-            except (AttributeError, NotImplementedError, RuntimeError) as e:
-                # Fallback to deleteFeatures if truncate not supported
-                # Use allFeatureIds() to avoid loading feature objects into memory
-                print(f"Truncate not available for {self.CURRENT_LAYER_NAME}, using deleteFeatures: {e}")
-                layer.deleteFeatures(layer.allFeatureIds())
-
-        # Add new features
-        for pos in positions:
-            feature = QgsFeature(layer.fields())
-            feature.setGeometry(
-                QgsGeometry.fromPointXY(
-                    QgsPointXY(pos['lon'], pos['lat'])
-                )
+        # Check if layer is already being edited (Issue #3 safety check)
+        if layer.isEditable():
+            warning(
+                self.iface.messageBar(),
+                "Layer Busy",
+                f"{self.CURRENT_LAYER_NAME} is currently being edited. Skipping update."
             )
-            feature.setAttributes([
-                pos['device_id'],
-                pos['name'],
-                pos['ts'],
-                pos.get('altitude'),
-                pos.get('speed'),
-                pos.get('battery')
-            ])
-            layer.addFeature(feature)
+            return
 
-        layer.commitChanges()
+        # Layer update with proper transaction handling (Issue #3 fix)
+        # This ensures the layer is NEVER left in edit mode, even in edge cases
+        try:
+            # Start editing
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.CURRENT_LAYER_NAME}")
 
-        # Apply styling
-        self._apply_current_positions_style(layer)
+            # Clear existing features efficiently
+            # Use dataProvider().truncate() for better performance with many features
+            # This is faster than iterating through all features to delete them
+            if layer.featureCount() > 0:
+                try:
+                    # Truncate is faster for clearing all features
+                    layer.dataProvider().truncate()
+                except (AttributeError, NotImplementedError, RuntimeError) as e:
+                    # Fallback to deleteFeatures if truncate not supported
+                    # Use allFeatureIds() to avoid loading feature objects into memory
+                    print(f"Truncate not available for {self.CURRENT_LAYER_NAME}, using deleteFeatures: {e}")
+                    if not layer.deleteFeatures(layer.allFeatureIds()):
+                        raise RuntimeError(f"Failed to clear features from {self.CURRENT_LAYER_NAME}")
+
+            # Add new features
+            for pos in positions:
+                feature = QgsFeature(layer.fields())
+                feature.setGeometry(
+                    QgsGeometry.fromPointXY(
+                        QgsPointXY(pos['lon'], pos['lat'])
+                    )
+                )
+                feature.setAttributes([
+                    pos['device_id'],
+                    pos['name'],
+                    pos['ts'],
+                    pos.get('altitude'),
+                    pos.get('speed'),
+                    pos.get('battery')
+                ])
+                if not layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
+
+            # Commit changes and check for errors
+            if not layer.commitChanges():
+                # Get commit errors for better error message
+                errors = layer.commitErrors()
+                raise RuntimeError(
+                    f"Failed to commit changes to {self.CURRENT_LAYER_NAME}: "
+                    f"{'; '.join(errors) if errors else 'Unknown error'}"
+                )
+
+        except Exception as e:
+            # Rollback on any error to prevent edit mode lockup (Issue #3)
+            layer.rollBack()
+
+            # Display error to user via message bar
+            error(
+                self.iface.messageBar(),
+                "Tracking Update Failed",
+                f"Failed to update {self.CURRENT_LAYER_NAME}: {str(e)}"
+            )
+
+            # Re-raise so caller knows update failed
+            raise RuntimeError(f"Error updating {self.CURRENT_LAYER_NAME}: {str(e)}") from e
+
+        finally:
+            # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
+            # This handles edge cases where commitChanges() succeeded but we raised exception anyway
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling (outside transaction - failures here don't affect data)
+        try:
+            self._apply_current_positions_style(layer)
+        except Exception as e:
+            # Log styling errors but don't fail the update
+            warning(
+                self.iface.messageBar(),
+                "Styling Error",
+                f"Failed to apply styling to {self.CURRENT_LAYER_NAME}: {str(e)}"
+            )
 
         # Zoom to extent ONLY on first load
         if self.first_load and positions:
@@ -351,93 +402,144 @@ class TrackingLayerManager(BaseLayerManager):
         # Get or create layer
         layer = self._get_or_create_breadcrumbs_layer()
 
-        # Clear existing features efficiently
-        layer.startEditing()
+        # Check if layer is already being edited (Issue #3 safety check)
+        if layer.isEditable():
+            warning(
+                self.iface.messageBar(),
+                "Layer Busy",
+                f"{self.BREADCRUMBS_LAYER_NAME} is currently being edited. Skipping update."
+            )
+            return
 
-        # Use dataProvider().truncate() for better performance
-        if layer.featureCount() > 0:
-            try:
-                # Truncate is faster for clearing all features
-                layer.dataProvider().truncate()
-            except (AttributeError, NotImplementedError, RuntimeError) as e:
-                # Fallback to deleteFeatures if truncate not supported
-                # Use allFeatureIds() to avoid loading feature objects into memory
-                print(f"Truncate not available for {self.BREADCRUMBS_LAYER_NAME}, using deleteFeatures: {e}")
-                layer.deleteFeatures(layer.allFeatureIds())
+        # Layer update with proper transaction handling (Issue #3 fix)
+        # This ensures the layer is NEVER left in edit mode, even in edge cases
+        try:
+            # Start editing
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.BREADCRUMBS_LAYER_NAME}")
 
-        # Group positions by device_id
-        device_positions = defaultdict(list)
-        for pos in positions:
-            device_positions[pos['device_id']].append(pos)
+            # Clear existing features efficiently
+            # Use dataProvider().truncate() for better performance
+            if layer.featureCount() > 0:
+                try:
+                    # Truncate is faster for clearing all features
+                    layer.dataProvider().truncate()
+                except (AttributeError, NotImplementedError, RuntimeError) as e:
+                    # Fallback to deleteFeatures if truncate not supported
+                    # Use allFeatureIds() to avoid loading feature objects into memory
+                    print(f"Truncate not available for {self.BREADCRUMBS_LAYER_NAME}, using deleteFeatures: {e}")
+                    if not layer.deleteFeatures(layer.allFeatureIds()):
+                        raise RuntimeError(f"Failed to clear features from {self.BREADCRUMBS_LAYER_NAME}")
 
-        # Create line segments per device
-        for device_id, device_pts in device_positions.items():
-            # Sort by timestamp
-            device_pts.sort(key=lambda p: p['ts'])
+            # Group positions by device_id
+            device_positions = defaultdict(list)
+            for pos in positions:
+                device_positions[pos['device_id']].append(pos)
 
-            # Break into segments on time gaps
-            segments = []
-            current_segment = []
+            # Create line segments per device
+            for device_id, device_pts in device_positions.items():
+                # Sort by timestamp
+                device_pts.sort(key=lambda p: p['ts'])
 
-            for i, pos in enumerate(device_pts):
-                if i == 0:
-                    current_segment.append(pos)
-                else:
-                    try:
-                        # Parse timestamps with fallback for various formats
-                        # This handles both ISO format and 'Z' suffix (UTC indicator)
-                        prev_ts = device_pts[i-1]['ts']
-                        curr_ts = pos['ts']
+                # Break into segments on time gaps
+                segments = []
+                current_segment = []
 
-                        # Handle 'Z' suffix (UTC indicator)
-                        if prev_ts.endswith('Z'):
-                            prev_ts = prev_ts[:-1] + '+00:00'
-                        if curr_ts.endswith('Z'):
-                            curr_ts = curr_ts[:-1] + '+00:00'
-
-                        prev_time = datetime.fromisoformat(prev_ts)
-                        curr_time = datetime.fromisoformat(curr_ts)
-                        time_diff = (curr_time - prev_time).total_seconds() / 60
-                    except (ValueError, AttributeError, TypeError) as e:
-                        # If timestamp parsing fails, assume no gap and continue segment
-                        # This prevents crashes on malformed timestamps
-                        # Warn user via message bar (visible in QGIS UI)
-                        warning(
-                            self.iface.messageBar(),
-                            "Timestamp Parsing",
-                            f"Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment."
-                        )
-                        time_diff = 0
-
-                    if time_diff > time_gap_minutes:
-                        # Save current segment, start new
-                        if len(current_segment) > 1:
-                            segments.append(current_segment)
-                        current_segment = [pos]
-                    else:
+                for i, pos in enumerate(device_pts):
+                    if i == 0:
                         current_segment.append(pos)
+                    else:
+                        try:
+                            # Parse timestamps with fallback for various formats
+                            # This handles both ISO format and 'Z' suffix (UTC indicator)
+                            prev_ts = device_pts[i-1]['ts']
+                            curr_ts = pos['ts']
 
-            # Add final segment
-            if len(current_segment) > 1:
-                segments.append(current_segment)
+                            # Handle 'Z' suffix (UTC indicator)
+                            if prev_ts.endswith('Z'):
+                                prev_ts = prev_ts[:-1] + '+00:00'
+                            if curr_ts.endswith('Z'):
+                                curr_ts = curr_ts[:-1] + '+00:00'
 
-            # Create features for each segment
-            device_name = device_pts[0]['name']
-            for segment in segments:
-                points = [
-                    QgsPointXY(p['lon'], p['lat']) for p in segment
-                ]
-                geom = QgsGeometry.fromPolylineXY(points)
+                            prev_time = datetime.fromisoformat(prev_ts)
+                            curr_time = datetime.fromisoformat(curr_ts)
+                            time_diff = (curr_time - prev_time).total_seconds() / 60
+                        except (ValueError, AttributeError, TypeError) as e:
+                            # If timestamp parsing fails, assume no gap and continue segment
+                            # This prevents crashes on malformed timestamps
+                            # Warn user via message bar (visible in QGIS UI)
+                            warning(
+                                self.iface.messageBar(),
+                                "Timestamp Parsing",
+                                f"Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment."
+                            )
+                            time_diff = 0
 
-                feature = QgsFeature(layer.fields())
-                feature.setGeometry(geom)
-                feature.setAttributes([device_id, device_name])
-                layer.addFeature(feature)
+                        if time_diff > time_gap_minutes:
+                            # Save current segment, start new
+                            if len(current_segment) > 1:
+                                segments.append(current_segment)
+                            current_segment = [pos]
+                        else:
+                            current_segment.append(pos)
 
-        layer.commitChanges()
+                # Add final segment
+                if len(current_segment) > 1:
+                    segments.append(current_segment)
 
-        # Apply styling
-        self._apply_breadcrumbs_style(layer)
+                # Create features for each segment
+                device_name = device_pts[0]['name']
+                for segment in segments:
+                    points = [
+                        QgsPointXY(p['lon'], p['lat']) for p in segment
+                    ]
+                    geom = QgsGeometry.fromPolylineXY(points)
+
+                    feature = QgsFeature(layer.fields())
+                    feature.setGeometry(geom)
+                    feature.setAttributes([device_id, device_name])
+                    if not layer.addFeature(feature):
+                        raise RuntimeError(f"Failed to add breadcrumb segment for device {device_id}")
+
+            # Commit changes and check for errors
+            if not layer.commitChanges():
+                # Get commit errors for better error message
+                errors = layer.commitErrors()
+                raise RuntimeError(
+                    f"Failed to commit changes to {self.BREADCRUMBS_LAYER_NAME}: "
+                    f"{'; '.join(errors) if errors else 'Unknown error'}"
+                )
+
+        except Exception as e:
+            # Rollback on any error to prevent edit mode lockup (Issue #3)
+            layer.rollBack()
+
+            # Display error to user via message bar
+            error(
+                self.iface.messageBar(),
+                "Tracking Update Failed",
+                f"Failed to update {self.BREADCRUMBS_LAYER_NAME}: {str(e)}"
+            )
+
+            # Re-raise so caller knows update failed
+            raise RuntimeError(f"Error updating {self.BREADCRUMBS_LAYER_NAME}: {str(e)}") from e
+
+        finally:
+            # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
+            # This handles edge cases where commitChanges() succeeded but we raised exception anyway
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling (outside transaction - failures here don't affect data)
+        try:
+            self._apply_breadcrumbs_style(layer)
+        except Exception as e:
+            # Log styling errors but don't fail the update
+            warning(
+                self.iface.messageBar(),
+                "Styling Error",
+                f"Failed to apply styling to {self.BREADCRUMBS_LAYER_NAME}: {str(e)}"
+            )
 
         # Refresh only this layer
         layer.triggerRepaint()

@@ -6,20 +6,23 @@ Dialog for adding/editing SAR markers: IPP/LKP, Clues, and Hazards.
 """
 
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLineEdit, QTextEdit, QComboBox,
     QLabel, QGroupBox, QRadioButton, QButtonGroup
 )
 
+from ..utils.dialog_utils import BaseDialog
 
-class MarkerDialog(QDialog):
+
+class MarkerDialog(BaseDialog):
     """
     Dialog for adding/editing SAR markers.
 
-    Supports three marker types:
+    Supports four marker types:
     - IPP/LKP (Initial Planning Point / Last Known Position)
     - Clue (Evidence, sightings, footprints, etc.)
     - Hazard (Safety-critical warnings)
+    - Casualty (Found injured or deceased persons)
 
     Shows coordinates in both WGS84 and Irish Grid (ITM).
     """
@@ -32,7 +35,7 @@ class MarkerDialog(QDialog):
         self.easting = easting
         self.northing = northing
 
-        self.marker_type = "ipp_lkp"  # or "clue" or "hazard"
+        self.marker_type = "ipp_lkp"  # or "clue" or "hazard" or "casualty"
 
         self._setup_ui()
         
@@ -77,6 +80,16 @@ class MarkerDialog(QDialog):
         self.hazard_radio.toggled.connect(self._on_type_changed)
         self.type_button_group.addButton(self.hazard_radio)
         type_layout.addWidget(self.hazard_radio)
+
+        self.casualty_radio = QRadioButton("Casualty")
+        self.casualty_radio.setToolTip(
+            "Found injured or deceased person:\n"
+            "CRITICAL: Use for actual casualties requiring medical response,\n"
+            "evacuation, and legal documentation. NOT for evidence/clues."
+        )
+        self.casualty_radio.toggled.connect(self._on_type_changed)
+        self.type_button_group.addButton(self.casualty_radio)
+        type_layout.addWidget(self.casualty_radio)
 
         type_group.setLayout(type_layout)
         layout.addWidget(type_group)
@@ -158,7 +171,43 @@ class MarkerDialog(QDialog):
         ])
         self.hazard_type_label = QLabel("Hazard Type:")
         details_layout.addRow(self.hazard_type_label, self.hazard_type_combo)
-        
+
+        # Casualty Condition (only for Casualty)
+        self.condition_combo = QComboBox()
+        self.condition_combo.addItems([
+            "Injured - Conscious",
+            "Injured - Unconscious",
+            "Deceased",
+            "Unresponsive",
+            "Medical Emergency",
+            "Unknown"
+        ])
+        self.condition_label = QLabel("Condition:*")
+        details_layout.addRow(self.condition_label, self.condition_combo)
+
+        # Treatment (only for Casualty)
+        self.treatment_input = QLineEdit()
+        self.treatment_input.setPlaceholderText("First aid administered...")
+        self.treatment_label = QLabel("Treatment:")
+        details_layout.addRow(self.treatment_label, self.treatment_input)
+
+        # Evacuation Priority (only for Casualty)
+        self.evacuation_priority_combo = QComboBox()
+        self.evacuation_priority_combo.addItems([
+            "Immediate",
+            "Urgent",
+            "Delayed",
+            "None Required"
+        ])
+        self.evacuation_priority_label = QLabel("Evacuation Priority:")
+        details_layout.addRow(self.evacuation_priority_label, self.evacuation_priority_combo)
+
+        # Found By (only for Casualty)
+        self.found_by_input = QLineEdit()
+        self.found_by_input.setPlaceholderText("Team member or device ID...")
+        self.found_by_label = QLabel("Found By:")
+        details_layout.addRow(self.found_by_label, self.found_by_input)
+
         # Description/Notes
         self.description_input = QTextEdit()
         self.description_input.setPlaceholderText("Enter additional notes...")
@@ -194,14 +243,17 @@ class MarkerDialog(QDialog):
         is_ipp_lkp = self.ipp_lkp_radio.isChecked()
         is_clue = self.clue_radio.isChecked()
         is_hazard = self.hazard_radio.isChecked()
+        is_casualty = self.casualty_radio.isChecked()
 
         # Update marker type
         if is_ipp_lkp:
             self.marker_type = "ipp_lkp"
         elif is_clue:
             self.marker_type = "clue"
-        else:
+        elif is_hazard:
             self.marker_type = "hazard"
+        else:
+            self.marker_type = "casualty"
 
         # Show/hide type-specific fields
         # IPP/LKP fields
@@ -217,6 +269,16 @@ class MarkerDialog(QDialog):
         # Hazard fields
         self.hazard_type_label.setVisible(is_hazard)
         self.hazard_type_combo.setVisible(is_hazard)
+
+        # Casualty fields
+        self.condition_label.setVisible(is_casualty)
+        self.condition_combo.setVisible(is_casualty)
+        self.treatment_label.setVisible(is_casualty)
+        self.treatment_input.setVisible(is_casualty)
+        self.evacuation_priority_label.setVisible(is_casualty)
+        self.evacuation_priority_combo.setVisible(is_casualty)
+        self.found_by_label.setVisible(is_casualty)
+        self.found_by_input.setVisible(is_casualty)
         
     def _on_save(self):
         """Validate and save."""
@@ -252,5 +314,10 @@ class MarkerDialog(QDialog):
             data['confidence'] = self.confidence_combo.currentText()
         elif self.marker_type == 'hazard':
             data['hazard_type'] = self.hazard_type_combo.currentText()
+        elif self.marker_type == 'casualty':
+            data['condition'] = self.condition_combo.currentText()
+            data['treatment'] = self.treatment_input.text().strip()
+            data['evacuation_priority'] = self.evacuation_priority_combo.currentText()
+            data['found_by'] = self.found_by_input.text().strip()
 
         return data

@@ -13,20 +13,21 @@ from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QRadioButton, QComboBox,
     QCheckBox, QGroupBox, QButtonGroup, QSpinBox
 )
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
+from ..utils.dialog_utils import BaseDialog
 from ..utils.lpb_statistics import LPBStatistics
 from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
 
-class RangeRingDialog(QDialog):
+class RangeRingDialog(BaseDialog):
     """
     Dialog for configuring range rings.
 
@@ -130,12 +131,6 @@ class RangeRingDialog(QDialog):
         layout.addLayout(button_layout)
 
         self.setLayout(layout)
-
-        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
-        from qgis.PyQt.QtWidgets import QApplication
-        layout.activate()
-        self.adjustSize()
-        QApplication.processEvents()
 
         # Connect signals
         self.manual_radio.toggled.connect(self._on_mode_changed)

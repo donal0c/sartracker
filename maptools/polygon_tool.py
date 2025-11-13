@@ -13,19 +13,20 @@ from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtCore import Qt, QTimer
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QComboBox, QTextEdit,
     QGroupBox, QFormLayout, QDoubleSpinBox, QMessageBox
 )
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
+from ..utils.dialog_utils import BaseDialog
 from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
 
-class SearchAreaDialog(QDialog):
+class SearchAreaDialog(BaseDialog):
     """
     Dialog for configuring search area properties.
 

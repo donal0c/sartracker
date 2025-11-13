@@ -9,6 +9,7 @@ and QGIS API compatibility.
 import json
 import os
 import sys
+import tempfile
 from datetime import datetime
 
 
@@ -58,15 +59,18 @@ def run_smoke_test(iface):
     # Test 6: qt_compat Imports
     results["tests"]["qt_compat_imports"] = _test_qt_compat_imports()
 
+    # Test 7: BaseDialog Rendering (Phase 3/6)
+    results["tests"]["basedialog_rendering"] = _test_basedialog_rendering()
+
     # Overall result
     all_passed = all(result == "PASS" for result in results["tests"].values())
     results["overall"] = "PASS" if all_passed else "FAIL"
 
-    # Save results to file
-    _save_results(results)
+    # Save results to file (capture path for display)
+    output_path = _save_results(results)
 
-    # Show result in message bar
-    _display_results(iface, results)
+    # Show result in message bar (with file path if saved)
+    _display_results(iface, results, output_path)
 
     return results
 
@@ -188,14 +192,22 @@ def _test_geometry_creation():
 
 
 def _test_qt_compat_imports():
-    """Test qt_compat module imports."""
+    """Test qt_compat module imports including Phase 2 additions."""
     try:
         from ..utils.qt_compat import (
+            # Original constants
             CrossCursor, LeftButton, Key_Escape,
-            dialog_exec, push_message, DialogAccepted
+            dialog_exec, push_message, DialogAccepted,
+            # Phase 2 additions - TextInteractionFlags
+            TextSelectableByMouse, TextSelectableByKeyboard,
+            NoTextInteraction, LinksAccessibleByMouse,
+            # Phase 2 additions - WindowFlags
+            WindowStaysOnTopHint, WindowModal, ApplicationModal,
+            # Phase 2 additions - Arrow Keys
+            Key_Left, Key_Right, Key_Up, Key_Down
         )
 
-        # Verify they're not None
+        # Verify original constants
         if CrossCursor is None:
             return "FAIL: CrossCursor is None"
         if LeftButton is None:
@@ -206,6 +218,71 @@ def _test_qt_compat_imports():
             return "FAIL: dialog_exec is None"
         if push_message is None:
             return "FAIL: push_message is None"
+
+        # Verify Phase 2 TextInteractionFlags
+        if TextSelectableByMouse is None:
+            return "FAIL: TextSelectableByMouse is None"
+        if TextSelectableByKeyboard is None:
+            return "FAIL: TextSelectableByKeyboard is None"
+        if NoTextInteraction is None:
+            return "FAIL: NoTextInteraction is None"
+        if LinksAccessibleByMouse is None:
+            return "FAIL: LinksAccessibleByMouse is None"
+
+        # Verify Phase 2 WindowFlags
+        if WindowStaysOnTopHint is None:
+            return "FAIL: WindowStaysOnTopHint is None"
+        if WindowModal is None:
+            return "FAIL: WindowModal is None"
+        if ApplicationModal is None:
+            return "FAIL: ApplicationModal is None"
+
+        # Verify Phase 2 Arrow Keys
+        if Key_Left is None:
+            return "FAIL: Key_Left is None"
+        if Key_Right is None:
+            return "FAIL: Key_Right is None"
+        if Key_Up is None:
+            return "FAIL: Key_Up is None"
+        if Key_Down is None:
+            return "FAIL: Key_Down is None"
+
+        return "PASS"
+    except Exception as e:
+        return f"FAIL: {e}"
+
+
+def _test_basedialog_rendering():
+    """Test BaseDialog (SafeQDialog) instantiates and has proper rendering workarounds."""
+    try:
+        from ..utils.dialog_utils import BaseDialog, SafeQDialog
+        from qgis.PyQt.QtWidgets import QVBoxLayout, QLabel
+
+        # Verify BaseDialog is alias of SafeQDialog
+        if BaseDialog is not SafeQDialog:
+            return "FAIL: BaseDialog is not alias of SafeQDialog"
+
+        # Create test dialog
+        dialog = BaseDialog()
+        dialog.setWindowTitle("Smoke Test Dialog")
+
+        # Add simple layout to test rendering workarounds
+        layout = QVBoxLayout()
+        label = QLabel("Test label")
+        layout.addWidget(label)
+        dialog.setLayout(layout)
+
+        # Verify dialog has workaround methods
+        if not hasattr(dialog, '_apply_rendering_workarounds'):
+            return "FAIL: BaseDialog missing _apply_rendering_workarounds method"
+
+        # Verify dialog is QDialog subclass
+        from qgis.PyQt.QtWidgets import QDialog
+        if not isinstance(dialog, QDialog):
+            return "FAIL: BaseDialog is not QDialog subclass"
+
+        # Clean up
+        dialog.deleteLater()
 
         return "PASS"
     except Exception as e:
@@ -231,36 +308,85 @@ def _get_plugin_version():
 
 
 def _save_results(results):
-    """Save test results to JSON file."""
+    """
+    Save test results to JSON file.
+
+    Attempts to save to QGIS profile directory first (persistent storage),
+    falls back to system temp directory if that fails. Uses timestamp in
+    filename to prevent overwrites and maintain diagnostic history.
+
+    Args:
+        results: Test results dictionary
+
+    Returns:
+        str: Path to saved file, or None if save failed
+
+    Qt5/Qt6 Compatible: Uses cross-platform tempfile.gettempdir()
+    """
     try:
-        output_path = "/tmp/sartracker_smoketest.json"
+        # Determine output directory (hybrid approach)
+        try:
+            # Try QGIS profile directory first (persistent storage)
+            from qgis.core import QgsApplication
+            base_dir = QgsApplication.qgisSettingsDirPath()
+            results_dir = os.path.join(base_dir, 'sartracker', 'diagnostics')
+            os.makedirs(results_dir, exist_ok=True)
+        except Exception:
+            # Fall back to system temp directory (cross-platform)
+            results_dir = tempfile.gettempdir()
+
+        # Create unique filename with timestamp to prevent overwrites
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"sartracker_smoketest_{timestamp}.json"
+        output_path = os.path.join(results_dir, filename)
+
+        # Write results
         with open(output_path, 'w') as f:
             json.dump(results, f, indent=2)
+
         print(f"Smoke test results saved to: {output_path}")
+        return output_path
+
     except Exception as e:
         print(f"Could not save smoke test results: {e}")
+        return None
 
 
-def _display_results(iface, results):
-    """Display test results in message bar."""
-    from ..utils.notify import success, error
+def _display_results(iface, results, output_path=None):
+    """
+    Display test results in message bar.
+
+    Args:
+        iface: QGIS interface instance
+        results: Test results dictionary
+        output_path: Path to saved results file (optional)
+
+    Qt5/Qt6 Compatible: Uses utils.notify helpers
+    """
+    from ..utils.notify import success, error, warning
 
     overall = results["overall"]
     test_count = len(results["tests"])
     passed_count = sum(1 for result in results["tests"].values() if result == "PASS")
 
     if overall == "PASS":
+        message = f"All {test_count} tests passed! Plugin is compatible with this environment."
+        if output_path:
+            message += f"\nResults saved to:\n{output_path}"
         success(
             iface.messageBar(),
             "Smoke Test",
-            f"All {test_count} tests passed! Plugin is compatible with this environment.",
+            message,
             duration=5
         )
     else:
         failed_tests = [name for name, result in results["tests"].items() if result != "PASS"]
+        message = f"{passed_count}/{test_count} tests passed. Failed: {', '.join(failed_tests)}"
+        if output_path:
+            message += f"\nResults saved to:\n{output_path}"
         error(
             iface.messageBar(),
             "Smoke Test",
-            f"{passed_count}/{test_count} tests passed. Failed: {', '.join(failed_tests)}",
+            message,
             duration=8
         )

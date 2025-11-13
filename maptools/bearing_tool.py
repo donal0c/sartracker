@@ -13,19 +13,20 @@ from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QDoubleSpinBox, QComboBox,
     QGroupBox, QFormLayout, QRadioButton, QButtonGroup
 )
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
+from ..utils.dialog_utils import BaseDialog
 from ..utils.notify import error
 
 from .base_drawing_tool import BaseDrawingTool
 
 
-class BearingLineDialog(QDialog):
+class BearingLineDialog(BaseDialog):
     """
     Dialog for configuring bearing line parameters.
 
@@ -188,12 +189,6 @@ class BearingLineDialog(QDialog):
         layout.addLayout(button_layout)
 
         self.setLayout(layout)
-
-        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
-        from qgis.PyQt.QtWidgets import QApplication
-        layout.activate()
-        self.adjustSize()
-        QApplication.processEvents()
 
         # Connect signals
         self.true_bearing_radio.toggled.connect(self._on_bearing_type_changed)

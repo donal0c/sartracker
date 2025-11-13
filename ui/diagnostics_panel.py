@@ -11,16 +11,16 @@ import platform
 import os
 
 from qgis.PyQt.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
+    QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QPushButton, QTextEdit, QApplication, QFormLayout
 )
-from qgis.PyQt.QtCore import Qt
 
 from ..utils import capabilities
-from ..utils.qt_compat import dialog_exec
+from ..utils.qt_compat import dialog_exec, TextSelectableByMouse
+from ..utils.dialog_utils import BaseDialog
 
 
-class DiagnosticsPanel(QDialog):
+class DiagnosticsPanel(BaseDialog):
     """
     Diagnostics panel showing environment and configuration information.
     """
@@ -85,11 +85,6 @@ class DiagnosticsPanel(QDialog):
 
         self.setLayout(layout)
 
-        # Qt 5.15.x workaround: Force layout calculation to prevent blank dialog
-        layout.activate()
-        self.adjustSize()
-        QApplication.processEvents()
-
     def _create_environment_section(self):
         """Create environment information section."""
         group = QGroupBox("Environment")
@@ -125,7 +120,7 @@ class DiagnosticsPanel(QDialog):
         plugin_path = os.path.dirname(os.path.dirname(__file__))
         path_label = QLabel(plugin_path)
         path_label.setWordWrap(True)
-        path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        path_label.setTextInteractionFlags(TextSelectableByMouse)
         form.addRow("<b>Plugin Path:</b>", path_label)
 
         group.setLayout(form)
@@ -189,6 +184,12 @@ class DiagnosticsPanel(QDialog):
 
         form.addRow("<b>Mission Status:</b>", QLabel(mission_status))
         form.addRow("<b>Data Source:</b>", QLabel(data_source))
+
+        # Device Color Status (Phase 5 addition)
+        color_method = "MD5 hash (deterministic)"
+        color_label = QLabel(f"{color_method}")
+        color_label.setToolTip("Device colors use stable MD5 hashing for consistency across sessions")
+        form.addRow("<b>Device Colors:</b>", color_label)
 
         group.setLayout(form)
         return group

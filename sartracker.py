@@ -26,7 +26,7 @@ from qgis.PyQt.QtGui import QIcon, QFont
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsProject, QgsPointXY, QgsRectangle
+    QgsProject, QgsPointXY, QgsRectangle, QgsApplication
 )
 
 # Initialize Qt resources from file resources.py
@@ -38,18 +38,85 @@ import traceback
 from .utils.qt_compat import RightDockWidgetArea, dialog_exec, DialogAccepted
 from .utils.notify import info, warning, error, success
 
-# Import our SAR tracking components
+# Import our SAR tracking components with individual error tracking
+# This allows us to detect and report exactly which imports fail, preventing
+# cryptic crashes later in initGui() when attempting to use undefined classes.
+
+# Module-level tracking of import failures (checked in initGui)
+_import_errors = []
+_imports_ok = True
+
+# Import FileCSVProvider
 try:
     from .providers.csv import FileCSVProvider
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('providers.csv.FileCSVProvider', e, traceback.format_exc()))
+    FileCSVProvider = None
+    print(f"ERROR importing FileCSVProvider: {e}")
+
+# Import CSVParseTask
+try:
+    from .providers.csv_task import CSVParseTask
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('providers.csv_task.CSVParseTask', e, traceback.format_exc()))
+    CSVParseTask = None
+    print(f"ERROR importing CSVParseTask: {e}")
+
+# Import LayersController
+try:
     from .controllers.layers_controller import LayersController
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('controllers.layers_controller.LayersController', e, traceback.format_exc()))
+    LayersController = None
+    print(f"ERROR importing LayersController: {e}")
+
+# Import SARPanel
+try:
     from .ui.sar_panel import SARPanel
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('ui.sar_panel.SARPanel', e, traceback.format_exc()))
+    SARPanel = None
+    print(f"ERROR importing SARPanel: {e}")
+
+# Import MarkerMapTool
+try:
     from .maptools.marker_tool import MarkerMapTool
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('maptools.marker_tool.MarkerMapTool', e, traceback.format_exc()))
+    MarkerMapTool = None
+    print(f"ERROR importing MarkerMapTool: {e}")
+
+# Import MeasureTool
+try:
     from .maptools.measure_tool import MeasureTool
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('maptools.measure_tool.MeasureTool', e, traceback.format_exc()))
+    MeasureTool = None
+    print(f"ERROR importing MeasureTool: {e}")
+
+# Import MarkerDialog
+try:
     from .ui.marker_dialog import MarkerDialog
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('ui.marker_dialog.MarkerDialog', e, traceback.format_exc()))
+    MarkerDialog = None
+    print(f"ERROR importing MarkerDialog: {e}")
+
+# Import CoordinateConverterDialog
+try:
     from .ui.coordinate_converter_dialog import CoordinateConverterDialog
 except Exception as e:
-    print(f"ERROR importing SAR tracking components: {e}")
-    print(traceback.format_exc())
+    _imports_ok = False
+    _import_errors.append(('ui.coordinate_converter_dialog.CoordinateConverterDialog', e, traceback.format_exc()))
+    CoordinateConverterDialog = None
+    print(f"ERROR importing CoordinateConverterDialog: {e}")
 
 
 class sartracker:
@@ -109,6 +176,10 @@ class sartracker:
         self.coords_label = None  # Status bar coordinate display
         self.last_coords_point = None  # Last mouse position (for throttling)
         self.coords_update_timer = None  # Timer to throttle coordinate updates
+
+        # Refresh state management (Issue #1: Prevent concurrent refreshes)
+        self._refresh_in_progress = False
+        self._current_refresh_task = None
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -242,6 +313,21 @@ class sartracker:
         self.iface.addPluginToMenu(self.menu, self.smoketest_action)
         self.actions.append(self.smoketest_action)
 
+        # ============================================================================
+        # FAIL-FAST CHECK: Abort initialization if critical imports failed
+        # ============================================================================
+        # This MUST come AFTER Diagnostics and Smoke Test menus are added,
+        # ensuring users can access diagnostic tools even when imports fail.
+        #
+        # If any imports failed during module loading, we display a clear error
+        # message and abort initialization to prevent cryptic crashes later.
+        if not _imports_ok:
+            self._handle_import_failure(_import_errors)
+            return  # Abort initialization - do not proceed with component setup
+
+        # If we reach here, all imports succeeded and we can safely proceed
+        # ============================================================================
+
         # will be set False in run()
         self.first_start = True
 
@@ -256,39 +342,74 @@ class sartracker:
         self.measure_tool = MeasureTool(self.iface.mapCanvas())
         self.measure_tool.measurement_complete.connect(self._on_measurement_complete)
 
-        # Initialize Line Tool
-        from .maptools import LineTool
-        self.line_tool = LineTool(self.iface.mapCanvas(), self.layers_controller)
-        self.line_tool.drawing_complete.connect(self._on_line_complete)
-        self.line_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        # Initialize Line Tool (with error handling for late-binding import)
+        try:
+            from .maptools import LineTool
+            self.line_tool = LineTool(self.iface.mapCanvas(), self.layers_controller)
+            self.line_tool.drawing_complete.connect(self._on_line_complete)
+            self.line_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        except Exception as e:
+            self.line_tool = None
+            warning(self.iface.messageBar(), "SAR Tracker",
+                   f"Line Tool failed to load: {e}", duration=5)
+            print(f"ERROR initializing LineTool: {e}")
 
-        # Initialize Range Ring Tool
-        from .maptools import RangeRingTool
-        self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller)
-        self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
-        self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        # Initialize Range Ring Tool (with error handling for late-binding import)
+        try:
+            from .maptools import RangeRingTool
+            self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller)
+            self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
+            self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        except Exception as e:
+            self.range_ring_tool = None
+            warning(self.iface.messageBar(), "SAR Tracker",
+                   f"Range Ring Tool failed to load: {e}", duration=5)
+            print(f"ERROR initializing RangeRingTool: {e}")
 
-        # Initialize Bearing Tool
-        from .maptools import BearingTool
-        self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller)
-        self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
-        self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        # Initialize Bearing Tool (with error handling for late-binding import)
+        try:
+            from .maptools import BearingTool
+            self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller)
+            self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
+            self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        except Exception as e:
+            self.bearing_tool = None
+            warning(self.iface.messageBar(), "SAR Tracker",
+                   f"Bearing Tool failed to load: {e}", duration=5)
+            print(f"ERROR initializing BearingTool: {e}")
 
-        # Initialize Polygon Tool (Search Areas)
-        from .maptools import PolygonTool
-        self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller)
-        self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
-        self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        # Initialize Polygon Tool (Search Areas) (with error handling for late-binding import)
+        try:
+            from .maptools import PolygonTool
+            self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller)
+            self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
+            self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+        except Exception as e:
+            self.polygon_tool = None
+            warning(self.iface.messageBar(), "SAR Tracker",
+                   f"Polygon Tool failed to load: {e}", duration=5)
+            print(f"ERROR initializing PolygonTool: {e}")
 
-        # Initialize Tool Registry
-        from .maptools import ToolRegistry
-        self.tool_registry = ToolRegistry(self.iface.mapCanvas(), self.iface)
-        self.tool_registry.register_tool('line', self.line_tool)
-        self.tool_registry.register_tool('range_rings', self.range_ring_tool)
-        self.tool_registry.register_tool('bearing', self.bearing_tool)
-        self.tool_registry.register_tool('polygon', self.polygon_tool)
-        self.tool_registry.tool_activated.connect(self._on_tool_activated)
-        self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
+        # Initialize Tool Registry (with error handling for late-binding import)
+        try:
+            from .maptools import ToolRegistry
+            self.tool_registry = ToolRegistry(self.iface.mapCanvas(), self.iface)
+            # Only register tools that successfully loaded
+            if self.line_tool:
+                self.tool_registry.register_tool('line', self.line_tool)
+            if self.range_ring_tool:
+                self.tool_registry.register_tool('range_rings', self.range_ring_tool)
+            if self.bearing_tool:
+                self.tool_registry.register_tool('bearing', self.bearing_tool)
+            if self.polygon_tool:
+                self.tool_registry.register_tool('polygon', self.polygon_tool)
+            self.tool_registry.tool_activated.connect(self._on_tool_activated)
+            self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
+        except Exception as e:
+            self.tool_registry = None
+            warning(self.iface.messageBar(), "SAR Tracker",
+                   f"Tool Registry failed to load: {e}", duration=5)
+            print(f"ERROR initializing ToolRegistry: {e}")
 
         # Initialize SAR Panel
         self.sar_panel = SARPanel(self.iface.mainWindow())
@@ -303,6 +424,7 @@ class sartracker:
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
         self.sar_panel.csv_load_requested.connect(self._on_load_csv)
         self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
+        self.sar_panel.add_clue_requested.connect(self._on_add_clue_requested)
         self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
         self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
         self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
@@ -338,21 +460,119 @@ class sartracker:
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
 
-    def _show_diagnostics(self):
-        """Show diagnostics dialog."""
-        from .ui.diagnostics_panel import DiagnosticsPanel
+    def _handle_import_failure(self, errors):
+        """
+        Handle import failures with clear user guidance.
+
+        This method is called from initGui() if any critical imports failed during
+        module loading. It displays both a persistent message bar warning and a
+        detailed modal dialog to help users diagnose and resolve the issue.
+
+        Args:
+            errors: List of (module_name, exception, traceback) tuples
+
+        Qt5/Qt6 Compatible: Uses utils.notify helpers and standard Qt dialogs
+        """
+        from qgis.PyQt.QtWidgets import QMessageBox, QTextEdit, QVBoxLayout, QDialog, QPushButton
+
+        # Show persistent message bar warning
+        error(
+            self.iface.messageBar(),
+            "SAR Tracker - Critical Error",
+            "Plugin failed to load due to import errors. Check the dialog for details.",
+            duration=0  # Persistent - stays until user dismisses
+        )
+
+        # Build detailed error message
+        error_summary = "SAR Tracker failed to load due to the following import errors:\n\n"
+
+        for module_name, exc, tb in errors:
+            error_summary += f"❌ Module: {module_name}\n"
+            error_summary += f"   Error: {type(exc).__name__}: {exc}\n\n"
+
+        error_summary += "\n" + "="*70 + "\n"
+        error_summary += "SUGGESTED ACTIONS:\n"
+        error_summary += "="*70 + "\n\n"
+        error_summary += "1. Verify all plugin files are present and not corrupted\n"
+        error_summary += "2. Run Diagnostics: Plugins > SAR Tracker > Diagnostics\n"
+        error_summary += "3. Run Smoke Test: Plugins > SAR Tracker > Run Smoke Test\n"
+        error_summary += "4. Try reinstalling the plugin\n"
+        error_summary += "5. Check QGIS Python console for additional details\n"
+        error_summary += "6. Ensure you have compatible QGIS version (3.28+)\n\n"
+        error_summary += "="*70 + "\n"
+        error_summary += "TECHNICAL DETAILS (first error):\n"
+        error_summary += "="*70 + "\n\n"
+        error_summary += errors[0][2]  # Include full traceback of first error
+
+        # Create custom dialog with scrollable text area
+        dialog = QDialog(self.iface.mainWindow())
+        dialog.setWindowTitle("SAR Tracker - Import Failure")
+        dialog.setMinimumSize(700, 500)
+
+        layout = QVBoxLayout()
+
+        # Scrollable text area for error details
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(error_summary)
+        text_edit.setFont(QFont("Courier New", 9))
+        layout.addWidget(text_edit)
+
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+
+        dialog.setLayout(layout)
+
+        # Show modal dialog
         from .utils.qt_compat import dialog_exec
-        dialog = DiagnosticsPanel(self.iface.mainWindow())
         dialog_exec(dialog)
 
+    def _show_diagnostics(self):
+        """Show diagnostics dialog with error handling."""
+        try:
+            from .ui.diagnostics_panel import DiagnosticsPanel
+            from .utils.qt_compat import dialog_exec
+            dialog = DiagnosticsPanel(self.iface.mainWindow())
+            dialog_exec(dialog)
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Failed to load Diagnostics panel: {e}",
+                duration=5
+            )
+            print(f"ERROR loading DiagnosticsPanel: {e}")
+            print(traceback.format_exc())
+
     def _run_smoke_test(self):
-        """Run smoke test."""
-        from .tools.smoketest import run_smoke_test
-        run_smoke_test(self.iface)
+        """Run smoke test with error handling."""
+        try:
+            from .tools.smoketest import run_smoke_test
+            run_smoke_test(self.iface)
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Failed to run Smoke Test: {e}",
+                duration=5
+            )
+            print(f"ERROR running smoke test: {e}")
+            print(traceback.format_exc())
 
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
+            # Cancel any running background refresh task (Issue #1 fix)
+            if self._current_refresh_task:
+                try:
+                    self._current_refresh_task.cancel()
+                    self._current_refresh_task = None
+                except:
+                    pass  # Task might have already completed
+            self._refresh_in_progress = False
+
             # Remove menu items and toolbar icons
             for action in self.actions:
                 self.iface.removePluginMenu(
@@ -508,7 +728,15 @@ class sartracker:
         )
 
     def _on_refresh_data(self):
-        """Handle data refresh request."""
+        """
+        Handle data refresh request using background task.
+
+        This method now uses QgsTask to parse CSVs in a background thread,
+        preventing UI freezes during refresh operations. Includes concurrent
+        refresh protection and proper error handling.
+
+        Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
+        """
         if not self.provider:
             warning(
                 self.iface.messageBar(),
@@ -518,21 +746,103 @@ class sartracker:
             )
             return
 
+        # Concurrent refresh protection (Issue #1)
+        if self._refresh_in_progress:
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Refresh already in progress, please wait...",
+                duration=2
+            )
+            return
+
         try:
-            # Get current positions
-            current = self.provider.get_current()
+            # Set refresh flag
+            self._refresh_in_progress = True
+
+            # Show loading state in UI
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(True)
+
+            # Create background task
+            task = CSVParseTask(self.provider, "Refreshing tracking data")
+
+            # Connect completion signals
+            task.taskCompleted.connect(lambda: self._on_refresh_complete(task))
+            task.taskTerminated.connect(lambda: self._on_refresh_error(task))
+
+            # Store reference to allow cancellation
+            self._current_refresh_task = task
+
+            # Start task using QGIS task manager (handles threading)
+            QgsApplication.taskManager().addTask(task)
+
+        except Exception as e:
+            # Reset state on setup error
+            self._refresh_in_progress = False
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            error(
+                self.iface.messageBar(),
+                "Refresh Error",
+                f"Failed to start refresh: {str(e)}",
+                duration=5
+            )
+
+    def _on_refresh_complete(self, task: CSVParseTask):
+        """
+        Handle successful refresh completion (runs in main thread).
+
+        Args:
+            task: Completed CSVParseTask with results
+        """
+        try:
+            # Reset refresh state
+            self._refresh_in_progress = False
+            self._current_refresh_task = None
+
+            # Hide loading state
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            # Check if task was cancelled
+            if task.isCanceled():
+                info(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    "Refresh cancelled",
+                    duration=2
+                )
+                return
+
+            # Get results from background task
+            if not task.results:
+                warning(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    "Refresh completed but no data returned",
+                    duration=3
+                )
+                return
+
+            results = task.results
+            current = results.get('current', [])
+            breadcrumbs = results.get('breadcrumbs', [])
+            devices = results.get('devices', [])
+
+            # Update layers (main thread operation)
             if current:
                 self.layers_controller.update_current_positions(current)
 
-            # Get breadcrumbs
-            breadcrumbs = self.provider.get_breadcrumbs()
             if breadcrumbs:
                 self.layers_controller.update_breadcrumbs(breadcrumbs)
 
             # Update device list in panel
-            devices = self.provider.get_devices()
-            self.sar_panel.update_devices(devices)
+            if self.sar_panel:
+                self.sar_panel.update_devices(devices)
 
+            # Show success message
             success(
                 self.iface.messageBar(),
                 "SAR Tracker",
@@ -541,50 +851,80 @@ class sartracker:
             )
 
         except Exception as e:
-            QMessageBox.critical(
-                self.iface.mainWindow(),
+            # Reset state on processing error
+            self._refresh_in_progress = False
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            error(
+                self.iface.messageBar(),
                 "Refresh Error",
-                f"Error refreshing data:\n\n{str(e)}"
+                f"Error processing refresh results: {str(e)}",
+                duration=5
             )
 
+    def _on_refresh_error(self, task: CSVParseTask):
+        """
+        Handle refresh task error or termination (runs in main thread).
+
+        Args:
+            task: Failed or terminated CSVParseTask
+        """
+        # Reset refresh state
+        self._refresh_in_progress = False
+        self._current_refresh_task = None
+
+        # Hide loading state
+        if self.sar_panel:
+            self.sar_panel.set_loading_state(False)
+
+        # Show error message
+        error_msg = task.error_message if task.error_message else "Unknown error during refresh"
+        error(
+            self.iface.messageBar(),
+            "Refresh Failed",
+            f"Error refreshing data: {error_msg}",
+            duration=5
+        )
+
     def _on_load_csv(self, csv_file):
-        """Handle CSV load request from panel."""
+        """
+        Handle CSV load request from panel using background task.
+
+        Uses same threading approach as refresh to prevent UI freeze
+        during initial data load.
+
+        Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
+
+        Args:
+            csv_file: Path to CSV file or folder
+        """
+        # Prevent concurrent operations
+        if self._refresh_in_progress:
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Please wait for current operation to complete",
+                duration=2
+            )
+            return
+
         try:
             # Create CSV provider
             self.provider = FileCSVProvider(csv_file)
 
-            # Test connection
+            # Test connection (quick synchronous check)
             if not self.provider.test_connection():
-                QMessageBox.warning(
-                    self.iface.mainWindow(),
+                error(
+                    self.iface.messageBar(),
                     "CSV Load Error",
-                    f"Could not read CSV file: {csv_file}"
+                    f"Could not read CSV file: {csv_file}",
+                    duration=5
                 )
+                self.provider = None
                 return
 
-            # Get tracking data
-            info(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                "Loading tracking data...",
-                duration=2
-            )
-
-            # Get current positions
-            current = self.provider.get_current()
-            if current:
-                self.layers_controller.update_current_positions(current)
-
-            # Get breadcrumbs
-            breadcrumbs = self.provider.get_breadcrumbs()
-            if breadcrumbs:
-                self.layers_controller.update_breadcrumbs(breadcrumbs)
-
-            # Update device list in panel
-            devices = self.provider.get_devices()
-            self.sar_panel.update_devices(devices)
-
-            # Update data source label
+            # Update data source label immediately
             import os
             if os.path.isdir(csv_file):
                 folder_name = os.path.basename(csv_file)
@@ -593,11 +933,103 @@ class sartracker:
                 filename = os.path.basename(csv_file)
                 self.sar_panel.set_data_source(f"CSV: {filename}")
 
-            if not current and not breadcrumbs:
-                QMessageBox.information(
-                    self.iface.mainWindow(),
+            # Set loading state
+            self._refresh_in_progress = True
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(True)
+
+            info(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Loading tracking data...",
+                duration=2
+            )
+
+            # Create background task for parsing
+            task = CSVParseTask(self.provider, "Loading tracking data")
+
+            # Connect completion signals (reuse same handlers)
+            task.taskCompleted.connect(lambda: self._on_load_complete(task))
+            task.taskTerminated.connect(lambda: self._on_refresh_error(task))
+
+            # Store reference
+            self._current_refresh_task = task
+
+            # Start task
+            QgsApplication.taskManager().addTask(task)
+
+        except Exception as e:
+            # Reset state on error
+            self._refresh_in_progress = False
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            error(
+                self.iface.messageBar(),
+                "Error Loading CSV",
+                f"An error occurred while loading the CSV file: {str(e)}",
+                duration=5
+            )
+
+    def _on_load_complete(self, task: CSVParseTask):
+        """
+        Handle CSV load completion (runs in main thread).
+
+        Args:
+            task: Completed CSVParseTask with results
+        """
+        try:
+            # Reset refresh state
+            self._refresh_in_progress = False
+            self._current_refresh_task = None
+
+            # Hide loading state
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            # Check if task was cancelled
+            if task.isCanceled():
+                info(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    "Load cancelled",
+                    duration=2
+                )
+                return
+
+            # Get results from background task
+            if not task.results:
+                warning(
+                    self.iface.messageBar(),
                     "No Data",
-                    "CSV file contains no valid tracking data."
+                    "CSV file contains no valid tracking data",
+                    duration=3
+                )
+                return
+
+            results = task.results
+            current = results.get('current', [])
+            breadcrumbs = results.get('breadcrumbs', [])
+            devices = results.get('devices', [])
+
+            # Update layers (main thread operation)
+            if current:
+                self.layers_controller.update_current_positions(current)
+
+            if breadcrumbs:
+                self.layers_controller.update_breadcrumbs(breadcrumbs)
+
+            # Update device list in panel
+            if self.sar_panel:
+                self.sar_panel.update_devices(devices)
+
+            # Show result
+            if not current and not breadcrumbs:
+                info(
+                    self.iface.messageBar(),
+                    "No Data",
+                    "CSV file contains no valid tracking data",
+                    duration=3
                 )
             else:
                 success(
@@ -608,10 +1040,16 @@ class sartracker:
                 )
 
         except Exception as e:
-            QMessageBox.critical(
-                self.iface.mainWindow(),
+            # Reset state on processing error
+            self._refresh_in_progress = False
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            error(
+                self.iface.messageBar(),
                 "Error Loading CSV",
-                f"An error occurred while loading the CSV file:\n\n{str(e)}"
+                f"Error processing CSV data: {str(e)}",
+                duration=5
             )
 
     def _on_mouse_move(self, point):
@@ -678,7 +1116,7 @@ class sartracker:
             duration=3
         )
 
-    def _on_add_casualty_requested(self):
+    def _on_add_clue_requested(self):
         """Handle Add Clue button click from SAR Panel."""
         # Deactivate any drawing tools first
         if self.tool_registry:
@@ -691,6 +1129,21 @@ class sartracker:
             "SAR Tracker",
             "Click on map to add Clue location",
             duration=3
+        )
+
+    def _on_add_casualty_requested(self):
+        """Handle Add Casualty button click from SAR Panel."""
+        # Deactivate any drawing tools first
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        self.current_marker_type = 'casualty'
+        self.iface.mapCanvas().setMapTool(self.marker_tool)
+        info(
+            self.iface.messageBar(),
+            "SAR Tracker - CRITICAL",
+            "Click on map to add Casualty location (found injured/deceased person)",
+            duration=5
         )
 
     def _on_add_hazard_requested(self):
@@ -726,6 +1179,8 @@ class sartracker:
             dialog.clue_radio.setChecked(True)
         elif self.current_marker_type == 'hazard':
             dialog.hazard_radio.setChecked(True)
+        elif self.current_marker_type == 'casualty':
+            dialog.casualty_radio.setChecked(True)
         else:
             dialog.ipp_lkp_radio.setChecked(True)
 
@@ -761,6 +1216,20 @@ class sartracker:
                         irish_grid_n=marker_data['northing']
                     )
                     marker_type_str = "Clue"
+                elif marker_data['type'] == 'casualty':
+                    marker_id = self.layers_controller.add_casualty(
+                        name=marker_data['name'],
+                        lat=marker_data['lat'],
+                        lon=marker_data['lon'],
+                        condition=marker_data.get('condition', ''),
+                        treatment=marker_data.get('treatment', ''),
+                        evacuation_priority=marker_data.get('evacuation_priority', ''),
+                        description=marker_data['description'],
+                        found_by=marker_data.get('found_by', ''),
+                        irish_grid_e=marker_data['easting'],
+                        irish_grid_n=marker_data['northing']
+                    )
+                    marker_type_str = "Casualty"
                 else:  # hazard
                     marker_id = self.layers_controller.add_hazard(
                         name=marker_data['name'],
@@ -1105,9 +1574,13 @@ class sartracker:
 
     def _check_for_paused_mission(self):
         """Check if there's a paused mission and prompt user to resume."""
-        saved_state = self.sar_panel.load_mission_state()
+        try:
+            saved_state = self.sar_panel.load_mission_state()
 
-        if saved_state:
+            if not saved_state:
+                # No saved state or invalid state (already cleared)
+                return
+
             # Show resume dialog
             dialog = QDialog(self.iface.mainWindow())
             dialog.setWindowTitle("Resume Mission?")
@@ -1115,11 +1588,17 @@ class sartracker:
 
             layout = QVBoxLayout()
 
-            # Message
+            # Message - safely format datetime string (don't parse here)
+            try:
+                # Try to format nicely, but fallback to raw string
+                start_time_display = saved_state['start_time'][:19].replace('T', ' ')
+            except (IndexError, KeyError):
+                start_time_display = saved_state.get('start_time', 'Unknown')
+
             message = QLabel(
                 f"<b>Found paused mission:</b><br><br>"
-                f"Mission: {saved_state['name']}<br>"
-                f"Started: {saved_state['start_time'][:19]}<br><br>"
+                f"Mission: {saved_state.get('name', 'Unknown')}<br>"
+                f"Started: {start_time_display}<br><br>"
                 f"Do you want to resume this mission?"
             )
             message.setWordWrap(True)
@@ -1144,18 +1623,28 @@ class sartracker:
             result = dialog_exec(dialog)
 
             if result == DialogAccepted:
-                # Resume the mission
-                self.sar_panel.restore_mission_state(saved_state)
-                self.sar_panel.show()  # Show panel
-                success(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"Mission '{saved_state['name']}' resumed",
-                    duration=3
-                )
+                # Attempt to resume the mission
+                if self.sar_panel.restore_mission_state(saved_state):
+                    self.sar_panel.show()  # Show panel
+                    success(
+                        self.iface.messageBar(),
+                        "SAR Tracker",
+                        f"Mission '{saved_state['name']}' resumed",
+                        duration=3
+                    )
+                else:
+                    # restore_mission_state() already showed error message
+                    pass
             else:
                 # User chose to start fresh - clear saved state
-                settings = QSettings()
-                settings.remove("SAR_Tracker/mission_paused")
-                settings.remove("SAR_Tracker/mission_name")
-                settings.remove("SAR_Tracker/mission_start_time")
+                self.sar_panel._clear_mission_state()
+
+        except Exception as e:
+            # Catch-all for any unexpected errors in the resume flow
+            print(f"Unexpected error in mission resume: {e}")
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Error checking for paused mission: {e}",
+                duration=5
+            )

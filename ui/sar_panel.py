@@ -21,7 +21,7 @@ from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
     Checked
 )
-from ..utils.notify import info, warning
+from ..utils.notify import info, warning, error
 
 
 class SARPanel(QDockWidget):
@@ -44,6 +44,7 @@ class SARPanel(QDockWidget):
     refresh_requested = pyqtSignal()
     csv_load_requested = pyqtSignal(str)  # file_path
     add_poi_requested = pyqtSignal()
+    add_clue_requested = pyqtSignal()
     add_casualty_requested = pyqtSignal()
     add_hazard_requested = pyqtSignal()
     line_tool_requested = pyqtSignal()
@@ -254,7 +255,7 @@ class SARPanel(QDockWidget):
             "Add evidence or clues found during search:\n"
             "Footprints, clothing, equipment, witness sightings, etc."
         )
-        self.add_clue_button.clicked.connect(self._on_add_casualty)
+        self.add_clue_button.clicked.connect(self._on_add_clue)
         markers_grid.addWidget(self.add_clue_button, 0, 1)
 
         self.add_hazard_button = QPushButton("Hazard")
@@ -264,6 +265,15 @@ class SARPanel(QDockWidget):
         )
         self.add_hazard_button.clicked.connect(self._on_add_hazard)
         markers_grid.addWidget(self.add_hazard_button, 1, 0)
+
+        self.add_casualty_button = QPushButton("Casualty")
+        self.add_casualty_button.setToolTip(
+            "Add found injured or deceased person:\n"
+            "CRITICAL: Use for actual casualties requiring medical response,\n"
+            "evacuation, and legal documentation. NOT for evidence/clues."
+        )
+        self.add_casualty_button.clicked.connect(self._on_add_casualty)
+        markers_grid.addWidget(self.add_casualty_button, 1, 1)
 
         markers_layout.addLayout(markers_grid)
         markers_group.setLayout(markers_layout)
@@ -512,9 +522,31 @@ class SARPanel(QDockWidget):
         """
         self.data_source_label.setText(f"Source: {source_info}")
 
+    def set_loading_state(self, loading: bool):
+        """
+        Show/hide loading indicator during refresh.
+
+        Args:
+            loading: True to show loading state, False to hide
+
+        Qt5/Qt6 Compatible: Uses standard Qt widget methods.
+        """
+        if loading:
+            self.refresh_button.setEnabled(False)
+            self.refresh_button.setText("Refreshing...")
+            self.refresh_button.setStyleSheet("QPushButton { background-color: #FFA500; color: white; }")
+        else:
+            self.refresh_button.setEnabled(True)
+            self.refresh_button.setText("Refresh Now")
+            self.refresh_button.setStyleSheet("")
+
     def _on_add_poi(self):
         """Handle Add POI button click."""
         self.add_poi_requested.emit()
+
+    def _on_add_clue(self):
+        """Handle Add Clue button click."""
+        self.add_clue_requested.emit()
 
     def _on_add_casualty(self):
         """Handle Add Casualty button click."""
@@ -612,26 +644,63 @@ class SARPanel(QDockWidget):
             settings.setValue("SAR_Tracker/mission_start_time", self.mission_start_time.isoformat())
         else:
             # Clear paused mission state
-            settings.remove("SAR_Tracker/mission_paused")
-            settings.remove("SAR_Tracker/mission_name")
-            settings.remove("SAR_Tracker/mission_start_time")
+            self._clear_mission_state()
+
+    def _clear_mission_state(self):
+        """
+        Clear saved mission state from QSettings.
+
+        This is called when invalid state is detected or mission is explicitly cleared.
+        """
+        settings = QSettings()
+        settings.remove("SAR_Tracker/mission_paused")
+        settings.remove("SAR_Tracker/mission_name")
+        settings.remove("SAR_Tracker/mission_start_time")
 
     def load_mission_state(self):
         """
         Load mission state from QSettings for auto-resume.
 
         Returns:
-            dict or None: Mission state if exists, None otherwise
+            dict or None: Mission state if exists and valid, None otherwise
         """
         settings = QSettings()
 
-        if settings.value("SAR_Tracker/mission_paused", False, bool):
-            return {
-                'name': settings.value("SAR_Tracker/mission_name", ""),
-                'start_time': settings.value("SAR_Tracker/mission_start_time", "")
-            }
+        if not settings.value("SAR_Tracker/mission_paused", False, bool):
+            return None
 
-        return None
+        # Load values with explicit None as default
+        mission_name = settings.value("SAR_Tracker/mission_name", None)
+        start_time_str = settings.value("SAR_Tracker/mission_start_time", None)
+
+        # Validate all required fields present and non-empty
+        if not mission_name or not start_time_str:
+            # Invalid state - clear it
+            print("Warning: Incomplete mission state in QSettings, clearing")
+            self._clear_mission_state()
+            return None
+
+        # Ensure we have strings (Qt5/Qt6 compatibility)
+        mission_name = str(mission_name).strip()
+        start_time_str = str(start_time_str).strip()
+
+        # Validate non-empty after stripping
+        if not mission_name or not start_time_str:
+            print("Warning: Empty mission state values in QSettings, clearing")
+            self._clear_mission_state()
+            return None
+
+        # Validate ISO format without parsing (basic sanity check)
+        # Valid ISO format should be at least 10 chars and contain 'T' separator
+        if len(start_time_str) < 10 or 'T' not in start_time_str:
+            print(f"Warning: Invalid mission_start_time format: {start_time_str}, clearing")
+            self._clear_mission_state()
+            return None
+
+        return {
+            'name': mission_name,
+            'start_time': start_time_str
+        }
 
     def restore_mission_state(self, state: dict):
         """
@@ -639,13 +708,50 @@ class SARPanel(QDockWidget):
 
         Args:
             state: Mission state dict from load_mission_state()
+
+        Returns:
+            bool: True if restore succeeded, False if failed
         """
-        self.mission_name_input.setText(state['name'])
-        self.mission_start_time = datetime.fromisoformat(state['start_time'])
-        self.mission_active = True
-        self.is_paused = True
-        self.pause_button.setText("Resume")
-        self._update_mission_status()
+        try:
+            # Validate state dictionary
+            if not state or 'name' not in state or 'start_time' not in state:
+                raise ValueError("Invalid state dictionary: missing required fields")
+
+            # Validate non-empty values
+            if not state['name'] or not state['start_time']:
+                raise ValueError("Empty mission name or start time")
+
+            # Attempt to parse datetime - this is where crashes occurred before
+            mission_start = datetime.fromisoformat(state['start_time'])
+
+            # All validation passed - apply state
+            self.mission_name_input.setText(state['name'])
+            self.mission_start_time = mission_start
+            self.mission_active = True
+            self.is_paused = True
+            self.pause_button.setText("Resume")
+            self._update_mission_status()
+
+            return True
+
+        except (ValueError, TypeError, AttributeError) as e:
+            # Parsing failed - clear invalid state and notify user
+            print(f"Error restoring mission state: {e}")
+
+            # Import iface locally to avoid circular imports
+            from qgis.utils import iface
+
+            error(
+                iface.messageBar(),
+                "Mission Resume Failed",
+                f"Could not restore saved mission state (corrupted settings). Please start a new mission.",
+                duration=8
+            )
+
+            # Clear corrupted state so it doesn't keep failing
+            self._clear_mission_state()
+
+            return False
 
     def _toggle_focus_mode(self):
         """

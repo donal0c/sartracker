@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 from qgis.core import QgsProject, QgsVectorLayer, QgsLayerTreeGroup
 from qgis.PyQt.QtGui import QColor
-import random
+import hashlib
 
 
 class BaseLayerManager(ABC):
@@ -76,9 +76,11 @@ class BaseLayerManager(ABC):
         """
         Get consistent, deterministic color for a device.
 
-        Uses device_id hash to ensure same device always gets same color
-        across sessions, restarts, and all layers. Generates distinct colors
-        avoiding very dark shades for visibility.
+        Uses stable MD5 hash to ensure same device always gets same color
+        across sessions, Python restarts, and all layers. Python's built-in
+        hash() uses randomization (PEP 456) which makes colors non-deterministic.
+
+        Generates distinct colors avoiding very dark shades for visibility.
 
         Args:
             device_id: Device identifier string
@@ -97,14 +99,19 @@ class BaseLayerManager(ABC):
             raise ValueError("device_id exceeds maximum length of 256 characters")
 
         if device_id not in self.device_colors:
-            # Use device_id hash for deterministic color generation
-            # This ensures same device always gets same color across sessions
-            hash_val = hash(device_id)
+            # Use MD5 hash for deterministic color generation
+            # Unlike Python's hash(), MD5 is stable across sessions/restarts
+            # This ensures same device always gets same color
+            hash_bytes = hashlib.md5(device_id.encode('utf-8')).digest()
+
+            # Convert first 12 bytes to integers for RGB
+            hash_int = int.from_bytes(hash_bytes[:12], byteorder='big')
 
             # Generate RGB values from hash (range 50-255 for visibility)
-            r = 50 + (abs(hash_val) % 206)
-            g = 50 + (abs(hash_val >> 8) % 206)
-            b = 50 + (abs(hash_val >> 16) % 206)
+            # Use different byte ranges for better color distribution
+            r = 50 + (hash_int % 206)
+            g = 50 + ((hash_int >> 16) % 206)
+            b = 50 + ((hash_int >> 32) % 206)
 
             self.device_colors[device_id] = QColor(r, g, b)
 

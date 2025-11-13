@@ -16,13 +16,74 @@ Usage:
     from utils.qt_compat import (
         LeftDockWidgetArea, RightDockWidgetArea,
         Checked, Unchecked,
-        CrossCursor
+        CrossCursor, TextSelectableByMouse,
+        dialog_exec, DialogAccepted
     )
 
     # Then use the constants directly:
     self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
     if state == Checked:
         ...
+    label.setTextInteractionFlags(TextSelectableByMouse)
+
+    # Execute dialogs:
+    if dialog_exec(my_dialog) == DialogAccepted:
+        ...
+
+Available Constants by Category:
+
+DockWidgetArea (6 constants):
+    LeftDockWidgetArea, RightDockWidgetArea, TopDockWidgetArea,
+    BottomDockWidgetArea, AllDockWidgetAreas, NoDockWidgetArea
+
+CheckState (3 constants):
+    Unchecked, PartiallyChecked, Checked
+
+CursorShape (16 constants):
+    ArrowCursor, CrossCursor, WaitCursor, IBeamCursor, PointingHandCursor,
+    SizeVerCursor, SizeHorCursor, SizeBDiagCursor, SizeFDiagCursor,
+    SizeAllCursor, BlankCursor, WhatsThisCursor, ForbiddenCursor,
+    BusyCursor, OpenHandCursor, ClosedHandCursor
+
+AlignmentFlag (8 constants):
+    AlignLeft, AlignRight, AlignHCenter, AlignJustify,
+    AlignTop, AlignBottom, AlignVCenter, AlignCenter
+
+MouseButton (6 constants):
+    NoButton, LeftButton, RightButton, MiddleButton,
+    BackButton, ForwardButton
+
+Key (11 constants):
+    Key_Return, Key_Enter, Key_Escape, Key_Delete, Key_Backspace,
+    Key_Tab, Key_Space, Key_Left, Key_Right, Key_Up, Key_Down
+
+Orientation (2 constants):
+    Horizontal, Vertical
+
+WindowType (4 constants):
+    WindowType_Widget, WindowType_Window, WindowType_Dialog, WindowType_Popup
+
+TextInteractionFlag (7 constants):
+    NoTextInteraction, TextSelectableByMouse, TextSelectableByKeyboard,
+    LinksAccessibleByMouse, LinksAccessibleByKeyboard,
+    TextEditorInteraction, TextBrowserInteraction
+
+WindowFlags (7 constants):
+    WindowStaysOnTopHint, WindowCloseButtonHint, WindowMinimizeButtonHint,
+    WindowMaximizeButtonHint, CustomizeWindowHint, WindowTitleHint,
+    FramelessWindowHint
+
+WindowModality (3 constants):
+    NonModal, WindowModal, ApplicationModal
+
+Dialog (2 constants):
+    DialogAccepted, DialogRejected
+
+Functions (2 functions):
+    dialog_exec(dialog) - Execute dialog in Qt5/Qt6 compatible way
+    push_message(bar, title, msg, level, duration) - Push message to QGIS message bar
+
+Total: 78 exported symbols for Qt5/Qt6 compatibility
 """
 
 from qgis.PyQt.QtCore import Qt
@@ -161,6 +222,11 @@ if QT_VERSION == 6:
     Key_Backspace = Qt.Key.Key_Backspace
     Key_Tab = Qt.Key.Key_Tab
     Key_Space = Qt.Key.Key_Space
+    # Arrow keys for navigation
+    Key_Left = Qt.Key.Key_Left
+    Key_Right = Qt.Key.Key_Right
+    Key_Up = Qt.Key.Key_Up
+    Key_Down = Qt.Key.Key_Down
 else:  # Qt5
     Key_Return = Qt.Key_Return
     Key_Enter = Qt.Key_Enter
@@ -169,6 +235,11 @@ else:  # Qt5
     Key_Backspace = Qt.Key_Backspace
     Key_Tab = Qt.Key_Tab
     Key_Space = Qt.Key_Space
+    # Arrow keys for navigation
+    Key_Left = Qt.Key_Left
+    Key_Right = Qt.Key_Right
+    Key_Up = Qt.Key_Up
+    Key_Down = Qt.Key_Down
 
 
 # =============================================================================
@@ -195,6 +266,61 @@ else:  # Qt5
     WindowType_Window = Qt.Window
     WindowType_Dialog = Qt.Dialog
     WindowType_Popup = Qt.Popup
+
+
+# =============================================================================
+# TextInteractionFlag enums
+# =============================================================================
+if QT_VERSION == 6:
+    NoTextInteraction = Qt.TextInteractionFlag.NoTextInteraction
+    TextSelectableByMouse = Qt.TextInteractionFlag.TextSelectableByMouse
+    TextSelectableByKeyboard = Qt.TextInteractionFlag.TextSelectableByKeyboard
+    LinksAccessibleByMouse = Qt.TextInteractionFlag.LinksAccessibleByMouse
+    LinksAccessibleByKeyboard = Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+    TextEditorInteraction = Qt.TextInteractionFlag.TextEditorInteraction
+    TextBrowserInteraction = Qt.TextInteractionFlag.TextBrowserInteraction
+else:  # Qt5
+    NoTextInteraction = Qt.NoTextInteraction
+    TextSelectableByMouse = Qt.TextSelectableByMouse
+    TextSelectableByKeyboard = Qt.TextSelectableByKeyboard
+    LinksAccessibleByMouse = Qt.LinksAccessibleByMouse
+    LinksAccessibleByKeyboard = Qt.LinksAccessibleByKeyboard
+    TextEditorInteraction = Qt.TextEditorInteraction
+    TextBrowserInteraction = Qt.TextBrowserInteraction
+
+
+# =============================================================================
+# WindowFlags enums (additional window customization)
+# =============================================================================
+if QT_VERSION == 6:
+    WindowStaysOnTopHint = Qt.WindowType.WindowStaysOnTopHint
+    WindowCloseButtonHint = Qt.WindowType.WindowCloseButtonHint
+    WindowMinimizeButtonHint = Qt.WindowType.WindowMinimizeButtonHint
+    WindowMaximizeButtonHint = Qt.WindowType.WindowMaximizeButtonHint
+    CustomizeWindowHint = Qt.WindowType.CustomizeWindowHint
+    WindowTitleHint = Qt.WindowType.WindowTitleHint
+    FramelessWindowHint = Qt.WindowType.FramelessWindowHint
+else:  # Qt5
+    WindowStaysOnTopHint = Qt.WindowStaysOnTopHint
+    WindowCloseButtonHint = Qt.WindowCloseButtonHint
+    WindowMinimizeButtonHint = Qt.WindowMinimizeButtonHint
+    WindowMaximizeButtonHint = Qt.WindowMaximizeButtonHint
+    CustomizeWindowHint = Qt.CustomizeWindowHint
+    WindowTitleHint = Qt.WindowTitleHint
+    FramelessWindowHint = Qt.FramelessWindowHint
+
+
+# =============================================================================
+# WindowModality enums
+# =============================================================================
+if QT_VERSION == 6:
+    NonModal = Qt.WindowModality.NonModal
+    WindowModal = Qt.WindowModality.WindowModal
+    ApplicationModal = Qt.WindowModality.ApplicationModal
+else:  # Qt5
+    NonModal = Qt.NonModal
+    WindowModal = Qt.WindowModal
+    ApplicationModal = Qt.ApplicationModal
 
 
 # =============================================================================
@@ -353,6 +479,10 @@ __all__ = [
     'Key_Backspace',
     'Key_Tab',
     'Key_Space',
+    'Key_Left',
+    'Key_Right',
+    'Key_Up',
+    'Key_Down',
     # Orientation
     'Horizontal',
     'Vertical',
@@ -361,4 +491,24 @@ __all__ = [
     'WindowType_Window',
     'WindowType_Dialog',
     'WindowType_Popup',
+    # TextInteractionFlag
+    'NoTextInteraction',
+    'TextSelectableByMouse',
+    'TextSelectableByKeyboard',
+    'LinksAccessibleByMouse',
+    'LinksAccessibleByKeyboard',
+    'TextEditorInteraction',
+    'TextBrowserInteraction',
+    # WindowFlags
+    'WindowStaysOnTopHint',
+    'WindowCloseButtonHint',
+    'WindowMinimizeButtonHint',
+    'WindowMaximizeButtonHint',
+    'CustomizeWindowHint',
+    'WindowTitleHint',
+    'FramelessWindowHint',
+    # WindowModality
+    'NonModal',
+    'WindowModal',
+    'ApplicationModal',
 ]

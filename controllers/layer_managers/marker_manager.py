@@ -26,10 +26,11 @@ class MarkerLayerManager(BaseLayerManager):
     """
     Manages marker layers for SAR operations.
 
-    Handles three distinct marker types:
+    Handles four distinct marker types:
     - IPP/LKP: Initial Planning Point / Last Known Position
     - Clues: Evidence found during search
     - Hazards: Safety-critical warnings
+    - Casualties: Found injured or deceased persons
 
     Each type has its own layer with specific fields and styling.
     """
@@ -38,6 +39,7 @@ class MarkerLayerManager(BaseLayerManager):
     IPP_LKP_LAYER_NAME = "IPP/LKP"
     CLUES_LAYER_NAME = "Clues"
     HAZARDS_LAYER_NAME = "Hazards"
+    CASUALTIES_LAYER_NAME = "Casualties"
 
     def __init__(self, iface, shared_device_colors=None):
         """Initialize marker layer manager."""
@@ -48,7 +50,8 @@ class MarkerLayerManager(BaseLayerManager):
         return [
             self.IPP_LKP_LAYER_NAME,
             self.CLUES_LAYER_NAME,
-            self.HAZARDS_LAYER_NAME
+            self.HAZARDS_LAYER_NAME,
+            self.CASUALTIES_LAYER_NAME
         ]
 
     # =========================================================================
@@ -486,6 +489,171 @@ class MarkerLayerManager(BaseLayerManager):
             if layer.isEditable():
                 layer.rollBack()
             raise RuntimeError(f"Error adding {self.HAZARDS_LAYER_NAME} marker '{name}': {str(e)}")
+
+    # =========================================================================
+    # Casualties Layer (Found injured or deceased persons)
+    # =========================================================================
+
+    def _get_or_create_casualties_layer(self) -> QgsVectorLayer:
+        """
+        Get or create Casualties layer.
+
+        Casualties are found injured or deceased persons during SAR operations.
+        This is distinct from clues - casualties require medical response,
+        evacuation, and specific documentation for legal/coroner requirements.
+
+        Returns:
+            QgsVectorLayer: Casualties layer
+        """
+        # Check if layer already exists
+        layers = self.project.mapLayersByName(self.CASUALTIES_LAYER_NAME)
+        if layers:
+            return layers[0]
+
+        # Create new memory layer with WGS84 CRS
+        # Qt5/Qt6 Compatible: Using QVariant types
+        layer = QgsVectorLayer(
+            "Point?crs=EPSG:4326",
+            self.CASUALTIES_LAYER_NAME,
+            "memory"
+        )
+
+        # Add fields - casualty-specific attributes for medical and legal documentation
+        layer.dataProvider().addAttributes([
+            QgsField("id", QVariant.String),                    # String - UUID
+            QgsField("name", QVariant.String),                  # String - person identifier
+            QgsField("condition", QVariant.String),             # String - Injured, Deceased, Unresponsive
+            QgsField("treatment", QVariant.String),             # String - First aid administered
+            QgsField("evacuation_priority", QVariant.String),   # String - Immediate, Urgent, Delayed
+            QgsField("description", QVariant.String),           # String - additional notes
+            QgsField("found_by", QVariant.String),              # String - team member/device who found
+            QgsField("lat", QVariant.Double),                   # Double - WGS84 latitude
+            QgsField("lon", QVariant.Double),                   # Double - WGS84 longitude
+            QgsField("irish_grid_e", QVariant.Double),          # Double - ITM easting
+            QgsField("irish_grid_n", QVariant.Double),          # Double - ITM northing
+            QgsField("created", QVariant.String),               # String - ISO timestamp
+        ])
+        layer.updateFields()
+
+        # Apply styling - Red cross/medical symbol for high visibility
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'cross2',  # Medical cross symbol
+            'color': '#DC143C',  # Crimson red
+            'size': '8',
+            'outline_color': 'black',
+            'outline_width': '0.8'
+        })
+        layer.renderer().setSymbol(symbol)
+
+        # Apply labels - red color for high visibility
+        self._apply_marker_labels(layer, QColor('#8B0000'))  # Dark red for labels
+
+        # Add to project in SAR group (position 3 - after hazards)
+        self._add_layer_to_group(layer, position=3)
+
+        return layer
+
+    def add_casualty(self, name: str, lat: float, lon: float,
+                     condition: str = "", treatment: str = "",
+                     evacuation_priority: str = "",
+                     description: str = "", found_by: str = "",
+                     irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+        """
+        Add a casualty marker to the map.
+
+        CRITICAL: Casualties are found injured or deceased persons.
+        This is distinct from clues (evidence). Casualties trigger:
+        - Medical response and evacuation
+        - Legal/coroner documentation
+        - Family notifications
+        - Mission reporting requirements
+
+        Args:
+            name: Person identifier/name
+            lat: Latitude (WGS84 decimal degrees)
+            lon: Longitude (WGS84 decimal degrees)
+            condition: Condition (Injured, Deceased, Unresponsive, etc.)
+            treatment: First aid administered
+            evacuation_priority: Priority (Immediate, Urgent, Delayed, None)
+            description: Additional notes
+            found_by: Team member or device ID who found the casualty
+            irish_grid_e: Irish Grid (ITM) Easting (optional)
+            irish_grid_n: Irish Grid (ITM) Northing (optional)
+
+        Returns:
+            str: UUID of added casualty
+
+        Raises:
+            ValueError: If inputs are invalid
+            RuntimeError: If layer operation fails
+        """
+        # Validate name (required)
+        if not name or not name.strip():
+            raise ValueError("Casualty name/identifier cannot be empty")
+
+        # Validate coordinates
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
+
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Invalid longitude: {lon}. Must be between -180 and 180")
+
+        # Validate optional Irish Grid coordinates if provided
+        if irish_grid_e is not None:
+            if not (0 <= irish_grid_e <= 1000000):
+                raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
+
+        if irish_grid_n is not None:
+            if not (0 <= irish_grid_n <= 1500000):
+                raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
+        layer = self._get_or_create_casualties_layer()
+
+        # Create feature
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+        # Generate UUID
+        marker_id = str(uuid.uuid4())
+
+        # Set attributes
+        feature.setAttributes([
+            marker_id,
+            name,
+            condition,
+            treatment,
+            evacuation_priority,
+            description,
+            found_by,
+            lat,
+            lon,
+            irish_grid_e,
+            irish_grid_n,
+            datetime.now().isoformat()
+        ])
+
+        # Add to layer with proper transaction handling (Issue #3 pattern)
+        try:
+            layer.startEditing()
+
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.CASUALTIES_LAYER_NAME} layer")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit changes to {self.CASUALTIES_LAYER_NAME} layer: {', '.join(errors)}")
+
+            # Force immediate visual update
+            layer.triggerRepaint()
+
+            return marker_id
+
+        except Exception as e:
+            # Ensure layer is not left in editing state (Issue #3 fix)
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error adding {self.CASUALTIES_LAYER_NAME} marker '{name}': {str(e)}")
 
     # =========================================================================
     # Common Helper Methods
