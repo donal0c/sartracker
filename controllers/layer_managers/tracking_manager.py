@@ -22,7 +22,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
-from ...utils.notify import warning, error
+from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 
 
 class TrackingLayerManager(BaseLayerManager):
@@ -153,12 +153,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Check if layer is already being edited (Issue #3 safety check)
         if layer.isEditable():
-            warning(
-                self.iface.messageBar(),
-                "Layer Busy",
-                f"{self.CURRENT_LAYER_NAME} is currently being edited. Skipping update."
-            )
-            return
+            raise LayerLockError(self.CURRENT_LAYER_NAME)
 
         # Layer update with proper transaction handling (Issue #3 fix)
         # This ensures the layer is NEVER left in edit mode, even in edge cases
@@ -213,15 +208,12 @@ class TrackingLayerManager(BaseLayerManager):
             # Rollback on any error to prevent edit mode lockup (Issue #3)
             layer.rollBack()
 
-            # Display error to user via message bar
-            error(
-                self.iface.messageBar(),
-                "Tracking Update Failed",
-                f"Failed to update {self.CURRENT_LAYER_NAME}: {str(e)}"
-            )
-
-            # Re-raise so caller knows update failed
-            raise RuntimeError(f"Error updating {self.CURRENT_LAYER_NAME}: {str(e)}") from e
+            # Raise typed exception for error handler (Issue #3)
+            raise LayerTransactionError(
+                self.CURRENT_LAYER_NAME,
+                "commit changes",
+                details=str(e)
+            ) from e
 
         finally:
             # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
@@ -233,12 +225,9 @@ class TrackingLayerManager(BaseLayerManager):
         try:
             self._apply_current_positions_style(layer)
         except Exception as e:
-            # Log styling errors but don't fail the update
-            warning(
-                self.iface.messageBar(),
-                "Styling Error",
-                f"Failed to apply styling to {self.CURRENT_LAYER_NAME}: {str(e)}"
-            )
+            # Log styling errors but don't fail the update (Issue #3)
+            # Non-critical: styling failure doesn't affect core functionality
+            print(f"Warning: Failed to apply styling to {self.CURRENT_LAYER_NAME}: {str(e)}")
 
         # Zoom to extent ONLY on first load
         if self.first_load and positions:
@@ -404,12 +393,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Check if layer is already being edited (Issue #3 safety check)
         if layer.isEditable():
-            warning(
-                self.iface.messageBar(),
-                "Layer Busy",
-                f"{self.BREADCRUMBS_LAYER_NAME} is currently being edited. Skipping update."
-            )
-            return
+            raise LayerLockError(self.BREADCRUMBS_LAYER_NAME)
 
         # Layer update with proper transaction handling (Issue #3 fix)
         # This ensures the layer is NEVER left in edit mode, even in edge cases
@@ -466,13 +450,9 @@ class TrackingLayerManager(BaseLayerManager):
                             time_diff = (curr_time - prev_time).total_seconds() / 60
                         except (ValueError, AttributeError, TypeError) as e:
                             # If timestamp parsing fails, assume no gap and continue segment
-                            # This prevents crashes on malformed timestamps
-                            # Warn user via message bar (visible in QGIS UI)
-                            warning(
-                                self.iface.messageBar(),
-                                "Timestamp Parsing",
-                                f"Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment."
-                            )
+                            # This prevents crashes on malformed timestamps (Issue #3)
+                            # Non-critical: log warning but continue processing
+                            print(f"Warning: Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment.")
                             time_diff = 0
 
                         if time_diff > time_gap_minutes:
@@ -514,15 +494,12 @@ class TrackingLayerManager(BaseLayerManager):
             # Rollback on any error to prevent edit mode lockup (Issue #3)
             layer.rollBack()
 
-            # Display error to user via message bar
-            error(
-                self.iface.messageBar(),
-                "Tracking Update Failed",
-                f"Failed to update {self.BREADCRUMBS_LAYER_NAME}: {str(e)}"
-            )
-
-            # Re-raise so caller knows update failed
-            raise RuntimeError(f"Error updating {self.BREADCRUMBS_LAYER_NAME}: {str(e)}") from e
+            # Raise typed exception for error handler (Issue #3)
+            raise LayerTransactionError(
+                self.BREADCRUMBS_LAYER_NAME,
+                "commit changes",
+                details=str(e)
+            ) from e
 
         finally:
             # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
@@ -534,12 +511,9 @@ class TrackingLayerManager(BaseLayerManager):
         try:
             self._apply_breadcrumbs_style(layer)
         except Exception as e:
-            # Log styling errors but don't fail the update
-            warning(
-                self.iface.messageBar(),
-                "Styling Error",
-                f"Failed to apply styling to {self.BREADCRUMBS_LAYER_NAME}: {str(e)}"
-            )
+            # Log styling errors but don't fail the update (Issue #3)
+            # Non-critical: styling failure doesn't affect core functionality
+            print(f"Warning: Failed to apply styling to {self.BREADCRUMBS_LAYER_NAME}: {str(e)}")
 
         # Refresh only this layer
         layer.triggerRepaint()

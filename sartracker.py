@@ -37,6 +37,8 @@ import traceback
 # Import Qt5/Qt6 compatible constants and functions
 from .utils.qt_compat import RightDockWidgetArea, dialog_exec, DialogAccepted
 from .utils.notify import info, warning, error, success
+from .utils.error_handler import ErrorHandler
+from .utils.exceptions import SARTrackerError
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -128,6 +130,10 @@ class sartracker:
         """
         # Save reference to the QGIS interface
         self.iface = iface
+
+        # Create centralized error handler (Issue #3)
+        self.error_handler = ErrorHandler(self.iface.messageBar())
+
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
         # initialize locale
@@ -346,6 +352,7 @@ class sartracker:
             self.line_tool = LineTool(self.iface.mapCanvas(), self.layers_controller)
             self.line_tool.drawing_complete.connect(self._on_line_complete)
             self.line_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+            self.line_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Line drawing"))
         except Exception as e:
             self.line_tool = None
             warning(self.iface.messageBar(), "SAR Tracker",
@@ -358,6 +365,7 @@ class sartracker:
             self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller)
             self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
             self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+            self.range_ring_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Range ring"))
         except Exception as e:
             self.range_ring_tool = None
             warning(self.iface.messageBar(), "SAR Tracker",
@@ -370,6 +378,7 @@ class sartracker:
             self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller)
             self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
             self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+            self.bearing_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Bearing line"))
         except Exception as e:
             self.bearing_tool = None
             warning(self.iface.messageBar(), "SAR Tracker",
@@ -382,6 +391,7 @@ class sartracker:
             self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller)
             self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
             self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
+            self.polygon_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Polygon drawing"))
         except Exception as e:
             self.polygon_tool = None
             warning(self.iface.messageBar(), "SAR Tracker",

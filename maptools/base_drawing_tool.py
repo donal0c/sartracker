@@ -40,11 +40,13 @@ class BaseDrawingTool(QgsMapTool):
     Signals:
         drawing_complete: Emitted when drawing is finished (feature_data: dict)
         drawing_cancelled: Emitted when drawing is cancelled
+        drawing_error: Emitted when drawing operation fails (exception: Exception)
     """
 
     # Signals
     drawing_complete = pyqtSignal(object)  # Emits feature data dict
     drawing_cancelled = pyqtSignal()
+    drawing_error = pyqtSignal(Exception)  # Emits exception for error handler (Issue #3)
 
     def __init__(self, canvas):
         """

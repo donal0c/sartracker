@@ -21,7 +21,7 @@ from qgis.PyQt.QtWidgets import (
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
 from ..utils.dialog_utils import BaseDialog
-from ..utils.notify import error
+from ..utils.exceptions import DrawingError
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -479,18 +479,10 @@ class PolygonTool(BaseDrawingTool):
             print(f"Error saving search area: {e}")
             import traceback
             traceback.print_exc()
-            # Show error to user
-            try:
-                from qgis.utils import iface
-                if iface:
-                    error(
-                        iface.messageBar(),
-                        "Polygon Tool",
-                        f"Failed to create search area: {str(e)}",
-                        duration=5
-                    )
-            except:
-                pass  # iface not available
+            # Emit error signal for error handler (Issue #3)
+            self.drawing_error.emit(
+                DrawingError(f"Failed to create search area: {str(e)}", tool_name="Polygon")
+            )
 
         finally:
             # Reset for next polygon (same as range_ring pattern)

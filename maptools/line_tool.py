@@ -13,7 +13,7 @@ from qgis.PyQt.QtGui import QColor
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import LeftButton, RightButton, Key_Escape
-from ..utils.notify import error
+from ..utils.exceptions import DrawingError
 
 from .base_drawing_tool import BaseDrawingTool
 
@@ -192,18 +192,10 @@ class LineTool(BaseDrawingTool):
             print(f"Error saving line: {e}")
             import traceback
             traceback.print_exc()
-            # Show error to user via iface if available
-            try:
-                from qgis.utils import iface
-                if iface:
-                    error(
-                        iface.messageBar(),
-                        "Line Tool",
-                        f"Failed to save line: {str(e)}",
-                        duration=5
-                    )
-            except:
-                pass  # iface not available
+            # Emit error signal for error handler (Issue #3)
+            self.drawing_error.emit(
+                DrawingError(f"Failed to save line: {str(e)}", tool_name="Line")
+            )
 
         finally:
             # Reset for next line
