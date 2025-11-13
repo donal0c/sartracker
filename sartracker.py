@@ -46,23 +46,19 @@ from .utils.notify import info, warning, error, success
 _import_errors = []
 _imports_ok = True
 
-# Import FileCSVProvider
+# Import Provider Registry and trigger provider self-registration
 try:
-    from .providers.csv import FileCSVProvider
+    from .providers.registry import registry as provider_registry
+    from .providers.base import Provider
+    # Trigger provider registration by importing them
+    from .providers import csv
+    # Note: provider_registry now contains registered providers
 except Exception as e:
     _imports_ok = False
-    _import_errors.append(('providers.csv.FileCSVProvider', e, traceback.format_exc()))
-    FileCSVProvider = None
-    print(f"ERROR importing FileCSVProvider: {e}")
-
-# Import CSVParseTask
-try:
-    from .providers.csv_task import CSVParseTask
-except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('providers.csv_task.CSVParseTask', e, traceback.format_exc()))
-    CSVParseTask = None
-    print(f"ERROR importing CSVParseTask: {e}")
+    _import_errors.append(('providers', e, traceback.format_exc()))
+    provider_registry = None
+    Provider = None
+    print(f"ERROR importing providers: {e}")
 
 # Import LayersController
 try:
@@ -164,6 +160,8 @@ class sartracker:
         # Initialize SAR tracking components
         self.layers_controller = None
         self.provider = None
+        self.provider_name = None  # Track which provider is active (e.g., 'csv', 'http_traccar')
+        self.provider_config = None  # Track provider config for reconnection
         self.sar_panel = None
         self.marker_tool = None
         self.measure_tool = None
@@ -741,7 +739,7 @@ class sartracker:
             warning(
                 self.iface.messageBar(),
                 "SAR Tracker",
-                "No data source loaded. Please load a CSV file first.",
+                "No data source loaded. Please load a data source first.",
                 duration=3
             )
             return
@@ -764,8 +762,8 @@ class sartracker:
             if self.sar_panel:
                 self.sar_panel.set_loading_state(True)
 
-            # Create background task
-            task = CSVParseTask(self.provider, "Refreshing tracking data")
+            # Create provider-specific background task
+            task = self.provider.create_refresh_task("Refreshing tracking data")
 
             # Connect completion signals
             task.taskCompleted.connect(lambda: self._on_refresh_complete(task))
@@ -790,12 +788,12 @@ class sartracker:
                 duration=5
             )
 
-    def _on_refresh_complete(self, task: CSVParseTask):
+    def _on_refresh_complete(self, task):
         """
         Handle successful refresh completion (runs in main thread).
 
         Args:
-            task: Completed CSVParseTask with results
+            task: Completed ProviderRefreshTask with results
         """
         try:
             # Reset refresh state
@@ -863,12 +861,12 @@ class sartracker:
                 duration=5
             )
 
-    def _on_refresh_error(self, task: CSVParseTask):
+    def _on_refresh_error(self, task):
         """
         Handle refresh task error or termination (runs in main thread).
 
         Args:
-            task: Failed or terminated CSVParseTask
+            task: Failed or terminated ProviderRefreshTask
         """
         # Reset refresh state
         self._refresh_in_progress = False
@@ -887,17 +885,21 @@ class sartracker:
             duration=5
         )
 
-    def _on_load_csv(self, csv_file):
+    def _load_provider(self, provider_name: str, config: dict):
         """
-        Handle CSV load request from panel using background task.
+        Load and initialize a data provider via registry.
 
-        Uses same threading approach as refresh to prevent UI freeze
-        during initial data load.
+        This method provides a provider-agnostic way to load data sources,
+        supporting CSV, HTTP, PostGIS, and future providers without code changes.
 
-        Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
+        CRITICAL FOR LIFE-SAFETY: This must handle errors gracefully and never
+        leave the plugin in an inconsistent state.
 
         Args:
-            csv_file: Path to CSV file or folder
+            provider_name: Name of provider (e.g., 'csv', 'http_traccar')
+            config: Provider-specific configuration dict
+
+        Qt5/Qt6 Compatible: Uses provider registry pattern.
         """
         # Prevent concurrent operations
         if self._refresh_in_progress:
@@ -910,28 +912,44 @@ class sartracker:
             return
 
         try:
-            # Create CSV provider
-            self.provider = FileCSVProvider(csv_file)
+            # Create provider via registry
+            self.provider = provider_registry.get_provider(provider_name, config)
+            self.provider_name = provider_name
+            self.provider_config = config
 
             # Test connection (quick synchronous check)
             if not self.provider.test_connection():
                 error(
                     self.iface.messageBar(),
-                    "CSV Load Error",
-                    f"Could not read CSV file: {csv_file}",
+                    "Connection Error",
+                    f"Could not connect to {provider_name} data source",
                     duration=5
                 )
                 self.provider = None
+                self.provider_name = None
+                self.provider_config = None
                 return
 
-            # Update data source label immediately
-            import os
-            if os.path.isdir(csv_file):
-                folder_name = os.path.basename(csv_file)
-                self.sar_panel.set_data_source(f"CSV Folder: {folder_name}")
+            # Update data source label with provider-specific info
+            metadata = next(
+                (m for m in provider_registry.list_providers() if m.name == provider_name),
+                None
+            )
+            display_name = metadata.display_name if metadata else provider_name
+
+            # Generate appropriate label based on provider type
+            if provider_name == 'csv':
+                import os
+                csv_path = config['csv_path']
+                if os.path.isdir(csv_path):
+                    label = f"{display_name}: {os.path.basename(csv_path)}"
+                else:
+                    label = f"{display_name}: {os.path.basename(csv_path)}"
             else:
-                filename = os.path.basename(csv_file)
-                self.sar_panel.set_data_source(f"CSV: {filename}")
+                # Generic label for other providers
+                label = display_name
+
+            self.sar_panel.set_data_source(label)
 
             # Set loading state
             self._refresh_in_progress = True
@@ -941,14 +959,14 @@ class sartracker:
             info(
                 self.iface.messageBar(),
                 "SAR Tracker",
-                "Loading tracking data...",
+                f"Loading data from {display_name}...",
                 duration=2
             )
 
-            # Create background task for parsing
-            task = CSVParseTask(self.provider, "Loading tracking data")
+            # Create provider-specific background task
+            task = self.provider.create_refresh_task("Loading tracking data")
 
-            # Connect completion signals (reuse same handlers)
+            # Connect completion signals
             task.taskCompleted.connect(lambda: self._on_load_complete(task))
             task.taskTerminated.connect(lambda: self._on_refresh_error(task))
 
@@ -966,17 +984,28 @@ class sartracker:
 
             error(
                 self.iface.messageBar(),
-                "Error Loading CSV",
-                f"An error occurred while loading the CSV file: {str(e)}",
+                "Error Loading Provider",
+                f"Failed to load {provider_name}: {str(e)}",
                 duration=5
             )
 
-    def _on_load_complete(self, task: CSVParseTask):
+    def _on_load_csv(self, csv_file):
         """
-        Handle CSV load completion (runs in main thread).
+        Handle CSV load request from panel.
+
+        Delegates to _load_provider() for provider-agnostic loading.
 
         Args:
-            task: Completed CSVParseTask with results
+            csv_file: Path to CSV file or folder
+        """
+        self._load_provider('csv', {'csv_path': csv_file})
+
+    def _on_load_complete(self, task):
+        """
+        Handle provider load completion (runs in main thread).
+
+        Args:
+            task: Completed ProviderRefreshTask with results
         """
         try:
             # Reset refresh state

@@ -357,6 +357,21 @@ class FileCSVProvider(Provider):
         except Exception:
             return False
 
+    def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
+        """
+        Create CSV-specific refresh task.
+
+        Args:
+            description: Task description for progress display
+
+        Returns:
+            CSVRefreshTask instance for background parsing
+
+        Qt5/Qt6 Compatible: Returns QgsTask subclass.
+        """
+        from .tasks import CSVRefreshTask
+        return CSVRefreshTask(self, description)
+
     def invalidate_cache(self, filepath: Optional[str] = None):
         """
         Invalidate cache for specific file or all files.
@@ -389,3 +404,47 @@ class FileCSVProvider(Provider):
             'total_positions': total_positions,
             'memory_kb': int(memory_kb)
         }
+
+
+# ============================================================================
+# Provider Self-Registration
+# ============================================================================
+
+def _create_csv_provider(config: Dict) -> FileCSVProvider:
+    """
+    Factory function for CSV provider.
+
+    Args:
+        config: Configuration dict with 'csv_path' key
+
+    Returns:
+        FileCSVProvider instance
+
+    Raises:
+        ValueError: If csv_path not provided in config
+    """
+    csv_path = config.get('csv_path')
+    if not csv_path:
+        raise ValueError("CSV provider requires 'csv_path' in config")
+    return FileCSVProvider(csv_path)
+
+
+# Register CSV provider with global registry
+from .registry import registry, ProviderMetadata
+
+registry.register(
+    ProviderMetadata(
+        name='csv',
+        display_name='CSV Files',
+        description='Load tracking data from Traccar CSV exports (file or folder)',
+        requires_config=True,
+        config_schema={
+            'csv_path': {
+                'type': 'path',
+                'description': 'Path to CSV file or folder containing CSV files',
+                'required': True
+            }
+        }
+    ),
+    _create_csv_provider
+)

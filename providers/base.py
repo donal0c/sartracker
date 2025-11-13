@@ -126,3 +126,22 @@ class Provider(ABC):
             True if connection successful, False otherwise
         """
         pass
+
+    @abstractmethod
+    def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
+        """
+        Create provider-specific refresh task.
+
+        Each provider implements its own task type (CSVRefreshTask,
+        HTTPRefreshTask, etc.) that handles provider-specific data
+        fetching in a background thread.
+
+        Args:
+            description: Task description for progress display
+
+        Returns:
+            ProviderRefreshTask subclass instance
+
+        Qt5/Qt6 Compatible: Returns QgsTask subclass.
+        """
+        pass
