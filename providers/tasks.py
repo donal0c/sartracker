@@ -118,3 +118,221 @@ class CSVRefreshTask(ProviderRefreshTask):
             # CRITICAL: Do NOT show error dialogs here - we're in background thread
             self.error_message = str(e)
             return False
+
+
+class HTTPRefreshTask(ProviderRefreshTask):
+    """
+    HTTP-specific refresh task with retry logic and throttling.
+
+    Wraps HTTP API calls in background thread to prevent UI freezes during
+    network operations. Includes retry logic for transient failures and
+    request throttling to avoid overwhelming the server.
+
+    LIFE-SAFETY CRITICAL: This task must never block the UI thread during
+    active rescue operations. Network failures must be handled gracefully.
+
+    Qt5/Qt6 Compatible: Uses QgsTask API.
+    """
+
+    def __init__(self, provider: 'Provider', description: str = "Fetching tracking data",
+                 retry_count: int = 3, retry_backoff: float = 1.0, request_throttle: float = 0.1):
+        """
+        Initialize HTTP refresh task.
+
+        Args:
+            provider: HttpTraccarProvider instance (thread-safe)
+            description: Task description for progress display
+            retry_count: Number of retry attempts for failed requests (default: 3)
+            retry_backoff: Base backoff time in seconds for exponential backoff (default: 1.0)
+            request_throttle: Delay in seconds between device requests (default: 0.1)
+        """
+        super().__init__(provider, description)
+        self.retry_count = retry_count
+        self.retry_backoff = retry_backoff
+        self.request_throttle = request_throttle
+
+    def run(self) -> bool:
+        """
+        Run HTTP fetches in background thread with retries.
+
+        CRITICAL: This runs in a background thread. Do NOT:
+        - Create or modify Qt widgets
+        - Use QgsMessageBar or any GUI operations
+        - Access QGIS map canvas or layers directly
+
+        Returns:
+            True if successful, False if error occurred
+        """
+        import time
+
+        try:
+            # Check for cancellation before starting
+            if self.isCanceled():
+                return False
+
+            # Fetch devices with retry logic
+            devices = self._fetch_with_retry(
+                lambda: self.provider.get_devices(),
+                "devices"
+            )
+
+            if devices is None:
+                return False  # Error occurred
+
+            # Check for cancellation
+            if self.isCanceled():
+                return False
+
+            # Fetch current positions with individual device error handling
+            current = []
+            device_count = len(devices)
+
+            for i, device in enumerate(devices):
+                # Check for cancellation before each device
+                if self.isCanceled():
+                    return False
+
+                # Update progress (0-50% for current positions)
+                progress = int((i / device_count) * 50)
+                self.setProgress(progress)
+
+                try:
+                    # Fetch this device's current position
+                    device_id = str(device['id'])
+                    device_name = device.get('name', f"Device {device_id}")
+
+                    # Use provider's existing method but handle individual failures
+                    from datetime import datetime, timedelta
+                    current_time = datetime.utcnow()
+                    from_time = current_time - timedelta(hours=1)
+
+                    params = {
+                        'deviceId': device['id'],
+                        'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }
+                    routes = self.provider._make_request('/api/reports/route', params)
+
+                    if routes:
+                        latest = max(routes, key=lambda x: x.get('fixTime', ''))
+                        current.append({
+                            'device_id': device_id,
+                            'name': device_name,
+                            'lat': latest['latitude'],
+                            'lon': latest['longitude'],
+                            'ts': latest['fixTime'],
+                            'altitude': latest.get('altitude'),
+                            'speed': latest.get('speed'),
+                            'battery': latest.get('attributes', {}).get('batteryLevel')
+                        })
+
+                except Exception as e:
+                    # Log error but continue with other devices (graceful degradation)
+                    print(f"Warning: Could not fetch position for device {device.get('name', device['id'])}: {e}")
+                    continue
+
+                # Throttle requests to avoid overwhelming server
+                if i < device_count - 1:  # Don't sleep after last device
+                    time.sleep(self.request_throttle)
+
+            # Check for cancellation
+            if self.isCanceled():
+                return False
+
+            # Fetch breadcrumbs with individual device error handling
+            breadcrumbs = []
+
+            for i, device in enumerate(devices):
+                # Check for cancellation before each device
+                if self.isCanceled():
+                    return False
+
+                # Update progress (50-100% for breadcrumbs)
+                progress = 50 + int((i / device_count) * 50)
+                self.setProgress(progress)
+
+                try:
+                    # Fetch this device's breadcrumbs
+                    device_id = str(device['id'])
+                    device_name = device.get('name', f"Device {device_id}")
+
+                    from datetime import datetime, timedelta
+                    current_time = datetime.utcnow()
+                    from_time = current_time - timedelta(hours=3)
+
+                    params = {
+                        'deviceId': device['id'],
+                        'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                        'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                    }
+                    routes = self.provider._make_request('/api/reports/route', params)
+
+                    for pos in routes:
+                        breadcrumbs.append({
+                            'device_id': device_id,
+                            'name': device_name,
+                            'lat': pos['latitude'],
+                            'lon': pos['longitude'],
+                            'ts': pos['fixTime'],
+                            'altitude': pos.get('altitude'),
+                            'speed': pos.get('speed'),
+                            'battery': pos.get('attributes', {}).get('batteryLevel')
+                        })
+
+                except Exception as e:
+                    # Log error but continue with other devices
+                    print(f"Warning: Could not fetch breadcrumbs for device {device.get('name', device['id'])}: {e}")
+                    continue
+
+                # Throttle requests
+                if i < device_count - 1:
+                    time.sleep(self.request_throttle)
+
+            # Sort breadcrumbs by device then timestamp
+            breadcrumbs.sort(key=lambda x: (x['device_id'], x['ts']))
+
+            # Store results for main thread retrieval
+            self.results = {
+                'current': current,
+                'breadcrumbs': breadcrumbs,
+                'devices': devices
+            }
+
+            return True
+
+        except Exception as e:
+            # Capture error for main thread handling
+            self.error_message = str(e)
+            return False
+
+    def _fetch_with_retry(self, fetch_func, operation_name: str) -> Optional[Any]:
+        """
+        Execute fetch function with retry logic and exponential backoff.
+
+        Args:
+            fetch_func: Function to execute
+            operation_name: Name for error messages
+
+        Returns:
+            Result of fetch_func, or None if all retries failed
+        """
+        import time
+
+        for attempt in range(self.retry_count):
+            # Check for cancellation before each attempt
+            if self.isCanceled():
+                return None
+
+            try:
+                result = fetch_func()
+                return result
+
+            except Exception as e:
+                # Last attempt - capture error
+                if attempt == self.retry_count - 1:
+                    self.error_message = f"Failed to fetch {operation_name} after {self.retry_count} attempts: {str(e)}"
+                    return None
+
+                # Wait before retry (exponential backoff)
+                wait_time = self.retry_backoff * (2 ** attempt)
+                time.sleep(wait_time)

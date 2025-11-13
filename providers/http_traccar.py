@@ -185,3 +185,131 @@ class HttpTraccarProvider(Provider):
 
         except Exception as e:
             raise RuntimeError(f"Failed to fetch breadcrumbs: {str(e)}")
+
+    def save_casualty(self, mission_id: int, name: str,
+                     lat: float, lon: float,
+                     irish_grid_e: Optional[float] = None,
+                     irish_grid_n: Optional[float] = None,
+                     description: str = "") -> int:
+        """
+        HTTP provider does not support saving casualties.
+
+        Raises:
+            NotImplementedError
+        """
+        raise NotImplementedError("HTTP Traccar provider does not support saving casualties")
+
+    def save_poi(self, mission_id: int, name: str,
+                lat: float, lon: float,
+                poi_type: str = "",
+                irish_grid_e: Optional[float] = None,
+                irish_grid_n: Optional[float] = None,
+                description: str = "",
+                color: str = "#007BFF") -> int:
+        """
+        HTTP provider does not support saving POIs.
+
+        Raises:
+            NotImplementedError
+        """
+        raise NotImplementedError("HTTP Traccar provider does not support saving POIs")
+
+    def test_connection(self) -> bool:
+        """
+        Test connection to Traccar server.
+
+        Returns:
+            True if connection successful, False otherwise
+        """
+        try:
+            # Simple API call to verify connectivity
+            self._make_request('/api/devices')
+            return True
+        except Exception:
+            return False
+
+    def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
+        """
+        Create HTTP-specific refresh task with retry logic.
+
+        Args:
+            description: Task description for progress display
+
+        Returns:
+            HTTPRefreshTask instance for background fetching
+
+        Qt5/Qt6 Compatible: Returns QgsTask subclass.
+        """
+        from .tasks import HTTPRefreshTask
+        return HTTPRefreshTask(self, description)
+
+
+# ============================================================================
+# Provider Self-Registration
+# ============================================================================
+
+def _create_http_traccar_provider(config: Dict) -> HttpTraccarProvider:
+    """
+    Factory function for HTTP Traccar provider.
+
+    Args:
+        config: Configuration dict with required keys:
+            - server_url: Traccar server URL (required)
+            - username: API username (required)
+            - password: API password (required)
+            - timeout: Request timeout in seconds (optional, default: 10)
+
+    Returns:
+        HttpTraccarProvider instance
+
+    Raises:
+        ValueError: If required config keys are missing
+    """
+    required = ['server_url', 'username', 'password']
+    for key in required:
+        if key not in config:
+            raise ValueError(f"HTTP Traccar provider requires '{key}' in config")
+
+    return HttpTraccarProvider(
+        server_url=config['server_url'],
+        username=config['username'],
+        password=config['password'],
+        timeout=config.get('timeout', 10)
+    )
+
+
+# Register HTTP Traccar provider with global registry
+from .registry import registry, ProviderMetadata
+
+registry.register(
+    ProviderMetadata(
+        name='http_traccar',
+        display_name='Traccar Server (HTTP)',
+        description='Real-time tracking from Traccar Server HTTP API',
+        requires_config=True,
+        config_schema={
+            'server_url': {
+                'type': 'string',
+                'description': 'Traccar server URL (e.g., http://kmrtsar.eu:8082)',
+                'required': True
+            },
+            'username': {
+                'type': 'string',
+                'description': 'API username',
+                'required': True
+            },
+            'password': {
+                'type': 'password',
+                'description': 'API password/token',
+                'required': True
+            },
+            'timeout': {
+                'type': 'integer',
+                'description': 'HTTP request timeout (seconds)',
+                'required': False,
+                'default': 10
+            }
+        }
+    ),
+    _create_http_traccar_provider
+)

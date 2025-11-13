@@ -51,8 +51,8 @@ try:
     from .providers.registry import registry as provider_registry
     from .providers.base import Provider
     # Trigger provider registration by importing them
-    from .providers import csv
-    # Note: provider_registry now contains registered providers
+    from .providers import csv, http_traccar
+    # Note: provider_registry now contains registered providers (csv, http_traccar)
 except Exception as e:
     _imports_ok = False
     _import_errors.append(('providers', e, traceback.format_exc()))
