@@ -73,17 +73,17 @@ class SARPanel(QDockWidget):
         # Setup UI
         self._setup_ui()
 
-        # Setup auto-refresh timer
-        self.refresh_timer = QTimer()
+        # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
+        self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._on_auto_refresh)
 
         # Setup UI update timer (updates elapsed time every second)
-        self.ui_update_timer = QTimer()
+        self.ui_update_timer = QTimer(self)
         self.ui_update_timer.timeout.connect(self._update_mission_status)
         self.ui_update_timer.start(1000)  # Update every second
 
         # Setup auto-save timer
-        self.autosave_timer = QTimer()
+        self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self._on_autosave)
         
     def _setup_ui(self):
@@ -822,3 +822,63 @@ class SARPanel(QDockWidget):
                 f"Error in focus mode: {e}",
                 duration=3
             )
+
+    def cleanup(self):
+        """
+        Explicit cleanup method for proper resource release.
+
+        Stops all timers and disconnects signals before widget destruction.
+        This method should be called from the plugin's unload() sequence.
+
+        Called by:
+            - sartracker.py:unload() during plugin unload
+            - closeEvent() when dock widget is closed by user
+
+        Qt5/Qt6 Compatible: Uses standard QTimer methods (isActive, stop).
+        """
+        try:
+            # Stop auto-refresh timer
+            if hasattr(self, 'refresh_timer') and self.refresh_timer:
+                if self.refresh_timer.isActive():
+                    self.refresh_timer.stop()
+                    print("[SARTRACKER] SARPanel: Stopped refresh_timer")
+
+            # Stop UI update timer
+            if hasattr(self, 'ui_update_timer') and self.ui_update_timer:
+                if self.ui_update_timer.isActive():
+                    self.ui_update_timer.stop()
+                    print("[SARTRACKER] SARPanel: Stopped ui_update_timer")
+
+            # Stop autosave timer
+            if hasattr(self, 'autosave_timer') and self.autosave_timer:
+                if self.autosave_timer.isActive():
+                    self.autosave_timer.stop()
+                    print("[SARTRACKER] SARPanel: Stopped autosave_timer")
+
+            print("[SARTRACKER] SARPanel: All timers stopped during cleanup")
+
+        except Exception as e:
+            # Don't let cleanup errors propagate - log and continue
+            print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def closeEvent(self, event):
+        """
+        Handle widget close event - stop timers before closing.
+
+        This ensures timers are stopped when user manually closes the dock widget
+        (not just during plugin unload).
+
+        Args:
+            event: QCloseEvent from Qt
+
+        Qt5/Qt6 Compatible: Standard Qt event handler.
+        """
+        # Stop all timers before closing
+        self.cleanup()
+
+        # Call parent implementation to complete close
+        super().closeEvent(event)
+
+        print("[SARTRACKER] SARPanel: closeEvent handled, timers stopped")

@@ -176,14 +176,16 @@ class sartracker:
         self.bearing_tool = None
         self.polygon_tool = None
         self.tool_registry = None
+        self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
         self.coords_label = None  # Status bar coordinate display
         self.last_coords_point = None  # Last mouse position (for throttling)
         self.coords_update_timer = None  # Timer to throttle coordinate updates
+        self._map_canvas_connection = None  # Track xyCoordinates signal connection (Issue #4)
 
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
-        self._current_refresh_task = None
+        self._current_refresh_task = None  # For backwards compatibility with Issue #4 cleanup
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -335,6 +337,10 @@ class sartracker:
         # will be set False in run()
         self.first_start = True
 
+        # Initialize task manager for background operations (Issue #6 fix)
+        from .utils.task_manager import TaskManager
+        self.task_manager = TaskManager()
+
         # Initialize layers controller
         self.layers_controller = LayersController(self.iface)
 
@@ -463,7 +469,8 @@ class sartracker:
         self.coords_update_timer.start(50)
 
         # Connect to map canvas mouse movement (stores point, actual update happens on timer)
-        self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
+        # Store connection reference for proper cleanup in unload() (Issue #4)
+        self._map_canvas_connection = self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
 
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
@@ -572,13 +579,58 @@ class sartracker:
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
-            # Cancel any running background refresh task (Issue #1 fix)
+            # ============================================================
+            # CRITICAL: Disconnect signals FIRST (Issue #4 fix)
+            # Do this BEFORE cleaning up widgets to prevent handlers from
+            # running while we're in the middle of cleanup
+            # ============================================================
+
+            # Disconnect map canvas mouse move signal
+            if self._map_canvas_connection is not None:
+                try:
+                    self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
+                    print("[SARTRACKER] xyCoordinates signal disconnected successfully")
+                except (TypeError, RuntimeError) as e:
+                    # TypeError: Signal not connected (initGui never completed)
+                    # RuntimeError: C++ object already deleted
+                    print(f"[SARTRACKER] Warning: Could not disconnect xyCoordinates: {e}")
+                self._map_canvas_connection = None
+
+            # Cancel all background tasks (Issue #6 fix)
+            # TaskManager handles:
+            # - Signal disconnection BEFORE cancellation
+            # - Task cancellation
+            # - Cleanup of all active tasks
+            if self.task_manager:
+                try:
+                    active_count = self.task_manager.get_active_count()
+                    if active_count > 0:
+                        print(f"[SARTRACKER] Cancelling {active_count} active task(s)...")
+                        self.task_manager.cancel_all()
+                        print("[SARTRACKER] All tasks cancelled successfully")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: TaskManager cleanup error: {e}")
+                finally:
+                    self.task_manager = None
+
+            # Legacy cleanup (for backwards compatibility if TaskManager not initialized)
             if self._current_refresh_task:
                 try:
+                    # Disconnect signals BEFORE canceling
+                    try:
+                        self._current_refresh_task.taskCompleted.disconnect()
+                    except TypeError:
+                        pass
+                    try:
+                        self._current_refresh_task.taskTerminated.disconnect()
+                    except TypeError:
+                        pass
                     self._current_refresh_task.cancel()
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Legacy task cleanup error: {e}")
+                finally:
                     self._current_refresh_task = None
-                except:
-                    pass  # Task might have already completed
+
             self._refresh_in_progress = False
 
             # Remove menu items and toolbar icons
@@ -640,6 +692,13 @@ class sartracker:
 
             # Disconnect and clean up SAR Panel
             if self.sar_panel:
+                # Stop all timers BEFORE disconnecting signals (Issue #5 fix)
+                try:
+                    if hasattr(self.sar_panel, 'cleanup'):
+                        self.sar_panel.cleanup()
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
+
                 try:
                     # Disconnect all signals
                     self.sar_panel.mission_started.disconnect()
@@ -775,15 +834,20 @@ class sartracker:
             # Create provider-specific background task
             task = self.provider.create_refresh_task("Refreshing tracking data")
 
-            # Connect completion signals
-            task.taskCompleted.connect(lambda: self._on_refresh_complete(task))
-            task.taskTerminated.connect(lambda: self._on_refresh_error(task))
+            # Start task with managed lifecycle (Issue #6 fix)
+            # TaskManager handles:
+            # - Signal connection
+            # - Automatic cleanup after completion
+            # - Safe cancellation
+            task_id = self.task_manager.start_task(
+                task=task,
+                on_complete=self._on_refresh_complete,
+                on_error=self._on_refresh_error,
+                task_id="refresh"
+            )
 
-            # Store reference to allow cancellation
+            # Store task reference for backwards compatibility with Issue #4 cleanup
             self._current_refresh_task = task
-
-            # Start task using QGIS task manager (handles threading)
-            QgsApplication.taskManager().addTask(task)
 
         except Exception as e:
             # Reset state on setup error
@@ -804,13 +868,21 @@ class sartracker:
 
         Args:
             task: Completed ProviderRefreshTask with results
+
+        SAFETY: May be called after plugin unload if signal disconnect failed
+        or task completed during unload. Check component existence.
         """
+        # CRITICAL GUARD: Check if plugin components still exist
+        if not self.layers_controller or not self.sar_panel:
+            print("[SARTRACKER] Refresh completed after plugin unload, ignoring results")
+            return
+
         try:
             # Reset refresh state
             self._refresh_in_progress = False
             self._current_refresh_task = None
 
-            # Hide loading state
+            # Hide loading state (check again before accessing)
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
@@ -877,23 +949,48 @@ class sartracker:
 
         Args:
             task: Failed or terminated ProviderRefreshTask
+
+        SAFETY: May be called after plugin unload if signal disconnect failed
+        or task terminated during unload. Check component existence.
         """
-        # Reset refresh state
-        self._refresh_in_progress = False
-        self._current_refresh_task = None
+        # CRITICAL GUARD: Check if plugin components still exist
+        if not self.sar_panel:
+            print("[SARTRACKER] Refresh error after plugin unload, ignoring")
+            return
 
-        # Hide loading state
-        if self.sar_panel:
-            self.sar_panel.set_loading_state(False)
+        try:
+            # Reset refresh state
+            self._refresh_in_progress = False
+            self._current_refresh_task = None
 
-        # Show error message
-        error_msg = task.error_message if task.error_message else "Unknown error during refresh"
-        error(
-            self.iface.messageBar(),
-            "Refresh Failed",
-            f"Error refreshing data: {error_msg}",
-            duration=5
-        )
+            # Hide loading state
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            # Show error message
+            error_msg = task.error_message if task.error_message else "Unknown error during refresh"
+            error(
+                self.iface.messageBar(),
+                "Refresh Failed",
+                f"Error refreshing data: {error_msg}",
+                duration=5
+            )
+
+        except Exception as e:
+            # DEFENSIVE: Catch ALL exceptions to prevent crashes in error handler
+            print(f"[SARTRACKER] Exception in _on_refresh_error: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Reset state (safe even if components are None)
+            self._refresh_in_progress = False
+
+            # Try to update UI, but don't crash if components are gone
+            try:
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+            except:
+                pass
 
     def _load_provider(self, provider_name: str, config: dict):
         """
@@ -976,15 +1073,20 @@ class sartracker:
             # Create provider-specific background task
             task = self.provider.create_refresh_task("Loading tracking data")
 
-            # Connect completion signals
-            task.taskCompleted.connect(lambda: self._on_load_complete(task))
-            task.taskTerminated.connect(lambda: self._on_refresh_error(task))
+            # Start task with managed lifecycle (Issue #6 fix)
+            # TaskManager handles:
+            # - Signal connection
+            # - Automatic cleanup after completion
+            # - Safe cancellation
+            task_id = self.task_manager.start_task(
+                task=task,
+                on_complete=self._on_load_complete,
+                on_error=self._on_refresh_error,
+                task_id="load"
+            )
 
-            # Store reference
+            # Store task reference for backwards compatibility with Issue #4 cleanup
             self._current_refresh_task = task
-
-            # Start task
-            QgsApplication.taskManager().addTask(task)
 
         except Exception as e:
             # Reset state on error
@@ -1016,13 +1118,21 @@ class sartracker:
 
         Args:
             task: Completed ProviderRefreshTask with results
+
+        SAFETY: May be called after plugin unload if signal disconnect failed
+        or task completed during unload. Check component existence.
         """
+        # CRITICAL GUARD: Check if plugin components still exist
+        if not self.layers_controller or not self.sar_panel:
+            print("[SARTRACKER] Load completed after plugin unload, ignoring results")
+            return
+
         try:
             # Reset refresh state
             self._refresh_in_progress = False
             self._current_refresh_task = None
 
-            # Hide loading state
+            # Hide loading state (check again before accessing)
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
@@ -1098,15 +1208,30 @@ class sartracker:
 
         Args:
             point: QgsPointXY in map canvas CRS
+
+        SAFETY: This handler may be called after plugin unload if signal
+        disconnect failed. Check widget existence before processing.
         """
+        # Defensive check: Ensure our widgets haven't been destroyed
+        # This prevents crashes if disconnect failed or event arrived during unload
+        if not self.coords_label or not self.coords_update_timer:
+            # Plugin is being/has been unloaded, ignore event silently
+            # (This is normal during unload, not an error condition)
+            return
+
+        # Safe to proceed - store point for timer-based update
         self.last_coords_point = point
 
     def _update_coords_display(self):
         """
         Update coordinate display in status bar.
         Called by timer to throttle updates.
+
+        SAFETY: Timer may fire during unload or after widgets destroyed.
+        Check existence before accessing Qt objects.
         """
-        if not self.last_coords_point:
+        # Defensive checks
+        if not self.coords_label or not self.last_coords_point:
             return
 
         try:
@@ -1134,11 +1259,26 @@ class sartracker:
                 f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
                 f"Irish Grid: E:{int(itm_point.x()):7d}  N:{int(itm_point.y()):7d}"
             )
+
+            # Update label (may raise RuntimeError if widget C++ object destroyed)
             self.coords_label.setText(coords_text)
 
+        except RuntimeError as e:
+            # Qt C++ object has been deleted but Python wrapper still exists
+            # This is expected during cleanup - mark widget as invalid
+            print(f"[SARTRACKER] Coordinate label destroyed, stopping updates")
+            self.coords_label = None
+            return
+
         except Exception as e:
-            # Silently fail - don't spam user with coordinate errors
-            pass
+            # Log unexpected errors instead of silent pass
+            # This helps diagnose real bugs vs normal cleanup issues
+            print(f"[SARTRACKER] Warning: Error updating coordinates display: {e}")
+            # Don't spam console - only log first occurrence
+            if not hasattr(self, '_coords_error_logged'):
+                import traceback
+                print(traceback.format_exc())
+                self._coords_error_logged = True
 
     def _on_add_poi_requested(self):
         """Handle Add IPP/LKP button click from SAR Panel."""
