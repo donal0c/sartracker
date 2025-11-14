@@ -29,58 +29,104 @@ class HttpTraccarProvider(Provider):
             username: API username
             password: API password/token
             timeout: HTTP request timeout in seconds
+
+        THREAD-SAFETY (Issue #1 fix):
+        Does NOT create a shared session - sessions are created per-task
+        to avoid thread contention on connection pools.
         """
         self.server_url = server_url.rstrip('/')
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.auth = (username, password)
-        self.session.headers.update({'Accept': 'application/json'})
+        # Do NOT create session here - sessions are per-task now (Issue #1)
+        # Each background task creates its own session for thread isolation
 
-    def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> List[Dict]:
+    def _create_session(self) -> requests.Session:
+        """
+        Create a new requests.Session for this thread.
+
+        THREAD-SAFETY (Issue #1 fix):
+        Each background task must create its own session to avoid
+        sharing connection pools and mutable state across threads.
+
+        Returns:
+            Fresh requests.Session instance configured for Traccar API
+        """
+        session = requests.Session()
+        session.auth = (self.username, self.password)
+        session.headers.update({'Accept': 'application/json'})
+        return session
+
+    def _make_request(self, endpoint: str, params: Optional[Dict] = None,
+                      session: Optional[requests.Session] = None) -> List[Dict]:
         """
         Make HTTP request to Traccar API.
 
         Args:
             endpoint: API endpoint (e.g., "/api/devices")
             params: Optional query parameters
+            session: Optional requests.Session (for thread-safe task execution).
+                     If None, creates a temporary session (legacy compatibility).
 
         Returns:
             Parsed JSON response as list of dicts
 
         Raises:
             requests.RequestException: On network or HTTP errors
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks MUST pass their own session to avoid thread contention.
         """
         url = f"{self.server_url}{endpoint}"
-        response = self.session.get(url, params=params, timeout=self.timeout)
+
+        # Use provided session or create temporary one (backwards compatibility)
+        if session is None:
+            # Legacy path: create temporary session for synchronous calls
+            # (e.g., test_connection, get_devices from main thread)
+            session = self._create_session()
+
+        response = session.get(url, params=params, timeout=self.timeout)
         response.raise_for_status()
         return response.json()
 
-    def get_devices(self) -> List[Dict[str, object]]:
+    def get_devices(self, session: Optional[requests.Session] = None) -> List[Dict[str, object]]:
         """
         Get all devices from Traccar server.
 
+        Args:
+            session: Optional requests.Session for thread-safe execution.
+                     If None, creates temporary session.
+
         Returns:
             List of device dicts with id, name, status, etc.
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks should pass their own session instance.
         """
         try:
-            return self._make_request('/api/devices')
+            return self._make_request('/api/devices', session=session)
         except Exception as e:
             raise RuntimeError(f"Failed to fetch devices: {str(e)}")
 
-    def get_current(self) -> List[FeatureDict]:
+    def get_current(self, session: Optional[requests.Session] = None) -> List[FeatureDict]:
         """
         Get current positions for all devices.
 
         Uses /api/positions endpoint or gets latest from recent routes.
 
+        Args:
+            session: Optional requests.Session for thread-safe execution.
+                     If None, creates temporary session.
+
         Returns:
             List of current position features
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks should pass their own session instance.
         """
         try:
             # Get all devices first
-            devices = self.get_devices()
+            devices = self.get_devices(session=session)
 
             # Get positions for last hour to find latest per device
             current_time = datetime.utcnow()
@@ -100,7 +146,7 @@ class HttpTraccarProvider(Provider):
                         'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
                         'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
                     }
-                    routes = self._make_request('/api/reports/route', params)
+                    routes = self._make_request('/api/reports/route', params, session=session)
 
                     if routes:
                         # Get the most recent position
@@ -127,19 +173,25 @@ class HttpTraccarProvider(Provider):
         except Exception as e:
             raise RuntimeError(f"Failed to fetch current positions: {str(e)}")
 
-    def get_breadcrumbs(self, since_iso: Optional[str] = None) -> List[FeatureDict]:
+    def get_breadcrumbs(self, since_iso: Optional[str] = None,
+                        session: Optional[requests.Session] = None) -> List[FeatureDict]:
         """
         Get historical breadcrumb trail for all devices.
 
         Args:
             since_iso: ISO timestamp to fetch from (default: last 3 hours)
+            session: Optional requests.Session for thread-safe execution.
+                     If None, creates temporary session.
 
         Returns:
             List of position features ordered by device then time
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks should pass their own session instance.
         """
         try:
             # Get all devices
-            devices = self.get_devices()
+            devices = self.get_devices(session=session)
 
             # Determine time range
             current_time = datetime.utcnow()
@@ -160,7 +212,7 @@ class HttpTraccarProvider(Provider):
                         'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
                         'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
                     }
-                    routes = self._make_request('/api/reports/route', params)
+                    routes = self._make_request('/api/reports/route', params, session=session)
 
                     for pos in routes:
                         all_positions.append({
@@ -214,16 +266,23 @@ class HttpTraccarProvider(Provider):
         """
         raise NotImplementedError("HTTP Traccar provider does not support saving POIs")
 
-    def test_connection(self) -> bool:
+    def test_connection(self, session: Optional[requests.Session] = None) -> bool:
         """
         Test connection to Traccar server.
 
+        Args:
+            session: Optional requests.Session for thread-safe execution.
+                     If None, creates temporary session.
+
         Returns:
             True if connection successful, False otherwise
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks should pass their own session instance.
         """
         try:
             # Simple API call to verify connectivity
-            self._make_request('/api/devices')
+            self._make_request('/api/devices', session=session)
             return True
         except Exception:
             return False

@@ -160,19 +160,27 @@ class HTTPRefreshTask(ProviderRefreshTask):
         - Use QgsMessageBar or any GUI operations
         - Access QGIS map canvas or layers directly
 
+        THREAD-SAFETY (Issue #1 fix):
+        Creates a dedicated requests.Session for this task to avoid
+        sharing connection pools with other concurrent tasks.
+
         Returns:
             True if successful, False if error occurred
         """
         import time
+
+        # Create thread-local session (Issue #1 fix)
+        # This session is used ONLY by this task and disposed after completion
+        session = self.provider._create_session()
 
         try:
             # Check for cancellation before starting
             if self.isCanceled():
                 return False
 
-            # Fetch devices with retry logic
+            # Fetch devices with retry logic (pass session)
             devices = self._fetch_with_retry(
-                lambda: self.provider.get_devices(),
+                lambda: self.provider.get_devices(session=session),
                 "devices"
             )
 
@@ -211,7 +219,8 @@ class HTTPRefreshTask(ProviderRefreshTask):
                         'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
                         'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
                     }
-                    routes = self.provider._make_request('/api/reports/route', params)
+                    # Pass session to provider method (Issue #1 fix)
+                    routes = self.provider._make_request('/api/reports/route', params, session=session)
 
                     if routes:
                         latest = max(routes, key=lambda x: x.get('fixTime', ''))
@@ -265,7 +274,8 @@ class HTTPRefreshTask(ProviderRefreshTask):
                         'from': from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
                         'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
                     }
-                    routes = self.provider._make_request('/api/reports/route', params)
+                    # Pass session to provider method (Issue #1 fix)
+                    routes = self.provider._make_request('/api/reports/route', params, session=session)
 
                     for pos in routes:
                         breadcrumbs.append({
@@ -305,16 +315,27 @@ class HTTPRefreshTask(ProviderRefreshTask):
             self.error_message = str(e)
             return False
 
+        finally:
+            # CRITICAL: Close session to release connections (Issue #1 fix)
+            try:
+                session.close()
+            except Exception as e:
+                print(f"Warning: Error closing HTTP session: {e}")
+
     def _fetch_with_retry(self, fetch_func, operation_name: str) -> Optional[Any]:
         """
         Execute fetch function with retry logic and exponential backoff.
 
         Args:
-            fetch_func: Function to execute
+            fetch_func: Function to execute (should include session parameter)
             operation_name: Name for error messages
 
         Returns:
             Result of fetch_func, or None if all retries failed
+
+        THREAD-SAFETY (Issue #1 fix):
+        fetch_func should be a lambda that passes the task's session
+        to provider methods, ensuring thread-isolated HTTP state.
         """
         import time
 

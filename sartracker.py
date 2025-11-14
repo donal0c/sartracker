@@ -39,6 +39,7 @@ from .utils.qt_compat import RightDockWidgetArea, dialog_exec, DialogAccepted
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
+from .utils.dialog_utils import BaseDialog
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -115,6 +116,119 @@ except Exception as e:
     _import_errors.append(('ui.coordinate_converter_dialog.CoordinateConverterDialog', e, traceback.format_exc()))
     CoordinateConverterDialog = None
     print(f"ERROR importing CoordinateConverterDialog: {e}")
+
+
+class MissionResumeDialog(BaseDialog):
+    """
+    Dialog to prompt user to resume a paused mission.
+
+    Shows mission details and offers two options:
+    - Resume Mission: Restore saved mission state
+    - Start Fresh: Clear saved state and begin new mission
+
+    Qt5/Qt6 Compatible: Uses BaseDialog for rendering workarounds.
+    """
+
+    def __init__(self, saved_state, parent=None):
+        """
+        Initialize mission resume dialog.
+
+        Args:
+            saved_state: Dictionary containing mission state data
+                Required keys: 'name', 'start_time'
+            parent: Parent widget (should be iface.mainWindow())
+        """
+        super().__init__(parent)
+        self.saved_state = saved_state
+        self.setWindowTitle("Resume Mission?")
+        self.setModal(True)
+        self.setMinimumWidth(400)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Build the dialog UI."""
+        layout = QVBoxLayout()
+
+        # Format start time for display
+        try:
+            start_time_display = self.saved_state['start_time'][:19].replace('T', ' ')
+        except (IndexError, KeyError):
+            start_time_display = self.saved_state.get('start_time', 'Unknown')
+
+        # Message label
+        message = QLabel(
+            f"<b>Found paused mission:</b><br><br>"
+            f"Mission: {self.saved_state.get('name', 'Unknown')}<br>"
+            f"Started: {start_time_display}<br><br>"
+            f"Do you want to resume this mission?"
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        resume_button = QPushButton("Resume Mission")
+        resume_button.setDefault(True)
+        resume_button.clicked.connect(self.accept)
+        button_layout.addWidget(resume_button)
+
+        cancel_button = QPushButton("Start Fresh")
+        cancel_button.clicked.connect(self.reject)
+        button_layout.addWidget(cancel_button)
+
+        layout.addLayout(button_layout)
+
+        # Apply layout (triggers BaseDialog workarounds)
+        self.setLayout(layout)
+
+
+class ImportFailureDialog(BaseDialog):
+    """
+    Dialog to display import failure details when plugin fails to load.
+
+    Shows detailed error information in a scrollable text area to help
+    users diagnose and report plugin initialization problems.
+
+    Qt5/Qt6 Compatible: Uses BaseDialog for rendering workarounds.
+    """
+
+    def __init__(self, error_summary, parent=None):
+        """
+        Initialize import failure dialog.
+
+        Args:
+            error_summary: Formatted string containing error details
+            parent: Parent widget (should be iface.mainWindow())
+        """
+        super().__init__(parent)
+        self.error_summary = error_summary
+        self.setWindowTitle("SAR Tracker - Import Failure")
+        self.setMinimumSize(700, 500)
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Build the dialog UI."""
+        from qgis.PyQt.QtWidgets import QTextEdit
+
+        layout = QVBoxLayout()
+
+        # Scrollable text area for error details
+        text_edit = QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setPlainText(self.error_summary)
+        text_edit.setFont(QFont("Courier New", 9))
+        layout.addWidget(text_edit)
+
+        # Close button
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+        # Apply layout (triggers BaseDialog workarounds)
+        self.setLayout(layout)
 
 
 class sartracker:
@@ -486,10 +600,8 @@ class sartracker:
         Args:
             errors: List of (module_name, exception, traceback) tuples
 
-        Qt5/Qt6 Compatible: Uses utils.notify helpers and standard Qt dialogs
+        Qt5/Qt6 Compatible: Uses utils.notify helpers and BaseDialog
         """
-        from qgis.PyQt.QtWidgets import QMessageBox, QTextEdit, QVBoxLayout, QDialog, QPushButton
-
         # Show persistent message bar warning
         error(
             self.iface.messageBar(),
@@ -519,29 +631,8 @@ class sartracker:
         error_summary += "="*70 + "\n\n"
         error_summary += errors[0][2]  # Include full traceback of first error
 
-        # Create custom dialog with scrollable text area
-        dialog = QDialog(self.iface.mainWindow())
-        dialog.setWindowTitle("SAR Tracker - Import Failure")
-        dialog.setMinimumSize(700, 500)
-
-        layout = QVBoxLayout()
-
-        # Scrollable text area for error details
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(error_summary)
-        text_edit.setFont(QFont("Courier New", 9))
-        layout.addWidget(text_edit)
-
-        # Close button
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(dialog.accept)
-        layout.addWidget(close_button)
-
-        dialog.setLayout(layout)
-
-        # Show modal dialog
-        from .utils.qt_compat import dialog_exec
+        # Show import failure dialog using BaseDialog (Issue #2 fix)
+        dialog = ImportFailureDialog(error_summary, parent=self.iface.mainWindow())
         dialog_exec(dialog)
 
     def _show_diagnostics(self):
@@ -1760,45 +1851,8 @@ class sartracker:
                 # No saved state or invalid state (already cleared)
                 return
 
-            # Show resume dialog
-            dialog = QDialog(self.iface.mainWindow())
-            dialog.setWindowTitle("Resume Mission?")
-            dialog.setModal(True)
-
-            layout = QVBoxLayout()
-
-            # Message - safely format datetime string (don't parse here)
-            try:
-                # Try to format nicely, but fallback to raw string
-                start_time_display = saved_state['start_time'][:19].replace('T', ' ')
-            except (IndexError, KeyError):
-                start_time_display = saved_state.get('start_time', 'Unknown')
-
-            message = QLabel(
-                f"<b>Found paused mission:</b><br><br>"
-                f"Mission: {saved_state.get('name', 'Unknown')}<br>"
-                f"Started: {start_time_display}<br><br>"
-                f"Do you want to resume this mission?"
-            )
-            message.setWordWrap(True)
-            layout.addWidget(message)
-
-            # Buttons
-            button_layout = QHBoxLayout()
-
-            resume_button = QPushButton("Resume Mission")
-            resume_button.setDefault(True)
-            resume_button.clicked.connect(dialog.accept)
-            button_layout.addWidget(resume_button)
-
-            cancel_button = QPushButton("Start Fresh")
-            cancel_button.clicked.connect(dialog.reject)
-            button_layout.addWidget(cancel_button)
-
-            layout.addLayout(button_layout)
-            dialog.setLayout(layout)
-
-            # Show dialog and handle result
+            # Show resume dialog using BaseDialog (Issue #2 fix)
+            dialog = MissionResumeDialog(saved_state, parent=self.iface.mainWindow())
             result = dialog_exec(dialog)
 
             if result == DialogAccepted:
