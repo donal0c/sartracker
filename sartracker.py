@@ -1881,3 +1881,73 @@ class sartracker:
                 f"Error checking for paused mission: {e}",
                 duration=5
             )
+
+    def get_plugin_status(self) -> dict:
+        """
+        Get current plugin status for diagnostics.
+
+        This is a lightweight read-only API for diagnostic tools
+        to inspect plugin state without tight coupling to internal components.
+
+        Returns:
+            dict: Plugin status with keys:
+                - mission_active: bool (True if mission is running)
+                - mission_name: str or None (name of current mission)
+                - mission_paused: bool (True if mission is paused)
+                - data_source: str or None (e.g., "CSV: tracking.csv", "HTTP: Traccar")
+                - provider_type: str or None (e.g., "csv", "http_traccar")
+                - devices_count: int (number of tracked devices)
+                - last_refresh: str or None (ISO timestamp of last refresh)
+
+        Qt5/Qt6 Compatible: Pure Python data structures, no Qt types.
+
+        Issue #4 Fix: Replaces widget tree scanning pattern with explicit API contract.
+        """
+        status = {
+            'mission_active': False,
+            'mission_name': None,
+            'mission_paused': False,
+            'data_source': None,
+            'provider_type': None,
+            'devices_count': 0,
+            'last_refresh': None
+        }
+
+        try:
+            # Safely read SAR panel state
+            if self.sar_panel:
+                status['mission_active'] = self.sar_panel.mission_active
+                status['mission_paused'] = self.sar_panel.is_paused
+
+                # Get mission name from input field
+                if hasattr(self.sar_panel, 'mission_name_input'):
+                    mission_name = self.sar_panel.mission_name_input.text().strip()
+                    status['mission_name'] = mission_name if mission_name else None
+
+            # Safely read provider state
+            if self.provider:
+                status['provider_type'] = self.provider_name
+
+                # Get data source display string
+                if self.provider_name == 'csv' and self.provider_config:
+                    csv_path = self.provider_config.get('csv_path', '')
+                    if csv_path:
+                        status['data_source'] = f"CSV: {os.path.basename(csv_path)}"
+                elif self.provider_name == 'http_traccar':
+                    status['data_source'] = "HTTP: Traccar Server"
+                else:
+                    status['data_source'] = self.provider_name
+
+                # Get device count
+                try:
+                    devices = self.provider.get_devices()
+                    status['devices_count'] = len(devices) if devices else 0
+                except Exception:
+                    # Provider may not support get_devices() or may have error
+                    pass
+
+        except Exception as e:
+            # Defensive: Don't let diagnostics query crash plugin
+            print(f"[SARTRACKER] Warning: Error reading plugin status: {e}")
+
+        return status

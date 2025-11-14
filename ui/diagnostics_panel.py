@@ -4,6 +4,11 @@ SAR Tracker Diagnostics Panel
 
 User-facing diagnostics dialog showing environment information,
 compatibility status, and configuration details.
+
+Accesses plugin state via proper API (get_plugin_status()) rather than
+widget tree scanning. See Issue #4 for architectural decision.
+
+Qt5/Qt6 Compatible: Uses qgis.PyQt and BaseDialog.
 """
 
 import sys
@@ -159,26 +164,60 @@ class DiagnosticsPanel(BaseDialog):
         return group
 
     def _create_configuration_section(self):
-        """Create configuration section."""
+        """
+        Create configuration section.
+
+        ARCHITECTURE NOTE: Uses plugin status API (get_plugin_status()) rather
+        than scanning widget tree. This maintains proper layering and makes
+        dependencies explicit. See Issue #4 for historical context.
+        """
         group = QGroupBox("Current Configuration")
         form = QFormLayout()
 
-        # Try to get mission status from SAR Panel (if accessible)
-        try:
-            from qgis.utils import iface
-            # Try to find SAR Panel instance
-            mission_status = "Unable to detect"
-            data_source = "No data source loaded"
+        # Try to get mission status from plugin via proper API
+        mission_status = "Unable to detect"
+        data_source = "No data source loaded"
 
-            # Look for SAR tracker plugin instance
-            plugins = iface.mainWindow().findChildren(QDialog)
-            for plugin_widget in plugins:
-                if hasattr(plugin_widget, 'objectName') and 'sar' in plugin_widget.objectName().lower():
-                    # Found potential SAR panel - try to get status
-                    if hasattr(plugin_widget, 'mission_active'):
-                        mission_status = "Active" if plugin_widget.mission_active else "Inactive"
-                    break
-        except:
+        try:
+            from qgis.utils import plugins
+
+            # Access plugin via QGIS plugin registry (proper way)
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+
+                # Check if plugin has status API (defensive check)
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+
+                    # Format mission status
+                    if status['mission_active']:
+                        if status['mission_paused']:
+                            mission_status = "Active (Paused)"
+                        else:
+                            mission_status = "Active"
+
+                        # Add mission name if available
+                        if status['mission_name']:
+                            mission_status += f" - {status['mission_name']}"
+                    else:
+                        mission_status = "Inactive"
+
+                    # Format data source
+                    if status['data_source']:
+                        device_count = status['devices_count']
+                        data_source = f"{status['data_source']} ({device_count} devices)"
+                    else:
+                        data_source = "No data source loaded"
+                else:
+                    # Plugin doesn't have status API (old version?)
+                    mission_status = "Unable to detect (old plugin version)"
+            else:
+                # Plugin not loaded
+                mission_status = "Plugin not loaded"
+
+        except Exception as e:
+            # Fail gracefully
+            print(f"[DIAGNOSTICS] Error reading plugin status: {e}")
             mission_status = "Unable to detect"
             data_source = "Unable to detect"
 
