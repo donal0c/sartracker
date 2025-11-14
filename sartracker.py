@@ -482,7 +482,7 @@ class sartracker:
         # Initialize Range Ring Tool (with error handling for late-binding import)
         try:
             from .maptools import RangeRingTool
-            self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller)
+            self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
             self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
             self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
             self.range_ring_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Range ring"))
@@ -495,7 +495,7 @@ class sartracker:
         # Initialize Bearing Tool (with error handling for late-binding import)
         try:
             from .maptools import BearingTool
-            self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller)
+            self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
             self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
             self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
             self.bearing_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Bearing line"))
@@ -508,7 +508,7 @@ class sartracker:
         # Initialize Polygon Tool (Search Areas) (with error handling for late-binding import)
         try:
             from .maptools import PolygonTool
-            self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller)
+            self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
             self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
             self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
             self.polygon_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Polygon drawing"))

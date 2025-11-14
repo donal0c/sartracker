@@ -243,16 +243,18 @@ class PolygonTool(BaseDrawingTool):
     Shows live preview with rubber band.
     """
 
-    def __init__(self, canvas, layers_controller):
+    def __init__(self, canvas, layers_controller, iface):
         """
         Initialize polygon drawing tool.
 
         Args:
             canvas: QGIS map canvas
             layers_controller: LayersController instance for saving polygons
+            iface: QgisInterface instance for accessing mainWindow (Issue #3 fix)
         """
         super().__init__(canvas)
         self.layers_controller = layers_controller
+        self.iface = iface
 
         # Polygon drawing state
         self.points = []  # Points in canvas CRS
@@ -417,7 +419,10 @@ class PolygonTool(BaseDrawingTool):
         area_sqkm = self._calculate_area(points_wgs84)
 
         # Show dialog while tool is still active (same as range_ring/bearing)
-        dialog = SearchAreaDialog(area_sqkm, None)
+        # Use iface.mainWindow() as parent for proper lifecycle (Issue #3 fix)
+        # This ensures dialog is destroyed when plugin unloads and maintains
+        # correct modal focus behavior
+        dialog = SearchAreaDialog(area_sqkm, self.iface.mainWindow())
 
         result = dialog_exec(dialog)
 

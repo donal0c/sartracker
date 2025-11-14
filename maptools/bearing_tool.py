@@ -317,16 +317,18 @@ class BearingTool(BaseDrawingTool):
     Click to set origin point, then configure bearing and distance in dialog.
     """
 
-    def __init__(self, canvas, layers_controller):
+    def __init__(self, canvas, layers_controller, iface):
         """
         Initialize bearing line tool.
 
         Args:
             canvas: QGIS map canvas
             layers_controller: LayersController instance for saving bearing lines
+            iface: QgisInterface instance for accessing mainWindow (Issue #3 fix)
         """
         super().__init__(canvas)
         self.layers_controller = layers_controller
+        self.iface = iface
 
         # State
         self.origin_point = None  # Canvas CRS
@@ -361,8 +363,10 @@ class BearingTool(BaseDrawingTool):
             # Transform origin to WGS84 for display
             origin_wgs84 = self.transform_to_wgs84(self.origin_point)
 
-            # Use None as parent since canvas is not a QWidget
-            dialog = BearingLineDialog(origin_wgs84.y(), origin_wgs84.x(), None)
+            # Use iface.mainWindow() as parent for proper lifecycle (Issue #3 fix)
+            # This ensures dialog is destroyed when plugin unloads and maintains
+            # correct modal focus behavior
+            dialog = BearingLineDialog(origin_wgs84.y(), origin_wgs84.x(), self.iface.mainWindow())
 
             if dialog_exec(dialog) == DialogAccepted and dialog.bearing_data:
                 self._create_bearing_line(origin_wgs84, dialog.bearing_data)

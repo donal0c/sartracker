@@ -226,16 +226,18 @@ class RangeRingTool(BaseDrawingTool):
     Supports both manual radii and LPB statistics.
     """
 
-    def __init__(self, canvas, layers_controller):
+    def __init__(self, canvas, layers_controller, iface):
         """
         Initialize range ring tool.
 
         Args:
             canvas: QGIS map canvas
             layers_controller: LayersController instance for saving rings
+            iface: QgisInterface instance for accessing mainWindow (Issue #3 fix)
         """
         super().__init__(canvas)
         self.layers_controller = layers_controller
+        self.iface = iface
 
         # State
         self.center_point = None  # Canvas CRS
@@ -278,8 +280,10 @@ class RangeRingTool(BaseDrawingTool):
 
     def _show_dialog(self):
         """Show range ring configuration dialog."""
-        # Use None as parent since canvas is not a QWidget
-        dialog = RangeRingDialog(None)
+        # Use iface.mainWindow() as parent for proper lifecycle (Issue #3 fix)
+        # This ensures dialog is destroyed when plugin unloads and maintains
+        # correct modal focus behavior
+        dialog = RangeRingDialog(self.iface.mainWindow())
 
         if dialog_exec(dialog) == DialogAccepted and dialog.ring_data:
             self._create_rings(dialog.ring_data)
