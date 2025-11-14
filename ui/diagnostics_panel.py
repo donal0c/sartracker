@@ -206,6 +206,21 @@ class DiagnosticsPanel(BaseDialog):
                     if status['data_source']:
                         device_count = status['devices_count']
                         data_source = f"{status['data_source']} ({device_count} devices)"
+
+                        # ============================================================
+                        # ISSUE #1 FIX: Show last refresh time to indicate data freshness
+                        # This tells user the device count is cached, not real-time
+                        # ============================================================
+                        if status['last_refresh']:
+                            # Parse ISO timestamp and format as human-readable
+                            try:
+                                from datetime import datetime
+                                refresh_time = datetime.fromisoformat(status['last_refresh'])
+                                time_str = refresh_time.strftime('%Y-%m-%d %H:%M:%S')
+                                data_source += f"\n  Last refreshed: {time_str}"
+                            except Exception:
+                                # If parsing fails, just show count
+                                pass
                     else:
                         data_source = "No data source loaded"
                 else:

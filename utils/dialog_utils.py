@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Dialog utilities for Qt 5.15.x rendering workarounds.
+Dialog utilities for Qt 5.15.x rendering workarounds and Qt5/Qt6 compatibility.
 
 This module provides utilities and base classes to work around known
 Qt 5.15.x dialog rendering issues where dialogs appear blank or grey,
 especially on Windows 10/11.
+
+The module is fully compatible with both Qt5 and Qt6, automatically
+detecting the Qt version and using the appropriate dialog execution method.
 
 Classes:
     SafeQDialog - Base dialog class with automatic rendering workarounds
@@ -15,20 +18,25 @@ Functions:
     safe_show_dialog(dialog) - Show any dialog with rendering workarounds
     create_test_dialog() - Create a test dialog for smoke testing
 
+Qt5/Qt6 Compatibility:
+    Both SafeQDialog and BaseDialog automatically handle the exec() vs exec_()
+    difference between Qt5 and Qt6. No changes needed in subclasses.
+
 Usage:
     # Recommended approach:
     from utils.dialog_utils import BaseDialog
+    from utils.qt_compat import dialog_exec, DialogAccepted
 
     class MyDialog(BaseDialog):
         def __init__(self, parent=None):
             super().__init__(parent)
             # Your dialog code here
 
-    # Or use the explicit name:
-    from utils.dialog_utils import SafeQDialog
-
-    class MyDialog(SafeQDialog):
-        ...
+    # Execute the dialog (Qt5/Qt6 compatible):
+    result = dialog_exec(dialog)
+    if result == DialogAccepted:
+        # Process dialog results
+        pass
 """
 
 from qgis.PyQt.QtCore import QTimer, QCoreApplication
@@ -66,8 +74,9 @@ def safe_show_dialog(dialog, modal=True, force_update=True):
 
     # Show dialog
     if modal:
-        # For modal dialogs, use exec_()
-        result = dialog.exec_()
+        # For modal dialogs, use exec_() (Qt5) or exec() (Qt6)
+        from .qt_compat import dialog_exec
+        result = dialog_exec(dialog)
 
         # Extra safety: process events after close
         QApplication.processEvents()
@@ -154,25 +163,52 @@ class SafeQDialog(QDialog):
         """Delayed update to ensure rendering."""
         self.repaint()
 
-    def exec_(self):
+    def _apply_rendering_workarounds(self):
         """
-        Override exec_ to apply workarounds before modal execution.
+        Apply rendering workarounds before showing dialog.
+
+        Internal method to avoid code duplication between exec() and exec_().
+        This method applies the necessary workarounds for Qt 5.15.x blank dialog
+        rendering issues.
         """
-        # Apply pre-show workarounds
         if self.layout():
             self.layout().activate()
-
         self.adjustSize()
         QApplication.processEvents()
 
-        # Call parent exec_
-        return super().exec_()
+    def exec_(self):
+        """
+        Override exec_ to apply workarounds before modal execution.
+
+        Qt5 compatibility: This method exists for Qt5 where dialog.exec_() is standard.
+        On Qt6, this method is deprecated but we keep it for backwards compatibility
+        in case any code directly calls dialog.exec_().
+        """
+        self._apply_rendering_workarounds()
+
+        # Call parent exec_ (Qt5) or exec (Qt6)
+        from .qt_compat import QT_VERSION
+        if QT_VERSION == 6:
+            return super().exec()
+        else:  # Qt5
+            return super().exec_()
 
     def exec(self):
         """
         Qt5/Qt6 compatible exec method.
+
+        This is the recommended method for Qt6. On Qt5, we delegate to exec_()
+        to maintain compatibility. This method applies all rendering workarounds
+        before executing the dialog.
         """
-        return self.exec_()
+        self._apply_rendering_workarounds()
+
+        # Call parent exec (Qt6) or exec_ (Qt5)
+        from .qt_compat import QT_VERSION
+        if QT_VERSION == 6:
+            return super().exec()
+        else:  # Qt5
+            return super().exec_()
 
 
 class DelayedShowDialog(QDialog):

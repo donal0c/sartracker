@@ -45,6 +45,15 @@ If you encounter issues:
 3. Go to **Plugins → SAR Tracker → Run Smoke Test**
 4. Report any failures with screenshots
 
+### Developer Documentation
+
+If you're contributing to SAR Tracker:
+1. Read **[docs/compatibility_and_best_practices.md](docs/compatibility_and_best_practices.md)** for Qt5/Qt6 compatibility rules
+2. Run `./tools/check_compatibility.sh` before committing
+3. Run smoke tests from QGIS Python console
+
+For AI-assisted development, see **[AI_CODE_REFERENCE.md](AI_CODE_REFERENCE.md)**.
+
 ---
 
 ## 📥 Installation

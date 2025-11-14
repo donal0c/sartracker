@@ -200,6 +200,27 @@ fi
 echo ""
 
 # ============================================================================
+# Check 6: Documentation link validation
+# ============================================================================
+echo "Check 6: Documentation link validation..."
+echo "  Verifying: docs/compatibility_and_best_practices.md exists"
+echo ""
+
+if [ -f "docs/compatibility_and_best_practices.md" ]; then
+    echo -e "  ${GREEN}✅ PASS${NC} - Compatibility documentation exists"
+else
+    echo -e "  ${RED}❌ FAIL${NC} - Required documentation missing!"
+    echo ""
+    echo "  ⚠️  File not found: docs/compatibility_and_best_practices.md"
+    echo "  This file is referenced in error messages and must exist."
+    echo ""
+    echo "  If the file was moved or renamed, update this check."
+    FAILED=1
+fi
+
+echo ""
+
+# ============================================================================
 # Summary
 # ============================================================================
 echo "=================================================="
@@ -217,7 +238,10 @@ else
     echo -e "${RED}❌ SOME CHECKS FAILED${NC}"
     echo ""
     echo "Please fix the compatibility issues above before committing."
-    echo "See compatibility_and_best_practices_doc.md for guidance."
+    echo ""
+    echo "📖 Documentation: docs/compatibility_and_best_practices.md"
+    echo "🔧 Run this script: ./tools/check_compatibility.sh"
+    echo "🧪 Test environment: Run smoke tests from QGIS Python console"
     echo ""
     exit 1
 fi

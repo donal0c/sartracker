@@ -823,11 +823,77 @@ class SARPanel(QDockWidget):
                 duration=3
             )
 
+    def _restore_hidden_panels(self):
+        """
+        Restore panels hidden by Focus Mode.
+
+        This is called during cleanup to ensure QGIS returns to its prior
+        state even if the plugin is unloaded while Focus Mode is active.
+
+        Handles edge cases:
+        - Panels already deleted/destroyed (RuntimeError caught)
+        - Panels manually re-shown by user (setVisible is no-op)
+        - Multiple calls (idempotent via focus_mode_active guard)
+
+        Qt5/Qt6 Compatible: Uses standard QDockWidget visibility methods.
+
+        ISSUE #3 FIX: Ensures Focus Mode exits cleanly during plugin unload.
+        """
+        if not self.focus_mode_active:
+            # Not in focus mode, nothing to restore
+            return
+
+        try:
+            restored_count = 0
+            error_count = 0
+
+            # Iterate over copy of list to avoid issues if Qt deletes objects during iteration
+            for panel in list(self.hidden_panels):
+                try:
+                    # Attempt to restore panel visibility
+                    # Note: This may fail if panel was destroyed by user or during shutdown
+                    if not panel.isVisible():  # Optional optimization: only restore if still hidden
+                        panel.setVisible(True)
+                        restored_count += 1
+                except RuntimeError as e:
+                    # Panel's C++ object was deleted - this is expected in some scenarios
+                    # (user closed the panel, or QGIS is shutting down)
+                    error_count += 1
+                    print(f"[SARTRACKER] Panel restoration skipped - C++ object deleted: {e}")
+                except Exception as e:
+                    # Unexpected error - log but continue restoring other panels
+                    error_count += 1
+                    print(f"[SARTRACKER] Warning: Error restoring panel: {e}")
+
+            # Clear state
+            self.hidden_panels = []
+            self.focus_mode_active = False
+
+            # Update button UI if possible (may fail during shutdown)
+            try:
+                self.focus_mode_button.setText("Enter Focus Mode")
+                self.focus_mode_button.setStyleSheet("")
+            except (RuntimeError, AttributeError):
+                # Button already destroyed or doesn't exist - ignore
+                pass
+
+            # Log result
+            if restored_count > 0:
+                print(f"[SARTRACKER] Focus Mode cleanup: {restored_count} panels restored, {error_count} errors")
+
+        except Exception as e:
+            # Catch-all: Don't let panel restoration crash the cleanup sequence
+            print(f"[SARTRACKER] Error in _restore_hidden_panels: {e}")
+            # Ensure state is cleared even if restoration failed
+            self.hidden_panels = []
+            self.focus_mode_active = False
+
     def cleanup(self):
         """
         Explicit cleanup method for proper resource release.
 
-        Stops all timers and disconnects signals before widget destruction.
+        Stops all timers, restores hidden panels (if Focus Mode active),
+        and disconnects signals before widget destruction.
         This method should be called from the plugin's unload() sequence.
 
         Called by:
@@ -837,6 +903,12 @@ class SARPanel(QDockWidget):
         Qt5/Qt6 Compatible: Uses standard QTimer methods (isActive, stop).
         """
         try:
+            # CRITICAL: Restore hidden panels FIRST (Issue #3 fix)
+            # If Focus Mode is active when plugin unloads, we must restore
+            # all hidden dock widgets to return QGIS to its prior state
+            if hasattr(self, '_restore_hidden_panels'):
+                self._restore_hidden_panels()
+
             # Stop auto-refresh timer
             if hasattr(self, 'refresh_timer') and self.refresh_timer:
                 if self.refresh_timer.isActive():
@@ -865,17 +937,17 @@ class SARPanel(QDockWidget):
 
     def closeEvent(self, event):
         """
-        Handle widget close event - stop timers before closing.
+        Handle widget close event - stop timers and restore panels before closing.
 
-        This ensures timers are stopped when user manually closes the dock widget
-        (not just during plugin unload).
+        This ensures timers are stopped and Focus Mode is exited when user manually
+        closes the dock widget (not just during plugin unload).
 
         Args:
             event: QCloseEvent from Qt
 
         Qt5/Qt6 Compatible: Standard Qt event handler.
         """
-        # Stop all timers before closing
+        # Stop all timers and restore panels before closing
         self.cleanup()
 
         # Call parent implementation to complete close

@@ -62,8 +62,11 @@ def run_smoke_test(iface):
     # Test 7: BaseDialog Rendering (Phase 3/6)
     results["tests"]["basedialog_rendering"] = _test_basedialog_rendering()
 
+    # Test 8: run() Method Guard (Issue #3)
+    results["tests"]["run_method_guard"] = _test_run_method_guard()
+
     # Overall result
-    all_passed = all(result == "PASS" for result in results["tests"].values())
+    all_passed = all(result == "PASS" or result.startswith("SKIP") for result in results["tests"].values())
     results["overall"] = "PASS" if all_passed else "FAIL"
 
     # Save results to file (capture path for display)
@@ -256,7 +259,8 @@ def _test_basedialog_rendering():
     """Test BaseDialog (SafeQDialog) instantiates and has proper rendering workarounds."""
     try:
         from ..utils.dialog_utils import BaseDialog, SafeQDialog
-        from qgis.PyQt.QtWidgets import QVBoxLayout, QLabel
+        from qgis.PyQt.QtWidgets import QVBoxLayout, QLabel, QDialog
+        from ..utils.qt_compat import QT_VERSION
 
         # Verify BaseDialog is alias of SafeQDialog
         if BaseDialog is not SafeQDialog:
@@ -277,16 +281,107 @@ def _test_basedialog_rendering():
             return "FAIL: BaseDialog missing _apply_rendering_workarounds method"
 
         # Verify dialog is QDialog subclass
-        from qgis.PyQt.QtWidgets import QDialog
         if not isinstance(dialog, QDialog):
             return "FAIL: BaseDialog is not QDialog subclass"
 
+        # CRITICAL TEST: Verify exec/exec_ methods don't cause AttributeError
+        # This tests Issue #1 fix
+
+        # Test that the correct method exists on parent QDialog
+        base_dialog = QDialog()
+        if QT_VERSION == 6:
+            if not hasattr(base_dialog, 'exec'):
+                return "FAIL: Qt6 QDialog missing exec() method"
+            if hasattr(base_dialog, 'exec_'):
+                return "FAIL: Qt6 QDialog should not have exec_() method"
+        else:  # Qt5
+            if not hasattr(base_dialog, 'exec_'):
+                return "FAIL: Qt5 QDialog missing exec_() method"
+            if not hasattr(base_dialog, 'exec'):
+                return "FAIL: Qt5 QDialog missing exec() method"
+
+        # Test that our BaseDialog has both methods regardless of Qt version
+        if not hasattr(dialog, 'exec'):
+            return "FAIL: BaseDialog missing exec() method"
+        if not hasattr(dialog, 'exec_'):
+            return "FAIL: BaseDialog missing exec_() method"
+
+        # Test that methods are callable (don't actually execute, that would block)
+        if not callable(dialog.exec):
+            return "FAIL: BaseDialog.exec() is not callable"
+        if not callable(dialog.exec_):
+            return "FAIL: BaseDialog.exec_() is not callable"
+
+        # Verify the methods would call the correct parent method by checking
+        # that they don't raise AttributeError when accessing super() methods
+        # We can't actually call them without blocking, but we can verify the
+        # parent has the methods that would be called
+        try:
+            # Simulate what happens inside exec_() and exec()
+            from ..utils.qt_compat import QT_VERSION as qt_ver
+            parent_class = super(BaseDialog, dialog)
+            if qt_ver == 6:
+                # Our code should call super().exec() on Qt6
+                if not hasattr(parent_class, 'exec'):
+                    return "FAIL: Qt6 parent class missing exec() for super() call"
+            else:
+                # Our code should call super().exec_() on Qt5
+                if not hasattr(parent_class, 'exec_'):
+                    return "FAIL: Qt5 parent class missing exec_() for super() call"
+        except Exception as e:
+            return f"FAIL: Error verifying super() method access: {e}"
+
         # Clean up
         dialog.deleteLater()
+        base_dialog.deleteLater()
 
         return "PASS"
+    except AttributeError as e:
+        # This is the specific error we're trying to prevent with Issue #1 fix
+        return f"FAIL: AttributeError indicates Qt6 compatibility issue: {e}"
     except Exception as e:
         return f"FAIL: {e}"
+
+
+def _test_run_method_guard():
+    """
+    Test that run() method guards against None panel (Issue #3).
+
+    Simulates scenario where imports failed but action callback fires.
+    Verifies defensive guard prevents AttributeError crash.
+    """
+    try:
+        from qgis.utils import plugins
+
+        if 'sartracker' not in plugins:
+            return "SKIP: Plugin not loaded"
+
+        plugin = plugins['sartracker']
+
+        # Save original panel reference
+        original_panel = plugin.sar_panel
+
+        try:
+            # Simulate import failure scenario (panel is None)
+            plugin.sar_panel = None
+
+            # Attempt to call run() - should not crash
+            try:
+                plugin.run()
+                # If we get here, guard worked (no AttributeError)
+                result = "PASS"
+            except AttributeError as e:
+                # This indicates Issue #3 is not fixed!
+                result = f"FAIL: run() crashed with AttributeError: {e}"
+
+        finally:
+            # Restore original panel reference
+            plugin.sar_panel = original_panel
+
+        return result
+
+    except Exception as e:
+        return f"FAIL: Test setup error: {e}"
 
 
 def _get_plugin_version():

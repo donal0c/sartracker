@@ -295,11 +295,15 @@ class sartracker:
         self.coords_label = None  # Status bar coordinate display
         self.last_coords_point = None  # Last mouse position (for throttling)
         self.coords_update_timer = None  # Timer to throttle coordinate updates
-        self._map_canvas_connection = None  # Track xyCoordinates signal connection (Issue #4)
+        self._map_canvas_connected = False  # Track xyCoordinates signal connection (Issue #4)
 
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
         self._current_refresh_task = None  # For backwards compatibility with Issue #4 cleanup
+
+        # Cached data for diagnostics (Issue #1 fix)
+        self._cached_device_count = 0  # Last known device count
+        self._last_refresh_time = None  # ISO timestamp of last successful refresh
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -455,6 +459,10 @@ class sartracker:
         from .utils.task_manager import TaskManager
         self.task_manager = TaskManager()
 
+        # Connection test tracking (Issue #2 fix)
+        self._current_connection_task = None
+        self._pending_provider_metadata = None
+
         # Initialize layers controller
         self.layers_controller = LayersController(self.iface)
 
@@ -584,7 +592,8 @@ class sartracker:
 
         # Connect to map canvas mouse movement (stores point, actual update happens on timer)
         # Store connection reference for proper cleanup in unload() (Issue #4)
-        self._map_canvas_connection = self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
+        self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
+        self._map_canvas_connected = True
 
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
@@ -677,7 +686,7 @@ class sartracker:
             # ============================================================
 
             # Disconnect map canvas mouse move signal
-            if self._map_canvas_connection is not None:
+            if self._map_canvas_connected:
                 try:
                     self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
                     print("[SARTRACKER] xyCoordinates signal disconnected successfully")
@@ -685,7 +694,8 @@ class sartracker:
                     # TypeError: Signal not connected (initGui never completed)
                     # RuntimeError: C++ object already deleted
                     print(f"[SARTRACKER] Warning: Could not disconnect xyCoordinates: {e}")
-                self._map_canvas_connection = None
+                finally:
+                    self._map_canvas_connected = False
 
             # Cancel all background tasks (Issue #6 fix)
             # TaskManager handles:
@@ -721,6 +731,14 @@ class sartracker:
                     print(f"[SARTRACKER] Warning: Legacy task cleanup error: {e}")
                 finally:
                     self._current_refresh_task = None
+
+            # Legacy cleanup for connection test task (Issue #2 fix)
+            if hasattr(self, '_current_connection_task') and self._current_connection_task:
+                try:
+                    self._current_connection_task.cancel()
+                    self._current_connection_task = None
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Connection task cleanup error: {e}")
 
             self._refresh_in_progress = False
 
@@ -829,6 +847,11 @@ class sartracker:
             if self.provider:
                 try:
                     self.provider = None
+                    # ============================================================
+                    # ISSUE #1 FIX: Clear cached device count when provider removed
+                    # ============================================================
+                    self._cached_device_count = 0
+                    self._last_refresh_time = None
                 except:
                     pass
 
@@ -839,7 +862,34 @@ class sartracker:
 
 
     def run(self):
-        """Toggle SAR Tracker panel visibility"""
+        """
+        Toggle SAR Tracker panel visibility.
+
+        Guards against initialization failure (Issue #3 fix):
+        If imports failed during initGui(), self.sar_panel will be None.
+        Show user-friendly error instead of crashing with AttributeError.
+        """
+        # CRITICAL GUARD: Check if panel exists (Issue #3 fix)
+        # Panel may be None if imports failed during initialization
+        if not self.sar_panel:
+            # Show persistent error message with actionable guidance
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Not Initialized",
+                "Plugin failed to load due to import errors. Click 'Diagnostics' in the SAR Tracker menu for details and troubleshooting guidance.",
+                duration=0  # Persistent - stays until user dismisses
+            )
+
+            # Auto-open diagnostics dialog for immediate remediation
+            try:
+                self._show_diagnostics()
+            except Exception as e:
+                # If diagnostics also fails, log but don't crash
+                print(f"[SARTRACKER] Could not open diagnostics: {e}")
+
+            return  # Early exit - don't attempt to access panel
+
+        # Safe to proceed - panel exists and is valid
         if self.sar_panel.isVisible():
             self.sar_panel.hide()
         else:
@@ -1002,6 +1052,17 @@ class sartracker:
             breadcrumbs = results.get('breadcrumbs', [])
             devices = results.get('devices', [])
 
+            # ============================================================
+            # ISSUE #1 FIX: Update cached device count for diagnostics
+            # This happens AFTER background task completes, never on UI thread
+            # ============================================================
+            try:
+                from datetime import datetime
+                self._cached_device_count = len(devices) if devices else 0
+                self._last_refresh_time = datetime.now().isoformat()
+            except Exception as cache_error:
+                print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
+
             # Update layers (main thread operation)
             if current:
                 self.layers_controller.update_current_positions(current)
@@ -1098,6 +1159,9 @@ class sartracker:
             config: Provider-specific configuration dict
 
         Qt5/Qt6 Compatible: Uses provider registry pattern.
+
+        ISSUE #2 FIX: Connection test now runs in background to prevent
+        UI freezes during HTTP operations with slow/unreachable servers.
         """
         # Prevent concurrent operations
         if self._refresh_in_progress:
@@ -1115,41 +1179,13 @@ class sartracker:
             self.provider_name = provider_name
             self.provider_config = config
 
-            # Test connection (quick synchronous check)
-            if not self.provider.test_connection():
-                error(
-                    self.iface.messageBar(),
-                    "Connection Error",
-                    f"Could not connect to {provider_name} data source",
-                    duration=5
-                )
-                self.provider = None
-                self.provider_name = None
-                self.provider_config = None
-                return
-
-            # Update data source label with provider-specific info
-            metadata = next(
+            # Store provider metadata for later use
+            self._pending_provider_metadata = next(
                 (m for m in provider_registry.list_providers() if m.name == provider_name),
                 None
             )
-            display_name = metadata.display_name if metadata else provider_name
 
-            # Generate appropriate label based on provider type
-            if provider_name == 'csv':
-                import os
-                csv_path = config['csv_path']
-                if os.path.isdir(csv_path):
-                    label = f"{display_name}: {os.path.basename(csv_path)}"
-                else:
-                    label = f"{display_name}: {os.path.basename(csv_path)}"
-            else:
-                # Generic label for other providers
-                label = display_name
-
-            self.sar_panel.set_data_source(label)
-
-            # Set loading state
+            # Set loading state IMMEDIATELY (Issue #2 fix)
             self._refresh_in_progress = True
             if self.sar_panel:
                 self.sar_panel.set_loading_state(True)
@@ -1157,27 +1193,24 @@ class sartracker:
             info(
                 self.iface.messageBar(),
                 "SAR Tracker",
-                f"Loading data from {display_name}...",
+                f"Connecting to {provider_name}...",
                 duration=2
             )
 
-            # Create provider-specific background task
-            task = self.provider.create_refresh_task("Loading tracking data")
+            # Create connection test task (Issue #2 fix)
+            from .providers.tasks import ConnectionTestTask
+            test_task = ConnectionTestTask(self.provider, f"Testing {provider_name} connection")
 
-            # Start task with managed lifecycle (Issue #6 fix)
-            # TaskManager handles:
-            # - Signal connection
-            # - Automatic cleanup after completion
-            # - Safe cancellation
+            # Start task with managed lifecycle
             task_id = self.task_manager.start_task(
-                task=task,
-                on_complete=self._on_load_complete,
-                on_error=self._on_refresh_error,
-                task_id="load"
+                task=test_task,
+                on_complete=self._on_connection_test_complete,
+                on_error=self._on_connection_test_error,
+                task_id="connection_test"
             )
 
-            # Store task reference for backwards compatibility with Issue #4 cleanup
-            self._current_refresh_task = task
+            # Store task reference for potential cancellation
+            self._current_connection_task = test_task
 
         except Exception as e:
             # Reset state on error
@@ -1191,6 +1224,222 @@ class sartracker:
                 f"Failed to load {provider_name}: {str(e)}",
                 duration=5
             )
+
+            # Clean up provider on failure
+            self.provider = None
+            self.provider_name = None
+            self.provider_config = None
+
+    def _on_connection_test_complete(self, task):
+        """
+        Handle connection test completion (runs in main thread).
+
+        If connection successful, proceeds to load data.
+        If connection failed, shows error and cleans up.
+
+        Args:
+            task: Completed ConnectionTestTask
+
+        SAFETY: May be called after plugin unload if signal disconnect failed.
+        Check component existence before accessing.
+
+        ISSUE #2 FIX: This callback runs after background connection test,
+        preventing UI freezes during HTTP operations.
+        """
+        # CRITICAL GUARD: Check if plugin components still exist
+        if not self.sar_panel:
+            print("[SARTRACKER] Connection test completed after plugin unload, ignoring")
+            return
+
+        try:
+            # Clear task reference
+            self._current_connection_task = None
+
+            # Check if connection test succeeded
+            if not task.success:
+                # Connection failed - show error and clean up
+                self._refresh_in_progress = False
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+
+                error(
+                    self.iface.messageBar(),
+                    "Connection Error",
+                    f"Could not connect to {self.provider_name} data source",
+                    duration=5
+                )
+
+                # Clean up provider
+                self.provider = None
+                self.provider_name = None
+                self.provider_config = None
+                self._pending_provider_metadata = None
+                return
+
+            # Connection successful - show notification
+            success(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Connected to {self.provider_name} successfully",
+                duration=2
+            )
+
+            # Update data source label with provider-specific info
+            display_name = (
+                self._pending_provider_metadata.display_name
+                if self._pending_provider_metadata
+                else self.provider_name
+            )
+
+            # Generate appropriate label based on provider type
+            if self.provider_name == 'csv':
+                import os
+                csv_path = self.provider_config['csv_path']
+                if os.path.isdir(csv_path):
+                    label = f"{display_name}: {os.path.basename(csv_path)}"
+                else:
+                    label = f"{display_name}: {os.path.basename(csv_path)}"
+            else:
+                # Generic label for other providers
+                label = display_name
+
+            # Set data source label (check panel still exists)
+            if self.sar_panel:
+                self.sar_panel.set_data_source(label)
+
+            # Clean up metadata
+            self._pending_provider_metadata = None
+
+            # Update info message for data loading phase
+            info(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Loading data from {display_name}...",
+                duration=2
+            )
+
+            # Verify provider still exists (defensive check for life-safety)
+            if not self.provider:
+                self._refresh_in_progress = False
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+                # Clean up state
+                self.provider_name = None
+                self.provider_config = None
+                self._pending_provider_metadata = None
+                error(
+                    self.iface.messageBar(),
+                    "Internal Error",
+                    "Provider was cleared during connection test",
+                    duration=5
+                )
+                return
+
+            # Create provider-specific background task for data load
+            data_task = self.provider.create_refresh_task("Loading tracking data")
+
+            # Verify task manager still exists (defensive check)
+            if not self.task_manager:
+                self._refresh_in_progress = False
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+                # Clean up provider state
+                self.provider = None
+                self.provider_name = None
+                self.provider_config = None
+                self._pending_provider_metadata = None
+                error(
+                    self.iface.messageBar(),
+                    "Internal Error",
+                    "Task manager was cleared during connection test",
+                    duration=5
+                )
+                return
+
+            # Start data load task with managed lifecycle
+            task_id = self.task_manager.start_task(
+                task=data_task,
+                on_complete=self._on_load_complete,
+                on_error=self._on_refresh_error,
+                task_id="load"
+            )
+
+            # Store task reference for backwards compatibility with Issue #4 cleanup
+            self._current_refresh_task = data_task
+
+        except Exception as e:
+            # Reset state on error
+            self._refresh_in_progress = False
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            error(
+                self.iface.messageBar(),
+                "Error After Connection Test",
+                f"Failed to start data load: {str(e)}",
+                duration=5
+            )
+
+            # Clean up provider
+            self.provider = None
+            self.provider_name = None
+            self.provider_config = None
+            self._pending_provider_metadata = None
+
+    def _on_connection_test_error(self, task):
+        """
+        Handle connection test error or cancellation (runs in main thread).
+
+        Args:
+            task: Failed or cancelled ConnectionTestTask
+
+        SAFETY: May be called after plugin unload if signal disconnect failed.
+        Check component existence before accessing.
+
+        ISSUE #2 FIX: This callback runs after background connection test,
+        preventing UI freezes during HTTP operations.
+        """
+        # CRITICAL GUARD: Check if plugin components still exist
+        if not self.sar_panel:
+            print("[SARTRACKER] Connection test error after plugin unload, ignoring")
+            return
+
+        try:
+            # Clear task reference
+            self._current_connection_task = None
+
+            # Reset refresh state
+            self._refresh_in_progress = False
+
+            # Hide loading state
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+
+            # Show error message
+            error_msg = (
+                task.error_message
+                if hasattr(task, 'error_message') and task.error_message
+                else "Connection test failed or was cancelled"
+            )
+
+            error(
+                self.iface.messageBar(),
+                "Connection Test Failed",
+                error_msg,
+                duration=5
+            )
+
+            # Clean up provider
+            self.provider = None
+            self.provider_name = None
+            self.provider_config = None
+            self._pending_provider_metadata = None
+
+        except Exception as e:
+            # Last resort error handling
+            print(f"[SARTRACKER] Error in connection test error handler: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _on_load_csv(self, csv_file):
         """
@@ -1251,6 +1500,17 @@ class sartracker:
             current = results.get('current', [])
             breadcrumbs = results.get('breadcrumbs', [])
             devices = results.get('devices', [])
+
+            # ============================================================
+            # ISSUE #1 FIX: Update cached device count for diagnostics
+            # This happens AFTER background task completes, never on UI thread
+            # ============================================================
+            try:
+                from datetime import datetime
+                self._cached_device_count = len(devices) if devices else 0
+                self._last_refresh_time = datetime.now().isoformat()
+            except Exception as cache_error:
+                print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
 
             # Update layers (main thread operation)
             if current:
@@ -1844,6 +2104,12 @@ class sartracker:
 
     def _check_for_paused_mission(self):
         """Check if there's a paused mission and prompt user to resume."""
+        # CRITICAL GUARD: Check if plugin components still exist (Issue #4 fix)
+        # Single-shot timer may fire after unload in fast reload scenarios
+        if not self.sar_panel or not self.iface:
+            print("[SARTRACKER] Mission resume check skipped - plugin unloaded")
+            return
+
         try:
             saved_state = self.sar_panel.load_mission_state()
 
@@ -1896,12 +2162,14 @@ class sartracker:
                 - mission_paused: bool (True if mission is paused)
                 - data_source: str or None (e.g., "CSV: tracking.csv", "HTTP: Traccar")
                 - provider_type: str or None (e.g., "csv", "http_traccar")
-                - devices_count: int (number of tracked devices)
+                - devices_count: int (number of tracked devices, cached)
                 - last_refresh: str or None (ISO timestamp of last refresh)
 
         Qt5/Qt6 Compatible: Pure Python data structures, no Qt types.
 
         Issue #4 Fix: Replaces widget tree scanning pattern with explicit API contract.
+        Issue #1 Fix: Returns cached device count populated by background refresh tasks.
+                      Never performs network I/O on UI thread.
         """
         status = {
             'mission_active': False,
@@ -1938,13 +2206,12 @@ class sartracker:
                 else:
                     status['data_source'] = self.provider_name
 
-                # Get device count
-                try:
-                    devices = self.provider.get_devices()
-                    status['devices_count'] = len(devices) if devices else 0
-                except Exception:
-                    # Provider may not support get_devices() or may have error
-                    pass
+                # ============================================================
+                # ISSUE #1 FIX: Use cached device count instead of querying provider
+                # Cache is updated by background refresh tasks, never blocks UI
+                # ============================================================
+                status['devices_count'] = self._cached_device_count
+                status['last_refresh'] = self._last_refresh_time
 
         except Exception as e:
             # Defensive: Don't let diagnostics query crash plugin
