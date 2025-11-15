@@ -1,0 +1,265 @@
+# -*- coding: utf-8 -*-
+"""
+Centralized QSettings Key Definitions
+
+This module provides a single source of truth for all QSettings keys used
+throughout the SAR Tracker plugin. Centralizing keys here prevents typos,
+makes refactoring easier, and provides clear documentation of all persisted
+settings.
+
+Qt5/Qt6 Compatible: Pure Python constants, no Qt dependencies.
+
+Usage:
+    from config.keys import SETTINGS_KEYS
+    settings = QSettings()
+    settings.setValue(SETTINGS_KEYS.AUTO_REFRESH_ENABLED, True)
+"""
+
+
+class SETTINGS_KEYS:
+    """
+    Centralized QSettings key definitions.
+
+    All keys use the "SARTracker/" prefix for namespace isolation.
+    Keys are organized by functional area for maintainability.
+    """
+
+    # ========================================================================
+    # AUTO-REFRESH CONFIGURATION
+    # ========================================================================
+    AUTO_REFRESH_ENABLED = "SARTracker/AutoRefresh/enabled"
+    AUTO_REFRESH_INTERVAL = "SARTracker/AutoRefresh/interval_seconds"
+
+    # Defaults
+    AUTO_REFRESH_ENABLED_DEFAULT = False
+    AUTO_REFRESH_INTERVAL_DEFAULT = 30  # seconds
+    AUTO_REFRESH_INTERVAL_MIN = 5
+    AUTO_REFRESH_INTERVAL_MAX = 300
+
+    # ========================================================================
+    # AUTO-SAVE CONFIGURATION
+    # ========================================================================
+    AUTO_SAVE_ENABLED = "SARTracker/AutoSave/enabled"
+    AUTO_SAVE_INTERVAL = "SARTracker/AutoSave/interval_minutes"
+
+    # Defaults
+    AUTO_SAVE_ENABLED_DEFAULT = False
+    AUTO_SAVE_INTERVAL_DEFAULT = 5  # minutes
+    AUTO_SAVE_INTERVAL_MIN = 1
+    AUTO_SAVE_INTERVAL_MAX = 60
+
+    # ========================================================================
+    # PROVIDER CONFIGURATION
+    # ========================================================================
+    PROVIDER_LAST = "SARTracker/Providers/last_provider"
+    PROVIDER_AUTO_CONNECT = "SARTracker/Providers/auto_connect_on_startup"
+
+    # Provider-specific config (use format: f"SARTracker/Providers/{provider_name}/{key}")
+    # CSV Provider
+    PROVIDER_CSV_PATH = "SARTracker/Providers/csv/csv_path"
+
+    # HTTP Traccar Provider (legacy)
+    PROVIDER_HTTP_SERVER_URL = "SARTracker/Providers/http_traccar/server_url"
+    PROVIDER_HTTP_USERNAME = "SARTracker/Providers/http_traccar/username"
+    PROVIDER_HTTP_PASSWORD = "SARTracker/Providers/http_traccar/password"
+    PROVIDER_HTTP_TIMEOUT = "SARTracker/Providers/http_traccar/timeout"
+
+    # Traccar HTTP Provider (Phase 4)
+    PROVIDER_TRACCAR_BASE_URL = "SARTracker/Providers/traccar_http/base_url"
+    PROVIDER_TRACCAR_AUTH_TYPE = "SARTracker/Providers/traccar_http/auth_type"
+    PROVIDER_TRACCAR_USERNAME = "SARTracker/Providers/traccar_http/username"
+    PROVIDER_TRACCAR_PASSWORD = "SARTracker/Providers/traccar_http/password"
+    PROVIDER_TRACCAR_TOKEN = "SARTracker/Providers/traccar_http/token"
+    PROVIDER_TRACCAR_TIMEOUT = "SARTracker/Providers/traccar_http/timeout_s"
+    PROVIDER_TRACCAR_CACHE_TTL = "SARTracker/Providers/traccar_http/cache_ttl"
+    PROVIDER_TRACCAR_CACHE_ENABLED = "SARTracker/Providers/traccar_http/enable_last_good_cache"
+    PROVIDER_TRACCAR_FEATURE_FLAG = "SARTracker/Providers/traccar_http/enabled"
+
+    # Defaults
+    PROVIDER_AUTO_CONNECT_DEFAULT = False
+    PROVIDER_HTTP_TIMEOUT_DEFAULT = 10  # seconds
+    PROVIDER_TRACCAR_TIMEOUT_DEFAULT = 10  # seconds
+    PROVIDER_TRACCAR_CACHE_TTL_DEFAULT = 300  # seconds
+    PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT = True
+    PROVIDER_TRACCAR_FEATURE_FLAG_DEFAULT = False
+
+    # ========================================================================
+    # MISSION STATE (transient - not configuration)
+    # These keys store active mission state for auto-resume functionality.
+    # They are NOT part of settings configuration and should NOT be exposed
+    # in the Settings panel.
+    # ========================================================================
+    MISSION_PAUSED = "SAR_Tracker/mission_paused"  # Legacy key format
+    MISSION_NAME = "SAR_Tracker/mission_name"      # Legacy key format
+    MISSION_START_TIME = "SAR_Tracker/mission_start_time"  # Legacy key format
+
+    # ========================================================================
+    # UI STATE (Phase N1)
+    # ========================================================================
+    SETTINGS_MIGRATION_NOTICE_SHOWN = "SARTracker/UI/settings_migration_notice_shown"
+
+    # ========================================================================
+    # FEATURE FLAGS
+    # ========================================================================
+    # Note: Feature flags can also be enabled via environment variables
+    # (e.g., SARTRACKER_ENABLE_TRACCAR_HTTP=1)
+    FEATURE_TRACCAR_HTTP = PROVIDER_TRACCAR_FEATURE_FLAG
+
+    # ========================================================================
+    # VALIDATION RULES
+    # ========================================================================
+
+    @staticmethod
+    def validate_interval(value: int, min_val: int, max_val: int) -> bool:
+        """
+        Validate interval setting.
+
+        Args:
+            value: Value to validate
+            min_val: Minimum allowed value
+            max_val: Maximum allowed value
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if not isinstance(value, int):
+            return False
+        return min_val <= value <= max_val
+
+    @staticmethod
+    def validate_url(url: str) -> bool:
+        """
+        Validate URL format.
+
+        Args:
+            url: URL string to validate
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if not url or not isinstance(url, str):
+            return False
+        url = url.strip()
+        if not url:
+            return False
+        # Basic URL validation (http or https)
+        return url.startswith('http://') or url.startswith('https://')
+
+    @staticmethod
+    def validate_file_path(path: str) -> bool:
+        """
+        Validate file path (not empty, basic format check).
+
+        Args:
+            path: File path to validate
+
+        Returns:
+            True if valid format, False otherwise
+
+        Note: Does NOT check if file exists - that's a runtime check.
+        """
+        if not path or not isinstance(path, str):
+            return False
+        return bool(path.strip())
+
+
+class ConfigStore:
+    """
+    Helper class for reading/writing QSettings with defaults and validation.
+
+    Provides a consistent interface for accessing settings throughout the plugin,
+    reducing boilerplate and preventing typos.
+
+    Qt5/Qt6 Compatible: Uses QSettings which is identical in both versions.
+    """
+
+    @staticmethod
+    def get(key: str, default=None, value_type=None):
+        """
+        Get setting value with default.
+
+        Args:
+            key: QSettings key
+            default: Default value if key doesn't exist
+            value_type: Type to cast value to (e.g., bool, int, str)
+
+        Returns:
+            Setting value or default
+        """
+        from qgis.PyQt.QtCore import QSettings
+        settings = QSettings()
+
+        if value_type is not None:
+            return settings.value(key, default, type=value_type)
+        else:
+            return settings.value(key, default)
+
+    @staticmethod
+    def set(key: str, value):
+        """
+        Set setting value.
+
+        Args:
+            key: QSettings key
+            value: Value to store
+        """
+        from qgis.PyQt.QtCore import QSettings
+        settings = QSettings()
+        settings.setValue(key, value)
+
+    @staticmethod
+    def remove(key: str):
+        """
+        Remove setting.
+
+        Args:
+            key: QSettings key to remove
+        """
+        from qgis.PyQt.QtCore import QSettings
+        settings = QSettings()
+        settings.remove(key)
+
+    @staticmethod
+    def get_auto_refresh_enabled() -> bool:
+        """Get auto-refresh enabled setting."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.AUTO_REFRESH_ENABLED,
+            SETTINGS_KEYS.AUTO_REFRESH_ENABLED_DEFAULT,
+            bool
+        )
+
+    @staticmethod
+    def get_auto_refresh_interval() -> int:
+        """Get auto-refresh interval setting (seconds)."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.AUTO_REFRESH_INTERVAL,
+            SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT,
+            int
+        )
+
+    @staticmethod
+    def get_auto_save_enabled() -> bool:
+        """Get auto-save enabled setting."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.AUTO_SAVE_ENABLED,
+            SETTINGS_KEYS.AUTO_SAVE_ENABLED_DEFAULT,
+            bool
+        )
+
+    @staticmethod
+    def get_auto_save_interval() -> int:
+        """Get auto-save interval setting (minutes)."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.AUTO_SAVE_INTERVAL,
+            SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT,
+            int
+        )
+
+    @staticmethod
+    def get_provider_auto_connect() -> bool:
+        """Get provider auto-connect setting."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.PROVIDER_AUTO_CONNECT,
+            SETTINGS_KEYS.PROVIDER_AUTO_CONNECT_DEFAULT,
+            bool
+        )

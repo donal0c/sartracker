@@ -35,11 +35,12 @@ import os.path
 import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import RightDockWidgetArea, dialog_exec, DialogAccepted
+from .utils.qt_compat import RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
 from .utils.dialog_utils import BaseDialog
+from .config.keys import ConfigStore, SETTINGS_KEYS
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -89,6 +90,15 @@ except Exception as e:
     _import_errors.append(('ui.sar_panel.SARPanel', e, traceback.format_exc()))
     SARPanel = None
     print(f"ERROR importing SARPanel: {e}")
+
+# Import SettingsPanel (Phase N1)
+try:
+    from .ui.settings_panel import SettingsPanel
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('ui.settings_panel.SettingsPanel', e, traceback.format_exc()))
+    SettingsPanel = None
+    print(f"ERROR importing SettingsPanel: {e}")
 
 # Import MarkerMapTool
 try:
@@ -300,6 +310,7 @@ class sartracker:
         self._pending_provider_task = None     # Connection test task reference
 
         self.sar_panel = None
+        self.settings_panel = None  # Phase N1: Dedicated settings/configuration dock
         self.marker_tool = None
         self.measure_tool = None
         self.line_tool = None
@@ -441,6 +452,12 @@ class sartracker:
         separator = QAction(self.iface.mainWindow())
         separator.setSeparator(True)
         self.iface.addPluginToMenu(self.menu, separator)
+
+        # Add Settings menu item (Phase N1)
+        self.settings_action = QAction("Settings...", self.iface.mainWindow())
+        self.settings_action.triggered.connect(self._show_settings)
+        self.iface.addPluginToMenu(self.menu, self.settings_action)
+        self.actions.append(self.settings_action)
 
         # Add Diagnostics menu item
         self.diagnostics_action = QAction("Diagnostics", self.iface.mainWindow())
@@ -610,9 +627,8 @@ class sartracker:
                     parent=self.iface.mainWindow()
                 )
 
-                # Connect panel provider signals to controller
-                self.sar_panel.provider_test_requested.connect(self._on_provider_test_requested)
-                self.sar_panel.provider_save_requested.connect(self._on_provider_save_requested)
+                # Phase N1: SARPanel provider signals removed - configuration moved to Settings Panel
+                # Provider test/save signals now come from SettingsPanel only
 
                 # Connect controller signals to panel and plugin
                 self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
@@ -620,8 +636,7 @@ class sartracker:
                 self.provider_controller.provider_connected.connect(self._save_provider_config)
                 self.provider_controller.refresh_requested.connect(self._on_refresh_data)
 
-                # Populate provider dropdown from registry
-                self._populate_provider_dropdown()
+                # Phase N1: Provider dropdown population moved to SettingsPanel (lines 682-696)
 
                 # Load saved provider config (if any)
                 self._load_provider_config()
@@ -645,6 +660,53 @@ class sartracker:
                 duration=0  # Persistent
             )
             print("[SARTRACKER] ProviderController not available (import failed)")
+        # ============================================================================
+
+        # ============================================================================
+        # PHASE N1: Settings Panel Setup
+        # ============================================================================
+        # Initialize settings panel (after provider_controller for dropdown population)
+        if SettingsPanel is not None:
+            try:
+                self.settings_panel = SettingsPanel(self.iface.mainWindow())
+                self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
+                self.settings_panel.hide()  # Hidden by default, accessible via menu
+
+                # Connect Settings Panel signals
+                self.settings_panel.settings_changed.connect(self._on_settings_changed)
+                self.settings_panel.provider_test_requested.connect(self._on_provider_test_requested)
+                self.settings_panel.provider_save_requested.connect(self._on_provider_save_requested)
+
+                # Populate provider dropdown from registry (if controller available)
+                if self.provider_controller and provider_registry:
+                    try:
+                        providers_list = provider_registry.list_providers()
+                        providers_metadata = [
+                            {
+                                'name': p.name,
+                                'display_name': p.display_name,
+                                'description': p.description
+                            }
+                            for p in providers_list
+                        ]
+                        self.settings_panel.populate_providers(providers_metadata)
+                        print(f"[SARTRACKER] Populated {len(providers_metadata)} providers in Settings Panel")
+                    except Exception as dropdown_error:
+                        print(f"[SARTRACKER] Warning: Failed to populate Settings Panel provider dropdown: {dropdown_error}")
+
+                print("[SARTRACKER] Settings panel initialized")
+            except Exception as e:
+                self.settings_panel = None
+                error(
+                    self.iface.messageBar(),
+                    "SAR Tracker - Settings Panel Unavailable",
+                    f"Settings panel failed to initialize: {e}. Settings accessible via SARPanel.",
+                    duration=0  # Persistent
+                )
+                print(f"[SARTRACKER] ERROR initializing SettingsPanel: {e}")
+        else:
+            self.settings_panel = None
+            print("[SARTRACKER] SettingsPanel not available (import failed)")
         # ============================================================================
 
         # CRITICAL: Disable drawing tool buttons if tool registry failed to initialize (Issue #2 fix)
@@ -726,6 +788,30 @@ class sartracker:
         # Show import failure dialog using BaseDialog (Issue #2 fix)
         dialog = ImportFailureDialog(error_summary, parent=self.iface.mainWindow())
         dialog_exec(dialog)
+
+    def _show_settings(self):
+        """
+        Show/toggle Settings panel (Phase N1).
+
+        Opens or focuses the Settings panel when user clicks Settings menu item.
+        Guards against initialization failure.
+        """
+        # CRITICAL GUARD: Check if settings panel exists (defensive guard Pattern 9)
+        if not self.settings_panel:
+            # Settings panel failed to initialize - show user-friendly error
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Settings Unavailable",
+                "Settings panel failed to load. Check Diagnostics for details.",
+                duration=5
+            )
+            return
+
+        # Toggle visibility or bring to front
+        if self.settings_panel.isVisible():
+            self.settings_panel.raise_()  # Bring to front if already visible
+        else:
+            self.settings_panel.show()
 
     def _show_diagnostics(self):
         """Show diagnostics dialog with error handling."""
@@ -947,9 +1033,7 @@ class sartracker:
                     self.sar_panel.coordinate_converter_requested.disconnect()
                     self.sar_panel.measure_distance_requested.disconnect()
                     self.sar_panel.autosave_requested.disconnect()
-                    # Phase 3: Provider signals
-                    self.sar_panel.provider_test_requested.disconnect()
-                    self.sar_panel.provider_save_requested.disconnect()
+                    # Phase N1: SARPanel provider signals removed
                 except:
                     pass  # Signals may not be connected
 
@@ -961,6 +1045,29 @@ class sartracker:
                 except:
                     pass
                 self.sar_panel = None
+
+            # ============================================================
+            # PHASE N1: Clean up Settings Panel
+            # ============================================================
+            if self.settings_panel:
+                try:
+                    # Disconnect signals
+                    self.settings_panel.settings_changed.disconnect()
+                    self.settings_panel.provider_test_requested.disconnect()
+                    self.settings_panel.provider_save_requested.disconnect()
+                except:
+                    pass  # Signals may not be connected
+
+                try:
+                    # Remove from dock widget area
+                    self.iface.removeDockWidget(self.settings_panel)
+                    # Delete the panel
+                    self.settings_panel.deleteLater()
+                except:
+                    pass
+                self.settings_panel = None
+                print("[SARTRACKER] Settings panel cleaned up")
+            # ============================================================
 
             # Clean up layers controller
             if self.layers_controller:
@@ -2589,35 +2696,39 @@ class sartracker:
 
     def _load_provider_config(self):
         """
-        Load provider configuration from QSettings and populate UI.
+        Load provider configuration from QSettings and auto-connect if enabled.
 
-        If valid config exists, populate panel fields.
-        If incomplete or missing, panel remains in default state (CSV, empty fields).
+        Phase N1: UI population removed - SettingsPanel handles its own UI loading.
+        This method now only handles auto-connection functionality.
 
-        Qt5/Qt6 Compatible: Uses QSettings.
+        Qt5/Qt6 Compatible: Uses QSettings and ConfigStore.
         """
         try:
-            settings = QSettings()
+            # Check if auto-connect is enabled
+            auto_connect = ConfigStore.get_provider_auto_connect()
+            if not auto_connect:
+                print("[SARTRACKER] Auto-connect disabled, skipping provider restoration")
+                return
 
             # Load last provider
-            provider_name = settings.value("SARTracker/Providers/last_provider", None)
+            provider_name = ConfigStore.get(SETTINGS_KEYS.PROVIDER_LAST, None)
             if not provider_name:
                 print("[SARTRACKER] No saved provider config found")
                 return
 
-            print(f"[SARTRACKER] Loading saved provider config: {provider_name}")
+            print(f"[SARTRACKER] Auto-connecting to saved provider: {provider_name}")
 
-            # Load provider-specific config
+            # Load provider-specific config using ConfigStore
             config = {}
             if provider_name == 'csv':
-                csv_path = settings.value(f"SARTracker/Providers/{provider_name}/csv_path", None)
+                csv_path = ConfigStore.get(SETTINGS_KEYS.PROVIDER_CSV_PATH, None)
                 if csv_path:
                     config['csv_path'] = str(csv_path)
             elif provider_name == 'http_traccar':
-                server_url = settings.value(f"SARTracker/Providers/{provider_name}/server_url", None)
-                username = settings.value(f"SARTracker/Providers/{provider_name}/username", None)
-                password = settings.value(f"SARTracker/Providers/{provider_name}/password", None)
-                timeout = settings.value(f"SARTracker/Providers/{provider_name}/timeout", 10, type=int)
+                server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, None)
+                username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, None)
+                password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
+                timeout = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT, SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT, int)
                 if server_url and username and password:
                     config = {
                         'server_url': str(server_url),
@@ -2626,15 +2737,11 @@ class sartracker:
                         'timeout': int(timeout)
                     }
             elif provider_name == 'traccar_http':
-                base_url = settings.value(f"SARTracker/Providers/{provider_name}/base_url", None)
-                auth_type = settings.value(f"SARTracker/Providers/{provider_name}/auth_type", 'basic')
-                timeout = settings.value(f"SARTracker/Providers/{provider_name}/timeout_s", 10, type=int)
-                cache_ttl = settings.value(f"SARTracker/Providers/{provider_name}/cache_ttl", 300, type=int)
-                enable_cache = settings.value(
-                    f"SARTracker/Providers/{provider_name}/enable_last_good_cache",
-                    True,
-                    type=bool
-                )
+                base_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, None)
+                auth_type = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, 'basic')
+                timeout = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT, int)
+                cache_ttl = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT, int)
+                enable_cache = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT, bool)
 
                 if base_url and auth_type:
                     config = {
@@ -2646,99 +2753,78 @@ class sartracker:
                     }
 
                     if auth_type == 'basic':
-                        username = settings.value(f"SARTracker/Providers/{provider_name}/username", None)
-                        password = settings.value(f"SARTracker/Providers/{provider_name}/password", None)
+                        username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, None)
+                        password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
                         if username and password:
                             config['username'] = str(username)
                             config['password'] = str(password)
                     elif auth_type == 'bearer':
-                        token = settings.value(f"SARTracker/Providers/{provider_name}/token", None)
+                        token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
                         if token:
                             config['token'] = str(token)
 
             # Validate config is complete
             if not config:
-                print(f"[SARTRACKER] Incomplete config for {provider_name}, skipping restore")
+                print(f"[SARTRACKER] Incomplete config for {provider_name}, skipping auto-connect")
                 return
 
-            # Populate panel UI
-            if self.sar_panel:
-                # Set provider combo selection
-                for i in range(self.sar_panel.provider_combo.count()):
-                    if self.sar_panel.provider_combo.itemData(i) == provider_name:
-                        self.sar_panel.provider_combo.setCurrentIndex(i)
-                        break
-
-                # Populate provider-specific fields
-                if provider_name == 'csv' and 'csv_path' in config:
-                    self.sar_panel.csv_path_input.setText(config['csv_path'])
-                elif provider_name == 'http_traccar':
-                    self.sar_panel.provider_config_stack.setCurrentIndex(self.sar_panel.PROVIDER_PAGE_HTTP_TRACCAR)
-                    self.sar_panel.http_url_input.setText(config.get('server_url', ''))
-                    auth_index = self.sar_panel.http_auth_type_combo.findData('basic')
-                    if auth_index >= 0:
-                        self.sar_panel.http_auth_type_combo.setCurrentIndex(auth_index)
-                    self.sar_panel._on_auth_type_changed(self.sar_panel.http_auth_type_combo.currentIndex())
-                    self.sar_panel.http_username_input.setText(config.get('username', ''))
-                    self.sar_panel.http_password_input.setText(config.get('password', ''))
-                    self.sar_panel.http_timeout_spin.setValue(config.get('timeout', 10))
-                elif provider_name == 'traccar_http':
-                    self.sar_panel.provider_config_stack.setCurrentIndex(self.sar_panel.PROVIDER_PAGE_HTTP_TRACCAR)
-                    self.sar_panel.http_url_input.setText(config.get('base_url', ''))
-                    auth_type = config.get('auth_type', 'basic')
-                    auth_index = self.sar_panel.http_auth_type_combo.findData(auth_type)
-                    if auth_index >= 0:
-                        self.sar_panel.http_auth_type_combo.setCurrentIndex(auth_index)
-                    self.sar_panel._on_auth_type_changed(self.sar_panel.http_auth_type_combo.currentIndex())
-
-                    if auth_type == 'basic':
-                        self.sar_panel.http_username_input.setText(config.get('username', ''))
-                        self.sar_panel.http_password_input.setText(config.get('password', ''))
-                    else:
-                        self.sar_panel.http_token_input.setText(config.get('token', ''))
-
-                    self.sar_panel.http_timeout_spin.setValue(config.get('timeout_s', 10))
-                    self.sar_panel.http_cache_ttl_spin.setValue(config.get('cache_ttl', 300))
-                    self.sar_panel.http_enable_cache_check.setChecked(config.get('enable_last_good_cache', True))
-
-            print(f"[SARTRACKER] Restored provider config: {provider_name}")
+            # Auto-connect to provider (no UI population - SettingsPanel handles that)
+            if self.provider_controller:
+                print(f"[SARTRACKER] Initiating auto-connect to {provider_name}")
+                # Use the existing provider connection handler
+                self._on_provider_save_requested(provider_name, config)
+            else:
+                print("[SARTRACKER] Warning: Provider controller not available for auto-connect")
 
         except Exception as e:
-            print(f"[SARTRACKER] Warning: Failed to load provider config: {e}")
+            print(f"[SARTRACKER] Warning: Failed to auto-connect provider: {e}")
 
-    def _populate_provider_dropdown(self):
+    # Phase N1: _populate_provider_dropdown method removed
+    # Provider dropdown is now populated in SettingsPanel during initialization (sartracker.py lines 682-696)
+
+    def _on_settings_changed(self, changes: dict):
         """
-        Populate provider dropdown in SARPanel from provider registry.
+        Handle settings changes from Settings Panel (Phase N1).
 
-        Qt5/Qt6 Compatible: Uses provider registry list_providers().
+        When user clicks Apply in Settings Panel, this handler is called to
+        apply the new settings to the running plugin.
+
+        Args:
+            changes: Dict of changed settings with keys:
+                - auto_refresh_enabled: bool
+                - auto_refresh_interval: int (seconds)
+                - auto_save_enabled: bool
+                - auto_save_interval: int (minutes)
+                - provider_auto_connect: bool
+
+        Qt5/Qt6 Compatible: Pure Python handler.
         """
         try:
-            # Get providers from registry
-            providers_list = provider_registry.list_providers()
+            print(f"[SARTRACKER] Settings changed: {changes}")
 
-            # Convert to dict format expected by panel
-            providers_metadata = [
-                {
-                    'name': p.name,
-                    'display_name': p.display_name,
-                    'description': p.description
-                }
-                for p in providers_list
-            ]
+            if self.sar_panel:
+                if 'auto_refresh_enabled' in changes or 'auto_refresh_interval' in changes:
+                    enabled = changes.get('auto_refresh_enabled', ConfigStore.get_auto_refresh_enabled())
+                    interval = changes.get('auto_refresh_interval', ConfigStore.get_auto_refresh_interval())
+                    self.sar_panel.set_auto_refresh_config(enabled, interval)
+                    print(f"[SARTRACKER] Applied auto-refresh config: enabled={enabled}, interval={interval}s")
 
-            # Populate panel dropdown
-            self.sar_panel.populate_providers(providers_metadata)
+                if 'auto_save_enabled' in changes or 'auto_save_interval' in changes:
+                    enabled = changes.get('auto_save_enabled', ConfigStore.get_auto_save_enabled())
+                    interval = changes.get('auto_save_interval', ConfigStore.get_auto_save_interval())
+                    self.sar_panel.set_autosave_config(enabled, interval)
+                    print(f"[SARTRACKER] Applied auto-save config: enabled={enabled}, interval={interval}m")
 
-            print(f"[SARTRACKER] Populated {len(providers_metadata)} providers in dropdown")
+            # Settings already persisted to QSettings by SettingsPanel.
 
         except Exception as e:
+            print(f"[SARTRACKER] Error handling settings change: {e}")
             error(
                 self.iface.messageBar(),
-                "Provider Error",
-                f"Failed to load provider list: {e}",
+                "Settings Error",
+                f"Failed to apply settings: {e}",
                 duration=5
             )
-            print(f"[SARTRACKER] Error populating providers: {e}")
 
     def _on_provider_test_requested(self, provider_name: str, config: dict):
         """

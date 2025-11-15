@@ -34,7 +34,7 @@ i18n/
 From_Eamon/
 test/
 fixtures/
-test_import.py
+test_import.py Yes, please.
 
 # Large image files (keep only icon.png)
 *.jpg

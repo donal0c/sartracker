@@ -8,7 +8,7 @@ Main docked control panel for SAR tracking operations.
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem,
-    QGroupBox, QSpinBox, QCheckBox, QFileDialog, QLineEdit,
+    QGroupBox, QFileDialog, QLineEdit,
     QScrollArea, QComboBox, QStackedWidget
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
@@ -18,10 +18,10 @@ from typing import Optional, List, Dict, Any
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
-    LeftDockWidgetArea, RightDockWidgetArea,
-    Checked
+    LeftDockWidgetArea, RightDockWidgetArea
 )
 from ..utils.notify import info, warning, error
+from ..config.keys import ConfigStore, SETTINGS_KEYS
 
 
 class SARPanel(QDockWidget):
@@ -55,12 +55,8 @@ class SARPanel(QDockWidget):
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
 
-    # Phase 3: Provider selection signals
-    provider_selected = pyqtSignal(str)  # provider_name
-    provider_config_changed = pyqtSignal(dict)  # config dict
-    provider_test_requested = pyqtSignal(str, dict)  # provider_name, config
-    provider_save_requested = pyqtSignal(str, dict)  # provider_name, config
-    
+    # Phase N1: Provider signals removed - configuration moved to Settings Panel
+
     def __init__(self, parent=None):
         super().__init__("SAR Tracking", parent)
         
@@ -71,8 +67,11 @@ class SARPanel(QDockWidget):
         self.is_paused = False  # Renamed to avoid shadowing the signal
         self.mission_start_time = None
         self.auto_refresh_enabled = False
+        self.auto_refresh_interval_seconds = SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT
         self.autosave_enabled = False
+        self.autosave_interval_minutes = SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT
         self.last_autosave_time = None
+        self._last_autosave_success: Optional[bool] = None
         self.focus_mode_active = False
         self.hidden_panels = []  # Track which panels we hid
 
@@ -91,6 +90,9 @@ class SARPanel(QDockWidget):
         # Setup auto-save timer
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self._on_autosave)
+
+        # Load persisted defaults for auto-refresh / auto-save
+        self._initialize_auto_settings()
         
     def _setup_ui(self):
         """Build the panel UI."""
@@ -162,27 +164,15 @@ class SARPanel(QDockWidget):
         devices_group.setLayout(devices_layout)
         layout.addWidget(devices_group)
         
-        # Auto-Refresh Section
-        refresh_group = QGroupBox("Auto-Refresh")
+        # Data Refresh Section (status + manual button)
+        refresh_group = QGroupBox("Data Refresh")
         refresh_layout = QVBoxLayout()
-        
-        # Enable/disable checkbox
-        self.auto_refresh_checkbox = QCheckBox("Enable auto-refresh")
-        self.auto_refresh_checkbox.stateChanged.connect(self._on_auto_refresh_toggled)
-        refresh_layout.addWidget(self.auto_refresh_checkbox)
-        
-        # Interval setting
-        interval_layout = QHBoxLayout()
-        interval_layout.addWidget(QLabel("Interval (seconds):"))
-        self.refresh_interval_spin = QSpinBox()
-        self.refresh_interval_spin.setMinimum(5)
-        self.refresh_interval_spin.setMaximum(300)
-        self.refresh_interval_spin.setValue(30)
-        self.refresh_interval_spin.valueChanged.connect(self._on_interval_changed)
-        interval_layout.addWidget(self.refresh_interval_spin)
-        refresh_layout.addLayout(interval_layout)
-        
-        # Manual refresh button
+
+        self.auto_refresh_status_label = QLabel("Auto Refresh: OFF")
+        self.auto_refresh_status_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        self.auto_refresh_status_label.setWordWrap(True)
+        refresh_layout.addWidget(self.auto_refresh_status_label)
+
         self.refresh_button = QPushButton("Refresh Now")
         self.refresh_button.clicked.connect(self._on_manual_refresh)
         refresh_layout.addWidget(self.refresh_button)
@@ -190,29 +180,13 @@ class SARPanel(QDockWidget):
         refresh_group.setLayout(refresh_layout)
         layout.addWidget(refresh_group)
 
-        # Auto-Save Section
+        # Auto-Save Section (status + manual button)
         autosave_group = QGroupBox("Auto-Save")
         autosave_layout = QVBoxLayout()
 
-        # Enable/disable checkbox
-        self.autosave_checkbox = QCheckBox("Enable auto-save")
-        self.autosave_checkbox.stateChanged.connect(self._on_autosave_toggled)
-        autosave_layout.addWidget(self.autosave_checkbox)
-
-        # Interval setting
-        save_interval_layout = QHBoxLayout()
-        save_interval_layout.addWidget(QLabel("Interval (minutes):"))
-        self.autosave_interval_spin = QSpinBox()
-        self.autosave_interval_spin.setMinimum(1)
-        self.autosave_interval_spin.setMaximum(60)
-        self.autosave_interval_spin.setValue(5)
-        self.autosave_interval_spin.valueChanged.connect(self._on_autosave_interval_changed)
-        save_interval_layout.addWidget(self.autosave_interval_spin)
-        autosave_layout.addLayout(save_interval_layout)
-
-        # Last save time
-        self.autosave_status_label = QLabel("Last save: Never")
+        self.autosave_status_label = QLabel("Auto Save: OFF | Last save: Never")
         self.autosave_status_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
+        self.autosave_status_label.setWordWrap(True)
         autosave_layout.addWidget(self.autosave_status_label)
 
         # Manual save button
@@ -224,160 +198,29 @@ class SARPanel(QDockWidget):
         layout.addWidget(autosave_group)
 
         # ========================================
-        # Provider Selection Section (Phase 3)
+        # Provider Status Section (Phase N1 - Read-only display)
         # ========================================
-        provider_group = QGroupBox("Provider Selection")
+        # Note: Provider configuration moved to Settings Panel
+        # (Plugins → SAR Tracker → Settings...)
+        provider_group = QGroupBox("Data Source Status")
         provider_layout = QVBoxLayout()
 
-        # Provider dropdown
-        provider_select_layout = QHBoxLayout()
-        provider_select_layout.addWidget(QLabel("Provider:"))
-        self.provider_combo = QComboBox()
-        self.provider_combo.setToolTip("Select data provider for tracking data")
-        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
-        provider_select_layout.addWidget(self.provider_combo)
-        provider_layout.addLayout(provider_select_layout)
-
-        # Provider configuration stack (different UI for each provider)
-        self.provider_config_stack = QStackedWidget()
-
-        # Provider page indices (for maintainability)
-        self.PROVIDER_PAGE_CSV = 0
-        self.PROVIDER_PAGE_HTTP_TRACCAR = 1
-
-        # CSV Provider Configuration Page
-        csv_config_page = QWidget()
-        csv_config_layout = QVBoxLayout()
-        csv_file_layout = QHBoxLayout()
-        csv_file_layout.addWidget(QLabel("File/Folder:"))
-        self.csv_path_input = QLineEdit()
-        self.csv_path_input.setPlaceholderText("Select CSV file or folder...")
-        self.csv_path_input.setReadOnly(True)
-        csv_file_layout.addWidget(self.csv_path_input)
-        self.csv_browse_button = QPushButton("Browse...")
-        self.csv_browse_button.clicked.connect(self._on_csv_browse)
-        csv_file_layout.addWidget(self.csv_browse_button)
-        csv_config_layout.addLayout(csv_file_layout)
-        csv_config_page.setLayout(csv_config_layout)
-        self.provider_config_stack.addWidget(csv_config_page)
-
-        # HTTP Traccar Provider Configuration Page (Phase 4 MVP)
-        http_config_page = QWidget()
-        http_config_layout = QVBoxLayout()
-
-        # Server URL
-        http_config_layout.addWidget(QLabel("Server URL:"))
-        self.http_url_input = QLineEdit()
-        self.http_url_input.setPlaceholderText("http://kmrtsar.eu:8082")
-        self.http_url_input.setToolTip("Traccar server base URL (e.g., http://server:8082)")
-        http_config_layout.addWidget(self.http_url_input)
-
-        # Authentication Type
-        auth_type_layout = QHBoxLayout()
-        auth_type_layout.addWidget(QLabel("Auth Type:"))
-        self.http_auth_type_combo = QComboBox()
-        self.http_auth_type_combo.addItem("Basic Authentication", "basic")
-        self.http_auth_type_combo.addItem("Bearer Token", "bearer")
-        self.http_auth_type_combo.setToolTip("Authentication method for Traccar API")
-        self.http_auth_type_combo.currentIndexChanged.connect(self._on_auth_type_changed)
-        auth_type_layout.addWidget(self.http_auth_type_combo)
-        http_config_layout.addLayout(auth_type_layout)
-
-        # Basic Auth Fields (shown by default)
-        self.http_basic_auth_widget = QWidget()
-        basic_auth_layout = QVBoxLayout()
-        basic_auth_layout.setContentsMargins(0, 0, 0, 0)
-        basic_auth_layout.addWidget(QLabel("Username:"))
-        self.http_username_input = QLineEdit()
-        self.http_username_input.setPlaceholderText("admin")
-        self.http_username_input.setToolTip("Traccar API username")
-        basic_auth_layout.addWidget(self.http_username_input)
-        basic_auth_layout.addWidget(QLabel("Password:"))
-        self.http_password_input = QLineEdit()
-        self.http_password_input.setEchoMode(QLineEdit.Password)
-        self.http_password_input.setPlaceholderText("••••••••")
-        self.http_password_input.setToolTip("Traccar API password")
-        basic_auth_layout.addWidget(self.http_password_input)
-        self.http_basic_auth_widget.setLayout(basic_auth_layout)
-        http_config_layout.addWidget(self.http_basic_auth_widget)
-
-        # Bearer Token Field (hidden by default)
-        self.http_bearer_auth_widget = QWidget()
-        bearer_auth_layout = QVBoxLayout()
-        bearer_auth_layout.setContentsMargins(0, 0, 0, 0)
-        bearer_auth_layout.addWidget(QLabel("Bearer Token:"))
-        self.http_token_input = QLineEdit()
-        self.http_token_input.setEchoMode(QLineEdit.Password)
-        self.http_token_input.setPlaceholderText("Enter API token")
-        self.http_token_input.setToolTip("Traccar API bearer token")
-        bearer_auth_layout.addWidget(self.http_token_input)
-        self.http_bearer_auth_widget.setLayout(bearer_auth_layout)
-        self.http_bearer_auth_widget.setVisible(False)
-        http_config_layout.addWidget(self.http_bearer_auth_widget)
-
-        # Advanced Settings (collapsible)
-        advanced_group = QGroupBox("Advanced Settings (Optional)")
-        advanced_group.setCheckable(True)
-        advanced_group.setChecked(False)
-        advanced_layout = QGridLayout()
-
-        # Timeout
-        advanced_layout.addWidget(QLabel("Timeout (seconds):"), 0, 0)
-        self.http_timeout_spin = QSpinBox()
-        self.http_timeout_spin.setMinimum(5)
-        self.http_timeout_spin.setMaximum(60)
-        self.http_timeout_spin.setValue(10)
-        self.http_timeout_spin.setToolTip("HTTP request timeout in seconds")
-        advanced_layout.addWidget(self.http_timeout_spin, 0, 1)
-
-        # Cache TTL
-        advanced_layout.addWidget(QLabel("Cache TTL (seconds):"), 1, 0)
-        self.http_cache_ttl_spin = QSpinBox()
-        self.http_cache_ttl_spin.setMinimum(0)
-        self.http_cache_ttl_spin.setMaximum(3600)
-        self.http_cache_ttl_spin.setValue(300)
-        self.http_cache_ttl_spin.setToolTip("Device cache time-to-live (0 = no cache)")
-        advanced_layout.addWidget(self.http_cache_ttl_spin, 1, 1)
-
-        # Last-good cache
-        self.http_enable_cache_check = QCheckBox("Enable offline cache")
-        self.http_enable_cache_check.setChecked(True)
-        self.http_enable_cache_check.setToolTip("Cache last good positions for offline resilience")
-        advanced_layout.addWidget(self.http_enable_cache_check, 2, 0, 1, 2)
-
-        advanced_group.setLayout(advanced_layout)
-        http_config_layout.addWidget(advanced_group)
-
-        http_config_layout.addStretch()
-        http_config_page.setLayout(http_config_layout)
-        self.provider_config_stack.addWidget(http_config_page)
-
-        provider_layout.addWidget(self.provider_config_stack)
-
-        # Provider action buttons
-        provider_buttons_layout = QHBoxLayout()
-        self.provider_test_button = QPushButton("Test Connection")
-        self.provider_test_button.setToolTip("Test connection to selected provider")
-        self.provider_test_button.clicked.connect(self._on_provider_test)
-        provider_buttons_layout.addWidget(self.provider_test_button)
-
-        self.provider_save_button = QPushButton("Connect")
-        self.provider_save_button.setToolTip("Connect to selected provider")
-        self.provider_save_button.clicked.connect(self._on_provider_save)
-        provider_buttons_layout.addWidget(self.provider_save_button)
-        provider_layout.addLayout(provider_buttons_layout)
-
-        # Provider status strip
+        # Read-only provider status display
         self.provider_status_label = QLabel("Provider: None | Status: Not connected")
         self.provider_status_label.setWordWrap(True)
         self.provider_status_label.setStyleSheet(
             "QLabel { "
-            "  padding: 4px; "
+            "  padding: 8px; "
             "  background-color: #f0f0f0; "
             "  border: 1px solid #ccc; "
             "  border-radius: 3px; "
-            "  font-size: 10px; "
+            "  font-size: 11px; "
             "}"
+        )
+        self.provider_status_label.setToolTip(
+            "Current data provider status.\n"
+            "To configure providers, go to:\n"
+            "Plugins → SAR Tracker → Settings..."
         )
         provider_layout.addWidget(self.provider_status_label)
 
@@ -590,21 +433,95 @@ class SARPanel(QDockWidget):
                 minutes, seconds = divmod(remainder, 60)
                 self.mission_time_label.setText(f"Elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
     
-    def _on_auto_refresh_toggled(self, state):
-        """Handle auto-refresh checkbox toggle."""
-        self.auto_refresh_enabled = (state == Checked)
-        
+    def _initialize_auto_settings(self):
+        """Load persisted auto-refresh/save defaults on startup."""
+        try:
+            auto_refresh_enabled = ConfigStore.get_auto_refresh_enabled()
+            auto_refresh_interval = ConfigStore.get_auto_refresh_interval()
+            auto_save_enabled = ConfigStore.get_auto_save_enabled()
+            auto_save_interval = ConfigStore.get_auto_save_interval()
+        except Exception as e:
+            print(f"[SARPANEL] Warning: Failed to load auto settings from QSettings: {e}")
+            auto_refresh_enabled = SETTINGS_KEYS.AUTO_REFRESH_ENABLED_DEFAULT
+            auto_refresh_interval = SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT
+            auto_save_enabled = SETTINGS_KEYS.AUTO_SAVE_ENABLED_DEFAULT
+            auto_save_interval = SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT
+
+        self.set_auto_refresh_config(auto_refresh_enabled, auto_refresh_interval)
+        self.set_autosave_config(auto_save_enabled, auto_save_interval)
+
+    def set_auto_refresh_config(self, enabled: bool, interval_seconds: int):
+        """Apply auto-refresh configuration coming from Settings panel."""
+        interval = interval_seconds or SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT
+        interval = int(max(SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_MIN,
+                           min(interval, SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_MAX)))
+        self.auto_refresh_enabled = bool(enabled)
+        self.auto_refresh_interval_seconds = interval
+        self._update_auto_refresh_status_label()
+        self._apply_auto_refresh_timer()
+
+    def _apply_auto_refresh_timer(self):
+        """Start/stop the auto-refresh timer based on current config."""
         if self.auto_refresh_enabled:
-            interval_ms = self.refresh_interval_spin.value() * 1000
-            self.refresh_timer.start(interval_ms)
+            self.refresh_timer.start(self.auto_refresh_interval_seconds * 1000)
         else:
             self.refresh_timer.stop()
-    
-    def _on_interval_changed(self, value):
-        """Handle refresh interval change."""
+
+    def _update_auto_refresh_status_label(self):
+        """Update the read-only auto-refresh status indicator."""
         if self.auto_refresh_enabled:
-            self.refresh_timer.stop()
-            self.refresh_timer.start(value * 1000)
+            text = f"Auto Refresh: ON (every {self.auto_refresh_interval_seconds}s)"
+            color = "#0a0"
+        else:
+            text = "Auto Refresh: OFF"
+            color = "#666"
+        self.auto_refresh_status_label.setText(text)
+        self.auto_refresh_status_label.setStyleSheet(f"QLabel {{ color: {color}; font-size: 10px; }}")
+
+    def set_autosave_config(self, enabled: bool, interval_minutes: int):
+        """Apply auto-save configuration coming from Settings panel."""
+        interval = interval_minutes or SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT
+        interval = int(max(SETTINGS_KEYS.AUTO_SAVE_INTERVAL_MIN,
+                           min(interval, SETTINGS_KEYS.AUTO_SAVE_INTERVAL_MAX)))
+        self.autosave_enabled = bool(enabled)
+        self.autosave_interval_minutes = interval
+        self._update_autosave_status_label()
+        self._apply_autosave_timer()
+
+    def _apply_autosave_timer(self):
+        """Start/stop the auto-save timer based on current config."""
+        if self.autosave_enabled:
+            self.autosave_timer.start(self.autosave_interval_minutes * 60 * 1000)
+        else:
+            self.autosave_timer.stop()
+
+    def _update_autosave_status_label(self):
+        """Update the read-only auto-save status indicator."""
+        status = "ON" if self.autosave_enabled else "OFF"
+        interval_text = f"(every {self.autosave_interval_minutes} min)" if self.autosave_enabled else ""
+        if self.last_autosave_time:
+            time_str = self.last_autosave_time.strftime("%H:%M:%S")
+            if self._last_autosave_success is True:
+                last_text = f"{time_str} ✓"
+            elif self._last_autosave_success is False:
+                last_text = f"{time_str} ✗ Failed"
+            else:
+                last_text = time_str
+        else:
+            last_text = "Never"
+
+        color = "#666"
+        if self._last_autosave_success is True:
+            color = "#0a0"
+        elif self._last_autosave_success is False:
+            color = "#d00"
+        elif self.autosave_enabled:
+            color = "#0a0"
+
+        self.autosave_status_label.setText(
+            f"Auto Save: {status} {interval_text} | Last save: {last_text}"
+        )
+        self.autosave_status_label.setStyleSheet(f"QLabel {{ color: {color}; font-size: 10px; }}")
     
     def _on_auto_refresh(self):
         """Handle auto-refresh timer."""
@@ -773,25 +690,10 @@ class SARPanel(QDockWidget):
 
         print(f"[SARTRACKER] Drawing tools disabled: {reason}")
 
-    def _on_autosave_toggled(self, state):
-        """Handle auto-save checkbox toggle."""
-        self.autosave_enabled = (state == Checked)
-
-        if self.autosave_enabled:
-            interval_ms = self.autosave_interval_spin.value() * 60 * 1000  # Convert minutes to ms
-            self.autosave_timer.start(interval_ms)
-        else:
-            self.autosave_timer.stop()
-
-    def _on_autosave_interval_changed(self, value):
-        """Handle auto-save interval change."""
-        if self.autosave_enabled:
-            self.autosave_timer.stop()
-            self.autosave_timer.start(value * 60 * 1000)  # Convert minutes to ms
-
     def _on_autosave(self):
         """Handle auto-save timer - request project save."""
-        self.autosave_requested.emit()
+        if self.autosave_enabled:
+            self.autosave_requested.emit()
 
     def _on_manual_save(self):
         """Handle manual save button - request immediate project save."""
@@ -805,14 +707,8 @@ class SARPanel(QDockWidget):
             success: Whether the save was successful
         """
         self.last_autosave_time = datetime.now()
-        time_str = self.last_autosave_time.strftime("%H:%M:%S")
-
-        if success:
-            self.autosave_status_label.setText(f"Last save: {time_str} ✓")
-            self.autosave_status_label.setStyleSheet("QLabel { color: #0a0; font-size: 10px; }")
-        else:
-            self.autosave_status_label.setText(f"Last save: {time_str} ✗ Failed")
-            self.autosave_status_label.setStyleSheet("QLabel { color: #d00; font-size: 10px; }")
+        self._last_autosave_success = success
+        self._update_autosave_status_label()
 
     def save_mission_state(self):
         """Save current mission state to QSettings for auto-resume."""
@@ -935,348 +831,10 @@ class SARPanel(QDockWidget):
             return False
 
     # ========================================
-    # Phase 3: Provider UI Handlers
+    # Phase N1: Provider configuration methods removed
+    # Provider configuration is now handled in Settings Panel
+    # (Plugins → SAR Tracker → Settings...)
     # ========================================
-
-    def populate_providers(self, providers_metadata: List[Dict]):
-        """
-        Populate provider dropdown from registry metadata.
-
-        Phase 4: Filters providers based on feature flags (e.g., traccar_http).
-
-        Args:
-            providers_metadata: List of provider metadata dicts with keys:
-                - name: str (internal provider name)
-                - display_name: str (UI display name)
-                - description: str (tooltip)
-
-        Qt5/Qt6 Compatible: Uses QComboBox standard methods.
-        """
-        self.provider_combo.clear()
-
-        for metadata in providers_metadata:
-            provider_name = metadata['name']
-
-            # Phase 4: Check feature flag for traccar_http provider
-            if provider_name == 'traccar_http':
-                if not self._is_provider_enabled('traccar_http'):
-                    print(f"[SARPANEL] Skipping {provider_name} (feature flag disabled)")
-                    continue
-
-            # Add item with display name, store internal name as user data
-            self.provider_combo.addItem(
-                metadata['display_name'],
-                provider_name  # Store as userData
-            )
-            # Set tooltip
-            self.provider_combo.setItemData(
-                self.provider_combo.count() - 1,
-                metadata['description'],
-                2  # ToolTipRole as integer (Qt5/Qt6 compatible)
-            )
-
-        print(f"[SARPANEL] Populated {self.provider_combo.count()} providers")
-
-    def _is_provider_enabled(self, provider_name: str) -> bool:
-        """
-        Check if provider is enabled via feature flag.
-
-        Phase 4: Allows controlled rollout of new providers (traccar_http).
-        Checks both environment variable and QSettings.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'traccar_http')
-
-        Returns:
-            True if provider is enabled, False otherwise
-
-        Enablement methods:
-            1. Environment variable: SARTRACKER_ENABLE_TRACCAR_HTTP=1
-            2. QSettings: SARTracker/Providers/traccar_http/enabled = true
-
-        Qt5/Qt6 Compatible: Uses QSettings.
-        """
-        import os
-
-        # Check environment variable first (for development/testing)
-        env_var_name = f"SARTRACKER_ENABLE_{provider_name.upper()}"
-        if os.environ.get(env_var_name) == '1':
-            print(f"[SARPANEL] Provider {provider_name} enabled via environment variable")
-            return True
-
-        # Check QSettings (for user configuration)
-        settings = QSettings()
-        settings_key = f"SARTracker/Providers/{provider_name}/enabled"
-        is_enabled = settings.value(settings_key, False, type=bool)
-
-        if is_enabled:
-            print(f"[SARPANEL] Provider {provider_name} enabled via QSettings")
-        else:
-            print(f"[SARPANEL] Provider {provider_name} disabled (to enable: {env_var_name}=1 or QSettings {settings_key}=true)")
-
-        return is_enabled
-
-    def _on_provider_changed(self, display_name: str):
-        """
-        Handle provider dropdown selection change.
-
-        Args:
-            display_name: Display name of selected provider (from combo box text)
-
-        Qt5/Qt6 Compatible: Uses QComboBox and QStackedWidget.
-        """
-        if not display_name:
-            return
-
-        # Get internal provider name from currentData()
-        provider_name = self.provider_combo.currentData()
-        if not provider_name:
-            return
-
-        print(f"[SARPANEL] Provider changed: {provider_name}")
-
-        # Switch config stack page
-        if provider_name == 'csv':
-            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_CSV)
-        elif provider_name in ('http_traccar', 'traccar_http'):
-            # Both old and new Traccar providers use same UI page
-            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_HTTP_TRACCAR)
-
-        # Emit signal
-        self.provider_selected.emit(provider_name)
-
-    def _on_auth_type_changed(self, index: int):
-        """
-        Handle authentication type dropdown change.
-
-        Shows/hides appropriate auth fields based on selected auth type.
-
-        Args:
-            index: Selected combo box index
-
-        Qt5/Qt6 Compatible: Uses QComboBox and QWidget visibility.
-        """
-        auth_type = self.http_auth_type_combo.currentData()
-
-        if auth_type == 'basic':
-            self.http_basic_auth_widget.setVisible(True)
-            self.http_bearer_auth_widget.setVisible(False)
-        elif auth_type == 'bearer':
-            self.http_basic_auth_widget.setVisible(False)
-            self.http_bearer_auth_widget.setVisible(True)
-
-    def _on_csv_browse(self):
-        """
-        Handle CSV browse button click.
-
-        Shows file/folder selection dialog and updates CSV path input.
-
-        Qt5/Qt6 Compatible: Uses QFileDialog standard methods.
-        """
-        # Show dialog with option to select file or folder
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "Select Folder with CSV Files (or Cancel and select single file)",
-            ""
-        )
-
-        # If user cancelled folder selection, try file selection
-        if not folder_path:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Traccar CSV Export",
-                "",
-                "CSV Files (*.csv);;All Files (*)"
-            )
-            if file_path:
-                self.csv_path_input.setText(file_path)
-        else:
-            self.csv_path_input.setText(folder_path)
-
-    def _on_provider_test(self):
-        """
-        Handle Test Connection button click.
-
-        Validates inputs and emits signal to controller for connection test.
-
-        Qt5/Qt6 Compatible: Pure Python validation + pyqtSignal.
-        """
-        # Get current provider
-        provider_name = self.provider_combo.currentData()
-        if not provider_name:
-            from qgis.utils import iface
-            from ..utils.notify import warning
-            warning(
-                iface.messageBar(),
-                "Provider Selection",
-                "Please select a provider first",
-                duration=3
-            )
-            return
-
-        # Build config dict based on selected provider
-        config = self._get_provider_config(provider_name)
-        if not config:
-            return  # Error already shown
-
-        # Emit signal
-        self.provider_test_requested.emit(provider_name, config)
-
-    def _on_provider_save(self):
-        """
-        Handle Connect/Save button click.
-
-        Validates inputs and emits signal to controller to connect to provider.
-
-        Qt5/Qt6 Compatible: Pure Python validation + pyqtSignal.
-        """
-        # Get current provider
-        provider_name = self.provider_combo.currentData()
-        if not provider_name:
-            from qgis.utils import iface
-            from ..utils.notify import warning
-            warning(
-                iface.messageBar(),
-                "Provider Selection",
-                "Please select a provider first",
-                duration=3
-            )
-            return
-
-        # Build config dict based on selected provider
-        config = self._get_provider_config(provider_name)
-        if not config:
-            return  # Error already shown
-
-        # Emit signal
-        self.provider_save_requested.emit(provider_name, config)
-
-    def _get_provider_config(self, provider_name: str) -> Optional[Dict]:
-        """
-        Get provider configuration from UI inputs.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
-
-        Returns:
-            Config dict if valid, None if validation fails
-
-        Qt5/Qt6 Compatible: Pure Python dict.
-        """
-        from qgis.utils import iface
-        from ..utils.notify import warning
-
-        if provider_name == 'csv':
-            csv_path = self.csv_path_input.text().strip()
-            if not csv_path:
-                warning(
-                    iface.messageBar(),
-                    "CSV Provider",
-                    "Please select a CSV file or folder",
-                    duration=3
-                )
-                return None
-            return {'csv_path': csv_path}
-
-        elif provider_name == 'http_traccar':
-            # OLD Traccar provider (Phase 1) - uses server_url, no auth_type
-            server_url = self.http_url_input.text().strip()
-            if not server_url:
-                warning(
-                    iface.messageBar(),
-                    "Traccar Configuration",
-                    "Please enter a Traccar server URL",
-                    duration=3
-                )
-                return None
-
-            username = self.http_username_input.text().strip()
-            password = self.http_password_input.text().strip()
-
-            if not username or not password:
-                warning(
-                    iface.messageBar(),
-                    "Traccar Configuration",
-                    "Please enter both username and password",
-                    duration=3
-                )
-                return None
-
-            config = {
-                'server_url': server_url,
-                'username': username,
-                'password': password,
-                'timeout': self.http_timeout_spin.value()
-            }
-
-            return config
-
-        elif provider_name == 'traccar_http':
-            # NEW Traccar provider (Phase 4) - uses base_url, auth_type
-            base_url = self.http_url_input.text().strip()
-            if not base_url:
-                warning(
-                    iface.messageBar(),
-                    "Traccar Configuration",
-                    "Please enter a Traccar server URL",
-                    duration=3
-                )
-                return None
-
-            # Get auth type
-            auth_type = self.http_auth_type_combo.currentData()
-
-            config = {
-                'base_url': base_url,
-                'auth_type': auth_type
-            }
-
-            # Validate and add auth credentials
-            if auth_type == 'basic':
-                username = self.http_username_input.text().strip()
-                password = self.http_password_input.text().strip()
-
-                if not username or not password:
-                    warning(
-                        iface.messageBar(),
-                        "Traccar Configuration",
-                        "Please enter both username and password for basic authentication",
-                        duration=3
-                    )
-                    return None
-
-                config['username'] = username
-                config['password'] = password
-
-            elif auth_type == 'bearer':
-                token = self.http_token_input.text().strip()
-
-                if not token:
-                    warning(
-                        iface.messageBar(),
-                        "Traccar Configuration",
-                        "Please enter a bearer token",
-                        duration=3
-                    )
-                    return None
-
-                config['token'] = token
-
-            # Add optional advanced settings
-            config['timeout_s'] = self.http_timeout_spin.value()
-            config['cache_ttl'] = self.http_cache_ttl_spin.value()
-            config['enable_last_good_cache'] = self.http_enable_cache_check.isChecked()
-
-            return config
-
-        else:
-            warning(
-                iface.messageBar(),
-                "Provider Selection",
-                f"Unknown provider: {provider_name}",
-                duration=3
-            )
-            return None
 
     def update_provider_status(self, status_dict: Dict[str, Any]):
         """
