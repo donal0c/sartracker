@@ -42,6 +42,7 @@ from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
 from .utils.dialog_utils import BaseDialog
+from .utils.dependency_guard import ensure_requests_charset_modules
 from .config.keys import ConfigStore, SETTINGS_KEYS
 
 # Import our SAR tracking components with individual error tracking
@@ -51,6 +52,10 @@ from .config.keys import ConfigStore, SETTINGS_KEYS
 # Module-level tracking of import failures (checked in initGui)
 _import_errors = []
 _imports_ok = True
+
+# Ensure optional third-party dependencies (charset detection) are available
+# before importing providers that depend on the requests package.
+ensure_requests_charset_modules()
 
 # Import Provider Registry and trigger provider self-registration
 try:

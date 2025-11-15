@@ -20,7 +20,7 @@ Transform QGIS into a dedicated SAR operations console for real-time tracking of
 - **QGIS Version:** 3.28 or newer
 - **Tested On:** QGIS 3.28 - 3.44 (both Qt5 and Qt6)
 - **Python:** 3.8+ (included with QGIS)
-- **Dependencies:** None (uses QGIS built-in libraries only)
+- **Dependencies:** None – plugin bundles fallbacks for `chardet` / `charset_normalizer` so no extra installs are needed
 
 ### Version Compatibility
 
