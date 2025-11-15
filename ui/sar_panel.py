@@ -592,6 +592,35 @@ class SARPanel(QDockWidget):
         else:
             self.active_tool_label.setText(f"<b>{tool_name}</b>")
 
+    def disable_drawing_tools(self, reason: str = "Drawing tools unavailable"):
+        """
+        Disable all drawing tool buttons when tools fail to load.
+
+        This prevents users from clicking buttons that would cause crashes
+        when the tool registry or individual tools failed to initialize.
+
+        Args:
+            reason: User-friendly explanation for why tools are disabled
+
+        Qt5/Qt6 Compatible: Uses standard QPushButton methods.
+
+        Issue #2 Fix: Prevents crashes when tool registry fails to initialize.
+        """
+        # Disable all drawing tool buttons
+        self.line_tool_button.setEnabled(False)
+        self.search_area_button.setEnabled(False)
+        self.range_rings_button.setEnabled(False)
+        self.bearing_line_button.setEnabled(False)
+
+        # Update tool tips to explain why buttons are disabled
+        tooltip = f"⚠ {reason}\n\nRun Diagnostics (SAR Tracker menu) for details."
+        self.line_tool_button.setToolTip(tooltip)
+        self.search_area_button.setToolTip(tooltip)
+        self.range_rings_button.setToolTip(tooltip)
+        self.bearing_line_button.setToolTip(tooltip)
+
+        print(f"[SARTRACKER] Drawing tools disabled: {reason}")
+
     def _on_autosave_toggled(self, state):
         """Handle auto-save checkbox toggle."""
         self.autosave_enabled = (state == Checked)

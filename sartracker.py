@@ -282,6 +282,13 @@ class sartracker:
         self.provider = None
         self.provider_name = None  # Track which provider is active (e.g., 'csv', 'http_traccar')
         self.provider_config = None  # Track provider config for reconnection
+
+        # Transactional provider change state (Issue #1 fix)
+        self._pending_provider = None          # Provider being validated
+        self._pending_provider_name = None     # Name of pending provider
+        self._pending_provider_config = None   # Config of pending provider
+        self._pending_provider_task = None     # Connection test task reference
+
         self.sar_panel = None
         self.marker_tool = None
         self.measure_tool = None
@@ -543,9 +550,19 @@ class sartracker:
             self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
         except Exception as e:
             self.tool_registry = None
-            warning(self.iface.messageBar(), "SAR Tracker",
-                   f"Tool Registry failed to load: {e}", duration=5)
-            print(f"ERROR initializing ToolRegistry: {e}")
+
+            # NOTE: Drawing tool buttons will be disabled after SAR panel creation (line 594)
+            # Cannot disable here because panel doesn't exist yet
+
+            # Show clear error message to user
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Drawing Tools Unavailable",
+                f"Drawing tools failed to initialize: {e}. Other features remain available. Run Diagnostics for details.",
+                duration=0  # Persistent - user must acknowledge
+            )
+            print(f"[SARTRACKER] ERROR initializing ToolRegistry: {e}")
+            print(f"[SARTRACKER] Drawing tools will be disabled after panel creation")
 
         # Initialize SAR Panel
         self.sar_panel = SARPanel(self.iface.mainWindow())
@@ -570,6 +587,12 @@ class sartracker:
         self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
+
+        # CRITICAL: Disable drawing tool buttons if tool registry failed to initialize (Issue #2 fix)
+        # This check MUST come after SAR panel creation since panel is created after tool registry
+        if not self.tool_registry:
+            self.sar_panel.disable_drawing_tools("Tool Registry failed to load")
+            print("[SARTRACKER] Drawing tool buttons disabled due to registry initialization failure")
 
         # Add coordinate display to status bar
         self.coords_label = QLabel()
@@ -739,6 +762,21 @@ class sartracker:
                     self._current_connection_task = None
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Connection task cleanup error: {e}")
+
+            # Clean up pending provider state (Issue #1 fix)
+            if hasattr(self, '_pending_provider_task') and self._pending_provider_task:
+                try:
+                    self._pending_provider_task.cancel()
+                    self._pending_provider_task = None
+                    print("[SARTRACKER] Pending provider task cancelled")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Pending provider task cleanup error: {e}")
+
+            # Clear shadow state variables (Issue #1 fix)
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
 
             self._refresh_in_progress = False
 
@@ -1148,21 +1186,37 @@ class sartracker:
         """
         Load and initialize a data provider via registry.
 
-        This method provides a provider-agnostic way to load data sources,
-        supporting CSV, HTTP, PostGIS, and future providers without code changes.
+        ISSUE #1 FIX: Uses transactional two-phase commit pattern.
+        New provider is validated in shadow state before replacing current provider.
+        Current provider remains active until new provider passes connection test.
 
-        CRITICAL FOR LIFE-SAFETY: This must handle errors gracefully and never
-        leave the plugin in an inconsistent state.
+        Phase 1: Validation
+        - Create new provider in shadow state (_pending_provider)
+        - Test connection asynchronously
+        - Current provider remains active and functional
+
+        Phase 2: Commit (only if validation succeeds)
+        - Replace self.provider with _pending_provider
+        - Clear shadow state
+
+        Rollback (if validation fails):
+        - Discard _pending_provider
+        - Current provider remains unchanged
+        - User sees clear error message
 
         Args:
             provider_name: Name of provider (e.g., 'csv', 'http_traccar')
             config: Provider-specific configuration dict
 
         Qt5/Qt6 Compatible: Uses provider registry pattern.
-
-        ISSUE #2 FIX: Connection test now runs in background to prevent
-        UI freezes during HTTP operations with slow/unreachable servers.
         """
+        # INPUT VALIDATION (mandatory pattern)
+        if not provider_name or not isinstance(provider_name, str):
+            raise ValueError("Provider name must be a non-empty string")
+
+        if config is None or not isinstance(config, dict):
+            raise ValueError("Provider config must be a dictionary")
+
         # Prevent concurrent operations
         if self._refresh_in_progress:
             warning(
@@ -1173,11 +1227,29 @@ class sartracker:
             )
             return
 
+        # DEFENSIVE GUARD: Prevent concurrent provider changes
+        if self._pending_provider is not None:
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Provider change already in progress, please wait...",
+                duration=2
+            )
+            return
+
         try:
-            # Create provider via registry
-            self.provider = provider_registry.get_provider(provider_name, config)
-            self.provider_name = provider_name
-            self.provider_config = config
+            # PHASE 1: CREATE NEW PROVIDER IN SHADOW STATE
+            # This does NOT touch self.provider - old provider remains active
+            print(f"[SARTRACKER] Starting provider change: {provider_name}")
+            print(f"[SARTRACKER] Current provider: {self.provider_name}")
+
+            # Create provider via registry (may raise exception)
+            new_provider = provider_registry.get_provider(provider_name, config)
+
+            # Store in SHADOW variables (not committed yet)
+            self._pending_provider = new_provider
+            self._pending_provider_name = provider_name
+            self._pending_provider_config = config
 
             # Store provider metadata for later use
             self._pending_provider_metadata = next(
@@ -1185,21 +1257,26 @@ class sartracker:
                 None
             )
 
-            # Set loading state IMMEDIATELY (Issue #2 fix)
+            # Set loading state for UI feedback
             self._refresh_in_progress = True
             if self.sar_panel:
                 self.sar_panel.set_loading_state(True)
 
+            # Show testing message (not "loading" - we're testing, not committed yet)
             info(
                 self.iface.messageBar(),
                 "SAR Tracker",
-                f"Connecting to {provider_name}...",
+                f"Testing connection to {provider_name}...",
                 duration=2
             )
 
-            # Create connection test task (Issue #2 fix)
+            # PHASE 1: TEST CONNECTION IN BACKGROUND
+            # Test the PENDING provider, not the current one
             from .providers.tasks import ConnectionTestTask
-            test_task = ConnectionTestTask(self.provider, f"Testing {provider_name} connection")
+            test_task = ConnectionTestTask(
+                self._pending_provider,  # Test pending provider
+                f"Testing {provider_name} connection"
+            )
 
             # Start task with managed lifecycle
             task_id = self.task_manager.start_task(
@@ -1210,10 +1287,12 @@ class sartracker:
             )
 
             # Store task reference for potential cancellation
-            self._current_connection_task = test_task
+            self._pending_provider_task = test_task
+
+            print(f"[SARTRACKER] Provider validation task started for: {provider_name}")
 
         except Exception as e:
-            # Reset state on error
+            # Reset state on error during provider creation
             self._refresh_in_progress = False
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
@@ -1221,87 +1300,149 @@ class sartracker:
             error(
                 self.iface.messageBar(),
                 "Error Loading Provider",
-                f"Failed to load {provider_name}: {str(e)}",
+                f"Failed to create {provider_name} provider: {str(e)}",
                 duration=5
             )
 
-            # Clean up provider on failure
-            self.provider = None
-            self.provider_name = None
-            self.provider_config = None
+            # Clean up shadow state (DO NOT touch self.provider)
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+
+            print(f"[SARTRACKER] Provider creation failed: {e}")
 
     def _on_connection_test_complete(self, task):
         """
         Handle connection test completion (runs in main thread).
 
-        If connection successful, proceeds to load data.
-        If connection failed, shows error and cleans up.
+        ISSUE #1 FIX: Implements two-phase commit for provider changes.
+
+        If connection successful:
+        - PHASE 2 COMMIT: Replace self.provider with validated _pending_provider
+        - Proceed to load initial data
+
+        If connection failed:
+        - ROLLBACK: Discard _pending_provider
+        - Preserve current provider (may be None if this is first load)
+        - Show error to user
 
         Args:
             task: Completed ConnectionTestTask
 
         SAFETY: May be called after plugin unload if signal disconnect failed.
         Check component existence before accessing.
-
-        ISSUE #2 FIX: This callback runs after background connection test,
-        preventing UI freezes during HTTP operations.
         """
-        # CRITICAL GUARD: Check if plugin components still exist
+        # CRITICAL GUARD: Check if plugin components still exist (Pattern 9)
         if not self.sar_panel:
             print("[SARTRACKER] Connection test completed after plugin unload, ignoring")
+            # Clean up shadow state
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+            self._pending_provider_task = None
             return
 
         try:
             # Clear task reference
-            self._current_connection_task = None
+            self._pending_provider_task = None
+
+            # DEFENSIVE CHECK: Ensure we have pending provider state
+            if self._pending_provider is None:
+                print("[SARTRACKER] Warning: Connection test completed but no pending provider")
+                self._refresh_in_progress = False
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+                return
 
             # Check if connection test succeeded
             if not task.success:
-                # Connection failed - show error and clean up
+                # ================================================================
+                # ROLLBACK: Connection test failed
+                # ================================================================
+                print(f"[SARTRACKER] Connection test FAILED for {self._pending_provider_name}")
+                print(f"[SARTRACKER] Rolling back to previous provider: {self.provider_name}")
+
                 self._refresh_in_progress = False
                 if self.sar_panel:
                     self.sar_panel.set_loading_state(False)
 
+                # Show user-friendly error
+                provider_display = self._pending_provider_name
+                if self._pending_provider_metadata:
+                    provider_display = self._pending_provider_metadata.display_name
+
                 error(
                     self.iface.messageBar(),
-                    "Connection Error",
-                    f"Could not connect to {self.provider_name} data source",
-                    duration=5
+                    "Connection Failed",
+                    f"Could not connect to {provider_display}. "
+                    + (f"Your current data source ({self.provider_name}) remains active."
+                       if self.provider else "No data source loaded."),
+                    duration=8  # Longer duration for critical message
                 )
 
-                # Clean up provider
-                self.provider = None
-                self.provider_name = None
-                self.provider_config = None
+                # ROLLBACK: Discard pending provider (keep current provider)
+                self._pending_provider = None
+                self._pending_provider_name = None
+                self._pending_provider_config = None
                 self._pending_provider_metadata = None
+
+                # Current provider (self.provider) is UNCHANGED - rollback complete
+                print(f"[SARTRACKER] Rollback complete. Active provider: {self.provider_name}")
                 return
 
-            # Connection successful - show notification
-            success(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Connected to {self.provider_name} successfully",
-                duration=2
-            )
+            # ================================================================
+            # PHASE 2 COMMIT: Connection test succeeded
+            # ================================================================
+            print(f"[SARTRACKER] Connection test SUCCEEDED for {self._pending_provider_name}")
+            print(f"[SARTRACKER] Committing provider change: {self.provider_name} -> {self._pending_provider_name}")
 
-            # Update data source label with provider-specific info
-            display_name = (
+            # Store old provider info for logging
+            old_provider_name = self.provider_name
+
+            # ATOMIC COMMIT: Replace current provider with validated pending provider
+            self.provider = self._pending_provider
+            self.provider_name = self._pending_provider_name
+            self.provider_config = self._pending_provider_config
+
+            # Clear shadow state (commit complete)
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+
+            print(f"[SARTRACKER] Provider commit complete: {old_provider_name} -> {self.provider_name}")
+
+            # Show success notification
+            provider_display = (
                 self._pending_provider_metadata.display_name
                 if self._pending_provider_metadata
                 else self.provider_name
             )
 
-            # Generate appropriate label based on provider type
+            success(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Connected to {provider_display} successfully",
+                duration=3
+            )
+
+            # Update data source label with provider-specific info
             if self.provider_name == 'csv':
                 import os
-                csv_path = self.provider_config['csv_path']
-                if os.path.isdir(csv_path):
-                    label = f"{display_name}: {os.path.basename(csv_path)}"
+                csv_path = self.provider_config.get('csv_path', '')
+                if csv_path:
+                    if os.path.isdir(csv_path):
+                        label = f"{provider_display}: {os.path.basename(csv_path)}"
+                    else:
+                        label = f"{provider_display}: {os.path.basename(csv_path)}"
                 else:
-                    label = f"{display_name}: {os.path.basename(csv_path)}"
+                    label = provider_display
+            elif self.provider_name == 'http_traccar':
+                server_url = self.provider_config.get('server_url', 'Unknown')
+                label = f"{provider_display}: {server_url}"
             else:
-                # Generic label for other providers
-                label = display_name
+                label = provider_display
 
             # Set data source label (check panel still exists)
             if self.sar_panel:
@@ -1314,7 +1455,7 @@ class sartracker:
             info(
                 self.iface.messageBar(),
                 "SAR Tracker",
-                f"Loading data from {display_name}...",
+                f"Loading initial data from {provider_display}...",
                 duration=2
             )
 
@@ -1323,38 +1464,31 @@ class sartracker:
                 self._refresh_in_progress = False
                 if self.sar_panel:
                     self.sar_panel.set_loading_state(False)
-                # Clean up state
-                self.provider_name = None
-                self.provider_config = None
-                self._pending_provider_metadata = None
                 error(
                     self.iface.messageBar(),
                     "Internal Error",
                     "Provider was cleared during connection test",
                     duration=5
                 )
+                print("[SARTRACKER] ERROR: Provider is None after commit")
                 return
-
-            # Create provider-specific background task for data load
-            data_task = self.provider.create_refresh_task("Loading tracking data")
 
             # Verify task manager still exists (defensive check)
             if not self.task_manager:
                 self._refresh_in_progress = False
                 if self.sar_panel:
                     self.sar_panel.set_loading_state(False)
-                # Clean up provider state
-                self.provider = None
-                self.provider_name = None
-                self.provider_config = None
-                self._pending_provider_metadata = None
                 error(
                     self.iface.messageBar(),
                     "Internal Error",
                     "Task manager was cleared during connection test",
                     duration=5
                 )
+                print("[SARTRACKER] ERROR: Task manager is None")
                 return
+
+            # Create provider-specific background task for initial data load
+            data_task = self.provider.create_refresh_task("Loading tracking data")
 
             # Start data load task with managed lifecycle
             task_id = self.task_manager.start_task(
@@ -1367,46 +1501,73 @@ class sartracker:
             # Store task reference for backwards compatibility with Issue #4 cleanup
             self._current_refresh_task = data_task
 
+            print(f"[SARTRACKER] Initial data load task started for: {self.provider_name}")
+
         except Exception as e:
-            # Reset state on error
+            # DEFENSIVE: Catch all exceptions to prevent error handler crashes
+            print(f"[SARTRACKER] Exception in _on_connection_test_complete: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Reset state
             self._refresh_in_progress = False
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
+            # Clean up shadow state (preserve current provider on error)
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+
             error(
                 self.iface.messageBar(),
                 "Error After Connection Test",
-                f"Failed to start data load: {str(e)}",
+                f"Unexpected error during provider setup: {str(e)}",
                 duration=5
             )
-
-            # Clean up provider
-            self.provider = None
-            self.provider_name = None
-            self.provider_config = None
-            self._pending_provider_metadata = None
 
     def _on_connection_test_error(self, task):
         """
         Handle connection test error or cancellation (runs in main thread).
+
+        ISSUE #1 FIX: Implements rollback for provider changes on error/timeout.
+        Preserves current provider state.
 
         Args:
             task: Failed or cancelled ConnectionTestTask
 
         SAFETY: May be called after plugin unload if signal disconnect failed.
         Check component existence before accessing.
-
-        ISSUE #2 FIX: This callback runs after background connection test,
-        preventing UI freezes during HTTP operations.
         """
-        # CRITICAL GUARD: Check if plugin components still exist
+        # CRITICAL GUARD: Check if plugin components still exist (Pattern 9)
         if not self.sar_panel:
             print("[SARTRACKER] Connection test error after plugin unload, ignoring")
+            # Clean up shadow state
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+            self._pending_provider_task = None
             return
 
         try:
             # Clear task reference
-            self._current_connection_task = None
+            self._pending_provider_task = None
+
+            # DEFENSIVE CHECK: Ensure we have pending provider state
+            if self._pending_provider is None:
+                print("[SARTRACKER] Warning: Connection test error but no pending provider")
+                self._refresh_in_progress = False
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+                return
+
+            # ================================================================
+            # ROLLBACK: Connection test failed/timed out/cancelled
+            # ================================================================
+            print(f"[SARTRACKER] Connection test ERROR for {self._pending_provider_name}")
+            print(f"[SARTRACKER] Rolling back to previous provider: {self.provider_name}")
 
             # Reset refresh state
             self._refresh_in_progress = False
@@ -1415,31 +1576,54 @@ class sartracker:
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
-            # Show error message
+            # Get error message
             error_msg = (
                 task.error_message
                 if hasattr(task, 'error_message') and task.error_message
                 else "Connection test failed or was cancelled"
             )
 
+            # Show user-friendly error with rollback context
+            provider_display = self._pending_provider_name
+            if self._pending_provider_metadata:
+                provider_display = self._pending_provider_metadata.display_name
+
             error(
                 self.iface.messageBar(),
-                "Connection Test Failed",
-                error_msg,
-                duration=5
+                "Connection Failed",
+                f"{provider_display}: {error_msg}. "
+                + (f"Your current data source ({self.provider_name}) remains active."
+                   if self.provider else "No data source loaded."),
+                duration=8  # Longer duration for critical message
             )
 
-            # Clean up provider
-            self.provider = None
-            self.provider_name = None
-            self.provider_config = None
+            # ROLLBACK: Discard pending provider (keep current provider)
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
             self._pending_provider_metadata = None
+
+            # Current provider (self.provider) is UNCHANGED - rollback complete
+            print(f"[SARTRACKER] Rollback complete. Active provider: {self.provider_name}")
 
         except Exception as e:
             # Last resort error handling
             print(f"[SARTRACKER] Error in connection test error handler: {e}")
             import traceback
             traceback.print_exc()
+
+            # Best effort: clean up shadow state
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+            self._refresh_in_progress = False
+
+            try:
+                if self.sar_panel:
+                    self.sar_panel.set_loading_state(False)
+            except:
+                pass
 
     def _on_load_csv(self, csv_file):
         """
@@ -1633,7 +1817,7 @@ class sartracker:
 
     def _on_add_poi_requested(self):
         """Handle Add IPP/LKP button click from SAR Panel."""
-        # Deactivate any drawing tools first
+        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
         if self.tool_registry:
             self.tool_registry.deactivate_current()
 
@@ -1648,7 +1832,7 @@ class sartracker:
 
     def _on_add_clue_requested(self):
         """Handle Add Clue button click from SAR Panel."""
-        # Deactivate any drawing tools first
+        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
         if self.tool_registry:
             self.tool_registry.deactivate_current()
 
@@ -1663,7 +1847,7 @@ class sartracker:
 
     def _on_add_casualty_requested(self):
         """Handle Add Casualty button click from SAR Panel."""
-        # Deactivate any drawing tools first
+        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
         if self.tool_registry:
             self.tool_registry.deactivate_current()
 
@@ -1678,7 +1862,7 @@ class sartracker:
 
     def _on_add_hazard_requested(self):
         """Handle Add Hazard button click from SAR Panel."""
-        # Deactivate any drawing tools first
+        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
         if self.tool_registry:
             self.tool_registry.deactivate_current()
 
@@ -1851,7 +2035,28 @@ class sartracker:
         )
 
     def _on_line_tool_requested(self):
-        """Handle Line Tool button click."""
+        """
+        Handle Line Tool button click.
+
+        SAFETY: Guards against tool_registry being None if initialization failed.
+        This prevents AttributeError crashes on main thread (Issue #2 fix).
+        """
+        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
+        if not self.tool_registry:
+            error(
+                self.iface.messageBar(),
+                "Drawing Tool Unavailable",
+                "Line Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
+                duration=0  # Persistent - user must acknowledge
+            )
+            # Auto-open diagnostics for immediate troubleshooting
+            try:
+                self._show_diagnostics()
+            except Exception as e:
+                print(f"[SARTRACKER] Could not open diagnostics: {e}")
+            return  # Early exit - don't attempt to use None registry
+
+        # Safe to proceed - registry exists and is valid
         print(f"[SARTRACKER] _on_line_tool_requested() called")
         print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
         print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
@@ -1866,7 +2071,28 @@ class sartracker:
         )
 
     def _on_polygon_tool_requested(self):
-        """Handle Polygon Tool (Search Area) button click."""
+        """
+        Handle Polygon Tool (Search Area) button click.
+
+        SAFETY: Guards against tool_registry being None if initialization failed.
+        This prevents AttributeError crashes on main thread (Issue #2 fix).
+        """
+        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
+        if not self.tool_registry:
+            error(
+                self.iface.messageBar(),
+                "Drawing Tool Unavailable",
+                "Polygon Tool (Search Area) failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
+                duration=0  # Persistent - user must acknowledge
+            )
+            # Auto-open diagnostics for immediate troubleshooting
+            try:
+                self._show_diagnostics()
+            except Exception as e:
+                print(f"[SARTRACKER] Could not open diagnostics: {e}")
+            return  # Early exit - don't attempt to use None registry
+
+        # Safe to proceed - registry exists and is valid
         print(f"[SARTRACKER] _on_polygon_tool_requested() called")
         print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
         print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
@@ -1881,7 +2107,28 @@ class sartracker:
         )
 
     def _on_range_rings_tool_requested(self):
-        """Handle Range Rings Tool button click."""
+        """
+        Handle Range Rings Tool button click.
+
+        SAFETY: Guards against tool_registry being None if initialization failed.
+        This prevents AttributeError crashes on main thread (Issue #2 fix).
+        """
+        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
+        if not self.tool_registry:
+            error(
+                self.iface.messageBar(),
+                "Drawing Tool Unavailable",
+                "Range Rings Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
+                duration=0  # Persistent - user must acknowledge
+            )
+            # Auto-open diagnostics for immediate troubleshooting
+            try:
+                self._show_diagnostics()
+            except Exception as e:
+                print(f"[SARTRACKER] Could not open diagnostics: {e}")
+            return  # Early exit - don't attempt to use None registry
+
+        # Safe to proceed - registry exists and is valid
         self.tool_registry.activate_tool('range_rings')
         info(
             self.iface.messageBar(),
@@ -1891,7 +2138,28 @@ class sartracker:
         )
 
     def _on_bearing_tool_requested(self):
-        """Handle Bearing Tool button click."""
+        """
+        Handle Bearing Tool button click.
+
+        SAFETY: Guards against tool_registry being None if initialization failed.
+        This prevents AttributeError crashes on main thread (Issue #2 fix).
+        """
+        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
+        if not self.tool_registry:
+            error(
+                self.iface.messageBar(),
+                "Drawing Tool Unavailable",
+                "Bearing Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
+                duration=0  # Persistent - user must acknowledge
+            )
+            # Auto-open diagnostics for immediate troubleshooting
+            try:
+                self._show_diagnostics()
+            except Exception as e:
+                print(f"[SARTRACKER] Could not open diagnostics: {e}")
+            return  # Early exit - don't attempt to use None registry
+
+        # Safe to proceed - registry exists and is valid
         self.tool_registry.activate_tool('bearing')
         info(
             self.iface.messageBar(),
@@ -2178,7 +2446,10 @@ class sartracker:
             'data_source': None,
             'provider_type': None,
             'devices_count': 0,
-            'last_refresh': None
+            'last_refresh': None,
+            # NEW: Tool registry status (Issue #2 fix)
+            'tool_registry_loaded': False,
+            'drawing_tools_available': False
         }
 
         try:
@@ -2212,6 +2483,21 @@ class sartracker:
                 # ============================================================
                 status['devices_count'] = self._cached_device_count
                 status['last_refresh'] = self._last_refresh_time
+
+            # Read tool registry status (Issue #2 fix)
+            status['tool_registry_loaded'] = self.tool_registry is not None
+            if self.tool_registry:
+                # Count how many tools are registered
+                try:
+                    # Check if registry has a method to get registered tool count
+                    if hasattr(self.tool_registry, 'get_registered_tools'):
+                        registered_tools = self.tool_registry.get_registered_tools()
+                        status['drawing_tools_available'] = len(registered_tools) > 0
+                    else:
+                        # Fallback: assume tools are available if registry exists
+                        status['drawing_tools_available'] = True
+                except Exception as tool_error:
+                    print(f"[SARTRACKER] Warning: Error reading tool registry status: {tool_error}")
 
         except Exception as e:
             # Defensive: Don't let diagnostics query crash plugin

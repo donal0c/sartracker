@@ -239,6 +239,27 @@ class DiagnosticsPanel(BaseDialog):
         form.addRow("<b>Mission Status:</b>", QLabel(mission_status))
         form.addRow("<b>Data Source:</b>", QLabel(data_source))
 
+        # Tool Registry Status (Issue #2 fix)
+        tool_status = "Unable to detect"
+        try:
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+
+                    if status.get('tool_registry_loaded'):
+                        if status.get('drawing_tools_available'):
+                            tool_status = "✅ Loaded and operational"
+                        else:
+                            tool_status = "⚠ Loaded but no tools registered"
+                    else:
+                        tool_status = "❌ Failed to load"
+        except Exception as e:
+            print(f"[DIAGNOSTICS] Error reading tool registry status: {e}")
+            tool_status = "Unable to detect"
+
+        form.addRow("<b>Drawing Tools:</b>", QLabel(tool_status))
+
         # Device Color Status (Phase 5 addition)
         color_method = "MD5 hash (deterministic)"
         color_label = QLabel(f"{color_method}")

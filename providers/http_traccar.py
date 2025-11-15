@@ -6,7 +6,7 @@ Based on Kerry Mountain Rescue Team's existing Traccar setup.
 """
 
 import requests
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from .base import Provider, FeatureDict
 
@@ -89,7 +89,36 @@ class HttpTraccarProvider(Provider):
         response.raise_for_status()
         return response.json()
 
-    def get_devices(self, session: Optional[requests.Session] = None) -> List[Dict[str, object]]:
+    def _get_raw_devices(self, session: Optional[requests.Session] = None) -> List[Dict]:
+        """
+        Get raw devices from Traccar API (internal method).
+
+        This is an internal method used by get_current() and get_breadcrumbs()
+        which need the raw Traccar device IDs for API calls.
+
+        Args:
+            session: Optional requests.Session for thread-safe execution.
+                     If None, creates temporary session.
+
+        Returns:
+            List of raw device dicts from Traccar API
+
+        THREAD-SAFETY (Issue #1 fix):
+        Background tasks should pass their own session instance.
+        """
+        try:
+            raw_devices = self._make_request('/api/devices', session=session)
+
+            # Validate response type
+            if not isinstance(raw_devices, list):
+                raise RuntimeError(f"Invalid API response: expected list, got {type(raw_devices)}")
+
+            return raw_devices
+
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch raw devices: {str(e)}")
+
+    def get_devices(self, session: Optional[requests.Session] = None) -> List[Dict[str, Any]]:
         """
         Get all devices from Traccar server.
 
@@ -98,15 +127,152 @@ class HttpTraccarProvider(Provider):
                      If None, creates temporary session.
 
         Returns:
-            List of device dicts with id, name, status, etc.
+            List of normalized device dicts with keys:
+                - device_id: str
+                - name: str
+                - status: str ('online', 'offline', 'unknown')
+                - last_update: Optional[str] (ISO timestamp)
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
+
+        DATA NORMALIZATION (Issue #3 fix):
+        Transforms raw Traccar API response to Base Provider schema
+        for consistent UI display and diagnostics.
         """
         try:
-            return self._make_request('/api/devices', session=session)
+            # Fetch raw devices from Traccar API
+            raw_devices = self._get_raw_devices(session=session)
+
+            # Normalize each device to Base Provider schema (Issue #3 fix)
+            normalized_devices = []
+            for raw_device in raw_devices:
+                normalized = self._normalize_device(raw_device)
+                normalized_devices.append(normalized)
+
+            return normalized_devices
+
         except Exception as e:
             raise RuntimeError(f"Failed to fetch devices: {str(e)}")
+
+    def _normalize_device(self, raw_device: Dict) -> Dict[str, Any]:
+        """
+        Normalize Traccar API device response to Base Provider schema.
+
+        Transforms raw /api/devices response to consistent schema expected by UI.
+        Handles missing fields, type conversions, and status mapping.
+
+        Args:
+            raw_device: Raw device dict from Traccar API with fields:
+                - id: int (Traccar device ID)
+                - name: str (device name)
+                - uniqueId: str (unique device identifier)
+                - status: str (Traccar status: 'online', 'offline', 'disabled', etc.)
+                - lastUpdate: str (ISO timestamp of last update)
+                - ... other Traccar-specific fields
+
+        Returns:
+            Normalized device dict with keys:
+                - device_id: str (string version of id or uniqueId)
+                - name: str (device name, defaulted if missing)
+                - status: str ('online', 'offline', 'unknown')
+                - last_update: Optional[str] (ISO timestamp or None)
+
+        MANDATORY PATTERNS:
+            - Input Validation: All fields validated before use
+            - Error Handling: Exceptions caught, safe defaults returned
+            - Life-Safety: Invalid data defaults to 'unknown' status
+
+        Qt5/Qt6 Compatible: Pure Python implementation.
+
+        Issue #3 Fix: Ensures HTTP provider returns consistent schema.
+        """
+        try:
+            # === VALIDATE INPUT ===
+            if not isinstance(raw_device, dict):
+                raise ValueError(f"Invalid device: expected dict, got {type(raw_device)}")
+
+            # === EXTRACT device_id ===
+            # Traccar uses 'id' (int) and 'uniqueId' (str)
+            device_id = None
+
+            # Try 'id' first (convert to string)
+            if 'id' in raw_device and raw_device['id'] is not None:
+                try:
+                    device_id = str(raw_device['id'])
+                except (ValueError, TypeError):
+                    pass
+
+            # Fallback to 'uniqueId'
+            if not device_id and 'uniqueId' in raw_device:
+                unique_id = raw_device.get('uniqueId')
+                if unique_id and isinstance(unique_id, str):
+                    device_id = unique_id.strip()
+
+            # Final fallback
+            if not device_id:
+                device_id = 'Unknown'
+
+            # === EXTRACT name ===
+            name = raw_device.get('name', '').strip() if isinstance(raw_device.get('name'), str) else ''
+            if not name:
+                name = f"Device {device_id}"
+
+            # === NORMALIZE status ===
+            raw_status_value = raw_device.get('status', '')
+            # Safely convert to lowercase string
+            if isinstance(raw_status_value, str):
+                raw_status = raw_status_value.lower().strip()
+            else:
+                raw_status = ''
+
+            # Map Traccar status to Base Provider schema
+            if raw_status == 'online':
+                status = 'online'
+            elif raw_status in ('offline', 'disabled'):
+                # Treat disabled devices as offline for UI purposes
+                status = 'offline'
+            else:
+                # Unknown, null, or unrecognized status
+                status = 'unknown'
+
+            # === EXTRACT last_update ===
+            last_update = raw_device.get('lastUpdate')
+
+            # Validate timestamp format (basic check)
+            if last_update:
+                if not isinstance(last_update, str) or len(last_update) < 10:
+                    # Invalid format
+                    last_update = None
+
+            # === RETURN NORMALIZED DICT ===
+            return {
+                'device_id': device_id,
+                'name': name,
+                'status': status,
+                'last_update': last_update
+            }
+
+        except Exception as e:
+            # CRITICAL: Don't let normalization failure crash the refresh
+            # Return safe default so UI can display something
+
+            # Safely extract ID for logging (raw_device might not be dict)
+            try:
+                device_id_for_log = raw_device.get('id', 'unknown') if isinstance(raw_device, dict) else 'unknown'
+                device_id_for_return = str(raw_device.get('id', 'Unknown')) if isinstance(raw_device, dict) else 'Unknown'
+            except Exception:
+                device_id_for_log = 'unknown'
+                device_id_for_return = 'Unknown'
+
+            print(f"Warning: Error normalizing device {device_id_for_log}: {e}")
+
+            return {
+                'device_id': device_id_for_return,
+                'name': f"Device {device_id_for_return}",
+                'status': 'unknown',
+                'last_update': None
+            }
 
     def get_current(self, session: Optional[requests.Session] = None) -> List[FeatureDict]:
         """
@@ -125,8 +291,8 @@ class HttpTraccarProvider(Provider):
         Background tasks should pass their own session instance.
         """
         try:
-            # Get all devices first
-            devices = self.get_devices(session=session)
+            # Get raw devices (need Traccar IDs for API calls)
+            devices = self._get_raw_devices(session=session)
 
             # Get positions for last hour to find latest per device
             current_time = datetime.utcnow()
@@ -190,8 +356,8 @@ class HttpTraccarProvider(Provider):
         Background tasks should pass their own session instance.
         """
         try:
-            # Get all devices
-            devices = self.get_devices(session=session)
+            # Get raw devices (need Traccar IDs for API calls)
+            devices = self._get_raw_devices(session=session)
 
             # Determine time range
             current_time = datetime.utcnow()
