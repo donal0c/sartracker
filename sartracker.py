@@ -609,7 +609,8 @@ class sartracker:
         self.iface.statusBarIface().addPermanentWidget(self.coords_label)
 
         # Set up timer to throttle coordinate updates (50ms = 20 updates/sec max)
-        self.coords_update_timer = QTimer()
+        # Phase 0 fix: Add parent for proper Qt lifecycle (AI_CODE_REFERENCE.md Pattern 7)
+        self.coords_update_timer = QTimer(self.iface.mainWindow())
         self.coords_update_timer.timeout.connect(self._update_coords_display)
         self.coords_update_timer.start(50)
 
@@ -2432,12 +2433,14 @@ class sartracker:
                 - provider_type: str or None (e.g., "csv", "http_traccar")
                 - devices_count: int (number of tracked devices, cached)
                 - last_refresh: str or None (ISO timestamp of last refresh)
+                - active_tasks_count: int (number of active background tasks)
 
         Qt5/Qt6 Compatible: Pure Python data structures, no Qt types.
 
         Issue #4 Fix: Replaces widget tree scanning pattern with explicit API contract.
         Issue #1 Fix: Returns cached device count populated by background refresh tasks.
                       Never performs network I/O on UI thread.
+        Phase 0 Enhancement: Added active_tasks_count for health monitoring.
         """
         status = {
             'mission_active': False,
@@ -2447,6 +2450,7 @@ class sartracker:
             'provider_type': None,
             'devices_count': 0,
             'last_refresh': None,
+            'active_tasks_count': 0,  # Phase 0: Task manager health metric
             # NEW: Tool registry status (Issue #2 fix)
             'tool_registry_loaded': False,
             'drawing_tools_available': False
@@ -2499,8 +2503,18 @@ class sartracker:
                 except Exception as tool_error:
                     print(f"[SARTRACKER] Warning: Error reading tool registry status: {tool_error}")
 
+            # Read task manager status (Phase 0: Health monitoring)
+            # See AI_CODE_REFERENCE.md – Pattern 6 (TaskManager)
+            if self.task_manager:
+                try:
+                    status['active_tasks_count'] = self.task_manager.get_active_count()
+                except Exception as task_error:
+                    print(f"[SARTRACKER] Warning: Error reading task manager status: {task_error}")
+                    status['active_tasks_count'] = 0
+
         except Exception as e:
             # Defensive: Don't let diagnostics query crash plugin
+            # See AI_CODE_REFERENCE.md – Pattern 9 (Defensive Guards)
             print(f"[SARTRACKER] Warning: Error reading plugin status: {e}")
 
         return status

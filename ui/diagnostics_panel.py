@@ -266,6 +266,29 @@ class DiagnosticsPanel(BaseDialog):
         color_label.setToolTip("Device colors use stable MD5 hashing for consistency across sessions")
         form.addRow("<b>Device Colors:</b>", color_label)
 
+        # Active Tasks Status (Phase 0 addition)
+        # See AI_CODE_REFERENCE.md – Pattern 6 (TaskManager)
+        active_tasks_text = "Unable to detect"
+        try:
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+                    active_tasks_count = status.get('active_tasks_count', 0)
+                    if active_tasks_count == 0:
+                        active_tasks_text = "0 (Idle)"
+                    elif active_tasks_count == 1:
+                        active_tasks_text = "1 task running"
+                    else:
+                        active_tasks_text = f"{active_tasks_count} tasks running"
+        except Exception as e:
+            print(f"[DIAGNOSTICS] Error reading active tasks status: {e}")
+            active_tasks_text = "Unable to detect"
+
+        active_tasks_label = QLabel(active_tasks_text)
+        active_tasks_label.setToolTip("Number of background tasks (refresh, connection test, etc.)")
+        form.addRow("<b>Active Tasks:</b>", active_tasks_label)
+
         group.setLayout(form)
         return group
 
