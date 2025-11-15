@@ -3,12 +3,23 @@ HTTP Traccar Provider
 
 Production provider that connects to Traccar Server HTTP API.
 Based on Kerry Mountain Rescue Team's existing Traccar setup.
+
+Phase 1 - Provider Abstraction Hardening:
+Updated to use ProviderError hierarchy for consistent error handling.
+Raises ProviderAuthError, ProviderNetworkError, and ProviderDataError
+instead of generic RuntimeError.
+
+Existing limitations documented (per-device /api/reports/route loops)
+to be addressed in Phase 4 (WebSocket provider).
+
+Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
 """
 
 import requests
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from .base import Provider, FeatureDict
+from utils.exceptions import ProviderAuthError, ProviderNetworkError, ProviderDataError
 
 
 class HttpTraccarProvider(Provider):
@@ -18,6 +29,25 @@ class HttpTraccarProvider(Provider):
     Implements the Traccar REST API endpoints:
     - GET /api/devices - List all devices
     - GET /api/reports/route - Get position history
+
+    LIMITATIONS (Phase 1 documentation, to be addressed in Phase 4):
+    Current implementation uses per-device /api/reports/route loops which
+    can be slow for many devices. Phase 4 will introduce WebSocket-based
+    provider for real-time updates without polling overhead.
+
+    THREAD-SAFETY (Phase 1):
+    HTTP provider is thread-safe. Each background task creates its own
+    requests.Session (Issue #1 fix) to avoid sharing connection pools
+    across threads. Methods accept optional 'session' parameter for
+    background task usage.
+
+    ERROR HANDLING (Phase 1):
+    Raises specific ProviderError subclasses:
+    - ProviderAuthError: HTTP 401/403 authentication failures
+    - ProviderNetworkError: Timeouts, connection refused, DNS failures
+    - ProviderDataError: Invalid API responses, malformed JSON
+
+    Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
     """
 
     def __init__(self, server_url: str, username: str, password: str, timeout: int = 10):
@@ -72,7 +102,9 @@ class HttpTraccarProvider(Provider):
             Parsed JSON response as list of dicts
 
         Raises:
-            requests.RequestException: On network or HTTP errors
+            ProviderAuthError: On HTTP 401/403 authentication failures
+            ProviderNetworkError: On network/timeout errors
+            ProviderDataError: On invalid JSON or unexpected response format
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks MUST pass their own session to avoid thread contention.
@@ -85,9 +117,57 @@ class HttpTraccarProvider(Provider):
             # (e.g., test_connection, get_devices from main thread)
             session = self._create_session()
 
-        response = session.get(url, params=params, timeout=self.timeout)
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = session.get(url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.HTTPError as e:
+            # HTTP status code errors (4xx, 5xx)
+            status_code = e.response.status_code if e.response else None
+
+            if status_code in (401, 403):
+                raise ProviderAuthError(
+                    f"Authentication failed for {url}: {str(e)}",
+                    provider_name='http_traccar',
+                    recoverable=True
+                )
+            else:
+                raise ProviderNetworkError(
+                    f"HTTP error {status_code} for {url}: {str(e)}",
+                    provider_name='http_traccar',
+                    recoverable=True
+                )
+
+        except requests.exceptions.Timeout as e:
+            raise ProviderNetworkError(
+                f"Request timeout for {url} (>{self.timeout}s): {str(e)}",
+                provider_name='http_traccar',
+                recoverable=True
+            )
+
+        except requests.exceptions.ConnectionError as e:
+            raise ProviderNetworkError(
+                f"Connection failed for {url}: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=True
+            )
+
+        except requests.exceptions.RequestException as e:
+            # Catch-all for other requests errors (DNS, SSL, etc.)
+            raise ProviderNetworkError(
+                f"Network error for {url}: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=True
+            )
+
+        except ValueError as e:
+            # JSON parsing failed
+            raise ProviderDataError(
+                f"Invalid JSON response from {url}: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
 
     def _get_raw_devices(self, session: Optional[requests.Session] = None) -> List[Dict]:
         """
@@ -103,6 +183,11 @@ class HttpTraccarProvider(Provider):
         Returns:
             List of raw device dicts from Traccar API
 
+        Raises:
+            ProviderAuthError: If authentication fails
+            ProviderNetworkError: If network request fails
+            ProviderDataError: If response has invalid format
+
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
         """
@@ -111,12 +196,24 @@ class HttpTraccarProvider(Provider):
 
             # Validate response type
             if not isinstance(raw_devices, list):
-                raise RuntimeError(f"Invalid API response: expected list, got {type(raw_devices)}")
+                raise ProviderDataError(
+                    f"Invalid API response from /api/devices: expected list, got {type(raw_devices)}",
+                    provider_name='http_traccar',
+                    recoverable=False
+                )
 
             return raw_devices
 
+        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
+            # Re-raise provider errors
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch raw devices: {str(e)}")
+            # Wrap unexpected errors
+            raise ProviderDataError(
+                f"Unexpected error fetching devices: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
 
     def get_devices(self, session: Optional[requests.Session] = None) -> List[Dict[str, Any]]:
         """
@@ -132,6 +229,11 @@ class HttpTraccarProvider(Provider):
                 - name: str
                 - status: str ('online', 'offline', 'unknown')
                 - last_update: Optional[str] (ISO timestamp)
+
+        Raises:
+            ProviderAuthError: If authentication fails
+            ProviderNetworkError: If network request fails
+            ProviderDataError: If response has invalid format
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
@@ -152,8 +254,16 @@ class HttpTraccarProvider(Provider):
 
             return normalized_devices
 
+        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
+            # Re-raise provider errors
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch devices: {str(e)}")
+            # Wrap unexpected errors
+            raise ProviderDataError(
+                f"Unexpected error fetching devices: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
 
     def _normalize_device(self, raw_device: Dict) -> Dict[str, Any]:
         """
@@ -287,6 +397,11 @@ class HttpTraccarProvider(Provider):
         Returns:
             List of current position features
 
+        Raises:
+            ProviderAuthError: If authentication fails
+            ProviderNetworkError: If network request fails
+            ProviderDataError: If response has invalid format
+
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
         """
@@ -336,8 +451,16 @@ class HttpTraccarProvider(Provider):
 
             return positions
 
+        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
+            # Re-raise provider errors
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch current positions: {str(e)}")
+            # Wrap unexpected errors
+            raise ProviderDataError(
+                f"Unexpected error fetching current positions: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
 
     def get_breadcrumbs(self, since_iso: Optional[str] = None,
                         session: Optional[requests.Session] = None) -> List[FeatureDict]:
@@ -351,6 +474,11 @@ class HttpTraccarProvider(Provider):
 
         Returns:
             List of position features ordered by device then time
+
+        Raises:
+            ProviderAuthError: If authentication fails
+            ProviderNetworkError: If network request fails
+            ProviderDataError: If response has invalid format
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
@@ -401,8 +529,16 @@ class HttpTraccarProvider(Provider):
 
             return all_positions
 
+        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
+            # Re-raise provider errors
+            raise
         except Exception as e:
-            raise RuntimeError(f"Failed to fetch breadcrumbs: {str(e)}")
+            # Wrap unexpected errors
+            raise ProviderDataError(
+                f"Unexpected error fetching breadcrumbs: {str(e)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
 
     def save_casualty(self, mission_id: int, name: str,
                      lat: float, lon: float,
@@ -488,18 +624,47 @@ def _create_http_traccar_provider(config: Dict) -> HttpTraccarProvider:
         HttpTraccarProvider instance
 
     Raises:
-        ValueError: If required config keys are missing
+        ProviderDataError: If required config keys are missing or invalid
     """
+    # Validate config before creating provider (Phase 1 requirement)
+    if not isinstance(config, dict):
+        raise ProviderDataError(
+            "HTTP Traccar provider requires config dict",
+            provider_name='http_traccar',
+            recoverable=False
+        )
+
     required = ['server_url', 'username', 'password']
     for key in required:
         if key not in config:
-            raise ValueError(f"HTTP Traccar provider requires '{key}' in config")
+            raise ProviderDataError(
+                f"HTTP Traccar provider requires '{key}' in config",
+                provider_name='http_traccar',
+                recoverable=False
+            )
+
+        # Validate non-empty strings
+        if not isinstance(config[key], str) or not config[key].strip():
+            raise ProviderDataError(
+                f"HTTP Traccar provider '{key}' must be non-empty string",
+                provider_name='http_traccar',
+                recoverable=False
+            )
+
+    # Validate timeout if provided
+    timeout = config.get('timeout', 10)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        raise ProviderDataError(
+            f"HTTP Traccar provider 'timeout' must be positive number, got: {timeout}",
+            provider_name='http_traccar',
+            recoverable=False
+        )
 
     return HttpTraccarProvider(
         server_url=config['server_url'],
         username=config['username'],
         password=config['password'],
-        timeout=config.get('timeout', 10)
+        timeout=timeout
     )
 
 
@@ -534,7 +699,11 @@ registry.register(
                 'required': False,
                 'default': 10
             }
-        }
+        },
+        # Phase 1: Provider capabilities
+        supports_polling=True,  # HTTP polling via background tasks
+        supports_streaming=False,  # WebSocket streaming in Phase 4
+        auth_modes=['basic']  # HTTP Basic Authentication
     ),
     _create_http_traccar_provider
 )

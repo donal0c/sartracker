@@ -4,6 +4,12 @@ File CSV Provider
 
 Reads tracking data from Traccar CSV exports.
 This is a transitional provider for teams currently using CSV workflow.
+
+Phase 1 - Provider Abstraction Hardening:
+Updated to use ProviderError hierarchy for consistent error handling.
+All errors now raise ProviderDataError instead of generic RuntimeError.
+
+Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
 """
 
 import os
@@ -12,6 +18,7 @@ import glob
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from .base import Provider, FeatureDict
+from utils.exceptions import ProviderDataError
 
 
 class FileCSVProvider(Provider):
@@ -27,6 +34,20 @@ class FileCSVProvider(Provider):
     Performance Features:
     - File-level caching with mtime checks (avoids reparsing unchanged files)
     - Cache hit provides ~3x speedup for typical refresh cycles
+
+    THREAD-SAFETY (Phase 1):
+    CSV provider is thread-safe because it only uses local I/O and standard
+    Python data structures. The file cache uses mtime-based invalidation which
+    is safe across threads. Methods can be called from background threads
+    (QgsTask) without synchronization.
+
+    ERROR HANDLING (Phase 1):
+    Raises ProviderDataError for all failures:
+    - CSV file not found or inaccessible
+    - CSV file missing required columns (Valid, Time, Latitude, Longitude)
+    - CSV data malformed (invalid lat/lon values)
+
+    Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
     """
 
     def __init__(self, csv_path: str):
@@ -118,72 +139,129 @@ class FileCSVProvider(Provider):
 
         Returns:
             Tuple of (device_name, list of positions)
+
+        Raises:
+            ProviderDataError: If file cannot be read or has invalid format
         """
         device_name = os.path.basename(filepath).replace('.csv', '')
         positions = []
 
-        with open(filepath, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            
-            # Extract device name from header (line 4: "Device:,eoc,,,,,,")
-            for line in lines[:10]:  # Check first 10 lines for device name
-                if line.startswith('Device:'):
-                    parts = line.strip().split(',')
-                    if len(parts) > 1 and parts[1]:
-                        device_name = parts[1]
-                    break
-            
-            # Find the header row (contains "Valid,Time,Latitude")
-            header_idx = -1
-            for i, line in enumerate(lines):
-                if 'Valid' in line and 'Time' in line and 'Latitude' in line:
-                    header_idx = i
-                    break
-            
-            if header_idx == -1:
-                return device_name, []
-            
-            # Parse CSV data starting after header
-            reader = csv.DictReader(lines[header_idx:])
-            
-            for row in reader:
-                # Skip invalid rows
-                if row.get('Valid', '').strip().upper() not in ('TRUE', '1'):
-                    continue
-                
-                try:
-                    # Parse attributes
-                    attrs = self._parse_attributes(row.get('Attributes', ''))
-                    
-                    # Build position dict
-                    position = {
-                        'device_id': device_name,
-                        'name': device_name,
-                        'lat': float(row['Latitude']),
-                        'lon': float(row['Longitude']),
-                        'ts': row['Time'],  # Keep as string (ISO format)
-                        'altitude': float(row['Altitude'].replace(' m', '')) if row.get('Altitude') else None,
-                        'speed': float(row['Speed'].replace(' kn', '')) if row.get('Speed') else None,
-                        'battery': attrs.get('batteryLevel'),
-                        'motion': attrs.get('motion', True),
-                        'distance': attrs.get('distance'),
-                        'total_distance': attrs.get('totalDistance')
-                    }
-                    
-                    positions.append(position)
-                    
-                except (ValueError, KeyError) as e:
-                    # Skip malformed rows
-                    continue
-        
-        return device_name, positions
+        try:
+            f = open(filepath, 'r', encoding='utf-8')
+        except (IOError, OSError) as e:
+            raise ProviderDataError(
+                f"Cannot read CSV file {filepath}: {str(e)}",
+                provider_name='csv',
+                recoverable=True
+            )
+
+        try:
+            with f:
+                lines = f.readlines()
+
+                # Extract device name from header (line 4: "Device:,eoc,,,,,,")
+                for line in lines[:10]:  # Check first 10 lines for device name
+                    if line.startswith('Device:'):
+                        parts = line.strip().split(',')
+                        if len(parts) > 1 and parts[1]:
+                            device_name = parts[1]
+                        break
+
+                # Find the header row (contains "Valid,Time,Latitude")
+                header_idx = -1
+                for i, line in enumerate(lines):
+                    if 'Valid' in line and 'Time' in line and 'Latitude' in line:
+                        header_idx = i
+                        break
+
+                if header_idx == -1:
+                    raise ProviderDataError(
+                        f"CSV file missing required headers (Valid, Time, Latitude, Longitude): {filepath}",
+                        provider_name='csv',
+                        recoverable=False
+                    )
+
+                # Parse CSV data starting after header
+                reader = csv.DictReader(lines[header_idx:])
+
+                for row in reader:
+                    # Skip invalid rows
+                    if row.get('Valid', '').strip().upper() not in ('TRUE', '1'):
+                        continue
+
+                    try:
+                        # Parse attributes
+                        attrs = self._parse_attributes(row.get('Attributes', ''))
+
+                        # Build position dict
+                        position = {
+                            'device_id': device_name,
+                            'name': device_name,
+                            'lat': float(row['Latitude']),
+                            'lon': float(row['Longitude']),
+                            'ts': row['Time'],  # Keep as string (ISO format)
+                            'altitude': float(row['Altitude'].replace(' m', '')) if row.get('Altitude') else None,
+                            'speed': float(row['Speed'].replace(' kn', '')) if row.get('Speed') else None,
+                            'battery': attrs.get('batteryLevel'),
+                            'motion': attrs.get('motion', True),
+                            'distance': attrs.get('distance'),
+                            'total_distance': attrs.get('totalDistance')
+                        }
+
+                        positions.append(position)
+
+                    except (ValueError, KeyError) as e:
+                        # Skip malformed rows (non-critical, some rows may be metadata)
+                        continue
+
+                return device_name, positions
+
+        except ProviderDataError:
+            # Re-raise provider errors
+            raise
+        except Exception as e:
+            # Wrap unexpected errors
+            raise ProviderDataError(
+                f"Error parsing CSV file {filepath}: {str(e)}",
+                provider_name='csv',
+                recoverable=False
+            )
     
     def _get_csv_files(self) -> List[str]:
-        """Get list of CSV files to process."""
+        """
+        Get list of CSV files to process.
+
+        Returns:
+            List of CSV file paths
+
+        Raises:
+            ProviderDataError: If CSV path does not exist or is inaccessible
+        """
+        # Validate path exists
+        if not os.path.exists(self.csv_path):
+            raise ProviderDataError(
+                f"CSV path does not exist: {self.csv_path}",
+                provider_name='csv',
+                recoverable=True
+            )
+
         if self.is_folder:
-            return glob.glob(os.path.join(self.csv_path, '*.csv'))
+            csv_files = glob.glob(os.path.join(self.csv_path, '*.csv'))
+            if not csv_files:
+                raise ProviderDataError(
+                    f"No CSV files found in directory: {self.csv_path}",
+                    provider_name='csv',
+                    recoverable=True
+                )
+            return csv_files
         else:
-            return [self.csv_path] if os.path.exists(self.csv_path) else []
+            if not os.path.isfile(self.csv_path):
+                raise ProviderDataError(
+                    f"CSV file not found: {self.csv_path}",
+                    provider_name='csv',
+                    recoverable=True
+                )
+            return [self.csv_path]
     
     def get_current(self) -> List[FeatureDict]:
         """
@@ -206,6 +284,12 @@ class FileCSVProvider(Provider):
             - altitude: Optional[float]
             - speed: Optional[float]
             - battery: Optional[float]
+
+        Raises:
+            ProviderDataError: If CSV path does not exist or no CSV files found
+
+        THREAD-SAFETY:
+        Safe to call from background threads (uses only local I/O).
 
         Qt5/Qt6 Compatible: Pure Python implementation.
         """
@@ -238,13 +322,19 @@ class FileCSVProvider(Provider):
                        mission_id: Optional[int] = None) -> List[FeatureDict]:
         """
         Get all positions from CSV files.
-        
+
         Args:
             since_iso: Optional ISO timestamp to filter from
             mission_id: Ignored for CSV provider
-            
+
         Returns:
             List of all positions, time-ordered
+
+        Raises:
+            ProviderDataError: If CSV path does not exist or files are malformed
+
+        THREAD-SAFETY:
+        Safe to call from background threads (uses only local I/O).
         """
         all_positions = []
         
@@ -282,6 +372,12 @@ class FileCSVProvider(Provider):
             - name: str (device name)
             - status: str ('online' for CSV data)
             - last_update: str (ISO timestamp of most recent position)
+
+        Raises:
+            ProviderDataError: If CSV path does not exist or files are malformed
+
+        THREAD-SAFETY:
+        Safe to call from background threads (uses only local I/O).
 
         Qt5/Qt6 Compatible: Pure Python implementation.
         """
@@ -421,11 +517,31 @@ def _create_csv_provider(config: Dict) -> FileCSVProvider:
         FileCSVProvider instance
 
     Raises:
-        ValueError: If csv_path not provided in config
+        ProviderDataError: If csv_path not provided in config or path invalid
     """
+    # Validate config before creating provider (Phase 1 requirement)
+    if not isinstance(config, dict):
+        raise ProviderDataError(
+            "CSV provider requires config dict",
+            provider_name='csv',
+            recoverable=False
+        )
+
     csv_path = config.get('csv_path')
     if not csv_path:
-        raise ValueError("CSV provider requires 'csv_path' in config")
+        raise ProviderDataError(
+            "CSV provider requires 'csv_path' in config",
+            provider_name='csv',
+            recoverable=False
+        )
+
+    if not isinstance(csv_path, str) or not csv_path.strip():
+        raise ProviderDataError(
+            f"CSV provider 'csv_path' must be non-empty string, got: {type(csv_path)}",
+            provider_name='csv',
+            recoverable=False
+        )
+
     return FileCSVProvider(csv_path)
 
 
@@ -444,7 +560,11 @@ registry.register(
                 'description': 'Path to CSV file or folder containing CSV files',
                 'required': True
             }
-        }
+        },
+        # Phase 1: Provider capabilities
+        supports_polling=False,  # CSV is read-only, not a polled data source
+        supports_streaming=False,  # No streaming support
+        auth_modes=[]  # No authentication required (local files)
     ),
     _create_csv_provider
 )

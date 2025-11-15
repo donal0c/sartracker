@@ -245,3 +245,159 @@ def validate_coordinate_pair(lat, lon):
     validated_lat = validate_latitude(lat)
     validated_lon = validate_longitude(lon)
     return (validated_lat, validated_lon)
+
+
+# ============================================================================
+# Provider Errors (Phase 1 - Provider Abstraction Hardening)
+# ============================================================================
+
+class ProviderError(SARTrackerError):
+    """
+    Base class for provider failures.
+
+    All data provider errors inherit from this class, allowing UI/controller
+    code to catch provider-specific failures and route them to utils.notify
+    with actionable error messages.
+
+    Provider implementations must raise the most specific subclass (Auth,
+    Network, or Data) rather than generic ProviderError or RuntimeError.
+
+    See AI_CODE_REFERENCE.md - Error Handling Pattern for usage guidelines.
+
+    Qt5/Qt6 Compatible: No Qt dependencies in exception classes.
+    """
+
+    def __init__(self, message, provider_name=None, **kwargs):
+        """
+        Initialize provider error.
+
+        Args:
+            message: Detailed error message
+            provider_name: Name of provider that raised error (e.g., 'csv', 'http_traccar')
+            **kwargs: Additional arguments passed to SARTrackerError
+        """
+        super().__init__(message, **kwargs)
+        self.provider_name = provider_name
+
+
+class ProviderAuthError(ProviderError):
+    """
+    Authentication/authorization failure (HTTP 401/403 or equivalent).
+
+    Raised when:
+    - API credentials are invalid or expired
+    - User lacks permission to access resource
+    - Authentication token is malformed or missing
+
+    UI should prompt user to check credentials or contact administrator.
+
+    Examples:
+        >>> raise ProviderAuthError(
+        ...     "Invalid Traccar credentials",
+        ...     provider_name='http_traccar',
+        ...     recoverable=True
+        ... )
+
+    Qt5/Qt6 Compatible: No Qt dependencies.
+    """
+
+    def __init__(self, message, provider_name=None, **kwargs):
+        """
+        Initialize authentication error.
+
+        Args:
+            message: Detailed error message
+            provider_name: Name of provider that raised error
+            **kwargs: Additional arguments (severity, recoverable, etc.)
+        """
+        # Default to warning severity and recoverable (user can fix credentials)
+        kwargs.setdefault('title', 'Authentication Failed')
+        kwargs.setdefault('severity', 'warning')
+        kwargs.setdefault('recoverable', True)
+        super().__init__(message, provider_name=provider_name, **kwargs)
+
+
+class ProviderNetworkError(ProviderError):
+    """
+    Transport-level issues (timeouts, DNS, SSL, connection refused).
+
+    Raised when:
+    - Network connection cannot be established
+    - Request times out waiting for server response
+    - DNS resolution fails
+    - SSL/TLS certificate validation fails
+    - Server is unreachable
+
+    UI should suggest checking network connectivity, firewall rules, or
+    server availability.
+
+    Examples:
+        >>> raise ProviderNetworkError(
+        ...     "Connection timeout: server not responding",
+        ...     provider_name='http_traccar',
+        ...     recoverable=True
+        ... )
+
+    Qt5/Qt6 Compatible: No Qt dependencies.
+    """
+
+    def __init__(self, message, provider_name=None, **kwargs):
+        """
+        Initialize network error.
+
+        Args:
+            message: Detailed error message
+            provider_name: Name of provider that raised error
+            **kwargs: Additional arguments (severity, recoverable, etc.)
+        """
+        # Default to warning severity and recoverable (transient network issues)
+        kwargs.setdefault('title', 'Network Error')
+        kwargs.setdefault('severity', 'warning')
+        kwargs.setdefault('recoverable', True)
+        super().__init__(message, provider_name=provider_name, **kwargs)
+
+
+class ProviderDataError(ProviderError):
+    """
+    Malformed payloads or unexpected schemas.
+
+    Raised when:
+    - CSV file is missing required columns or has invalid format
+    - API response is not valid JSON
+    - Response schema doesn't match expected structure
+    - Required fields are missing from data
+    - Data types are incorrect (e.g., string instead of number)
+    - File does not exist or is inaccessible
+
+    UI should display specific validation failure and suggest data format fix.
+
+    Examples:
+        >>> raise ProviderDataError(
+        ...     "CSV file missing required 'Latitude' column",
+        ...     provider_name='csv',
+        ...     recoverable=False
+        ... )
+
+        >>> raise ProviderDataError(
+        ...     "CSV file not found: /path/to/missing.csv",
+        ...     provider_name='csv',
+        ...     recoverable=True
+        ... )
+
+    Qt5/Qt6 Compatible: No Qt dependencies.
+    """
+
+    def __init__(self, message, provider_name=None, **kwargs):
+        """
+        Initialize data error.
+
+        Args:
+            message: Detailed error message
+            provider_name: Name of provider that raised error
+            **kwargs: Additional arguments (severity, recoverable, etc.)
+        """
+        # Default to error severity (data issues often non-recoverable without user action)
+        kwargs.setdefault('title', 'Data Error')
+        kwargs.setdefault('severity', 'error')
+        kwargs.setdefault('recoverable', False)
+        super().__init__(message, provider_name=provider_name, **kwargs)
