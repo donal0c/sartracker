@@ -73,6 +73,25 @@ except Exception as e:
     LayersController = None
     print(f"ERROR importing LayersController: {e}")
 
+# Import MissionController (mission lifecycle + timers)
+try:
+    from .controllers.mission_controller import MissionController, MissionState
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('controllers.mission_controller.MissionController', e, traceback.format_exc()))
+    MissionController = None
+    MissionState = None
+    print(f"ERROR importing MissionController: {e}")
+
+# Import LayerManager (Phase N2)
+try:
+    from .layers import LayerManager
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('layers.LayerManager', e, traceback.format_exc()))
+    LayerManager = None
+    print(f"ERROR importing LayerManager: {e}")
+
 # Import ProviderController (Phase 3)
 try:
     from .controllers.provider_controller import ProviderController
@@ -297,6 +316,7 @@ class sartracker:
         self.first_start = None
 
         # Initialize SAR tracking components
+        self.layer_manager = None  # Phase N2: Canonical layer hierarchy manager
         self.layers_controller = None
         self.provider_controller = None  # Phase 3: Provider orchestration controller
         self.provider = None
@@ -318,6 +338,7 @@ class sartracker:
         self.bearing_tool = None
         self.polygon_tool = None
         self.tool_registry = None
+        self.mission_controller = None  # Phase N3: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
         self.coords_label = None  # Status bar coordinate display
@@ -497,6 +518,43 @@ class sartracker:
         self._current_connection_task = None
         self._pending_provider_metadata = None
 
+        # ============================================================================
+        # PHASE N2: Layer Manager Setup
+        # ============================================================================
+        # Initialize layer manager for canonical layer hierarchy (Phase N2)
+        if LayerManager is not None:
+            try:
+                self.layer_manager = LayerManager(self.iface)
+
+                # Ensure canonical layer structure exists
+                structure_ok = self.layer_manager.ensure_structure(auto_migrate=True)
+
+                if structure_ok:
+                    print("[SARTRACKER] Layer structure initialized successfully")
+                else:
+                    warning(
+                        self.iface.messageBar(),
+                        "Layer Structure",
+                        "Layer structure verification failed. Use 'Repair Layers' in Settings if needed.",
+                        duration=5
+                    )
+
+            except Exception as e:
+                self.layer_manager = None
+                warning(
+                    self.iface.messageBar(),
+                    "Layer Manager",
+                    f"Layer manager initialization failed: {e}. Layers may not be organized correctly.",
+                    duration=5
+                )
+                print(f"[SARTRACKER] ERROR initializing LayerManager: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            self.layer_manager = None
+            print("[SARTRACKER] LayerManager not available (import failed)")
+        # ============================================================================
+
         # Initialize layers controller
         self.layers_controller = LayersController(self.iface)
 
@@ -591,16 +649,26 @@ class sartracker:
             print(f"[SARTRACKER] ERROR initializing ToolRegistry: {e}")
             print(f"[SARTRACKER] Drawing tools will be disabled after panel creation")
 
+        # Initialize Mission Controller (Phase N3)
+        if MissionController is not None:
+            try:
+                self.mission_controller = MissionController(parent=self.iface.mainWindow())
+                self.mission_controller.mission_state_changed.connect(self._on_mission_state_changed)
+                self.mission_controller.mission_timing_updated.connect(self._on_mission_timing_update)
+                print("[SARTRACKER] Mission controller initialized")
+            except Exception as e:
+                self.mission_controller = None
+                print(f"[SARTRACKER] ERROR initializing MissionController: {e}")
+        else:
+            self.mission_controller = None
+            print("[SARTRACKER] MissionController import failed, mission UI limited")
+
         # Initialize SAR Panel
-        self.sar_panel = SARPanel(self.iface.mainWindow())
+        self.sar_panel = SARPanel(self.iface.mainWindow(), mission_controller=self.mission_controller)
         self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
         self.sar_panel.hide()  # Hidden by default
 
         # Connect SAR Panel signals
-        self.sar_panel.mission_started.connect(self._on_mission_started)
-        self.sar_panel.mission_paused.connect(self._on_mission_paused)
-        self.sar_panel.mission_resumed.connect(self._on_mission_resumed)
-        self.sar_panel.mission_finished.connect(self._on_mission_finished)
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
         self.sar_panel.csv_load_requested.connect(self._on_load_csv)
         self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
@@ -614,6 +682,8 @@ class sartracker:
         self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
+        self.sar_panel.clear_measurements_requested.connect(self._on_clear_measurements_requested)
+        self._update_measurement_overlay_indicator()
 
         # ============================================================================
         # PHASE 3: Provider Controller Setup
@@ -676,6 +746,7 @@ class sartracker:
                 self.settings_panel.settings_changed.connect(self._on_settings_changed)
                 self.settings_panel.provider_test_requested.connect(self._on_provider_test_requested)
                 self.settings_panel.provider_save_requested.connect(self._on_provider_save_requested)
+                self.settings_panel.repair_layers_requested.connect(self._on_repair_layers_requested)
 
                 # Populate provider dropdown from registry (if controller available)
                 if self.provider_controller and provider_registry:
@@ -866,6 +937,18 @@ class sartracker:
                 finally:
                     self._map_canvas_connected = False
 
+            if self.mission_controller:
+                try:
+                    self.mission_controller.mission_state_changed.disconnect(self._on_mission_state_changed)
+                except Exception:
+                    pass
+                try:
+                    self.mission_controller.mission_timing_updated.disconnect(self._on_mission_timing_update)
+                except Exception:
+                    pass
+                self.mission_controller.cleanup()
+                self.mission_controller = None
+
             # Cancel all background tasks (Issue #6 fix)
             # TaskManager handles:
             # - Signal disconnection BEFORE cancellation
@@ -982,6 +1065,24 @@ class sartracker:
                 except:
                     pass
                 self.tool_registry = None
+
+            # ============================================================
+            # PHASE N2: Clean up Layer Manager
+            # ============================================================
+            if self.layer_manager:
+                try:
+                    # Disconnect project signals
+                    self.layer_manager.disconnect_signals()
+
+                    # Clear caches
+                    self.layer_manager.clear_cache()
+
+                    print("[SARTRACKER] Layer manager cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during layer manager cleanup: {e}")
+                finally:
+                    self.layer_manager = None
+            # ============================================================
 
             # ============================================================
             # PHASE 3: Clean up Provider Controller
@@ -1128,45 +1229,53 @@ class sartracker:
         else:
             self.sar_panel.show()
 
-    def _on_mission_started(self, mission_name):
-        """Handle mission start."""
-        print(f"Mission started: {mission_name}")
-        success(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            f"Mission '{mission_name}' started",
-            duration=3
-        )
+    def _on_mission_state_changed(self, state, context):
+        """Handle mission state transitions from MissionController."""
+        mission_name = context.get('mission_name') or "Mission"
 
-    def _on_mission_paused(self):
-        """Handle mission pause."""
-        print("Mission paused")
-        warning(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Mission paused",
-            duration=2
-        )
+        if state == MissionState.ACTIVE:
+            if context.get('paused_since'):
+                message = "Mission resumed"
+            else:
+                message = f"Mission '{mission_name}' started"
+            success(self.iface.messageBar(), "SAR Tracker", message, duration=3)
+        elif state == MissionState.PAUSED:
+            warning(self.iface.messageBar(), "SAR Tracker", "Mission paused", duration=2)
+        elif state == MissionState.FINISHED:
+            final_elapsed = context.get('final_elapsed_seconds')
+            if final_elapsed:
+                hours, remainder = divmod(int(final_elapsed), 3600)
+                minutes, seconds = divmod(remainder, 60)
+                summary = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                success(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    f"Mission finished (elapsed {summary})",
+                    duration=3
+                )
+            else:
+                success(self.iface.messageBar(), "SAR Tracker", "Mission finished", duration=3)
+            self._handle_mission_finished_cleanup()
 
-    def _on_mission_resumed(self):
-        """Handle mission resume."""
-        print("Mission resumed")
-        success(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Mission resumed",
-            duration=2
-        )
+    def _on_mission_timing_update(self, elapsed_seconds, active_seconds):
+        """Relay timing updates to SARPanel."""
+        if self.sar_panel:
+            try:
+                self.sar_panel.update_mission_timers(elapsed_seconds, active_seconds)
+            except Exception as panel_error:
+                print(f"[SARTRACKER] Warning: Failed to update mission timers: {panel_error}")
 
-    def _on_mission_finished(self):
-        """Handle mission finish."""
-        print("Mission finished")
-        success(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Mission finished",
-            duration=3
-        )
+    def _handle_mission_finished_cleanup(self):
+        """Clear temporary overlays and reset UI badges when mission completes."""
+        if not self.layers_controller:
+            return
+
+        try:
+            removed = self.layers_controller.clear_measurement_overlays()
+            if removed:
+                self._update_measurement_overlay_indicator()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to clear overlays after mission finish: {exc}")
 
     def _on_refresh_data(self):
         """
@@ -2529,6 +2638,12 @@ class sartracker:
             duration=10
         )
 
+        try:
+            self._persist_measurement_overlay(distance_m, bearing, point1, point2)
+            self._update_measurement_overlay_indicator()
+        except Exception as overlay_error:
+            print(f"[SARTRACKER] Warning: Failed to persist measurement overlay: {overlay_error}")
+
         # Deactivate tool (return to pan/zoom)
         self.iface.mapCanvas().unsetMapTool(self.measure_tool)
 
@@ -2545,6 +2660,82 @@ class sartracker:
         directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
         index = int((bearing + 22.5) / 45) % 8
         return directions[index]
+
+    def _persist_measurement_overlay(self, distance_m, bearing, point1, point2):
+        """
+        Save measurement as temporary overlay in Lines layer.
+
+        Args:
+            distance_m: Distance in meters
+            bearing: Bearing in degrees
+            point1: Start point in canvas CRS
+            point2: End point in canvas CRS
+        """
+        if not self.layers_controller:
+            return
+
+        from datetime import datetime as dt
+
+        canvas = self.iface.mapCanvas()
+        canvas_crs = canvas.mapSettings().destinationCrs()
+        transform = QgsCoordinateTransform(canvas_crs, self.wgs84, QgsProject.instance())
+
+        points_wgs84 = [
+            transform.transform(point1),
+            transform.transform(point2)
+        ]
+
+        if distance_m < 1000:
+            distance_str = f"{distance_m:.1f} m"
+        else:
+            distance_str = f"{distance_m / 1000.0:.2f} km"
+
+        name = f"Measurement {dt.now().strftime('%H:%M:%S')}"
+        description = f"{distance_str} | {bearing:.1f}°"
+
+        self.layers_controller.add_measurement_overlay(
+            name=name,
+            points_wgs84=points_wgs84,
+            description=description
+        )
+
+    def _update_measurement_overlay_indicator(self):
+        """Update SARPanel measurement badge with current overlay count."""
+        if not self.layers_controller or not self.sar_panel:
+            return
+
+        try:
+            count = self.layers_controller.count_measurement_overlays()
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: Could not count measurement overlays: {e}")
+            count = 0
+
+        try:
+            self.sar_panel.update_measurements_indicator(count)
+        except Exception as panel_err:
+            print(f"[SARTRACKER] Warning: Could not update measurement indicator: {panel_err}")
+
+    def _on_clear_measurements_requested(self):
+        """Handle Clear Measurements request from panel."""
+        if not self.layers_controller:
+            return
+
+        try:
+            removed = self.layers_controller.clear_measurement_overlays()
+            self._update_measurement_overlay_indicator()
+            info(
+                self.iface.messageBar(),
+                "Measurement Overlays",
+                f"Cleared {removed} measurement overlay(s)." if removed else "No measurement overlays to clear.",
+                duration=3
+            )
+        except Exception as exc:
+            error(
+                self.iface.messageBar(),
+                "Measurement Overlays",
+                f"Failed to clear measurement overlays: {exc}",
+                duration=5
+            )
 
     def _on_autosave_requested(self):
         """Handle auto-save request from SAR Panel."""
@@ -2611,40 +2802,41 @@ class sartracker:
         """Check if there's a paused mission and prompt user to resume."""
         # CRITICAL GUARD: Check if plugin components still exist (Issue #4 fix)
         # Single-shot timer may fire after unload in fast reload scenarios
-        if not self.sar_panel or not self.iface:
+        if not self.sar_panel or not self.iface or not self.mission_controller:
             print("[SARTRACKER] Mission resume check skipped - plugin unloaded")
             return
 
         try:
-            saved_state = self.sar_panel.load_mission_state()
+            saved_state = self.mission_controller.load_saved_state()
 
             if not saved_state:
-                # No saved state or invalid state (already cleared)
                 return
 
-            # Show resume dialog using BaseDialog (Issue #2 fix)
             dialog = MissionResumeDialog(saved_state, parent=self.iface.mainWindow())
             result = dialog_exec(dialog)
 
             if result == DialogAccepted:
-                # Attempt to resume the mission
-                if self.sar_panel.restore_mission_state(saved_state):
-                    self.sar_panel.show()  # Show panel
-                    success(
+                try:
+                    if self.mission_controller.restore_from_state(saved_state):
+                        self.sar_panel.show()
+                        success(
+                            self.iface.messageBar(),
+                            "SAR Tracker",
+                            f"Mission '{saved_state['name']}' resumed",
+                            duration=3
+                        )
+                except Exception as restore_error:
+                    error(
                         self.iface.messageBar(),
-                        "SAR Tracker",
-                        f"Mission '{saved_state['name']}' resumed",
-                        duration=3
+                        "Mission Resume Failed",
+                        f"Could not restore mission: {restore_error}",
+                        duration=5
                     )
-                else:
-                    # restore_mission_state() already showed error message
-                    pass
+                    self.mission_controller.clear_saved_state()
             else:
-                # User chose to start fresh - clear saved state
-                self.sar_panel._clear_mission_state()
+                self.mission_controller.clear_saved_state()
 
         except Exception as e:
-            # Catch-all for any unexpected errors in the resume flow
             print(f"Unexpected error in mission resume: {e}")
             error(
                 self.iface.messageBar(),
@@ -2880,6 +3072,42 @@ class sartracker:
         # Delegate to controller with test_only=False (default - commits on success) (FIX ISSUE #4)
         self.provider_controller.set_provider(provider_name, config, test_only=False)
 
+    def _on_repair_layers_requested(self):
+        """Handle 'Repair Layer Structure' action from Settings panel."""
+        if not self.layer_manager:
+            error(
+                self.iface.messageBar(),
+                "Layer Manager",
+                "Layer manager is unavailable. Restart the plugin and try again.",
+                duration=5
+            )
+            return
+
+        try:
+            repaired = self.layer_manager.repair_structure()
+            if repaired:
+                success(
+                    self.iface.messageBar(),
+                    "Layer Structure",
+                    "Layer structure repaired successfully.",
+                    duration=4
+                )
+            else:
+                error(
+                    self.iface.messageBar(),
+                    "Layer Structure",
+                    "Failed to repair layer structure. Check logs for details.",
+                    duration=5
+                )
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "Layer Structure",
+                f"Unexpected error repairing layer structure: {e}",
+                duration=5
+            )
+            print(f"[SARTRACKER] ERROR repairing layer structure: {e}")
+
     def _on_provider_config_error(self, error_message: str):
         """
         Handle provider configuration error from controller.
@@ -2927,6 +3155,8 @@ class sartracker:
             'mission_active': False,
             'mission_name': None,
             'mission_paused': False,
+            'mission_elapsed_seconds': 0.0,
+            'mission_active_seconds': 0.0,
             'data_source': None,
             'provider_type': None,
             'devices_count': 0,
@@ -2939,11 +3169,17 @@ class sartracker:
 
         try:
             # Safely read SAR panel state
-            if self.sar_panel:
-                status['mission_active'] = self.sar_panel.mission_active
-                status['mission_paused'] = self.sar_panel.is_paused
-
-                # Get mission name from input field
+            if self.mission_controller:
+                snapshot = self.mission_controller.status_snapshot()
+                state_value = snapshot.get('state')
+                status['mission_active'] = state_value in ('active', 'paused')
+                status['mission_paused'] = state_value == 'paused'
+                status['mission_name'] = snapshot.get('mission_name')
+                status['mission_elapsed_seconds'] = snapshot.get('elapsed_seconds', 0.0)
+                status['mission_active_seconds'] = snapshot.get('active_seconds', 0.0)
+            elif self.sar_panel:
+                status['mission_active'] = getattr(self.sar_panel, 'mission_active', False)
+                status['mission_paused'] = getattr(self.sar_panel, 'is_paused', False)
                 if hasattr(self.sar_panel, 'mission_name_input'):
                     mission_name = self.sar_panel.mission_name_input.text().strip()
                     status['mission_name'] = mission_name if mission_name else None

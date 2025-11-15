@@ -14,6 +14,8 @@ from qgis.core import QgsProject, QgsVectorLayer, QgsLayerTreeGroup
 from qgis.PyQt.QtGui import QColor
 import hashlib
 
+from ...layers import GroupNames, LAYER_GROUP_PATHS
+
 
 class BaseLayerManager(ABC):
     """
@@ -29,7 +31,7 @@ class BaseLayerManager(ABC):
     """
 
     # Layer group name - all SAR layers belong to this group
-    LAYER_GROUP_NAME = "SAR Tracking"
+    LAYER_GROUP_NAME = GroupNames.ROOT
 
     # Class-level shared device color cache for consistency across all managers
     # This ensures the same device ID always gets the same color in all layers
@@ -127,14 +129,21 @@ class BaseLayerManager(ABC):
             layer: QgsVectorLayer to add
             position: Position in group (0 = top, higher = lower)
         """
-        # Add to project without adding to layer tree
-        self.project.addMapLayer(layer, False)
+        target_path = LAYER_GROUP_PATHS.get(layer.name(), [GroupNames.ROOT])
+        target_group = self._ensure_group_path(target_path)
 
-        # Get or create the group
-        group = self.get_or_create_layer_group()
+        root = self.project.layerTreeRoot()
+        layer_node = root.findLayer(layer.id()) if root else None
 
-        # Insert at specified position
-        group.insertLayer(position, layer)
+        if layer_node:
+            current_parent = layer_node.parent()
+            if current_parent != target_group:
+                if current_parent:
+                    current_parent.removeChildNode(layer_node)
+                target_group.insertChildNode(position, layer_node)
+        else:
+            self.project.addMapLayer(layer, False)
+            target_group.insertLayer(position, layer)
 
     def reset_state(self):
         """
@@ -155,6 +164,17 @@ class BaseLayerManager(ABC):
         # Clear project reference
         self.project = None
         self.iface = None
+
+    def _ensure_group_path(self, path: List[str]) -> QgsLayerTreeGroup:
+        """Ensure a group path exists and return the terminal group."""
+        root = self.project.layerTreeRoot()
+        current = root
+        for name in path:
+            group = current.findGroup(name)
+            if not group:
+                group = current.insertGroup(len(current.children()), name)
+            current = group
+        return current
 
     @abstractmethod
     def get_managed_layer_names(self) -> List[str]:

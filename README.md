@@ -100,12 +100,18 @@ The SAR Tracking panel will open on the right side of QGIS.
 
 1. Enter a **mission name** (e.g., "Glenbeigh Search")
 2. Click **"Start Mission"**
-3. Timer starts counting elapsed time
+3. Watch the dual mission timers:
+   - **Elapsed** – Total time since mission start
+   - **Active Search** – Time excluding pauses (auto-pauses when you pause the mission)
 
-**Mission Controls:**
-- **Pause** - Temporarily stop tracking
-- **Resume** - Continue tracking
-- **Finish** - Complete and save mission
+**Mission Controls (color-coded buttons):**
+- **Start** – Bright green, disabled while a mission is running
+- **Pause** – Orange button flashes while paused
+- **Resume** – Same button changes to “Resume” with play icon
+- **Finish** – Red button; asks for confirmation before resetting timers and clearing temporary overlays
+- **Focus Mode** – Blue toggle that hides other QGIS panels for distraction-free ops
+
+Status badges directly beneath the controls show Auto Refresh / Auto Save state (interval + last save).
 
 ### 3. Load Tracking Data
 
@@ -189,6 +195,7 @@ The SAR Tracking panel will open on the right side of QGIS.
 2. Click first point
 3. Click second point
 4. Results show distance and bearing (with cardinal direction)
+5. The measurement line stays pinned on the map (in the Lines layer) until you click **"Clear Measurements"** or finish the mission
 
 **Coordinate Converter:**
 1. Click **"Coordinate Converter"**

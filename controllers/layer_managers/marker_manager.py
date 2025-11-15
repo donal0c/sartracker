@@ -20,6 +20,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
+from ...layers import LAYER_FIELD_CHECKS
 
 
 class MarkerLayerManager(BaseLayerManager):
@@ -44,6 +45,7 @@ class MarkerLayerManager(BaseLayerManager):
     def __init__(self, iface, shared_device_colors=None):
         """Initialize marker layer manager."""
         super().__init__(iface, shared_device_colors)
+        self._invalid_layer_warnings = set()
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -53,6 +55,76 @@ class MarkerLayerManager(BaseLayerManager):
             self.HAZARDS_LAYER_NAME,
             self.CASUALTIES_LAYER_NAME
         ]
+
+    # ---------------------------------------------------------------------
+    # Internal helpers
+    # ---------------------------------------------------------------------
+
+    def _candidate_layer_names(self, layer_name: str):
+        """Return possible legacy aliases for a layer name."""
+        if layer_name == self.IPP_LKP_LAYER_NAME:
+            return [self.IPP_LKP_LAYER_NAME, "IPP / LKP"]
+        return [layer_name]
+
+    def _required_fields_for_layer(self, layer_name: str):
+        """Get required field names for a managed layer."""
+        fields = set(LAYER_FIELD_CHECKS.get(layer_name, []))
+        if fields:
+            return fields
+        # Handle legacy IPP naming
+        if layer_name == self.IPP_LKP_LAYER_NAME:
+            return set(LAYER_FIELD_CHECKS.get("IPP / LKP", []))
+        return set()
+
+    def _log_invalid_layer(self, layer, layer_name: str, missing_fields):
+        """Log a warning once per invalid layer to aid troubleshooting."""
+        layer_id = layer.id()
+        if layer_id in self._invalid_layer_warnings:
+            return
+        self._invalid_layer_warnings.add(layer_id)
+        print(
+            f"[MarkerLayerManager] Ignoring layer '{layer.name()}' ({layer_id}) "
+            f"for '{layer_name}' markers - missing fields: {', '.join(sorted(missing_fields))}"
+        )
+
+    def _get_existing_layer(self, layer_name: str):
+        """
+        Find an existing plugin-managed layer with the required schema.
+
+        Returns:
+            QgsVectorLayer or None
+        """
+        required_fields = self._required_fields_for_layer(layer_name)
+        candidate_names = self._candidate_layer_names(layer_name)
+
+        for name in candidate_names:
+            layers = self.project.mapLayersByName(name)
+            if not layers:
+                continue
+
+            for layer in layers:
+                # No schema requirements -> accept first match
+                if not required_fields:
+                    if name != layer_name:
+                        try:
+                            layer.setName(layer_name)
+                        except Exception:
+                            pass
+                    return layer
+
+                existing_fields = {field.name() for field in layer.fields()}
+                if required_fields.issubset(existing_fields):
+                    if name != layer_name:
+                        try:
+                            layer.setName(layer_name)
+                        except Exception:
+                            pass
+                    return layer
+
+                missing = required_fields - existing_fields
+                self._log_invalid_layer(layer, layer_name, missing)
+
+        return None
 
     # =========================================================================
     # IPP/LKP Layer (Initial Planning Point / Last Known Position)
@@ -70,9 +142,9 @@ class MarkerLayerManager(BaseLayerManager):
             QgsVectorLayer: IPP/LKP layer
         """
         # Check if layer already exists
-        layers = self.project.mapLayersByName(self.IPP_LKP_LAYER_NAME)
-        if layers:
-            return layers[0]
+        layer = self._get_existing_layer(self.IPP_LKP_LAYER_NAME)
+        if layer:
+            return layer
 
         # Create new memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using QVariant types
@@ -212,9 +284,9 @@ class MarkerLayerManager(BaseLayerManager):
             QgsVectorLayer: Clues layer
         """
         # Check if layer already exists
-        layers = self.project.mapLayersByName(self.CLUES_LAYER_NAME)
-        if layers:
-            return layers[0]
+        layer = self._get_existing_layer(self.CLUES_LAYER_NAME)
+        if layer:
+            return layer
 
         # Create new memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
@@ -358,9 +430,9 @@ class MarkerLayerManager(BaseLayerManager):
             QgsVectorLayer: Hazards layer
         """
         # Check if layer already exists
-        layers = self.project.mapLayersByName(self.HAZARDS_LAYER_NAME)
-        if layers:
-            return layers[0]
+        layer = self._get_existing_layer(self.HAZARDS_LAYER_NAME)
+        if layer:
+            return layer
 
         # Create new memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
@@ -506,9 +578,9 @@ class MarkerLayerManager(BaseLayerManager):
             QgsVectorLayer: Casualties layer
         """
         # Check if layer already exists
-        layers = self.project.mapLayersByName(self.CASUALTIES_LAYER_NAME)
-        if layers:
-            return layers[0]
+        layer = self._get_existing_layer(self.CASUALTIES_LAYER_NAME)
+        if layer:
+            return layer
 
         # Create new memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using QVariant types

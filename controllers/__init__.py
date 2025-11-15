@@ -6,5 +6,6 @@ providers and QGIS map canvas.
 """
 
 from .layers_controller import LayersController
+from .mission_controller import MissionController, MissionState
 
-__all__ = ['LayersController']
+__all__ = ['LayersController', 'MissionController', 'MissionState']

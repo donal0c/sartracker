@@ -54,6 +54,7 @@ class SettingsPanel(QDockWidget):
     settings_changed = pyqtSignal(dict)  # Changed settings
     provider_test_requested = pyqtSignal(str, dict)  # provider_name, config
     provider_save_requested = pyqtSignal(str, dict)  # provider_name, config
+    repair_layers_requested = pyqtSignal()  # User requested layer repair
 
     def __init__(self, parent=None):
         """
@@ -232,6 +233,13 @@ class SettingsPanel(QDockWidget):
         )
         self.traccar_http_feature_checkbox.stateChanged.connect(self._on_traccar_feature_changed)
         advanced_layout.addWidget(self.traccar_http_feature_checkbox)
+
+        self.repair_layers_button = QPushButton("Repair Layer Structure")
+        self.repair_layers_button.setToolTip(
+            "Recreate the SAR Tracker layer hierarchy and move existing layers into the correct groups."
+        )
+        self.repair_layers_button.clicked.connect(self._on_repair_layers_clicked)
+        advanced_layout.addWidget(self.repair_layers_button)
 
         advanced_layout.addStretch()
         advanced_group.setLayout(advanced_layout)
@@ -633,6 +641,12 @@ class SettingsPanel(QDockWidget):
     def _on_traccar_feature_changed(self, state):
         """Handle Traccar HTTP feature flag change."""
         self.apply_button.setEnabled(True)
+        # Update dropdown immediately so users see the effect without restart
+        self._refresh_provider_list()
+
+    def _on_repair_layers_clicked(self):
+        """Emit signal to request layer structure repair."""
+        self.repair_layers_requested.emit()
         # Update dropdown immediately so users see the effect without restart
         self._refresh_provider_list()
 

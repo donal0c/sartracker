@@ -9,19 +9,21 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem,
     QGroupBox, QFileDialog, QLineEdit,
-    QScrollArea, QComboBox, QStackedWidget
+    QScrollArea, QComboBox, QStackedWidget,
+    QToolButton, QMessageBox, QStyle
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
-from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtGui import QColor, QFont
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
-    LeftDockWidgetArea, RightDockWidgetArea
+    LeftDockWidgetArea, RightDockWidgetArea, AlignRight
 )
 from ..utils.notify import info, warning, error
 from ..config.keys import ConfigStore, SETTINGS_KEYS
+from ..controllers.mission_controller import MissionState
 
 
 class SARPanel(QDockWidget):
@@ -29,18 +31,10 @@ class SARPanel(QDockWidget):
     Main SAR tracking control panel.
     
     Signals:
-        mission_started: Emitted when mission starts (mission_name: str)
-        mission_paused: Emitted when mission pauses
-        mission_resumed: Emitted when mission resumes
-        mission_finished: Emitted when mission finishes
         refresh_requested: Emitted when manual refresh requested
         csv_load_requested: Emitted when user wants to load CSV (file_path: str)
     """
     
-    mission_started = pyqtSignal(str)  # mission_name
-    mission_paused = pyqtSignal()
-    mission_resumed = pyqtSignal()
-    mission_finished = pyqtSignal()
     refresh_requested = pyqtSignal()
     csv_load_requested = pyqtSignal(str)  # file_path
     add_poi_requested = pyqtSignal()
@@ -54,18 +48,18 @@ class SARPanel(QDockWidget):
     coordinate_converter_requested = pyqtSignal()
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
+    clear_measurements_requested = pyqtSignal()
 
     # Phase N1: Provider signals removed - configuration moved to Settings Panel
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, mission_controller=None):
         super().__init__("SAR Tracking", parent)
         
         self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
         
         # State
-        self.mission_active = False
-        self.is_paused = False  # Renamed to avoid shadowing the signal
-        self.mission_start_time = None
+        self._mission_controller = mission_controller
+        self._mission_state = MissionState.IDLE
         self.auto_refresh_enabled = False
         self.auto_refresh_interval_seconds = SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT
         self.autosave_enabled = False
@@ -74,6 +68,7 @@ class SARPanel(QDockWidget):
         self._last_autosave_success: Optional[bool] = None
         self.focus_mode_active = False
         self.hidden_panels = []  # Track which panels we hid
+        self._pause_flash = False
 
         # Setup UI
         self._setup_ui()
@@ -82,17 +77,22 @@ class SARPanel(QDockWidget):
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._on_auto_refresh)
 
-        # Setup UI update timer (updates elapsed time every second)
-        self.ui_update_timer = QTimer(self)
-        self.ui_update_timer.timeout.connect(self._update_mission_status)
-        self.ui_update_timer.start(1000)  # Update every second
-
         # Setup auto-save timer
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self._on_autosave)
 
+        # Timer for flashing pause button when paused
+        self.pause_flash_timer = QTimer(self)
+        self.pause_flash_timer.setInterval(600)
+        self.pause_flash_timer.timeout.connect(self._toggle_pause_flash)
+
         # Load persisted defaults for auto-refresh / auto-save
         self._initialize_auto_settings()
+
+        # Bind mission controller signals if available
+        if self._mission_controller:
+            self._mission_controller.mission_state_changed.connect(self._on_controller_state_changed)
+            self._mission_controller.mission_timing_updated.connect(self.update_mission_timers)
         
     def _setup_ui(self):
         """Build the panel UI."""
@@ -103,14 +103,17 @@ class SARPanel(QDockWidget):
 
         # Focus Mode Toggle (at top)
         focus_layout = QHBoxLayout()
-        self.focus_mode_button = QPushButton("Enter Focus Mode")
+        self.focus_mode_button = QToolButton()
+        self.focus_mode_button.setText("Enter Focus Mode")
+        self.focus_mode_button.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+        self.focus_mode_button.clicked.connect(self._toggle_focus_mode)
         self.focus_mode_button.setToolTip(
             "Hide other QGIS panels for cleaner workspace.\n"
             "Press F11 for full-screen mode."
         )
-        self.focus_mode_button.clicked.connect(self._toggle_focus_mode)
         focus_layout.addWidget(self.focus_mode_button)
         layout.addLayout(focus_layout)
+        self._apply_focus_mode_style()
 
         # Mission Info Section
         mission_group = QGroupBox("Mission")
@@ -128,28 +131,60 @@ class SARPanel(QDockWidget):
         self.mission_status_label = QLabel("Status: <b>No active mission</b>")
         mission_layout.addWidget(self.mission_status_label)
         
-        # Mission time
-        self.mission_time_label = QLabel("Elapsed: --:--:--")
-        mission_layout.addWidget(self.mission_time_label)
+        # Mission timers
+        timer_grid = QGridLayout()
+        timer_font = QFont("Courier New", 12)
+        if not timer_font.exactMatch():
+            timer_font = QFont("Monospace", 12)
+
+        elapsed_label = QLabel("Elapsed")
+        active_label = QLabel("Active Search")
+        self.elapsed_time_value = QLabel("00:00:00")
+        self.active_time_value = QLabel("00:00:00")
+        self.elapsed_time_value.setFont(timer_font)
+        self.active_time_value.setFont(timer_font)
+        self.elapsed_time_value.setAlignment(AlignRight)
+        self.active_time_value.setAlignment(AlignRight)
+
+        timer_grid.addWidget(elapsed_label, 0, 0)
+        timer_grid.addWidget(self.elapsed_time_value, 0, 1)
+        timer_grid.addWidget(active_label, 1, 0)
+        timer_grid.addWidget(self.active_time_value, 1, 1)
+        mission_layout.addLayout(timer_grid)
         
         # Mission controls
         controls_layout = QHBoxLayout()
         
-        self.start_button = QPushButton("Start Mission")
+        self.start_button = QToolButton()
+        self.start_button.setText("Start Mission")
+        self.start_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.start_button.clicked.connect(self._on_start_mission)
         controls_layout.addWidget(self.start_button)
         
-        self.pause_button = QPushButton("Pause")
+        self.pause_button = QToolButton()
+        self.pause_button.setText("Pause")
+        self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
         self.pause_button.clicked.connect(self._on_pause_mission)
         self.pause_button.setEnabled(False)
         controls_layout.addWidget(self.pause_button)
         
-        self.finish_button = QPushButton("Finish")
+        self.finish_button = QToolButton()
+        self.finish_button.setText("Finish")
+        self.finish_button.setIcon(self.style().standardIcon(QStyle.SP_DialogCloseButton))
         self.finish_button.clicked.connect(self._on_finish_mission)
         self.finish_button.setEnabled(False)
         controls_layout.addWidget(self.finish_button)
         
         mission_layout.addLayout(controls_layout)
+        self._apply_mission_button_styles()
+
+        badge_layout = QHBoxLayout()
+        self.auto_refresh_status_label = QLabel("Auto Refresh: OFF")
+        self.autosave_status_label = QLabel("Auto Save: OFF")
+        badge_layout.addWidget(self.auto_refresh_status_label)
+        badge_layout.addWidget(self.autosave_status_label)
+        badge_layout.addStretch()
+        mission_layout.addLayout(badge_layout)
         mission_group.setLayout(mission_layout)
         layout.addWidget(mission_group)
         
@@ -168,11 +203,6 @@ class SARPanel(QDockWidget):
         refresh_group = QGroupBox("Data Refresh")
         refresh_layout = QVBoxLayout()
 
-        self.auto_refresh_status_label = QLabel("Auto Refresh: OFF")
-        self.auto_refresh_status_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
-        self.auto_refresh_status_label.setWordWrap(True)
-        refresh_layout.addWidget(self.auto_refresh_status_label)
-
         self.refresh_button = QPushButton("Refresh Now")
         self.refresh_button.clicked.connect(self._on_manual_refresh)
         refresh_layout.addWidget(self.refresh_button)
@@ -183,11 +213,6 @@ class SARPanel(QDockWidget):
         # Auto-Save Section (status + manual button)
         autosave_group = QGroupBox("Auto-Save")
         autosave_layout = QVBoxLayout()
-
-        self.autosave_status_label = QLabel("Auto Save: OFF | Last save: Never")
-        self.autosave_status_label.setStyleSheet("QLabel { color: #666; font-size: 10px; }")
-        self.autosave_status_label.setWordWrap(True)
-        autosave_layout.addWidget(self.autosave_status_label)
 
         # Manual save button
         self.save_now_button = QPushButton("Save Project Now")
@@ -350,6 +375,18 @@ class SARPanel(QDockWidget):
         utilities_grid.addWidget(self.measure_button, 0, 1)
 
         utilities_layout.addLayout(utilities_grid)
+
+        measurements_layout = QHBoxLayout()
+        self.measurements_status_label = QLabel("Measurements pinned: 0")
+        self.measurements_status_label.setStyleSheet("QLabel { color: #666; }")
+        measurements_layout.addWidget(self.measurements_status_label)
+
+        self.clear_measurements_button = QPushButton("Clear Measurements")
+        self.clear_measurements_button.setEnabled(False)
+        self.clear_measurements_button.clicked.connect(self._on_clear_measurements_clicked)
+        measurements_layout.addWidget(self.clear_measurements_button)
+        utilities_layout.addLayout(measurements_layout)
+
         utilities_group.setLayout(utilities_layout)
         layout.addWidget(utilities_group)
 
@@ -367,71 +404,218 @@ class SARPanel(QDockWidget):
         
     def _on_start_mission(self):
         """Handle start mission button click."""
+        if not self._mission_controller:
+            QMessageBox.warning(
+                self,
+                "Mission Control",
+                "Mission controller unavailable. Restart plugin."
+            )
+            return
+
         mission_name = self.mission_name_input.text().strip()
         if not mission_name:
             mission_name = f"Mission {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             self.mission_name_input.setText(mission_name)
-        
-        self.mission_active = True
-        self.is_paused = False
-        self.mission_start_time = datetime.now()
 
-        self._update_mission_status()
-        self.mission_started.emit(mission_name)
+        try:
+            self._mission_controller.start_mission(mission_name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Mission Control", str(exc))
+        except RuntimeError as exc:
+            QMessageBox.information(self, "Mission Control", str(exc))
         
     def _on_pause_mission(self):
         """Handle pause/resume button click."""
-        if self.is_paused:
-            # Resume
-            self.is_paused = False
-            self.pause_button.setText("Pause")
-            self.mission_resumed.emit()
-        else:
-            # Pause
-            self.is_paused = True
-            self.pause_button.setText("Resume")
-            self.mission_paused.emit()
+        if not self._mission_controller:
+            return
 
-        self._update_mission_status()
-        self.save_mission_state()  # Save state for auto-resume
+        if self._mission_state == MissionState.PAUSED:
+            self._mission_controller.resume_mission()
+        else:
+            self._mission_controller.pause_mission()
         
     def _on_finish_mission(self):
         """Handle finish mission button click."""
-        self.mission_active = False
-        self.is_paused = False
-        self.mission_start_time = None
+        if not self._mission_controller:
+            return
 
-        self._update_mission_status()
-        self.save_mission_state()  # Clear saved state
-        self.mission_finished.emit()
+        confirm = QMessageBox.question(
+            self,
+            "Finish Mission",
+            "Are you sure you want to finish this mission?\n\n"
+            "This will reset timers and deactivate mission controls.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        self._mission_controller.finish_mission()
         
-    def _update_mission_status(self):
-        """Update mission status UI."""
-        if not self.mission_active:
-            self.mission_status_label.setText("Status: <b>No active mission</b>")
-            self.mission_time_label.setText("Elapsed: --:--:--")
-            self.start_button.setEnabled(True)
-            self.pause_button.setEnabled(False)
-            self.finish_button.setEnabled(False)
-            self.mission_name_input.setEnabled(True)
+    def _on_controller_state_changed(self, state: MissionState, context: dict):
+        """React to mission controller state updates."""
+        self._mission_state = state
+
+        mission_name = context.get('mission_name')
+        if mission_name:
+            self.mission_name_input.setText(mission_name)
+
+        if state == MissionState.ACTIVE:
+            status = "Status: <b style='color: #22aa5f;'>Active</b>"
+        elif state == MissionState.PAUSED:
+            status = "Status: <b style='color: orange;'>Paused</b>"
+        elif state == MissionState.FINISHED:
+            status = "Status: <b style='color: #c0392b;'>Finished</b>"
         else:
-            if self.is_paused:
-                status = "Status: <b style='color: orange;'>Paused</b>"
-            else:
-                status = "Status: <b style='color: green;'>Active</b>"
-            self.mission_status_label.setText(status)
-            
+            status = "Status: <b>No active mission</b>"
+
+        self.mission_status_label.setText(status)
+        self.mission_name_input.setEnabled(state in (MissionState.IDLE, MissionState.FINISHED))
+        self._refresh_mission_controls()
+
+    def update_mission_timers(self, elapsed_seconds: float, active_seconds: float):
+        """Update elapsed/active timer labels."""
+        self.elapsed_time_value.setText(self._format_seconds(elapsed_seconds))
+        self.active_time_value.setText(self._format_seconds(active_seconds))
+
+    def _refresh_mission_controls(self):
+        """Sync button enablement and styles to mission state."""
+        if self._mission_state == MissionState.ACTIVE:
             self.start_button.setEnabled(False)
             self.pause_button.setEnabled(True)
             self.finish_button.setEnabled(True)
-            self.mission_name_input.setEnabled(False)
-            
-            # Update elapsed time
-            if self.mission_start_time:
-                elapsed = datetime.now() - self.mission_start_time
-                hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
-                minutes, seconds = divmod(remainder, 60)
-                self.mission_time_label.setText(f"Elapsed: {hours:02d}:{minutes:02d}:{seconds:02d}")
+            self.pause_button.setText("Pause")
+            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self.pause_flash_timer.stop()
+            self._pause_flash = False
+            self._set_button_state(self.pause_button, "flashOn", False)
+            self._set_button_state(self.start_button, "state", "active")
+            self._set_button_state(self.pause_button, "state", "pause")
+            self._set_button_state(self.finish_button, "state", "ready")
+        elif self._mission_state == MissionState.PAUSED:
+            self.start_button.setEnabled(False)
+            self.pause_button.setEnabled(True)
+            self.finish_button.setEnabled(True)
+            self.pause_button.setText("Resume")
+            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            self.pause_flash_timer.start()
+            self._set_button_state(self.start_button, "state", "active")
+            self._set_button_state(self.pause_button, "state", "resume")
+            self._set_button_state(self.pause_button, "flashOn", True)
+            self._set_button_state(self.finish_button, "state", "ready")
+        else:
+            self.start_button.setEnabled(True)
+            self.pause_button.setEnabled(False)
+            self.finish_button.setEnabled(False)
+            self.pause_button.setText("Pause")
+            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self.pause_flash_timer.stop()
+            self._pause_flash = False
+            self._set_button_state(self.pause_button, "flashOn", False)
+            self._set_button_state(self.start_button, "state", "idle")
+            self._set_button_state(self.pause_button, "state", "pause")
+            self._set_button_state(self.finish_button, "state", "idle")
+
+    def _set_button_state(self, button: QToolButton, prop_name: str, value):
+        """Set dynamic stylesheet property and refresh widget."""
+        if not hasattr(button, 'setProperty'):
+            return
+        button.setProperty(prop_name, value)
+        button.style().unpolish(button)
+        button.style().polish(button)
+        button.update()
+
+    def _toggle_pause_flash(self):
+        """Flash pause button while mission paused."""
+        self._pause_flash = not self._pause_flash
+        self._set_button_state(self.pause_button, "flashOn", self._pause_flash)
+
+    def _format_seconds(self, seconds: float) -> str:
+        total = max(0, int(seconds or 0))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    def _apply_mission_button_styles(self):
+        """Apply consistent styling for mission control buttons."""
+        start_style = """
+        QToolButton {
+            border-radius: 6px;
+            padding: 8px 18px;
+            font-weight: 600;
+        }
+        QToolButton[state="idle"] {
+            background-color: #1f8b4d;
+            color: #ffffff;
+        }
+        QToolButton[state="active"] {
+            background-color: #25a65c;
+            color: #ffffff;
+        }
+        QToolButton:disabled {
+            background-color: #94a3b8;
+            color: #f2f2f2;
+        }
+        """
+        pause_style = """
+        QToolButton {
+            border-radius: 6px;
+            padding: 8px 18px;
+            font-weight: 600;
+        }
+        QToolButton[state="pause"] {
+            background-color: #ffa94d;
+            color: #1f1f1f;
+        }
+        QToolButton[state="resume"] {
+            background-color: #ff8c00;
+            color: #ffffff;
+        }
+        QToolButton[flashOn="true"] {
+            border: 2px solid #ffe0b2;
+        }
+        QToolButton:disabled {
+            background-color: #94a3b8;
+            color: #f2f2f2;
+        }
+        """
+        finish_style = """
+        QToolButton {
+            border-radius: 6px;
+            padding: 8px 18px;
+            font-weight: 600;
+        }
+        QToolButton[state="ready"] {
+            background-color: #c0392b;
+            color: #ffffff;
+        }
+        QToolButton:disabled {
+            background-color: #94a3b8;
+            color: #f2f2f2;
+        }
+        """
+
+        self.start_button.setStyleSheet(start_style)
+        self.pause_button.setStyleSheet(pause_style)
+        self.finish_button.setStyleSheet(finish_style)
+        self._set_button_state(self.start_button, "state", "idle")
+        self._set_button_state(self.pause_button, "state", "pause")
+        self._set_button_state(self.pause_button, "flashOn", False)
+        self._set_button_state(self.finish_button, "state", "idle")
+
+    def _apply_focus_mode_style(self):
+        """Update focus mode button styling."""
+        if not hasattr(self, 'focus_mode_button') or not self.focus_mode_button:
+            return
+        if self.focus_mode_active:
+            self.focus_mode_button.setStyleSheet(
+                "QToolButton { background-color: #4066d6; color: #ffffff; padding: 6px 12px; border-radius: 4px; }"
+            )
+        else:
+            self.focus_mode_button.setStyleSheet(
+                "QToolButton { padding: 6px 12px; border-radius: 4px; }"
+            )
     
     def _initialize_auto_settings(self):
         """Load persisted auto-refresh/save defaults on startup."""
@@ -470,13 +654,12 @@ class SARPanel(QDockWidget):
     def _update_auto_refresh_status_label(self):
         """Update the read-only auto-refresh status indicator."""
         if self.auto_refresh_enabled:
-            text = f"Auto Refresh: ON (every {self.auto_refresh_interval_seconds}s)"
-            color = "#0a0"
+            text = f"Auto Refresh ON ({self.auto_refresh_interval_seconds}s)"
+            color = "#1f8b4d"
         else:
-            text = "Auto Refresh: OFF"
-            color = "#666"
-        self.auto_refresh_status_label.setText(text)
-        self.auto_refresh_status_label.setStyleSheet(f"QLabel {{ color: {color}; font-size: 10px; }}")
+            text = "Auto Refresh OFF"
+            color = "#555"
+        self._set_feature_badge(self.auto_refresh_status_label, text, self.auto_refresh_enabled, color)
 
     def set_autosave_config(self, enabled: bool, interval_minutes: int):
         """Apply auto-save configuration coming from Settings panel."""
@@ -512,21 +695,23 @@ class SARPanel(QDockWidget):
 
         color = "#666"
         if self._last_autosave_success is True:
-            color = "#0a0"
+            color = "#1f8b4d"
         elif self._last_autosave_success is False:
             color = "#d00"
         elif self.autosave_enabled:
-            color = "#0a0"
+            color = "#1f8b4d"
 
-        self.autosave_status_label.setText(
-            f"Auto Save: {status} {interval_text} | Last save: {last_text}"
-        )
-        self.autosave_status_label.setStyleSheet(f"QLabel {{ color: {color}; font-size: 10px; }}")
+        text = f"Auto Save {status}{(' ' + interval_text) if interval_text else ''} | Last: {last_text}"
+        self._set_feature_badge(self.autosave_status_label, text, self.autosave_enabled, color)
     
     def _on_auto_refresh(self):
         """Handle auto-refresh timer."""
-        # Only refresh if mission is active and not paused, OR if no mission is active
-        if not self.mission_active or (self.mission_active and not self.is_paused):
+        # Only refresh if mission is not paused (or controller unavailable)
+        if not self._mission_controller:
+            self.refresh_requested.emit()
+            return
+
+        if self._mission_state != MissionState.PAUSED:
             self.refresh_requested.emit()
     
     def _on_manual_refresh(self):
@@ -633,6 +818,10 @@ class SARPanel(QDockWidget):
         """Handle Measure Distance button click."""
         self.measure_distance_requested.emit()
 
+    def _on_clear_measurements_clicked(self):
+        """Handle Clear Measurements button click."""
+        self.clear_measurements_requested.emit()
+
     def _on_line_tool(self):
         """Handle Line Tool button click."""
         self.line_tool_requested.emit()
@@ -660,6 +849,17 @@ class SARPanel(QDockWidget):
             self.active_tool_label.setText("<i>None</i>")
         else:
             self.active_tool_label.setText(f"<b>{tool_name}</b>")
+
+    def update_measurements_indicator(self, count: int):
+        """
+        Update pinned measurement counter and clear button state.
+
+        Args:
+            count: Number of persisted measurement overlays
+        """
+        label = "Measurement pinned" if count == 1 else "Measurements pinned"
+        self.measurements_status_label.setText(f"{label}: {count}")
+        self.clear_measurements_button.setEnabled(count > 0)
 
     def disable_drawing_tools(self, reason: str = "Drawing tools unavailable"):
         """
@@ -710,125 +910,6 @@ class SARPanel(QDockWidget):
         self._last_autosave_success = success
         self._update_autosave_status_label()
 
-    def save_mission_state(self):
-        """Save current mission state to QSettings for auto-resume."""
-        settings = QSettings()
-
-        if self.mission_active and self.is_paused:
-            # Save paused mission state
-            settings.setValue("SAR_Tracker/mission_paused", True)
-            settings.setValue("SAR_Tracker/mission_name", self.mission_name_input.text())
-            settings.setValue("SAR_Tracker/mission_start_time", self.mission_start_time.isoformat())
-        else:
-            # Clear paused mission state
-            self._clear_mission_state()
-
-    def _clear_mission_state(self):
-        """
-        Clear saved mission state from QSettings.
-
-        This is called when invalid state is detected or mission is explicitly cleared.
-        """
-        settings = QSettings()
-        settings.remove("SAR_Tracker/mission_paused")
-        settings.remove("SAR_Tracker/mission_name")
-        settings.remove("SAR_Tracker/mission_start_time")
-
-    def load_mission_state(self):
-        """
-        Load mission state from QSettings for auto-resume.
-
-        Returns:
-            dict or None: Mission state if exists and valid, None otherwise
-        """
-        settings = QSettings()
-
-        if not settings.value("SAR_Tracker/mission_paused", False, bool):
-            return None
-
-        # Load values with explicit None as default
-        mission_name = settings.value("SAR_Tracker/mission_name", None)
-        start_time_str = settings.value("SAR_Tracker/mission_start_time", None)
-
-        # Validate all required fields present and non-empty
-        if not mission_name or not start_time_str:
-            # Invalid state - clear it
-            print("Warning: Incomplete mission state in QSettings, clearing")
-            self._clear_mission_state()
-            return None
-
-        # Ensure we have strings (Qt5/Qt6 compatibility)
-        mission_name = str(mission_name).strip()
-        start_time_str = str(start_time_str).strip()
-
-        # Validate non-empty after stripping
-        if not mission_name or not start_time_str:
-            print("Warning: Empty mission state values in QSettings, clearing")
-            self._clear_mission_state()
-            return None
-
-        # Validate ISO format without parsing (basic sanity check)
-        # Valid ISO format should be at least 10 chars and contain 'T' separator
-        if len(start_time_str) < 10 or 'T' not in start_time_str:
-            print(f"Warning: Invalid mission_start_time format: {start_time_str}, clearing")
-            self._clear_mission_state()
-            return None
-
-        return {
-            'name': mission_name,
-            'start_time': start_time_str
-        }
-
-    def restore_mission_state(self, state: dict):
-        """
-        Restore mission from saved state.
-
-        Args:
-            state: Mission state dict from load_mission_state()
-
-        Returns:
-            bool: True if restore succeeded, False if failed
-        """
-        try:
-            # Validate state dictionary
-            if not state or 'name' not in state or 'start_time' not in state:
-                raise ValueError("Invalid state dictionary: missing required fields")
-
-            # Validate non-empty values
-            if not state['name'] or not state['start_time']:
-                raise ValueError("Empty mission name or start time")
-
-            # Attempt to parse datetime - this is where crashes occurred before
-            mission_start = datetime.fromisoformat(state['start_time'])
-
-            # All validation passed - apply state
-            self.mission_name_input.setText(state['name'])
-            self.mission_start_time = mission_start
-            self.mission_active = True
-            self.is_paused = True
-            self.pause_button.setText("Resume")
-            self._update_mission_status()
-
-            return True
-
-        except (ValueError, TypeError, AttributeError) as e:
-            # Parsing failed - clear invalid state and notify user
-            print(f"Error restoring mission state: {e}")
-
-            # Import iface locally to avoid circular imports
-            from qgis.utils import iface
-
-            error(
-                iface.messageBar(),
-                "Mission Resume Failed",
-                f"Could not restore saved mission state (corrupted settings). Please start a new mission.",
-                duration=8
-            )
-
-            # Clear corrupted state so it doesn't keep failing
-            self._clear_mission_state()
-
-            return False
 
     # ========================================
     # Phase N1: Provider configuration methods removed
@@ -934,8 +1015,8 @@ class SARPanel(QDockWidget):
 
                 # Update button
                 self.focus_mode_button.setText("Exit Focus Mode")
-                self.focus_mode_button.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; }")
                 self.focus_mode_active = True
+                self._apply_focus_mode_style()
 
                 # Show message
                 info(
@@ -956,8 +1037,8 @@ class SARPanel(QDockWidget):
 
                 # Update button
                 self.focus_mode_button.setText("Enter Focus Mode")
-                self.focus_mode_button.setStyleSheet("")
                 self.focus_mode_active = False
+                self._apply_focus_mode_style()
 
                 # Show message
                 info(
@@ -1027,7 +1108,7 @@ class SARPanel(QDockWidget):
             # Update button UI if possible (may fail during shutdown)
             try:
                 self.focus_mode_button.setText("Enter Focus Mode")
-                self.focus_mode_button.setStyleSheet("")
+                self._apply_focus_mode_style()
             except (RuntimeError, AttributeError):
                 # Button already destroyed or doesn't exist - ignore
                 pass
@@ -1070,11 +1151,9 @@ class SARPanel(QDockWidget):
                     self.refresh_timer.stop()
                     print("[SARTRACKER] SARPanel: Stopped refresh_timer")
 
-            # Stop UI update timer
-            if hasattr(self, 'ui_update_timer') and self.ui_update_timer:
-                if self.ui_update_timer.isActive():
-                    self.ui_update_timer.stop()
-                    print("[SARTRACKER] SARPanel: Stopped ui_update_timer")
+            if hasattr(self, 'pause_flash_timer') and self.pause_flash_timer:
+                if self.pause_flash_timer.isActive():
+                    self.pause_flash_timer.stop()
 
             # Stop autosave timer
             if hasattr(self, 'autosave_timer') and self.autosave_timer:
@@ -1089,6 +1168,20 @@ class SARPanel(QDockWidget):
             print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
             import traceback
             traceback.print_exc()
+
+    def _set_feature_badge(self, label: QLabel, text: str, enabled: bool, color: str):
+        """Apply consistent badge styling for feature indicators."""
+        background = color if enabled else "#4d5563"
+        label.setText(text)
+        label.setStyleSheet(
+            "QLabel {"
+            f"  background-color: {background};"
+            "  color: #fff;"
+            "  padding: 4px 8px;"
+            "  border-radius: 6px;"
+            "  font-size: 10px;"
+            "}"
+        )
 
     def closeEvent(self, event):
         """

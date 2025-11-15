@@ -237,7 +237,8 @@ class LayersController:
     # =========================================================================
 
     def add_line(self, name: str, points_wgs84: List[QgsPointXY],
-                 description: str = "", color: str = "#FF0000", width: int = 2) -> int:
+                 description: str = "", color: str = "#FF0000", width: int = 2,
+                 temporary_measure: bool = False) -> int:
         """
         Add a line feature.
 
@@ -248,10 +249,57 @@ class LayersController:
             color: Hex color string (default red)
             width: Line width in pixels (default 2)
 
+        Args:
+            temporary_measure: Flag measurement overlays for cleanup
+
         Returns:
             int: Feature ID of added line
         """
-        return self.drawings.add_line(name, points_wgs84, description, color, width)
+        return self.drawings.add_line(
+            name,
+            points_wgs84,
+            description,
+            color,
+            width,
+            temporary_measure=temporary_measure
+        )
+
+    def add_measurement_overlay(self, name: str, points_wgs84: List[QgsPointXY],
+                                description: str, color: str = "#FFD447",
+                                width: int = 3) -> int:
+        """
+        Add a temporary measurement overlay to the Lines layer.
+
+        Args:
+            name: Overlay label
+            points_wgs84: List of points describing the measurement line
+            description: Detail text (distance/bearing)
+            color: Hex color for the overlay
+            width: Overlay width in pixels
+
+        Returns:
+            int: Feature ID
+        """
+        return self.drawings.add_measurement_overlay(
+            name=name,
+            points_wgs84=points_wgs84,
+            description=description,
+            color=color,
+            width=width
+        )
+
+    def clear_measurement_overlays(self) -> int:
+        """
+        Remove all measurement overlays from the Lines layer.
+
+        Returns:
+            int: Number of overlays deleted
+        """
+        return self.drawings.clear_measurement_overlays()
+
+    def count_measurement_overlays(self) -> int:
+        """Return number of active measurement overlays."""
+        return self.drawings.count_measurement_overlays()
 
     def add_search_area(self, name: str, polygon_wgs84: List[QgsPointXY],
                         team: str = "Unassigned", status: str = "Planned",

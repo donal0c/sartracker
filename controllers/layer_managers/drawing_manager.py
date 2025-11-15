@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 from qgis.core import (
     QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
     QgsPointXY, QgsDistanceArea, QgsProject, QgsLineSymbol,
-    QgsMarkerSymbol
+    QgsMarkerSymbol, QgsFeatureRequest
 )
 from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
@@ -81,7 +81,9 @@ class DrawingLayerManager(BaseLayerManager):
         """
         layers = self.project.mapLayersByName(self.LINES_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._ensure_lines_layer_schema(layer)
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
@@ -100,6 +102,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("width", QVariant.Int),           # Int - line width in pixels
             QgsField("distance_m", QVariant.Double),   # Double - length in meters
             QgsField("created", QVariant.String),      # String - ISO timestamp
+            QgsField("temporary_measure", QVariant.Bool),  # Bool - measurement overlay flag
         ])
         layer.updateFields()
 
@@ -113,7 +116,8 @@ class DrawingLayerManager(BaseLayerManager):
         return layer
 
     def add_line(self, name: str, points_wgs84: List[QgsPointXY],
-                 description: str = "", color: str = "#FF0000", width: int = 2) -> int:
+                 description: str = "", color: str = "#FF0000", width: int = 2,
+                 temporary_measure: bool = False) -> int:
         """
         Add a line feature to the Lines layer.
 
@@ -128,6 +132,7 @@ class DrawingLayerManager(BaseLayerManager):
             int: Feature ID of added line
         """
         layer = self._get_or_create_lines_layer()
+        self._ensure_lines_layer_schema(layer)
 
         # Calculate total distance using WGS84 ellipsoid
         distance_calc = QgsDistanceArea()
@@ -155,7 +160,8 @@ class DrawingLayerManager(BaseLayerManager):
             color,
             width,
             total_distance,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            1 if temporary_measure else 0
         ])
 
         # Add to layer with proper resource cleanup
@@ -180,6 +186,106 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.triggerRepaint()
         return feature.id()
+
+    def add_measurement_overlay(self, name: str, points_wgs84: List[QgsPointXY],
+                                description: str, color: str = "#FFD447",
+                                width: int = 3) -> int:
+        """
+        Add a temporary measurement overlay feature to the Lines layer.
+
+        Args:
+            name: Overlay name
+            points_wgs84: Line points in WGS84 CRS
+            description: Detail text (distance/bearing)
+            color: Line color
+            width: Line width
+
+        Returns:
+            int: Feature ID
+        """
+        return self.add_line(
+            name=name,
+            points_wgs84=points_wgs84,
+            description=description,
+            color=color,
+            width=width,
+            temporary_measure=True
+        )
+
+    def clear_measurement_overlays(self) -> int:
+        """
+        Remove all temporary measurement overlays from the Lines layer.
+
+        Returns:
+            int: Number of deleted overlays
+        """
+        layer = self._get_or_create_lines_layer()
+        field_idx = layer.fields().indexFromName("temporary_measure")
+        if field_idx == -1:
+            return 0
+
+        ids_to_delete = [
+            feature.id()
+            for feature in layer.getFeatures(QgsFeatureRequest())
+            if bool(feature.attribute(field_idx))
+        ]
+
+        if not ids_to_delete:
+            return 0
+
+        layer.startEditing()
+        try:
+            layer.deleteFeatures(ids_to_delete)
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to delete overlays: {', '.join(errors)}")
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                self.LINES_LAYER_NAME,
+                "delete measurement overlays",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        layer.triggerRepaint()
+        return len(ids_to_delete)
+
+    def count_measurement_overlays(self) -> int:
+        """Return quantity of temporary measurement overlays."""
+        layer = self._get_or_create_lines_layer()
+        field_idx = layer.fields().indexFromName("temporary_measure")
+        if field_idx == -1:
+            return 0
+        return sum(
+            1
+            for feature in layer.getFeatures(QgsFeatureRequest())
+            if bool(feature.attribute(field_idx))
+        )
+
+    def _ensure_lines_layer_schema(self, layer: QgsVectorLayer):
+        """Ensure legacy lines layers include measurement overlay field."""
+        if layer.fields().indexFromName("temporary_measure") != -1:
+            return
+
+        layer.startEditing()
+        try:
+            if not layer.addAttribute(QgsField("temporary_measure", QVariant.Bool)):
+                raise RuntimeError("Failed to add temporary_measure field")
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit schema update: {', '.join(errors)}")
+        except Exception as exc:
+            layer.rollBack()
+            logger.warning(
+                "Could not update Lines layer schema for measurement overlays: %s",
+                exc
+            )
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
 
     # =========================================================================
     # Search Areas Layer
