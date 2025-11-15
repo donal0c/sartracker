@@ -18,7 +18,7 @@ from typing import Dict, Any, Optional, Tuple, List
 import requests
 from requests.auth import HTTPBasicAuth
 
-from utils.exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
+from .exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
 
 # Configure logger
 logger = logging.getLogger(__name__)

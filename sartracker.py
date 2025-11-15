@@ -54,8 +54,8 @@ try:
     from .providers.registry import registry as provider_registry
     from .providers.base import Provider
     # Trigger provider registration by importing them
-    from .providers import csv, http_traccar
-    # Note: provider_registry now contains registered providers (csv, http_traccar)
+    from .providers import csv, http_traccar, traccar_http
+    # Note: provider_registry now contains registered providers (csv, http_traccar, traccar_http)
 except Exception as e:
     _imports_ok = False
     _import_errors.append(('providers', e, traceback.format_exc()))
@@ -1178,6 +1178,11 @@ class sartracker:
             breadcrumbs = results.get('breadcrumbs', [])
             devices = results.get('devices', [])
 
+            print(
+                "[SARTRACKER] Refresh payload -> "
+                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
+            )
+
             # ============================================================
             # ISSUE #1 FIX: Update cached device count for diagnostics
             # This happens AFTER background task completes, never on UI thread
@@ -1189,16 +1194,33 @@ class sartracker:
             except Exception as cache_error:
                 print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
 
-            # Update layers (main thread operation)
-            if current:
+            # Update layers (main thread operation) with instrumentation
+            try:
                 self.layers_controller.update_current_positions(current)
+                if not current:
+                    print("[SARTRACKER] Current positions payload is empty - clearing layer")
+            except Exception as layer_err:
+                import traceback
+                print(f"[SARTRACKER] ERROR update_current_positions: {layer_err}")
+                traceback.print_exc()
 
-            if breadcrumbs:
+            try:
                 self.layers_controller.update_breadcrumbs(breadcrumbs)
+                if not breadcrumbs:
+                    print("[SARTRACKER] Breadcrumb payload is empty - clearing layer")
+            except Exception as breadcrumb_err:
+                import traceback
+                print(f"[SARTRACKER] ERROR update_breadcrumbs: {breadcrumb_err}")
+                traceback.print_exc()
 
             # Update device list in panel
             if self.sar_panel:
-                self.sar_panel.update_devices(devices)
+                try:
+                    self.sar_panel.update_devices(devices)
+                except Exception as panel_err:
+                    import traceback
+                    print(f"[SARTRACKER] ERROR update_devices: {panel_err}")
+                    traceback.print_exc()
 
             # FIX ISSUE #2: Update provider controller stats for status strip
             if self.provider_controller:
@@ -1208,13 +1230,25 @@ class sartracker:
                 )
                 print(f"[SARTRACKER] Updated controller stats: {self._cached_device_count} devices")
 
-            # Show success message
-            success(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
-                duration=2
+            # Show user feedback
+            print(
+                "[SARTRACKER] Refresh complete -> "
+                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
             )
+            if current or breadcrumbs:
+                success(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
+                    duration=2
+                )
+            else:
+                info(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    "Refresh completed but no tracking data was returned; layers cleared.",
+                    duration=3
+                )
 
         except Exception as e:
             # Reset state on processing error
@@ -2580,8 +2614,47 @@ class sartracker:
                 if csv_path:
                     config['csv_path'] = str(csv_path)
             elif provider_name == 'http_traccar':
-                # Phase 4: Load HTTP provider config
-                pass
+                server_url = settings.value(f"SARTracker/Providers/{provider_name}/server_url", None)
+                username = settings.value(f"SARTracker/Providers/{provider_name}/username", None)
+                password = settings.value(f"SARTracker/Providers/{provider_name}/password", None)
+                timeout = settings.value(f"SARTracker/Providers/{provider_name}/timeout", 10, type=int)
+                if server_url and username and password:
+                    config = {
+                        'server_url': str(server_url),
+                        'username': str(username),
+                        'password': str(password),
+                        'timeout': int(timeout)
+                    }
+            elif provider_name == 'traccar_http':
+                base_url = settings.value(f"SARTracker/Providers/{provider_name}/base_url", None)
+                auth_type = settings.value(f"SARTracker/Providers/{provider_name}/auth_type", 'basic')
+                timeout = settings.value(f"SARTracker/Providers/{provider_name}/timeout_s", 10, type=int)
+                cache_ttl = settings.value(f"SARTracker/Providers/{provider_name}/cache_ttl", 300, type=int)
+                enable_cache = settings.value(
+                    f"SARTracker/Providers/{provider_name}/enable_last_good_cache",
+                    True,
+                    type=bool
+                )
+
+                if base_url and auth_type:
+                    config = {
+                        'base_url': str(base_url),
+                        'auth_type': str(auth_type),
+                        'timeout_s': int(timeout),
+                        'cache_ttl': int(cache_ttl),
+                        'enable_last_good_cache': bool(enable_cache)
+                    }
+
+                    if auth_type == 'basic':
+                        username = settings.value(f"SARTracker/Providers/{provider_name}/username", None)
+                        password = settings.value(f"SARTracker/Providers/{provider_name}/password", None)
+                        if username and password:
+                            config['username'] = str(username)
+                            config['password'] = str(password)
+                    elif auth_type == 'bearer':
+                        token = settings.value(f"SARTracker/Providers/{provider_name}/token", None)
+                        if token:
+                            config['token'] = str(token)
 
             # Validate config is complete
             if not config:
@@ -2599,6 +2672,34 @@ class sartracker:
                 # Populate provider-specific fields
                 if provider_name == 'csv' and 'csv_path' in config:
                     self.sar_panel.csv_path_input.setText(config['csv_path'])
+                elif provider_name == 'http_traccar':
+                    self.sar_panel.provider_config_stack.setCurrentIndex(self.sar_panel.PROVIDER_PAGE_HTTP_TRACCAR)
+                    self.sar_panel.http_url_input.setText(config.get('server_url', ''))
+                    auth_index = self.sar_panel.http_auth_type_combo.findData('basic')
+                    if auth_index >= 0:
+                        self.sar_panel.http_auth_type_combo.setCurrentIndex(auth_index)
+                    self.sar_panel._on_auth_type_changed(self.sar_panel.http_auth_type_combo.currentIndex())
+                    self.sar_panel.http_username_input.setText(config.get('username', ''))
+                    self.sar_panel.http_password_input.setText(config.get('password', ''))
+                    self.sar_panel.http_timeout_spin.setValue(config.get('timeout', 10))
+                elif provider_name == 'traccar_http':
+                    self.sar_panel.provider_config_stack.setCurrentIndex(self.sar_panel.PROVIDER_PAGE_HTTP_TRACCAR)
+                    self.sar_panel.http_url_input.setText(config.get('base_url', ''))
+                    auth_type = config.get('auth_type', 'basic')
+                    auth_index = self.sar_panel.http_auth_type_combo.findData(auth_type)
+                    if auth_index >= 0:
+                        self.sar_panel.http_auth_type_combo.setCurrentIndex(auth_index)
+                    self.sar_panel._on_auth_type_changed(self.sar_panel.http_auth_type_combo.currentIndex())
+
+                    if auth_type == 'basic':
+                        self.sar_panel.http_username_input.setText(config.get('username', ''))
+                        self.sar_panel.http_password_input.setText(config.get('password', ''))
+                    else:
+                        self.sar_panel.http_token_input.setText(config.get('token', ''))
+
+                    self.sar_panel.http_timeout_spin.setValue(config.get('timeout_s', 10))
+                    self.sar_panel.http_cache_ttl_spin.setValue(config.get('cache_ttl', 300))
+                    self.sar_panel.http_enable_cache_check.setChecked(config.get('enable_last_good_cache', True))
 
             print(f"[SARTRACKER] Restored provider config: {provider_name}")
 
@@ -2816,6 +2917,9 @@ class sartracker:
                     status['provider_controller_state'] = controller_status.get('state', 'unknown')
                     status['provider_poll_active'] = controller_status.get('poll_active', False)
                     status['provider_poll_interval'] = controller_status.get('poll_interval', None)
+                    status['provider_base_url'] = controller_status.get('provider_base_url')
+                    status['provider_last_error'] = controller_status.get('last_error')
+                    status['provider_status_message'] = controller_status.get('message')
                 except Exception as controller_error:
                     print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
             # ============================================================

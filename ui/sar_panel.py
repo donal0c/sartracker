@@ -241,6 +241,10 @@ class SARPanel(QDockWidget):
         # Provider configuration stack (different UI for each provider)
         self.provider_config_stack = QStackedWidget()
 
+        # Provider page indices (for maintainability)
+        self.PROVIDER_PAGE_CSV = 0
+        self.PROVIDER_PAGE_HTTP_TRACCAR = 1
+
         # CSV Provider Configuration Page
         csv_config_page = QWidget()
         csv_config_layout = QVBoxLayout()
@@ -257,24 +261,93 @@ class SARPanel(QDockWidget):
         csv_config_page.setLayout(csv_config_layout)
         self.provider_config_stack.addWidget(csv_config_page)
 
-        # HTTP Traccar Provider Configuration Page (Placeholder for Phase 4)
+        # HTTP Traccar Provider Configuration Page (Phase 4 MVP)
         http_config_page = QWidget()
         http_config_layout = QVBoxLayout()
-        http_config_layout.addWidget(QLabel("<i>HTTP provider configuration coming in Phase 4</i>"))
+
+        # Server URL
         http_config_layout.addWidget(QLabel("Server URL:"))
         self.http_url_input = QLineEdit()
-        self.http_url_input.setPlaceholderText("https://traccar.example.com")
-        self.http_url_input.setEnabled(False)
+        self.http_url_input.setPlaceholderText("http://kmrtsar.eu:8082")
+        self.http_url_input.setToolTip("Traccar server base URL (e.g., http://server:8082)")
         http_config_layout.addWidget(self.http_url_input)
-        http_config_layout.addWidget(QLabel("Username:"))
+
+        # Authentication Type
+        auth_type_layout = QHBoxLayout()
+        auth_type_layout.addWidget(QLabel("Auth Type:"))
+        self.http_auth_type_combo = QComboBox()
+        self.http_auth_type_combo.addItem("Basic Authentication", "basic")
+        self.http_auth_type_combo.addItem("Bearer Token", "bearer")
+        self.http_auth_type_combo.setToolTip("Authentication method for Traccar API")
+        self.http_auth_type_combo.currentIndexChanged.connect(self._on_auth_type_changed)
+        auth_type_layout.addWidget(self.http_auth_type_combo)
+        http_config_layout.addLayout(auth_type_layout)
+
+        # Basic Auth Fields (shown by default)
+        self.http_basic_auth_widget = QWidget()
+        basic_auth_layout = QVBoxLayout()
+        basic_auth_layout.setContentsMargins(0, 0, 0, 0)
+        basic_auth_layout.addWidget(QLabel("Username:"))
         self.http_username_input = QLineEdit()
-        self.http_username_input.setEnabled(False)
-        http_config_layout.addWidget(self.http_username_input)
-        http_config_layout.addWidget(QLabel("Password:"))
+        self.http_username_input.setPlaceholderText("admin")
+        self.http_username_input.setToolTip("Traccar API username")
+        basic_auth_layout.addWidget(self.http_username_input)
+        basic_auth_layout.addWidget(QLabel("Password:"))
         self.http_password_input = QLineEdit()
         self.http_password_input.setEchoMode(QLineEdit.Password)
-        self.http_password_input.setEnabled(False)
-        http_config_layout.addWidget(self.http_password_input)
+        self.http_password_input.setPlaceholderText("••••••••")
+        self.http_password_input.setToolTip("Traccar API password")
+        basic_auth_layout.addWidget(self.http_password_input)
+        self.http_basic_auth_widget.setLayout(basic_auth_layout)
+        http_config_layout.addWidget(self.http_basic_auth_widget)
+
+        # Bearer Token Field (hidden by default)
+        self.http_bearer_auth_widget = QWidget()
+        bearer_auth_layout = QVBoxLayout()
+        bearer_auth_layout.setContentsMargins(0, 0, 0, 0)
+        bearer_auth_layout.addWidget(QLabel("Bearer Token:"))
+        self.http_token_input = QLineEdit()
+        self.http_token_input.setEchoMode(QLineEdit.Password)
+        self.http_token_input.setPlaceholderText("Enter API token")
+        self.http_token_input.setToolTip("Traccar API bearer token")
+        bearer_auth_layout.addWidget(self.http_token_input)
+        self.http_bearer_auth_widget.setLayout(bearer_auth_layout)
+        self.http_bearer_auth_widget.setVisible(False)
+        http_config_layout.addWidget(self.http_bearer_auth_widget)
+
+        # Advanced Settings (collapsible)
+        advanced_group = QGroupBox("Advanced Settings (Optional)")
+        advanced_group.setCheckable(True)
+        advanced_group.setChecked(False)
+        advanced_layout = QGridLayout()
+
+        # Timeout
+        advanced_layout.addWidget(QLabel("Timeout (seconds):"), 0, 0)
+        self.http_timeout_spin = QSpinBox()
+        self.http_timeout_spin.setMinimum(5)
+        self.http_timeout_spin.setMaximum(60)
+        self.http_timeout_spin.setValue(10)
+        self.http_timeout_spin.setToolTip("HTTP request timeout in seconds")
+        advanced_layout.addWidget(self.http_timeout_spin, 0, 1)
+
+        # Cache TTL
+        advanced_layout.addWidget(QLabel("Cache TTL (seconds):"), 1, 0)
+        self.http_cache_ttl_spin = QSpinBox()
+        self.http_cache_ttl_spin.setMinimum(0)
+        self.http_cache_ttl_spin.setMaximum(3600)
+        self.http_cache_ttl_spin.setValue(300)
+        self.http_cache_ttl_spin.setToolTip("Device cache time-to-live (0 = no cache)")
+        advanced_layout.addWidget(self.http_cache_ttl_spin, 1, 1)
+
+        # Last-good cache
+        self.http_enable_cache_check = QCheckBox("Enable offline cache")
+        self.http_enable_cache_check.setChecked(True)
+        self.http_enable_cache_check.setToolTip("Cache last good positions for offline resilience")
+        advanced_layout.addWidget(self.http_enable_cache_check, 2, 0, 1, 2)
+
+        advanced_group.setLayout(advanced_layout)
+        http_config_layout.addWidget(advanced_group)
+
         http_config_layout.addStretch()
         http_config_page.setLayout(http_config_layout)
         self.provider_config_stack.addWidget(http_config_page)
@@ -869,6 +942,8 @@ class SARPanel(QDockWidget):
         """
         Populate provider dropdown from registry metadata.
 
+        Phase 4: Filters providers based on feature flags (e.g., traccar_http).
+
         Args:
             providers_metadata: List of provider metadata dicts with keys:
                 - name: str (internal provider name)
@@ -880,10 +955,18 @@ class SARPanel(QDockWidget):
         self.provider_combo.clear()
 
         for metadata in providers_metadata:
+            provider_name = metadata['name']
+
+            # Phase 4: Check feature flag for traccar_http provider
+            if provider_name == 'traccar_http':
+                if not self._is_provider_enabled('traccar_http'):
+                    print(f"[SARPANEL] Skipping {provider_name} (feature flag disabled)")
+                    continue
+
             # Add item with display name, store internal name as user data
             self.provider_combo.addItem(
                 metadata['display_name'],
-                metadata['name']  # Store as userData
+                provider_name  # Store as userData
             )
             # Set tooltip
             self.provider_combo.setItemData(
@@ -892,7 +975,46 @@ class SARPanel(QDockWidget):
                 2  # ToolTipRole as integer (Qt5/Qt6 compatible)
             )
 
-        print(f"[SARPANEL] Populated {len(providers_metadata)} providers")
+        print(f"[SARPANEL] Populated {self.provider_combo.count()} providers")
+
+    def _is_provider_enabled(self, provider_name: str) -> bool:
+        """
+        Check if provider is enabled via feature flag.
+
+        Phase 4: Allows controlled rollout of new providers (traccar_http).
+        Checks both environment variable and QSettings.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'traccar_http')
+
+        Returns:
+            True if provider is enabled, False otherwise
+
+        Enablement methods:
+            1. Environment variable: SARTRACKER_ENABLE_TRACCAR_HTTP=1
+            2. QSettings: SARTracker/Providers/traccar_http/enabled = true
+
+        Qt5/Qt6 Compatible: Uses QSettings.
+        """
+        import os
+
+        # Check environment variable first (for development/testing)
+        env_var_name = f"SARTRACKER_ENABLE_{provider_name.upper()}"
+        if os.environ.get(env_var_name) == '1':
+            print(f"[SARPANEL] Provider {provider_name} enabled via environment variable")
+            return True
+
+        # Check QSettings (for user configuration)
+        settings = QSettings()
+        settings_key = f"SARTracker/Providers/{provider_name}/enabled"
+        is_enabled = settings.value(settings_key, False, type=bool)
+
+        if is_enabled:
+            print(f"[SARPANEL] Provider {provider_name} enabled via QSettings")
+        else:
+            print(f"[SARPANEL] Provider {provider_name} disabled (to enable: {env_var_name}=1 or QSettings {settings_key}=true)")
+
+        return is_enabled
 
     def _on_provider_changed(self, display_name: str):
         """
@@ -915,12 +1037,33 @@ class SARPanel(QDockWidget):
 
         # Switch config stack page
         if provider_name == 'csv':
-            self.provider_config_stack.setCurrentIndex(0)
-        elif provider_name == 'http_traccar':
-            self.provider_config_stack.setCurrentIndex(1)
+            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_CSV)
+        elif provider_name in ('http_traccar', 'traccar_http'):
+            # Both old and new Traccar providers use same UI page
+            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_HTTP_TRACCAR)
 
         # Emit signal
         self.provider_selected.emit(provider_name)
+
+    def _on_auth_type_changed(self, index: int):
+        """
+        Handle authentication type dropdown change.
+
+        Shows/hides appropriate auth fields based on selected auth type.
+
+        Args:
+            index: Selected combo box index
+
+        Qt5/Qt6 Compatible: Uses QComboBox and QWidget visibility.
+        """
+        auth_type = self.http_auth_type_combo.currentData()
+
+        if auth_type == 'basic':
+            self.http_basic_auth_widget.setVisible(True)
+            self.http_bearer_auth_widget.setVisible(False)
+        elif auth_type == 'bearer':
+            self.http_basic_auth_widget.setVisible(False)
+            self.http_bearer_auth_widget.setVisible(True)
 
     def _on_csv_browse(self):
         """
@@ -1036,14 +1179,95 @@ class SARPanel(QDockWidget):
             return {'csv_path': csv_path}
 
         elif provider_name == 'http_traccar':
-            # Phase 4: Add HTTP provider config validation
-            warning(
-                iface.messageBar(),
-                "HTTP Provider",
-                "HTTP provider configuration coming in Phase 4",
-                duration=3
-            )
-            return None
+            # OLD Traccar provider (Phase 1) - uses server_url, no auth_type
+            server_url = self.http_url_input.text().strip()
+            if not server_url:
+                warning(
+                    iface.messageBar(),
+                    "Traccar Configuration",
+                    "Please enter a Traccar server URL",
+                    duration=3
+                )
+                return None
+
+            username = self.http_username_input.text().strip()
+            password = self.http_password_input.text().strip()
+
+            if not username or not password:
+                warning(
+                    iface.messageBar(),
+                    "Traccar Configuration",
+                    "Please enter both username and password",
+                    duration=3
+                )
+                return None
+
+            config = {
+                'server_url': server_url,
+                'username': username,
+                'password': password,
+                'timeout': self.http_timeout_spin.value()
+            }
+
+            return config
+
+        elif provider_name == 'traccar_http':
+            # NEW Traccar provider (Phase 4) - uses base_url, auth_type
+            base_url = self.http_url_input.text().strip()
+            if not base_url:
+                warning(
+                    iface.messageBar(),
+                    "Traccar Configuration",
+                    "Please enter a Traccar server URL",
+                    duration=3
+                )
+                return None
+
+            # Get auth type
+            auth_type = self.http_auth_type_combo.currentData()
+
+            config = {
+                'base_url': base_url,
+                'auth_type': auth_type
+            }
+
+            # Validate and add auth credentials
+            if auth_type == 'basic':
+                username = self.http_username_input.text().strip()
+                password = self.http_password_input.text().strip()
+
+                if not username or not password:
+                    warning(
+                        iface.messageBar(),
+                        "Traccar Configuration",
+                        "Please enter both username and password for basic authentication",
+                        duration=3
+                    )
+                    return None
+
+                config['username'] = username
+                config['password'] = password
+
+            elif auth_type == 'bearer':
+                token = self.http_token_input.text().strip()
+
+                if not token:
+                    warning(
+                        iface.messageBar(),
+                        "Traccar Configuration",
+                        "Please enter a bearer token",
+                        duration=3
+                    )
+                    return None
+
+                config['token'] = token
+
+            # Add optional advanced settings
+            config['timeout_s'] = self.http_timeout_spin.value()
+            config['cache_ttl'] = self.http_cache_ttl_spin.value()
+            config['enable_last_good_cache'] = self.http_enable_cache_check.isChecked()
+
+            return config
 
         else:
             warning(

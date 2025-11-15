@@ -15,6 +15,7 @@ to be addressed in Phase 4 (WebSocket provider).
 Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
 """
 
+import os
 import requests
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
@@ -50,7 +51,14 @@ class HttpTraccarProvider(Provider):
     Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
     """
 
-    def __init__(self, server_url: str, username: str, password: str, timeout: int = 10):
+    ROUTE_LOOKBACK_ENV = "SARTRACKER_HTTP_ROUTE_LOOKBACK_HOURS"
+    ROUTE_FALLBACK_ENV = "SARTRACKER_HTTP_ROUTE_FALLBACK_HOURS"
+    DEFAULT_ROUTE_LOOKBACK_HOURS = 3
+    DEFAULT_ROUTE_FALLBACK_HOURS = 72  # 3 days fallback when diagnostics needed
+
+    def __init__(self, server_url: str, username: str, password: str, timeout: int = 10,
+                 route_lookback_hours: Optional[float] = None,
+                 route_fallback_hours: Optional[float] = None):
         """
         Initialize Traccar HTTP provider.
 
@@ -64,12 +72,30 @@ class HttpTraccarProvider(Provider):
         Does NOT create a shared session - sessions are created per-task
         to avoid thread contention on connection pools.
         """
-        self.server_url = server_url.rstrip('/')
+        # Users sometimes copy Traccar URLs with a web UI fragment like '/#/';
+        # strip anything after a '#' so API requests remain valid.
+        self.server_url = server_url.split('#')[0].rstrip('/')
         self.username = username
         self.password = password
         self.timeout = timeout
         # Do NOT create session here - sessions are per-task now (Issue #1)
         # Each background task creates its own session for thread isolation
+
+        self.route_lookback_hours = self._resolve_lookback_hours(
+            route_lookback_hours,
+            self.ROUTE_LOOKBACK_ENV,
+            self.DEFAULT_ROUTE_LOOKBACK_HOURS
+        )
+
+        fallback_default = max(self.DEFAULT_ROUTE_FALLBACK_HOURS, self.route_lookback_hours)
+        self.route_fallback_hours = self._resolve_lookback_hours(
+            route_fallback_hours,
+            self.ROUTE_FALLBACK_ENV,
+            fallback_default
+        )
+
+        if self.route_fallback_hours < self.route_lookback_hours:
+            self.route_fallback_hours = self.route_lookback_hours
 
     def _create_session(self) -> requests.Session:
         """
@@ -310,10 +336,13 @@ class HttpTraccarProvider(Provider):
 
         Issue #3 Fix: Ensures HTTP provider returns consistent schema.
         """
+        raw_id = None
         try:
             # === VALIDATE INPUT ===
             if not isinstance(raw_device, dict):
                 raise ValueError(f"Invalid device: expected dict, got {type(raw_device)}")
+
+            raw_id = raw_device.get('id')
 
             # === EXTRACT device_id ===
             # Traccar uses 'id' (int) and 'uniqueId' (str)
@@ -370,6 +399,7 @@ class HttpTraccarProvider(Provider):
 
             # === RETURN NORMALIZED DICT ===
             return {
+                'id': raw_id,
                 'device_id': device_id,
                 'name': name,
                 'status': status,
@@ -391,6 +421,7 @@ class HttpTraccarProvider(Provider):
             print(f"Warning: Error normalizing device {device_id_for_log}: {e}")
 
             return {
+                'id': raw_id,
                 'device_id': device_id_for_return,
                 'name': f"Device {device_id_for_return}",
                 'status': 'unknown',
@@ -615,9 +646,119 @@ class HttpTraccarProvider(Provider):
         try:
             # Simple API call to verify connectivity
             self._make_request('/api/devices', session=session)
+            print(f"[HTTP_TRACCAR] Connection test successful to {self.server_url}")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[HTTP_TRACCAR] Connection test FAILED: {type(e).__name__}: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    def _resolve_lookback_hours(self, config_value: Optional[float], env_var: str, default: float) -> float:
+        """
+        Resolve lookback window hours from config, falling back to env and defaults.
+        """
+        if config_value is not None:
+            try:
+                value = float(config_value)
+                if value > 0:
+                    return value
+            except (TypeError, ValueError):
+                print(f"[HTTP_TRACCAR] Invalid config value '{config_value}' for lookback hours, ignoring")
+
+        env_value = os.environ.get(env_var)
+        if env_value:
+            try:
+                value = float(env_value)
+                if value > 0:
+                    return value
+            except ValueError:
+                print(f"[HTTP_TRACCAR] Invalid {env_var}='{env_value}', ignoring")
+
+        return float(default)
+
+    def get_latest_positions(self, session: Optional[requests.Session] = None,
+                             device_names: Optional[Dict[str, str]] = None) -> List[FeatureDict]:
+        """
+        Fetch snapshot of latest positions via /api/positions for current layer updates.
+        """
+        snapshot = self._make_request('/api/positions', session=session)
+        if not isinstance(snapshot, list):
+            raise ProviderDataError(
+                f"Invalid /api/positions response: expected list, got {type(snapshot)}",
+                provider_name='http_traccar',
+                recoverable=False
+            )
+
+        features: List[FeatureDict] = []
+        for pos in snapshot:
+            try:
+                feature = self._normalize_position(pos, device_names)
+                features.append(feature)
+            except Exception as e:
+                device_id = pos.get('deviceId', 'unknown')
+                print(f"[HTTP_TRACCAR] Warning: Failed to normalize position for device {device_id}: {e}")
+                continue
+
+        features.sort(key=lambda x: x['ts'], reverse=True)
+        return features
+
+    def _normalize_position(self, raw_pos: Dict[str, Any],
+                             device_names: Optional[Dict[str, str]] = None) -> FeatureDict:
+        """
+        Normalize Traccar /api/positions payload into Base Provider schema.
+        """
+        if not isinstance(raw_pos, dict):
+            raise ValueError("Position payload must be a dict")
+
+        device_id = raw_pos.get('deviceId')
+        if device_id is None:
+            raise ValueError("Position missing deviceId")
+        device_id_str = str(device_id)
+
+        name = None
+        if device_names:
+            name = device_names.get(device_id_str)
+        if not name:
+            device_meta = raw_pos.get('device')
+            if isinstance(device_meta, dict):
+                name = device_meta.get('name')
+        if not name:
+            name = f"Device {device_id_str}"
+
+        lat = raw_pos.get('latitude')
+        lon = raw_pos.get('longitude')
+        if lat is None or lon is None:
+            raise ValueError("Position missing latitude/longitude")
+
+        try:
+            lat = float(lat)
+            lon = float(lon)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid lat/lon: {e}")
+
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            raise ValueError(f"Lat/Lon out of bounds: ({lat}, {lon})")
+
+        timestamp = raw_pos.get('fixTime') or raw_pos.get('serverTime') or raw_pos.get('deviceTime')
+        if not timestamp or not isinstance(timestamp, str):
+            raise ValueError("Position missing timestamp")
+
+        attributes = raw_pos.get('attributes')
+        battery = None
+        if isinstance(attributes, dict):
+            battery = attributes.get('batteryLevel')
+
+        return {
+            'device_id': device_id_str,
+            'name': name,
+            'lat': lat,
+            'lon': lon,
+            'ts': timestamp,
+            'altitude': raw_pos.get('altitude'),
+            'speed': raw_pos.get('speed'),
+            'battery': battery
+        }
 
     def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
         """
@@ -690,11 +831,16 @@ def _create_http_traccar_provider(config: Dict) -> HttpTraccarProvider:
             recoverable=False
         )
 
+    route_lookback = config.get('route_lookback_hours')
+    route_fallback = config.get('route_fallback_hours')
+
     return HttpTraccarProvider(
         server_url=config['server_url'],
         username=config['username'],
         password=config['password'],
-        timeout=timeout
+        timeout=int(timeout),
+        route_lookback_hours=route_lookback,
+        route_fallback_hours=route_fallback
     )
 
 
@@ -728,6 +874,16 @@ registry.register(
                 'description': 'HTTP request timeout (seconds)',
                 'required': False,
                 'default': 10
+            },
+            'route_lookback_hours': {
+                'type': 'number',
+                'description': 'Hours of history requested for breadcrumb routes (default: 3)',
+                'required': False
+            },
+            'route_fallback_hours': {
+                'type': 'number',
+                'description': 'Maximum hours to request if initial route window returns no data (default: 72)',
+                'required': False
             }
         },
         # Phase 1: Provider capabilities

@@ -11,6 +11,8 @@ from typing import Dict, List, Optional, Any
 from abc import ABC, abstractmethod
 from qgis.core import QgsTask
 
+from ..utils.exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
+
 
 class ProviderRefreshTask(QgsTask):
     """
@@ -181,108 +183,66 @@ class HTTPRefreshTask(ProviderRefreshTask):
             True if successful, False if error occurred
         """
         import time
+        from datetime import datetime, timedelta
 
         # Create thread-local session (Issue #1 fix)
-        # This session is used ONLY by this task and disposed after completion
         session = self.provider._create_session()
 
         try:
-            # Check for cancellation before starting
             if self.isCanceled():
                 return False
 
-            # Fetch devices with retry logic (pass session)
             devices = self._fetch_with_retry(
                 lambda: self.provider.get_devices(session=session),
                 "devices"
             )
-
             if devices is None:
-                return False  # Error occurred
+                return False
 
-            # Check for cancellation
             if self.isCanceled():
                 return False
 
-            # Fetch positions with unified device loop (eliminates duplicate fetches)
-            # OPTIMIZATION (Issue #4 fix):
-            # Strategy: Fetch each device once with 3-hour window, then split into
-            # "current" (latest position) and "breadcrumbs" (all positions) in memory.
-            # Performance: Reduces HTTP requests from 2N to N (50% improvement).
-            current = []
-            breadcrumbs = []
-            device_count = len(devices)
-
-            # Define time ranges once
-            from datetime import datetime, timedelta
-            current_time = datetime.utcnow()
-            breadcrumbs_from_time = current_time - timedelta(hours=3)
-
-            for i, device in enumerate(devices):
-                # Check for cancellation before each device
-                if self.isCanceled():
-                    return False
-
-                # Update progress (0-100% for all devices)
-                progress = int((i / device_count) * 100)
-                self.setProgress(progress)
-
-                try:
-                    # Fetch this device's route data ONCE using 3-hour window
-                    device_id = str(device['id'])
-                    device_name = device.get('name', f"Device {device_id}")
-
-                    params = {
-                        'deviceId': device['id'],
-                        'from': breadcrumbs_from_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                        'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
-                    }
-
-                    # Single API call per device (was 2 calls before)
-                    # Pass session to provider method (Issue #1 fix)
-                    routes = self.provider._make_request('/api/reports/route', params, session=session)
-
-                    if routes:
-                        # Extract current position (latest in the dataset)
-                        latest = max(routes, key=lambda x: x.get('fixTime', ''))
-                        current.append({
-                            'device_id': device_id,
-                            'name': device_name,
-                            'lat': latest['latitude'],
-                            'lon': latest['longitude'],
-                            'ts': latest['fixTime'],
-                            'altitude': latest.get('altitude'),
-                            'speed': latest.get('speed'),
-                            'battery': latest.get('attributes', {}).get('batteryLevel')
-                        })
-
-                        # Extract all positions as breadcrumbs
-                        for pos in routes:
-                            breadcrumbs.append({
-                                'device_id': device_id,
-                                'name': device_name,
-                                'lat': pos['latitude'],
-                                'lon': pos['longitude'],
-                                'ts': pos['fixTime'],
-                                'altitude': pos.get('altitude'),
-                                'speed': pos.get('speed'),
-                                'battery': pos.get('attributes', {}).get('batteryLevel')
-                            })
-
-                except Exception as e:
-                    # Log error but continue with other devices (graceful degradation)
-                    print(f"Warning: Could not fetch data for device {device.get('name', device['id'])}: {e}")
+            # Build lookup for device names
+            device_names: Dict[str, str] = {}
+            for device in devices or []:
+                device_id = device.get('id')
+                if device_id is None:
                     continue
+                device_names[str(device_id)] = device.get('name', f"Device {device_id}")
 
-                # Throttle requests to avoid overwhelming server
-                # Note: Only throttle if not the last device
-                if i < device_count - 1:
-                    time.sleep(self.request_throttle)
+            # Fetch snapshot of latest positions for current layer
+            current = []
+            try:
+                current = self.provider.get_latest_positions(session=session, device_names=device_names)
+            except (ProviderNetworkError, ProviderAuthError, ProviderDataError) as snapshot_error:
+                self.error_message = f"Failed to fetch latest positions: {snapshot_error}"
+                return False
+            except Exception as snapshot_error:
+                print(f"Warning: Unexpected error fetching /api/positions snapshot: {snapshot_error}")
+                self.error_message = f"Unexpected error fetching latest positions: {snapshot_error}"
+                return False
 
-            # Sort breadcrumbs by device then timestamp
+            lookback_hours = getattr(self.provider, 'route_lookback_hours', 3)
+            breadcrumbs = self._collect_breadcrumbs(
+                devices, device_names, session, lookback_hours,
+                datetime.utcnow(), report_progress=True
+            )
+            if breadcrumbs is None:
+                return False  # Cancelled during fetch
+
+            if not breadcrumbs:
+                fallback_hours = getattr(self.provider, 'route_fallback_hours', lookback_hours)
+                if fallback_hours > lookback_hours:
+                    print(f"[HTTP_REFRESH] No breadcrumbs returned for {lookback_hours}h window. Retrying with {fallback_hours}h.")
+                    breadcrumbs = self._collect_breadcrumbs(
+                        devices, device_names, session, fallback_hours,
+                        datetime.utcnow(), report_progress=False
+                    )
+                    if breadcrumbs is None:
+                        return False
+
             breadcrumbs.sort(key=lambda x: (x['device_id'], x['ts']))
 
-            # Store results for main thread retrieval
             self.results = {
                 'current': current,
                 'breadcrumbs': breadcrumbs,
@@ -302,6 +262,79 @@ class HTTPRefreshTask(ProviderRefreshTask):
                 session.close()
             except Exception as e:
                 print(f"Warning: Error closing HTTP session: {e}")
+
+    def _collect_breadcrumbs(
+        self,
+        devices: List[Dict[str, Any]],
+        device_names: Dict[str, str],
+        session,
+        lookback_hours: float,
+        current_time,
+        report_progress: bool
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch breadcrumb routes for each device within the requested window.
+        Returns list of normalized features or None if cancelled mid-way.
+        """
+        import time
+        from datetime import timedelta
+
+        if lookback_hours <= 0:
+            lookback_hours = 1
+
+        start_time = current_time - timedelta(hours=lookback_hours)
+        breadcrumbs: List[Dict[str, Any]] = []
+        device_count = len(devices) if devices else 0
+
+        for index, device in enumerate(devices or []):
+            if self.isCanceled():
+                return None
+
+            if report_progress and device_count:
+                progress = int((index / device_count) * 100)
+                self.setProgress(progress)
+
+            device_id = device.get('id')
+            if device_id is None:
+                continue
+            device_id_str = str(device_id)
+            device_name = device_names.get(device_id_str, f"Device {device_id_str}")
+
+            params = {
+                'deviceId': device_id,
+                'from': start_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                'to': current_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+            }
+
+            try:
+                routes = self.provider._make_request('/api/reports/route', params, session=session)
+            except Exception as e:
+                print(f"Warning: Could not fetch route data for device {device_name}: {e}")
+                continue
+
+            for pos in routes or []:
+                lat = pos.get('latitude')
+                lon = pos.get('longitude')
+                if lat is None or lon is None:
+                    continue
+                ts = pos.get('fixTime')
+                if not ts:
+                    continue
+                breadcrumbs.append({
+                    'device_id': device_id_str,
+                    'name': device_name,
+                    'lat': lat,
+                    'lon': lon,
+                    'ts': ts,
+                    'altitude': pos.get('altitude'),
+                    'speed': pos.get('speed'),
+                    'battery': (pos.get('attributes') or {}).get('batteryLevel')
+                })
+
+            if report_progress and device_count and index < device_count - 1:
+                time.sleep(self.request_throttle)
+
+        return breadcrumbs
 
     def _fetch_with_retry(self, fetch_func, operation_name: str) -> Optional[Any]:
         """
@@ -408,3 +441,169 @@ class ConnectionTestTask(QgsTask):
             self.error_message = str(e)
             self.success = False
             return False
+
+
+class TraccarRefreshTask(ProviderRefreshTask):
+    """
+    Traccar HTTP refresh task using Phase 4 optimized provider.
+
+    Uses TraccarHttpProvider with device caching, last-good cache, and
+    optimized API access patterns. Designed for life-safety operations.
+
+    Phase 4 Improvements:
+    - Uses /api/positions for current (not per-device loops)
+    - Device cache reduces API calls
+    - Last-good cache provides offline resilience
+    - Full error handling with ProviderError hierarchy
+
+    Qt5/Qt6 Compatible: Uses QgsTask API.
+    """
+
+    def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data"):
+        """
+        Initialize Traccar refresh task.
+
+        Args:
+            provider: TraccarHttpProvider instance (thread-safe)
+            description: Task description for progress display
+        """
+        super().__init__(provider, description)
+
+    def run(self) -> bool:
+        """
+        Run Traccar data fetch in background thread.
+
+        CRITICAL: This runs in a background thread. Do NOT:
+        - Create or modify Qt widgets
+        - Use QgsMessageBar or any GUI operations
+        - Access QGIS map canvas or layers directly
+
+        THREAD-SAFETY (Phase 4):
+        Creates a dedicated requests.Session for this task using
+        provider._create_session() to avoid sharing connection pools.
+
+        Returns:
+            True if successful, False if error occurred
+        """
+        # Create thread-local session for this task
+        session = self.provider._create_session()
+        fallback_features = None
+
+        try:
+            # Check for cancellation before starting
+            if self.isCanceled():
+                return False
+
+            # Fetch devices with session
+            def _devices_from_features(features: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                device_map: Dict[str, Dict[str, Any]] = {}
+                for feature in features or []:
+                    device_id = feature.get('device_id')
+                    if not device_id:
+                        continue
+                    if device_id in device_map:
+                        continue
+                    device_map[device_id] = {
+                        'device_id': device_id,
+                        'name': feature.get('name', f"Device {device_id}"),
+                        'status': 'unknown',
+                        'last_update': feature.get('ts')
+                    }
+                return list(device_map.values())
+
+            try:
+                devices = self.provider.get_devices(session=session)
+            except ProviderNetworkError as e:
+                if getattr(self.provider, 'enable_last_good_cache', False):
+                    fallback_features = self.provider._load_last_good_cache()
+                if fallback_features:
+                    print(f"[TRACCAR_TASK] Using cached devices due to network error: {e}")
+                    devices = _devices_from_features(fallback_features)
+                else:
+                    self.error_message = f"Failed to fetch devices: {str(e)}"
+                    return False
+            except (ProviderAuthError, ProviderDataError) as e:
+                self.error_message = f"Failed to fetch devices: {str(e)}"
+                return False
+            except Exception as e:
+                self.error_message = f"Unexpected error fetching devices: {str(e)}"
+                return False
+
+            # Check for cancellation
+            if self.isCanceled():
+                return False
+
+            # Update progress
+            self.setProgress(33)
+
+            # Fetch current positions with session
+            try:
+                current = self.provider.get_current(session=session)
+            except ProviderNetworkError as e:
+                if fallback_features is None and getattr(self.provider, 'enable_last_good_cache', False):
+                    fallback_features = self.provider._load_last_good_cache()
+                if fallback_features:
+                    print(f"[TRACCAR_TASK] Using cached positions due to network error: {e}")
+                    current = fallback_features
+                else:
+                    self.error_message = f"Failed to fetch current positions: {str(e)}"
+                    return False
+            except (ProviderAuthError, ProviderDataError) as e:
+                self.error_message = f"Failed to fetch current positions: {str(e)}"
+                return False
+            except Exception as e:
+                print(f"[TRACCAR_TASK] Error fetching current positions: {e}")
+                self.error_message = f"Failed to fetch current positions: {str(e)}"
+                return False
+
+            # Check for cancellation
+            if self.isCanceled():
+                return False
+
+            # Update progress
+            self.setProgress(66)
+
+            # Fetch breadcrumbs with session
+            try:
+                if fallback_features:
+                    breadcrumbs = []
+                else:
+                    breadcrumbs = self.provider.get_breadcrumbs(session=session)
+            except ProviderNetworkError as e:
+                print(f"[TRACCAR_TASK] Network error fetching breadcrumbs: {e}")
+                breadcrumbs = []
+            except (ProviderAuthError, ProviderDataError) as e:
+                self.error_message = f"Failed to fetch breadcrumbs: {str(e)}"
+                return False
+            except Exception as e:
+                print(f"[TRACCAR_TASK] Error fetching breadcrumbs: {e}")
+                breadcrumbs = []
+
+            # Check for cancellation
+            if self.isCanceled():
+                return False
+
+            # Store results for main thread retrieval
+            self.results = {
+                'current': current,
+                'breadcrumbs': breadcrumbs,
+                'devices': devices
+            }
+
+            # Update progress to 100%
+            self.setProgress(100)
+
+            return True
+
+        except Exception as e:
+            # Capture error for main thread handling
+            # CRITICAL: Do NOT show error dialogs here - we're in background thread
+            self.error_message = str(e)
+            return False
+
+        finally:
+            # CRITICAL: Close session to release connections
+            try:
+                session.close()
+            except Exception as e:
+                print(f"Warning: Error closing session in TraccarRefreshTask: {e}")

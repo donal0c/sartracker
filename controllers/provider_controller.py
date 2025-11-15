@@ -89,6 +89,7 @@ class ProviderController(QObject):
         # Status tracking
         self._cached_device_count = 0
         self._last_refresh_time: Optional[str] = None
+        self._last_error_message: Optional[str] = None
         self._last_status_dict = self._build_status_dict('ok', 'No provider loaded')
 
     def set_provider(self, provider_name: str, config: Dict[str, Any], test_only: bool = False):
@@ -502,6 +503,10 @@ class ProviderController(QObject):
 
         Qt5/Qt6 Compatible: Pure Python dict + pyqtSignal.
         """
+        if state == 'error':
+            self._last_error_message = message
+        elif state == 'ok':
+            self._last_error_message = None
         self._last_status_dict = self._build_status_dict(state, message)
         self.status_changed.emit(dict(self._last_status_dict))
 
@@ -518,15 +523,18 @@ class ProviderController(QObject):
 
         Qt5/Qt6 Compatible: Pure Python dict.
         """
-        return {
+        status_dict = {
             'provider': self.provider_name,
             'state': state,
             'message': message,
             'poll_interval': self.poll_timer.interval() // 1000 if self.poll_timer.isActive() else None,
             'poll_active': self.poll_timer.isActive(),
             'devices_count': self._cached_device_count,
-            'last_refresh': self._last_refresh_time
+            'last_refresh': self._last_refresh_time,
+            'provider_base_url': self._get_provider_base_url(),
+            'last_error': self._last_error_message
         }
+        return status_dict
 
     def update_refresh_stats(self, devices_count: int, refresh_time: str):
         """
@@ -543,6 +551,22 @@ class ProviderController(QObject):
 
         # Emit status update
         self._emit_status('ok', f'Last refresh: {devices_count} devices')
+
+    def _get_provider_base_url(self) -> Optional[str]:
+        """
+        Extract a display-safe base URL for diagnostics.
+
+        Returns:
+            str or None: Base URL for HTTP providers, or None if not applicable
+        """
+        if not self.provider_config:
+            return None
+
+        if 'base_url' in self.provider_config:
+            return self.provider_config.get('base_url')
+        if 'server_url' in self.provider_config:
+            return self.provider_config.get('server_url')
+        return None
 
     def _cleanup_shadow_state(self):
         """

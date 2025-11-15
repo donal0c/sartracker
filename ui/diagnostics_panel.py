@@ -306,7 +306,9 @@ class DiagnosticsPanel(BaseDialog):
                     if ctrl_state == 'ok':
                         provider_ctrl_text = "✅ Connected"
                         if poll_active and poll_interval:
-                            provider_ctrl_text += f" (Polling: {poll_interval}s)"
+                            provider_ctrl_text += f" (Polling every {poll_interval}s)"
+                        elif poll_active:
+                            provider_ctrl_text += " (Polling)"
                     elif ctrl_state == 'error':
                         provider_ctrl_text = "❌ Error"
                     elif ctrl_state == 'testing':
@@ -322,6 +324,37 @@ class DiagnosticsPanel(BaseDialog):
         provider_label = QLabel(provider_ctrl_text)
         provider_label.setToolTip("Provider Controller manages data source connections and polling")
         form.addRow("<b>Provider Controller:</b>", provider_label)
+
+        # Provider details (base URL, refresh info, last error)
+        provider_details_lines = []
+        try:
+            from qgis.utils import plugins as detail_plugins
+            if 'sartracker' in detail_plugins:
+                detail_plugin = detail_plugins['sartracker']
+                if hasattr(detail_plugin, 'get_plugin_status'):
+                    detail_status = detail_plugin.get_plugin_status()
+                    base_url = detail_status.get('provider_base_url')
+                    if base_url:
+                        provider_details_lines.append(f"Base URL: {base_url}")
+                    last_refresh = detail_status.get('last_refresh')
+                    if last_refresh:
+                        provider_details_lines.append(f"Last Refresh: {last_refresh}")
+                    device_count = detail_status.get('devices_count')
+                    if device_count:
+                        provider_details_lines.append(f"Devices: {device_count}")
+                    last_error = detail_status.get('provider_last_error')
+                    if last_error:
+                        provider_details_lines.append(f"Last Error: {last_error}")
+                    status_message = detail_status.get('provider_status_message')
+                    if status_message:
+                        provider_details_lines.append(f"Status: {status_message}")
+        except Exception as detail_error:
+            print(f"[DIAGNOSTICS] Error reading provider details: {detail_error}")
+
+        provider_details_text = "\n".join(provider_details_lines) if provider_details_lines else "No provider details available"
+        provider_details_label = QLabel(provider_details_text)
+        provider_details_label.setWordWrap(True)
+        form.addRow("<b>Provider Details:</b>", provider_details_label)
 
         group.setLayout(form)
         return group
