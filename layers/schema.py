@@ -183,11 +183,11 @@ def get_expected_structure() -> GroupDefinition:
                         geometry_type="Point",
                         fields=[
                             {"name": "device_id", "type": "String", "length": 50},
-                            {"name": "device_name", "type": "String", "length": 100},
+                            {"name": "name", "type": "String", "length": 100},
                             {"name": "timestamp", "type": "DateTime"},
+                            {"name": "altitude", "type": "Double"},
                             {"name": "speed", "type": "Double"},
-                            {"name": "heading", "type": "Double"},
-                            {"name": "altitude", "type": "Double"}
+                            {"name": "battery", "type": "Double"}
                         ],
                         metadata={"sartracker:type": "current_position"}
                     )

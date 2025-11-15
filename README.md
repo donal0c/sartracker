@@ -116,7 +116,7 @@ Status badges directly beneath the controls show Auto Refresh / Auto Save state 
 ### 3. Load Tracking Data
 
 **From CSV Files:**
-1. Click **"Load CSV File..."**
+1. Click **"Load CSV..."** in the Data Refresh section
 2. Select folder with CSV files OR single CSV file
 3. Data loads automatically to map
 

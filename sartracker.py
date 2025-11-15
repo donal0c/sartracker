@@ -21,6 +21,8 @@
  *                                                                         *
  ***************************************************************************/
 """
+from typing import Optional
+
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton
@@ -1119,22 +1121,30 @@ class sartracker:
                     print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
 
                 try:
-                    # Disconnect all signals
-                    self.sar_panel.mission_started.disconnect()
-                    self.sar_panel.mission_paused.disconnect()
-                    self.sar_panel.mission_resumed.disconnect()
-                    self.sar_panel.mission_finished.disconnect()
-                    self.sar_panel.refresh_requested.disconnect()
-                    self.sar_panel.csv_load_requested.disconnect()
-                    self.sar_panel.add_poi_requested.disconnect()
-                    self.sar_panel.add_casualty_requested.disconnect()
-                    self.sar_panel.add_hazard_requested.disconnect()
-                    self.sar_panel.line_tool_requested.disconnect()
-                    self.sar_panel.range_rings_tool_requested.disconnect()
-                    self.sar_panel.coordinate_converter_requested.disconnect()
-                    self.sar_panel.measure_distance_requested.disconnect()
-                    self.sar_panel.autosave_requested.disconnect()
-                    # Phase N1: SARPanel provider signals removed
+                    # Disconnect all signals (only those that exist in SARPanel)
+                    panel_signals = [
+                        'refresh_requested',
+                        'csv_load_requested',
+                        'add_poi_requested',
+                        'add_clue_requested',
+                        'add_casualty_requested',
+                        'add_hazard_requested',
+                        'line_tool_requested',
+                        'polygon_tool_requested',
+                        'range_rings_tool_requested',
+                        'bearing_tool_requested',
+                        'coordinate_converter_requested',
+                        'measure_distance_requested',
+                        'autosave_requested',
+                        'clear_measurements_requested'
+                    ]
+                    for signal_name in panel_signals:
+                        signal = getattr(self.sar_panel, signal_name, None)
+                        if signal:
+                            try:
+                                signal.disconnect()
+                            except TypeError:
+                                pass
                 except:
                     pass  # Signals may not be connected
 
@@ -2922,12 +2932,18 @@ class sartracker:
                 password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
                 timeout = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT, SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT, int)
                 if server_url and username and password:
-                    config = {
+                    legacy_config = {
                         'server_url': str(server_url),
                         'username': str(username),
                         'password': str(password),
                         'timeout': int(timeout)
                     }
+                    converted = self._convert_legacy_http_config(legacy_config)
+                    if converted:
+                        provider_name = 'traccar_http'
+                        config = converted
+                        ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, 'traccar_http')
+                        print("[SARTRACKER] Migrated legacy HTTP provider settings to Traccar HTTP")
             elif provider_name == 'traccar_http':
                 base_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, None)
                 auth_type = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, 'basic')
@@ -2970,6 +2986,42 @@ class sartracker:
 
         except Exception as e:
             print(f"[SARTRACKER] Warning: Failed to auto-connect provider: {e}")
+
+    def _convert_legacy_http_config(self, legacy_config: dict) -> Optional[dict]:
+        """Convert legacy http_traccar config to traccar_http config dict."""
+        base_url = str(legacy_config.get('server_url', '')).strip()
+        username = str(legacy_config.get('username', '')).strip()
+        password = str(legacy_config.get('password', '')).strip()
+        if not base_url or not username or not password:
+            return None
+
+        timeout = int(legacy_config.get('timeout', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
+
+        converted = {
+            'base_url': base_url,
+            'auth_type': 'basic',
+            'username': username,
+            'password': password,
+            'timeout_s': timeout,
+            'cache_ttl': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT,
+            'enable_last_good_cache': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT
+        }
+
+        self._persist_traccar_http_settings(converted)
+        return converted
+
+    def _persist_traccar_http_settings(self, config: dict):
+        """Persist Traccar HTTP provider settings to QSettings."""
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, config.get('base_url', ''))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, config.get('auth_type', 'basic'))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, config.get('timeout_s', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, config.get('cache_ttl', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT))
+        if config.get('auth_type') == 'basic':
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, config.get('username', ''))
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, config.get('password', ''))
+        else:
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, config.get('token', ''))
 
     # Phase N1: _populate_provider_dropdown method removed
     # Provider dropdown is now populated in SettingsPanel during initialization (sartracker.py lines 682-696)
@@ -3195,6 +3247,9 @@ class sartracker:
                         status['data_source'] = f"CSV: {os.path.basename(csv_path)}"
                 elif self.provider_name == 'http_traccar':
                     status['data_source'] = "HTTP: Traccar Server"
+                elif self.provider_name == 'traccar_http':
+                    base_url = (self.provider_config or {}).get('base_url')
+                    status['data_source'] = f"HTTP: {base_url}" if base_url else "HTTP: Traccar Server"
                 else:
                     status['data_source'] = self.provider_name
 

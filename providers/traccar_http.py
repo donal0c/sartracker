@@ -16,6 +16,8 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta, timezone
 import json
 import os
+import sys
+from pathlib import Path
 
 from .base import Provider, FeatureDict
 from ..utils.http import HttpClient
@@ -26,7 +28,19 @@ from ..utils.exceptions import (
 )
 
 # Cache file location (OS-specific)
-_CACHE_DIR = os.path.expanduser("~/.local/share/QGIS/sartracker")
+def _default_cache_dir() -> str:
+    """Return per-platform cache directory within the user profile."""
+    home = Path.home()
+    if sys.platform.startswith("win"):
+        base_dir = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base_dir = Path(os.environ.get("XDG_DATA_HOME", home / "Library" / "Application Support"))
+    else:
+        base_dir = Path(os.environ.get("XDG_DATA_HOME", home / ".local" / "share"))
+    return str(base_dir / "QGIS" / "sartracker")
+
+
+_CACHE_DIR = _default_cache_dir()
 _CACHE_FILE = os.path.join(_CACHE_DIR, "traccar_cache.json")
 
 

@@ -73,7 +73,6 @@ class SETTINGS_KEYS:
     PROVIDER_TRACCAR_TIMEOUT = "SARTracker/Providers/traccar_http/timeout_s"
     PROVIDER_TRACCAR_CACHE_TTL = "SARTracker/Providers/traccar_http/cache_ttl"
     PROVIDER_TRACCAR_CACHE_ENABLED = "SARTracker/Providers/traccar_http/enable_last_good_cache"
-    PROVIDER_TRACCAR_FEATURE_FLAG = "SARTracker/Providers/traccar_http/enabled"
 
     # Defaults
     PROVIDER_AUTO_CONNECT_DEFAULT = False
@@ -81,7 +80,6 @@ class SETTINGS_KEYS:
     PROVIDER_TRACCAR_TIMEOUT_DEFAULT = 10  # seconds
     PROVIDER_TRACCAR_CACHE_TTL_DEFAULT = 300  # seconds
     PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT = True
-    PROVIDER_TRACCAR_FEATURE_FLAG_DEFAULT = False
 
     # ========================================================================
     # MISSION STATE (transient - not configuration)
@@ -103,7 +101,6 @@ class SETTINGS_KEYS:
     # ========================================================================
     # Note: Feature flags can also be enabled via environment variables
     # (e.g., SARTRACKER_ENABLE_TRACCAR_HTTP=1)
-    FEATURE_TRACCAR_HTTP = PROVIDER_TRACCAR_FEATURE_FLAG
 
     # ========================================================================
     # VALIDATION RULES

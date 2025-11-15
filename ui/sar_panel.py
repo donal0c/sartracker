@@ -206,6 +206,11 @@ class SARPanel(QDockWidget):
         self.refresh_button = QPushButton("Refresh Now")
         self.refresh_button.clicked.connect(self._on_manual_refresh)
         refresh_layout.addWidget(self.refresh_button)
+
+        self.load_csv_button = QPushButton("Load CSV...")
+        self.load_csv_button.setToolTip("Load tracking data directly from a Traccar CSV export")
+        self.load_csv_button.clicked.connect(self._on_load_csv)
+        refresh_layout.addWidget(self.load_csv_button)
         
         refresh_group.setLayout(refresh_layout)
         layout.addWidget(refresh_group)
@@ -248,6 +253,15 @@ class SARPanel(QDockWidget):
             "Plugins → SAR Tracker → Settings..."
         )
         provider_layout.addWidget(self.provider_status_label)
+
+        self.data_source_label = QLabel("Source: None")
+        self.data_source_label.setStyleSheet(
+            "QLabel { "
+            "  color: #555; "
+            "  font-size: 10px; "
+            "}"
+        )
+        provider_layout.addWidget(self.data_source_label)
 
         provider_group.setLayout(provider_layout)
         layout.addWidget(provider_group)
@@ -774,7 +788,7 @@ class SARPanel(QDockWidget):
         Args:
             source_info: Description of current data source
         """
-        self.data_source_label.setText(f"Source: {source_info}")
+        self.data_source_label.setText(f"Source: {source_info or 'None'}")
 
     def set_loading_state(self, loading: bool):
         """

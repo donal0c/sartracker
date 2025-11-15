@@ -12,15 +12,23 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all Qt imports.
 from typing import Optional
 from qgis.core import (
     QgsVectorLayer,
+    QgsVectorLayerSimpleLabeling,
     QgsMarkerSymbol,
     QgsSimpleMarkerSymbolLayer,
     QgsPalLayerSettings,
     QgsTextFormat,
     QgsTextBufferSettings,
-    QgsVectorLayerSimpleLabeling
+    QgsFeature,
+    QgsGeometry,
+    QgsPointXY,
+    QgsProject,
+    QgsField
 )
 from qgis.PyQt.QtGui import QColor, QFont
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import Qt, QVariant
+
+from .schema import LayerIds
+from .utilities import get_group_by_path
 
 
 # Helicopter colors - distinct and easily distinguishable
@@ -35,6 +43,84 @@ HELICOPTER_COLORS = {
 HELICOPTER_SYMBOL_SIZE = 8
 HELICOPTER_OUTLINE_WIDTH = 0.8
 HELICOPTER_OUTLINE_COLOR = "#000000"
+
+
+class HelicopterLayerManager:
+    """
+    Ensures helicopter placeholder layers exist and are styled.
+
+    These layers are part of the canonical SAR schema even though no live feed
+    is connected yet. Styling them upfront keeps the UI consistent and ready
+    for future integration.
+    """
+
+    SLOT_LAYER_MAP = {
+        1: LayerIds.HELICOPTER_1,
+        2: LayerIds.HELICOPTER_2,
+        3: LayerIds.HELICOPTER_3,
+        4: LayerIds.HELICOPTER_4
+    }
+
+    def __init__(self, iface):
+        self.iface = iface
+        self.project = QgsProject.instance()
+        if not self.project:
+            raise RuntimeError("QgsProject instance not available - cannot initialize HelicopterLayerManager")
+        self._initialize_layers()
+
+    def _initialize_layers(self):
+        """Find (or recreate) helicopter layers and apply styling."""
+        for slot, layer_id in self.SLOT_LAYER_MAP.items():
+            layer = self._find_layer_by_id(layer_id)
+            if not layer:
+                layer = self._create_placeholder_layer(slot, layer_id)
+            if layer:
+                try:
+                    style_helicopter_layer(layer, slot)
+                except Exception as exc:
+                    print(f"[HelicopterManager] Warning: Failed to style Helicopter {slot}: {exc}")
+
+    def _find_layer_by_id(self, layer_id: str) -> Optional[QgsVectorLayer]:
+        """Return existing helicopter layer by SARTracker custom property."""
+        for layer in self.project.mapLayers().values():
+            if isinstance(layer, QgsVectorLayer):
+                stored_id = layer.customProperty('sartracker:layer_id')
+                if stored_id == layer_id:
+                    return layer
+        return None
+
+    def _create_placeholder_layer(self, slot: int, layer_id: str) -> Optional[QgsVectorLayer]:
+        """
+        Recreate a helicopter layer if users deleted it manually.
+
+        LayerManager normally auto-creates these, but this fallback prevents the
+        group from disappearing across reloads.
+        """
+        try:
+            layer = QgsVectorLayer("Point?crs=EPSG:4326", f"Helicopter {slot}", "memory")
+            provider = layer.dataProvider()
+            provider.addAttributes([
+                QgsField("call_sign", QVariant.String, len=50),
+                QgsField("hex_id", QVariant.String, len=20),
+                QgsField("last_update", QVariant.DateTime),
+                QgsField("speed", QVariant.Double),
+                QgsField("heading", QVariant.Double),
+                QgsField("altitude", QVariant.Double),
+                QgsField("timestamp", QVariant.DateTime)
+            ])
+            layer.updateFields()
+            layer.setCustomProperty('sartracker:layer_id', layer_id)
+
+            group = get_group_by_path(self.project, ["SAR Tracker", "Helicopters"])
+            self.project.addMapLayer(layer, False)
+            if group:
+                group.insertLayer(slot - 1, layer)
+
+            print(f"[HelicopterManager] Recreated missing Helicopter {slot} layer")
+            return layer
+        except Exception as exc:
+            print(f"[HelicopterManager] Failed to recreate Helicopter {slot} layer: {exc}")
+            return None
 
 
 def style_helicopter_layer(layer: QgsVectorLayer, slot: int):

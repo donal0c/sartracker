@@ -19,6 +19,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QFont
 from typing import Optional, List, Dict, Any
+import os
 
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import (
@@ -222,18 +223,6 @@ class SettingsPanel(QDockWidget):
         advanced_group.setChecked(False)  # Collapsed by default
         advanced_layout = QVBoxLayout()
 
-        # Feature flags
-        feature_flags_header = QLabel("<b>Feature Flags</b>")
-        advanced_layout.addWidget(feature_flags_header)
-
-        self.traccar_http_feature_checkbox = QCheckBox("Enable Traccar HTTP Provider (experimental)")
-        self.traccar_http_feature_checkbox.setToolTip(
-            "Enable the new Traccar HTTP provider with enhanced features.\n"
-            "Requires plugin reload to take effect."
-        )
-        self.traccar_http_feature_checkbox.stateChanged.connect(self._on_traccar_feature_changed)
-        advanced_layout.addWidget(self.traccar_http_feature_checkbox)
-
         self.repair_layers_button = QPushButton("Repair Layer Structure")
         self.repair_layers_button.setToolTip(
             "Recreate the SAR Tracker layer hierarchy and move existing layers into the correct groups."
@@ -426,14 +415,6 @@ class SettingsPanel(QDockWidget):
             auto_connect = ConfigStore.get_provider_auto_connect()
             self.auto_connect_checkbox.setChecked(auto_connect)
 
-            # Load feature flags
-            traccar_http_enabled = ConfigStore.get(
-                SETTINGS_KEYS.PROVIDER_TRACCAR_FEATURE_FLAG,
-                SETTINGS_KEYS.PROVIDER_TRACCAR_FEATURE_FLAG_DEFAULT,
-                bool
-            )
-            self.traccar_http_feature_checkbox.setChecked(traccar_http_enabled)
-
             # Load last provider configuration
             self._load_provider_config()
 
@@ -464,6 +445,14 @@ class SettingsPanel(QDockWidget):
             if not config:
                 print(f"[SETTINGS_PANEL] Saved config for {provider_name} incomplete; skipping restore")
                 return
+
+            if provider_name == 'http_traccar':
+                converted = self._convert_legacy_http_config(config)
+                if converted:
+                    provider_name = 'traccar_http'
+                    config = converted
+                    ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, 'traccar_http')
+                    print("[SETTINGS_PANEL] Migrated legacy HTTP provider settings to Traccar HTTP")
 
             self._pending_provider_name = provider_name
             self._pending_provider_config = config
@@ -638,17 +627,9 @@ class SettingsPanel(QDockWidget):
         """Handle auto-connect checkbox change."""
         self.apply_button.setEnabled(True)
 
-    def _on_traccar_feature_changed(self, state):
-        """Handle Traccar HTTP feature flag change."""
-        self.apply_button.setEnabled(True)
-        # Update dropdown immediately so users see the effect without restart
-        self._refresh_provider_list()
-
     def _on_repair_layers_clicked(self):
         """Emit signal to request layer structure repair."""
         self.repair_layers_requested.emit()
-        # Update dropdown immediately so users see the effect without restart
-        self._refresh_provider_list()
 
     # ========================================================================
     # SIGNAL HANDLERS - Provider Configuration
@@ -799,10 +780,6 @@ class SettingsPanel(QDockWidget):
                 SETTINGS_KEYS.PROVIDER_AUTO_CONNECT,
                 self.auto_connect_checkbox.isChecked()
             )
-            ConfigStore.set(
-                SETTINGS_KEYS.PROVIDER_TRACCAR_FEATURE_FLAG,
-                self.traccar_http_feature_checkbox.isChecked()
-            )
 
             # Disable Apply button
             self.apply_button.setEnabled(False)
@@ -859,7 +836,6 @@ class SettingsPanel(QDockWidget):
             self.auto_save_checkbox.setChecked(SETTINGS_KEYS.AUTO_SAVE_ENABLED_DEFAULT)
             self.autosave_interval_spin.setValue(SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT)
             self.auto_connect_checkbox.setChecked(SETTINGS_KEYS.PROVIDER_AUTO_CONNECT_DEFAULT)
-            self.traccar_http_feature_checkbox.setChecked(SETTINGS_KEYS.PROVIDER_TRACCAR_FEATURE_FLAG_DEFAULT)
 
             # Enable Apply button
             self.apply_button.setEnabled(True)
@@ -948,6 +924,42 @@ class SettingsPanel(QDockWidget):
                 config['token'] = token
 
         return provider_name, config
+
+    def _convert_legacy_http_config(self, legacy_config: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert legacy http_traccar config to traccar_http config dict."""
+        base_url = str(legacy_config.get('server_url', '')).strip()
+        username = str(legacy_config.get('username', '')).strip()
+        password = str(legacy_config.get('password', '')).strip()
+        if not base_url or not username or not password:
+            return None
+
+        timeout = int(legacy_config.get('timeout', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
+
+        converted = {
+            'base_url': base_url,
+            'auth_type': 'basic',
+            'username': username,
+            'password': password,
+            'timeout_s': timeout,
+            'cache_ttl': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT,
+            'enable_last_good_cache': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT
+        }
+
+        self._persist_traccar_http_settings(converted)
+        return converted
+
+    def _persist_traccar_http_settings(self, config: Dict[str, Any]):
+        """Persist converted Traccar HTTP config to QSettings."""
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, config.get('base_url', ''))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, config.get('auth_type', 'basic'))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, config.get('timeout_s', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, config.get('cache_ttl', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT))
+        if config.get('auth_type') == 'basic':
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, config.get('username', ''))
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, config.get('password', ''))
+        else:
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, config.get('token', ''))
 
     def _validate_provider_config(self, provider_name: str, config: dict) -> Optional[str]:
         """
@@ -1052,15 +1064,22 @@ class SettingsPanel(QDockWidget):
         self.provider_combo.blockSignals(True)
         self.provider_combo.clear()
 
+        legacy_env_enabled = os.environ.get('SARTRACKER_ENABLE_LEGACY_HTTP', '0') == '1'
+        legacy_needed_for_restore = self._pending_provider_name == 'http_traccar'
+
         for metadata in self._provider_metadata:
             provider_name = metadata['name']
 
-            if provider_name == 'traccar_http' and not self._is_provider_enabled('traccar_http'):
+            if provider_name == 'http_traccar' and not (legacy_env_enabled or legacy_needed_for_restore):
                 continue
 
             enabled_providers.append(provider_name)
 
-            self.provider_combo.addItem(metadata['display_name'], provider_name)
+            display_name = metadata['display_name']
+            if provider_name == 'http_traccar':
+                display_name = f"{display_name} (Legacy)"
+
+            self.provider_combo.addItem(display_name, provider_name)
             self.provider_combo.setItemData(
                 self.provider_combo.count() - 1,
                 metadata.get('description', ''),
@@ -1078,31 +1097,6 @@ class SettingsPanel(QDockWidget):
             self.provider_combo.setCurrentIndex(0)
 
         print(f"[SETTINGS_PANEL] Provider list refreshed ({self.provider_combo.count()} entries)")
-
-    def _is_provider_enabled(self, provider_name: str) -> bool:
-        """
-        Check if provider is enabled via feature flag.
-
-        Checks both environment variable and QSettings.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'traccar_http')
-
-        Returns:
-            True if provider is enabled, False otherwise
-        """
-        import os
-
-        # Check environment variable first
-        if provider_name == 'traccar_http':
-            env_var = os.environ.get('SARTRACKER_ENABLE_TRACCAR_HTTP', '0')
-            if env_var == '1':
-                return True
-
-            # Check QSettings
-            return self.traccar_http_feature_checkbox.isChecked()
-
-        return True  # Other providers enabled by default
 
     def closeEvent(self, event):
         """

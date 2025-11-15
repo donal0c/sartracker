@@ -28,6 +28,7 @@ from .schema import (
 from .manager import LayerManager
 
 from .helicopter_manager import (
+    HelicopterLayerManager,
     style_helicopter_layer,
     update_helicopter_position,
     clear_helicopter_layer,
@@ -64,6 +65,7 @@ __all__ = [
     'LAYER_FIELD_CHECKS',
     # Manager
     'LayerManager',
+    'HelicopterLayerManager',
     # Helicopter Manager
     'style_helicopter_layer',
     'update_helicopter_position',

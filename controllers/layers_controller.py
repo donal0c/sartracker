@@ -20,6 +20,7 @@ from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 from .layer_managers.tracking_manager import TrackingLayerManager
 from .layer_managers.marker_manager import MarkerLayerManager
 from .layer_managers.drawing_manager import DrawingLayerManager
+from ..layers.helicopter_manager import HelicopterLayerManager
 
 
 class LayersController:
@@ -90,6 +91,11 @@ class LayersController:
             self.drawings = DrawingLayerManager(iface, self._shared_device_colors)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize DrawingLayerManager: {e}")
+
+        try:
+            self.helicopters = HelicopterLayerManager(iface)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize HelicopterLayerManager: {e}")
 
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
