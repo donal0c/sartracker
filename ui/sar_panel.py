@@ -9,12 +9,12 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem,
     QGroupBox, QSpinBox, QCheckBox, QFileDialog, QLineEdit,
-    QScrollArea
+    QScrollArea, QComboBox, QStackedWidget
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
@@ -54,6 +54,12 @@ class SARPanel(QDockWidget):
     coordinate_converter_requested = pyqtSignal()
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
+
+    # Phase 3: Provider selection signals
+    provider_selected = pyqtSignal(str)  # provider_name
+    provider_config_changed = pyqtSignal(dict)  # config dict
+    provider_test_requested = pyqtSignal(str, dict)  # provider_name, config
+    provider_save_requested = pyqtSignal(str, dict)  # provider_name, config
     
     def __init__(self, parent=None):
         super().__init__("SAR Tracking", parent)
@@ -217,20 +223,93 @@ class SARPanel(QDockWidget):
         autosave_group.setLayout(autosave_layout)
         layout.addWidget(autosave_group)
 
-        # Data Source Section
-        data_group = QGroupBox("Data Source")
-        data_layout = QVBoxLayout()
-        
-        self.load_csv_button = QPushButton("Load CSV File...")
-        self.load_csv_button.clicked.connect(self._on_load_csv)
-        data_layout.addWidget(self.load_csv_button)
-        
-        self.data_source_label = QLabel("Source: None")
-        self.data_source_label.setWordWrap(True)
-        data_layout.addWidget(self.data_source_label)
-        
-        data_group.setLayout(data_layout)
-        layout.addWidget(data_group)
+        # ========================================
+        # Provider Selection Section (Phase 3)
+        # ========================================
+        provider_group = QGroupBox("Provider Selection")
+        provider_layout = QVBoxLayout()
+
+        # Provider dropdown
+        provider_select_layout = QHBoxLayout()
+        provider_select_layout.addWidget(QLabel("Provider:"))
+        self.provider_combo = QComboBox()
+        self.provider_combo.setToolTip("Select data provider for tracking data")
+        self.provider_combo.currentTextChanged.connect(self._on_provider_changed)
+        provider_select_layout.addWidget(self.provider_combo)
+        provider_layout.addLayout(provider_select_layout)
+
+        # Provider configuration stack (different UI for each provider)
+        self.provider_config_stack = QStackedWidget()
+
+        # CSV Provider Configuration Page
+        csv_config_page = QWidget()
+        csv_config_layout = QVBoxLayout()
+        csv_file_layout = QHBoxLayout()
+        csv_file_layout.addWidget(QLabel("File/Folder:"))
+        self.csv_path_input = QLineEdit()
+        self.csv_path_input.setPlaceholderText("Select CSV file or folder...")
+        self.csv_path_input.setReadOnly(True)
+        csv_file_layout.addWidget(self.csv_path_input)
+        self.csv_browse_button = QPushButton("Browse...")
+        self.csv_browse_button.clicked.connect(self._on_csv_browse)
+        csv_file_layout.addWidget(self.csv_browse_button)
+        csv_config_layout.addLayout(csv_file_layout)
+        csv_config_page.setLayout(csv_config_layout)
+        self.provider_config_stack.addWidget(csv_config_page)
+
+        # HTTP Traccar Provider Configuration Page (Placeholder for Phase 4)
+        http_config_page = QWidget()
+        http_config_layout = QVBoxLayout()
+        http_config_layout.addWidget(QLabel("<i>HTTP provider configuration coming in Phase 4</i>"))
+        http_config_layout.addWidget(QLabel("Server URL:"))
+        self.http_url_input = QLineEdit()
+        self.http_url_input.setPlaceholderText("https://traccar.example.com")
+        self.http_url_input.setEnabled(False)
+        http_config_layout.addWidget(self.http_url_input)
+        http_config_layout.addWidget(QLabel("Username:"))
+        self.http_username_input = QLineEdit()
+        self.http_username_input.setEnabled(False)
+        http_config_layout.addWidget(self.http_username_input)
+        http_config_layout.addWidget(QLabel("Password:"))
+        self.http_password_input = QLineEdit()
+        self.http_password_input.setEchoMode(QLineEdit.Password)
+        self.http_password_input.setEnabled(False)
+        http_config_layout.addWidget(self.http_password_input)
+        http_config_layout.addStretch()
+        http_config_page.setLayout(http_config_layout)
+        self.provider_config_stack.addWidget(http_config_page)
+
+        provider_layout.addWidget(self.provider_config_stack)
+
+        # Provider action buttons
+        provider_buttons_layout = QHBoxLayout()
+        self.provider_test_button = QPushButton("Test Connection")
+        self.provider_test_button.setToolTip("Test connection to selected provider")
+        self.provider_test_button.clicked.connect(self._on_provider_test)
+        provider_buttons_layout.addWidget(self.provider_test_button)
+
+        self.provider_save_button = QPushButton("Connect")
+        self.provider_save_button.setToolTip("Connect to selected provider")
+        self.provider_save_button.clicked.connect(self._on_provider_save)
+        provider_buttons_layout.addWidget(self.provider_save_button)
+        provider_layout.addLayout(provider_buttons_layout)
+
+        # Provider status strip
+        self.provider_status_label = QLabel("Provider: None | Status: Not connected")
+        self.provider_status_label.setWordWrap(True)
+        self.provider_status_label.setStyleSheet(
+            "QLabel { "
+            "  padding: 4px; "
+            "  background-color: #f0f0f0; "
+            "  border: 1px solid #ccc; "
+            "  border-radius: 3px; "
+            "  font-size: 10px; "
+            "}"
+        )
+        provider_layout.addWidget(self.provider_status_label)
+
+        provider_group.setLayout(provider_layout)
+        layout.addWidget(provider_group)
 
         # ========================================
         # Markers & Clues Section
@@ -781,6 +860,271 @@ class SARPanel(QDockWidget):
             self._clear_mission_state()
 
             return False
+
+    # ========================================
+    # Phase 3: Provider UI Handlers
+    # ========================================
+
+    def populate_providers(self, providers_metadata: List[Dict]):
+        """
+        Populate provider dropdown from registry metadata.
+
+        Args:
+            providers_metadata: List of provider metadata dicts with keys:
+                - name: str (internal provider name)
+                - display_name: str (UI display name)
+                - description: str (tooltip)
+
+        Qt5/Qt6 Compatible: Uses QComboBox standard methods.
+        """
+        self.provider_combo.clear()
+
+        for metadata in providers_metadata:
+            # Add item with display name, store internal name as user data
+            self.provider_combo.addItem(
+                metadata['display_name'],
+                metadata['name']  # Store as userData
+            )
+            # Set tooltip
+            self.provider_combo.setItemData(
+                self.provider_combo.count() - 1,
+                metadata['description'],
+                2  # ToolTipRole as integer (Qt5/Qt6 compatible)
+            )
+
+        print(f"[SARPANEL] Populated {len(providers_metadata)} providers")
+
+    def _on_provider_changed(self, display_name: str):
+        """
+        Handle provider dropdown selection change.
+
+        Args:
+            display_name: Display name of selected provider (from combo box text)
+
+        Qt5/Qt6 Compatible: Uses QComboBox and QStackedWidget.
+        """
+        if not display_name:
+            return
+
+        # Get internal provider name from currentData()
+        provider_name = self.provider_combo.currentData()
+        if not provider_name:
+            return
+
+        print(f"[SARPANEL] Provider changed: {provider_name}")
+
+        # Switch config stack page
+        if provider_name == 'csv':
+            self.provider_config_stack.setCurrentIndex(0)
+        elif provider_name == 'http_traccar':
+            self.provider_config_stack.setCurrentIndex(1)
+
+        # Emit signal
+        self.provider_selected.emit(provider_name)
+
+    def _on_csv_browse(self):
+        """
+        Handle CSV browse button click.
+
+        Shows file/folder selection dialog and updates CSV path input.
+
+        Qt5/Qt6 Compatible: Uses QFileDialog standard methods.
+        """
+        # Show dialog with option to select file or folder
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder with CSV Files (or Cancel and select single file)",
+            ""
+        )
+
+        # If user cancelled folder selection, try file selection
+        if not folder_path:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Traccar CSV Export",
+                "",
+                "CSV Files (*.csv);;All Files (*)"
+            )
+            if file_path:
+                self.csv_path_input.setText(file_path)
+        else:
+            self.csv_path_input.setText(folder_path)
+
+    def _on_provider_test(self):
+        """
+        Handle Test Connection button click.
+
+        Validates inputs and emits signal to controller for connection test.
+
+        Qt5/Qt6 Compatible: Pure Python validation + pyqtSignal.
+        """
+        # Get current provider
+        provider_name = self.provider_combo.currentData()
+        if not provider_name:
+            from qgis.utils import iface
+            from ..utils.notify import warning
+            warning(
+                iface.messageBar(),
+                "Provider Selection",
+                "Please select a provider first",
+                duration=3
+            )
+            return
+
+        # Build config dict based on selected provider
+        config = self._get_provider_config(provider_name)
+        if not config:
+            return  # Error already shown
+
+        # Emit signal
+        self.provider_test_requested.emit(provider_name, config)
+
+    def _on_provider_save(self):
+        """
+        Handle Connect/Save button click.
+
+        Validates inputs and emits signal to controller to connect to provider.
+
+        Qt5/Qt6 Compatible: Pure Python validation + pyqtSignal.
+        """
+        # Get current provider
+        provider_name = self.provider_combo.currentData()
+        if not provider_name:
+            from qgis.utils import iface
+            from ..utils.notify import warning
+            warning(
+                iface.messageBar(),
+                "Provider Selection",
+                "Please select a provider first",
+                duration=3
+            )
+            return
+
+        # Build config dict based on selected provider
+        config = self._get_provider_config(provider_name)
+        if not config:
+            return  # Error already shown
+
+        # Emit signal
+        self.provider_save_requested.emit(provider_name, config)
+
+    def _get_provider_config(self, provider_name: str) -> Optional[Dict]:
+        """
+        Get provider configuration from UI inputs.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
+
+        Returns:
+            Config dict if valid, None if validation fails
+
+        Qt5/Qt6 Compatible: Pure Python dict.
+        """
+        from qgis.utils import iface
+        from ..utils.notify import warning
+
+        if provider_name == 'csv':
+            csv_path = self.csv_path_input.text().strip()
+            if not csv_path:
+                warning(
+                    iface.messageBar(),
+                    "CSV Provider",
+                    "Please select a CSV file or folder",
+                    duration=3
+                )
+                return None
+            return {'csv_path': csv_path}
+
+        elif provider_name == 'http_traccar':
+            # Phase 4: Add HTTP provider config validation
+            warning(
+                iface.messageBar(),
+                "HTTP Provider",
+                "HTTP provider configuration coming in Phase 4",
+                duration=3
+            )
+            return None
+
+        else:
+            warning(
+                iface.messageBar(),
+                "Provider Selection",
+                f"Unknown provider: {provider_name}",
+                duration=3
+            )
+            return None
+
+    def update_provider_status(self, status_dict: Dict[str, Any]):
+        """
+        Update provider status strip from controller.
+
+        Args:
+            status_dict: Status from ProviderController.status_snapshot() with keys:
+                - provider: str or None
+                - state: str ('ok', 'error', 'testing', 'connecting')
+                - message: str
+                - poll_interval: int or None
+                - poll_active: bool
+                - devices_count: int
+                - last_refresh: str or None
+
+        Qt5/Qt6 Compatible: Uses QLabel.setText().
+        """
+        provider = status_dict.get('provider', 'None')
+        state = status_dict.get('state', 'unknown')
+        message = status_dict.get('message', '')
+        devices_count = status_dict.get('devices_count', 0)
+        last_refresh = status_dict.get('last_refresh', 'Never')
+        poll_active = status_dict.get('poll_active', False)
+
+        # Format last refresh time
+        if last_refresh and last_refresh != 'Never':
+            try:
+                # Extract time component from ISO timestamp
+                last_refresh = last_refresh.split('T')[1][:8] if 'T' in last_refresh else last_refresh
+            except:
+                pass
+
+        # Format status text
+        status_parts = [f"Provider: {provider}"]
+        status_parts.append(f"Devices: {devices_count}")
+        if last_refresh != 'Never':
+            status_parts.append(f"Last Refresh: {last_refresh}")
+        if poll_active:
+            status_parts.append("🔄 Polling")
+
+        # Add state indicator
+        if state == 'ok':
+            status_parts.append("✓ Connected")
+        elif state == 'error':
+            status_parts.append("✗ Error")
+        elif state == 'testing':
+            status_parts.append("⏳ Testing...")
+        elif state == 'connecting':
+            status_parts.append("⏳ Connecting...")
+
+        status_text = " | ".join(status_parts)
+        self.provider_status_label.setText(status_text)
+
+        # Update label background color based on state
+        if state == 'ok':
+            bg_color = "#d4edda"  # Light green
+        elif state == 'error':
+            bg_color = "#f8d7da"  # Light red
+        elif state in ('testing', 'connecting'):
+            bg_color = "#fff3cd"  # Light yellow
+        else:
+            bg_color = "#f0f0f0"  # Light gray
+
+        self.provider_status_label.setStyleSheet(
+            f"QLabel {{ "
+            f"  padding: 4px; "
+            f"  background-color: {bg_color}; "
+            f"  border: 1px solid #ccc; "
+            f"  border-radius: 3px; "
+            f"  font-size: 10px; "
+            f"}}"
+        )
 
     def _toggle_focus_mode(self):
         """

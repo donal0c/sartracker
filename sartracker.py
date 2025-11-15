@@ -72,6 +72,15 @@ except Exception as e:
     LayersController = None
     print(f"ERROR importing LayersController: {e}")
 
+# Import ProviderController (Phase 3)
+try:
+    from .controllers.provider_controller import ProviderController
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('controllers.provider_controller.ProviderController', e, traceback.format_exc()))
+    ProviderController = None
+    print(f"ERROR importing ProviderController: {e}")
+
 # Import SARPanel
 try:
     from .ui.sar_panel import SARPanel
@@ -279,6 +288,7 @@ class sartracker:
 
         # Initialize SAR tracking components
         self.layers_controller = None
+        self.provider_controller = None  # Phase 3: Provider orchestration controller
         self.provider = None
         self.provider_name = None  # Track which provider is active (e.g., 'csv', 'http_traccar')
         self.provider_config = None  # Track provider config for reconnection
@@ -588,6 +598,55 @@ class sartracker:
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
 
+        # ============================================================================
+        # PHASE 3: Provider Controller Setup
+        # ============================================================================
+        # Initialize provider controller (after task_manager and sar_panel)
+        if ProviderController is not None:
+            try:
+                self.provider_controller = ProviderController(
+                    self.iface,
+                    self.task_manager,
+                    parent=self.iface.mainWindow()
+                )
+
+                # Connect panel provider signals to controller
+                self.sar_panel.provider_test_requested.connect(self._on_provider_test_requested)
+                self.sar_panel.provider_save_requested.connect(self._on_provider_save_requested)
+
+                # Connect controller signals to panel and plugin
+                self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
+                self.provider_controller.config_error.connect(self._on_provider_config_error)
+                self.provider_controller.provider_connected.connect(self._save_provider_config)
+                self.provider_controller.refresh_requested.connect(self._on_refresh_data)
+
+                # Populate provider dropdown from registry
+                self._populate_provider_dropdown()
+
+                # Load saved provider config (if any)
+                self._load_provider_config()
+
+                print("[SARTRACKER] Provider controller initialized and wired")
+            except Exception as e:
+                self.provider_controller = None
+                error(
+                    self.iface.messageBar(),
+                    "SAR Tracker - Provider Controller Unavailable",
+                    f"Provider controller failed to initialize: {e}. CSV loading available via legacy workflow.",
+                    duration=0  # Persistent
+                )
+                print(f"[SARTRACKER] ERROR initializing ProviderController: {e}")
+        else:
+            self.provider_controller = None
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Provider Controller Unavailable",
+                "Provider controller not available. CSV loading available via legacy workflow.",
+                duration=0  # Persistent
+            )
+            print("[SARTRACKER] ProviderController not available (import failed)")
+        # ============================================================================
+
         # CRITICAL: Disable drawing tool buttons if tool registry failed to initialize (Issue #2 fix)
         # This check MUST come after SAR panel creation since panel is created after tool registry
         if not self.tool_registry:
@@ -838,6 +897,31 @@ class sartracker:
                     pass
                 self.tool_registry = None
 
+            # ============================================================
+            # PHASE 3: Clean up Provider Controller
+            # ============================================================
+            if self.provider_controller:
+                try:
+                    # Disconnect controller signals
+                    try:
+                        self.provider_controller.status_changed.disconnect()
+                        self.provider_controller.config_error.disconnect()
+                        self.provider_controller.provider_connected.disconnect()
+                        self.provider_controller.refresh_requested.disconnect()
+                    except:
+                        pass
+
+                    # Call cleanup method (stops polling timer)
+                    if hasattr(self.provider_controller, 'cleanup'):
+                        self.provider_controller.cleanup()
+
+                    print("[SARTRACKER] Provider controller cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during provider controller cleanup: {e}")
+                finally:
+                    self.provider_controller = None
+            # ============================================================
+
             # Disconnect and clean up SAR Panel
             if self.sar_panel:
                 # Stop all timers BEFORE disconnecting signals (Issue #5 fix)
@@ -863,6 +947,9 @@ class sartracker:
                     self.sar_panel.coordinate_converter_requested.disconnect()
                     self.sar_panel.measure_distance_requested.disconnect()
                     self.sar_panel.autosave_requested.disconnect()
+                    # Phase 3: Provider signals
+                    self.sar_panel.provider_test_requested.disconnect()
+                    self.sar_panel.provider_save_requested.disconnect()
                 except:
                     pass  # Signals may not be connected
 
@@ -1112,6 +1199,14 @@ class sartracker:
             # Update device list in panel
             if self.sar_panel:
                 self.sar_panel.update_devices(devices)
+
+            # FIX ISSUE #2: Update provider controller stats for status strip
+            if self.provider_controller:
+                self.provider_controller.update_refresh_stats(
+                    self._cached_device_count,
+                    self._last_refresh_time
+                )
+                print(f"[SARTRACKER] Updated controller stats: {self._cached_device_count} devices")
 
             # Show success message
             success(
@@ -2417,6 +2512,205 @@ class sartracker:
                 duration=5
             )
 
+    # ============================================================================
+    # PHASE 3: Provider Controller Integration Methods
+    # ============================================================================
+
+    def _save_provider_config(self, provider_name: str, config: dict):
+        """
+        Save provider configuration to QSettings and update plugin provider references.
+
+        This is called when the controller successfully connects to a provider.
+        Updates both QSettings for persistence AND plugin's provider references
+        for refresh operations.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Uses QSettings.
+        """
+        try:
+            # CRITICAL: Update plugin's provider references from controller
+            # The controller owns the provider instance, but sartracker needs
+            # a reference for refresh operations (_on_refresh_data checks self.provider)
+            if self.provider_controller:
+                self.provider = self.provider_controller.provider
+                self.provider_name = self.provider_controller.provider_name
+                self.provider_config = self.provider_controller.provider_config
+                print(f"[SARTRACKER] Updated plugin provider references from controller: {provider_name}")
+
+            # Save to QSettings for auto-restore on next startup
+            settings = QSettings()
+            settings.setValue("SARTracker/Providers/last_provider", provider_name)
+
+            # Save provider-specific config (namespace by provider name)
+            for key, value in config.items():
+                settings.setValue(f"SARTracker/Providers/{provider_name}/{key}", value)
+
+            print(f"[SARTRACKER] Saved provider config to QSettings: {provider_name}")
+
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: Failed to save provider config: {e}")
+
+    def _load_provider_config(self):
+        """
+        Load provider configuration from QSettings and populate UI.
+
+        If valid config exists, populate panel fields.
+        If incomplete or missing, panel remains in default state (CSV, empty fields).
+
+        Qt5/Qt6 Compatible: Uses QSettings.
+        """
+        try:
+            settings = QSettings()
+
+            # Load last provider
+            provider_name = settings.value("SARTracker/Providers/last_provider", None)
+            if not provider_name:
+                print("[SARTRACKER] No saved provider config found")
+                return
+
+            print(f"[SARTRACKER] Loading saved provider config: {provider_name}")
+
+            # Load provider-specific config
+            config = {}
+            if provider_name == 'csv':
+                csv_path = settings.value(f"SARTracker/Providers/{provider_name}/csv_path", None)
+                if csv_path:
+                    config['csv_path'] = str(csv_path)
+            elif provider_name == 'http_traccar':
+                # Phase 4: Load HTTP provider config
+                pass
+
+            # Validate config is complete
+            if not config:
+                print(f"[SARTRACKER] Incomplete config for {provider_name}, skipping restore")
+                return
+
+            # Populate panel UI
+            if self.sar_panel:
+                # Set provider combo selection
+                for i in range(self.sar_panel.provider_combo.count()):
+                    if self.sar_panel.provider_combo.itemData(i) == provider_name:
+                        self.sar_panel.provider_combo.setCurrentIndex(i)
+                        break
+
+                # Populate provider-specific fields
+                if provider_name == 'csv' and 'csv_path' in config:
+                    self.sar_panel.csv_path_input.setText(config['csv_path'])
+
+            print(f"[SARTRACKER] Restored provider config: {provider_name}")
+
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: Failed to load provider config: {e}")
+
+    def _populate_provider_dropdown(self):
+        """
+        Populate provider dropdown in SARPanel from provider registry.
+
+        Qt5/Qt6 Compatible: Uses provider registry list_providers().
+        """
+        try:
+            # Get providers from registry
+            providers_list = provider_registry.list_providers()
+
+            # Convert to dict format expected by panel
+            providers_metadata = [
+                {
+                    'name': p.name,
+                    'display_name': p.display_name,
+                    'description': p.description
+                }
+                for p in providers_list
+            ]
+
+            # Populate panel dropdown
+            self.sar_panel.populate_providers(providers_metadata)
+
+            print(f"[SARTRACKER] Populated {len(providers_metadata)} providers in dropdown")
+
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "Provider Error",
+                f"Failed to load provider list: {e}",
+                duration=5
+            )
+            print(f"[SARTRACKER] Error populating providers: {e}")
+
+    def _on_provider_test_requested(self, provider_name: str, config: dict):
+        """
+        Handle provider test connection request from panel.
+
+        FIX ISSUE #4: Test-only mode - tests connection without committing provider.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Delegates to ProviderController.
+        """
+        # Defensive guard (Pattern 9)
+        if not self.provider_controller:
+            error(
+                self.iface.messageBar(),
+                "Provider Error",
+                "Provider controller not available",
+                duration=3
+            )
+            return
+
+        print(f"[SARTRACKER] Provider test requested (test-only mode): {provider_name}")
+
+        # Delegate to controller with test_only=True (FIX ISSUE #4)
+        self.provider_controller.set_provider(provider_name, config, test_only=True)
+
+    def _on_provider_save_requested(self, provider_name: str, config: dict):
+        """
+        Handle provider connect/save request from panel.
+
+        FIX ISSUE #4: Connect mode - tests and commits provider on success.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Delegates to ProviderController.
+        """
+        # Defensive guard (Pattern 9)
+        if not self.provider_controller:
+            error(
+                self.iface.messageBar(),
+                "Provider Error",
+                "Provider controller not available",
+                duration=3
+            )
+            return
+
+        print(f"[SARTRACKER] Provider connect requested: {provider_name}")
+
+        # Delegate to controller with test_only=False (default - commits on success) (FIX ISSUE #4)
+        self.provider_controller.set_provider(provider_name, config, test_only=False)
+
+    def _on_provider_config_error(self, error_message: str):
+        """
+        Handle provider configuration error from controller.
+
+        Args:
+            error_message: Error message to display
+
+        Qt5/Qt6 Compatible: Uses utils.notify.
+        """
+        error(
+            self.iface.messageBar(),
+            "Provider Configuration Error",
+            error_message,
+            duration=5
+        )
+
+    # ============================================================================
+
     def get_plugin_status(self) -> dict:
         """
         Get current plugin status for diagnostics.
@@ -2511,6 +2805,20 @@ class sartracker:
                 except Exception as task_error:
                     print(f"[SARTRACKER] Warning: Error reading task manager status: {task_error}")
                     status['active_tasks_count'] = 0
+
+            # ============================================================
+            # PHASE 3: Read provider controller status
+            # ============================================================
+            if self.provider_controller:
+                try:
+                    controller_status = self.provider_controller.status_snapshot()
+                    # Merge controller status into plugin status
+                    status['provider_controller_state'] = controller_status.get('state', 'unknown')
+                    status['provider_poll_active'] = controller_status.get('poll_active', False)
+                    status['provider_poll_interval'] = controller_status.get('poll_interval', None)
+                except Exception as controller_error:
+                    print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
+            # ============================================================
 
         except Exception as e:
             # Defensive: Don't let diagnostics query crash plugin

@@ -289,6 +289,40 @@ class DiagnosticsPanel(BaseDialog):
         active_tasks_label.setToolTip("Number of background tasks (refresh, connection test, etc.)")
         form.addRow("<b>Active Tasks:</b>", active_tasks_label)
 
+        # FIX ISSUE #3: Provider Controller Status (Phase 3 addition)
+        provider_ctrl_text = "Unable to detect"
+        try:
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+
+                    # Get provider controller state
+                    ctrl_state = status.get('provider_controller_state', 'unknown')
+                    poll_active = status.get('provider_poll_active', False)
+                    poll_interval = status.get('provider_poll_interval', None)
+
+                    # Format based on state
+                    if ctrl_state == 'ok':
+                        provider_ctrl_text = "✅ Connected"
+                        if poll_active and poll_interval:
+                            provider_ctrl_text += f" (Polling: {poll_interval}s)"
+                    elif ctrl_state == 'error':
+                        provider_ctrl_text = "❌ Error"
+                    elif ctrl_state == 'testing':
+                        provider_ctrl_text = "⏳ Testing connection..."
+                    elif ctrl_state == 'connecting':
+                        provider_ctrl_text = "⏳ Connecting..."
+                    else:
+                        provider_ctrl_text = "Not connected"
+        except Exception as e:
+            print(f"[DIAGNOSTICS] Error reading provider controller status: {e}")
+            provider_ctrl_text = "Unable to detect"
+
+        provider_label = QLabel(provider_ctrl_text)
+        provider_label.setToolTip("Provider Controller manages data source connections and polling")
+        form.addRow("<b>Provider Controller:</b>", provider_label)
+
         group.setLayout(form)
         return group
 
