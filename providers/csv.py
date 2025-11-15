@@ -18,7 +18,7 @@ import glob
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from .base import Provider, FeatureDict
-from utils.exceptions import ProviderDataError
+from ..utils.exceptions import ProviderDataError
 
 
 class FileCSVProvider(Provider):

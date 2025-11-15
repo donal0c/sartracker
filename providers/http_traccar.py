@@ -19,7 +19,7 @@ import requests
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta
 from .base import Provider, FeatureDict
-from utils.exceptions import ProviderAuthError, ProviderNetworkError, ProviderDataError
+from ..utils.exceptions import ProviderAuthError, ProviderNetworkError, ProviderDataError
 
 
 class HttpTraccarProvider(Provider):
