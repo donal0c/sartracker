@@ -81,6 +81,12 @@ class HttpTraccarProvider(Provider):
 
         Returns:
             Fresh requests.Session instance configured for Traccar API
+
+        TODO (Phase 4): Replace direct session creation with utils.http.HttpClient.create_session()
+        Example:
+            from utils.http import HttpClient
+            client = HttpClient(self.server_url, timeout_s=self.timeout)
+            session = client.create_session(auth_type="basic", username=self.username, password=self.password)
         """
         session = requests.Session()
         session.auth = (self.username, self.password)
@@ -108,6 +114,13 @@ class HttpTraccarProvider(Provider):
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks MUST pass their own session to avoid thread contention.
+
+        TODO (Phase 4): Replace direct requests usage with utils.http.HttpClient
+        Example:
+            from utils.http import HttpClient
+            client = HttpClient(self.server_url, timeout_s=self.timeout)
+            data = client.get(endpoint, session=session, params=params)
+        This will provide automatic retry logic, structured error mapping, and PII-safe logging.
         """
         url = f"{self.server_url}{endpoint}"
 
@@ -404,12 +417,19 @@ class HttpTraccarProvider(Provider):
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
+
+        TODO (Phase 4): Replace manual time formatting with utils.timeparse
+        Example:
+            from utils.timeparse import window
+            from_iso, to_iso = window(hours=1)
+        This will provide consistent ISO8601 formatting and timezone handling.
         """
         try:
             # Get raw devices (need Traccar IDs for API calls)
             devices = self._get_raw_devices(session=session)
 
             # Get positions for last hour to find latest per device
+            # TODO (Phase 4): Replace with utils.timeparse.window(hours=1)
             current_time = datetime.utcnow()
             from_time = current_time - timedelta(hours=1)
 
@@ -482,12 +502,22 @@ class HttpTraccarProvider(Provider):
 
         THREAD-SAFETY (Issue #1 fix):
         Background tasks should pass their own session instance.
+
+        TODO (Phase 4): Replace manual time parsing with utils.timeparse
+        Example:
+            from utils.timeparse import parse_iso, window
+            if since_iso:
+                from_dt = parse_iso(since_iso)
+            else:
+                from_iso, to_iso = window(hours=3)
+        This will provide robust ISO8601 parsing with timezone handling.
         """
         try:
             # Get raw devices (need Traccar IDs for API calls)
             devices = self._get_raw_devices(session=session)
 
             # Determine time range
+            # TODO (Phase 4): Replace with utils.timeparse functions
             current_time = datetime.utcnow()
             if since_iso:
                 from_time = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
