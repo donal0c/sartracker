@@ -20,6 +20,11 @@ import sys
 import types
 from typing import Dict, List, Tuple
 
+_GUARD_STATE: Dict[str, object] = {
+    "invoked": False,
+    "installed": [],  # type: ignore[list-item]
+}
+
 
 def _try_import(module_name: str) -> bool:
     """
@@ -115,6 +120,7 @@ def ensure_requests_charset_modules(force_stub: bool = False) -> List[str]:
         List of module names that were installed as fallbacks.
     """
     installed: List[str] = []
+    _GUARD_STATE["invoked"] = True
 
     charset_module = None
 
@@ -141,6 +147,19 @@ def ensure_requests_charset_modules(force_stub: bool = False) -> List[str]:
             + ", ".join(sorted(set(installed)))
         )
 
+    _GUARD_STATE["installed"] = list(installed)
     return installed
+
+
+def get_charset_guard_status() -> Dict[str, object]:
+    """
+    Diagnostic helper describing guard activity.
+    """
+    installed = list(_GUARD_STATE.get("installed", []))
+    return {
+        "invoked": bool(_GUARD_STATE.get("invoked", False)),
+        "fallbacks": installed,
+        "using_fallback": bool(installed),
+    }
 
 

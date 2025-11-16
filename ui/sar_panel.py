@@ -13,7 +13,7 @@ from qgis.PyQt.QtWidgets import (
     QToolButton, QMessageBox, QStyle
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
-from qgis.PyQt.QtGui import QColor, QFont
+from qgis.PyQt.QtGui import QColor, QFont, QIcon
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 
@@ -72,6 +72,24 @@ class SARPanel(QDockWidget):
 
         # Setup UI
         self._setup_ui()
+    def _standard_icon(self, *enum_names: str) -> QIcon:
+        """
+        Resolve a QStyle standard icon with graceful fallbacks.
+
+        Qt 6 distributions occasionally omit certain enum values (e.g.,
+        SP_TitleBarMaxButton). This helper tries each enum name in order and
+        falls back to an empty QIcon if none are available.
+        """
+        style = self.style()
+        for name in enum_names:
+            icon_enum = getattr(QStyle, name, None)
+            if icon_enum is None:
+                continue
+            icon = style.standardIcon(icon_enum)
+            if not icon.isNull():
+                return icon
+        return QIcon()
+
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
@@ -105,7 +123,9 @@ class SARPanel(QDockWidget):
         focus_layout = QHBoxLayout()
         self.focus_mode_button = QToolButton()
         self.focus_mode_button.setText("Enter Focus Mode")
-        self.focus_mode_button.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+        self.focus_mode_button.setIcon(
+            self._standard_icon("SP_TitleBarMaxButton", "SP_TitleBarNormalButton", "SP_DialogYesButton")
+        )
         self.focus_mode_button.clicked.connect(self._toggle_focus_mode)
         self.focus_mode_button.setToolTip(
             "Hide other QGIS panels for cleaner workspace.\n"
@@ -157,20 +177,20 @@ class SARPanel(QDockWidget):
         
         self.start_button = QToolButton()
         self.start_button.setText("Start Mission")
-        self.start_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.start_button.setIcon(self._standard_icon("SP_MediaPlay", "SP_ArrowForward"))
         self.start_button.clicked.connect(self._on_start_mission)
         controls_layout.addWidget(self.start_button)
         
         self.pause_button = QToolButton()
         self.pause_button.setText("Pause")
-        self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+        self.pause_button.setIcon(self._standard_icon("SP_MediaPause", "SP_DialogApplyButton"))
         self.pause_button.clicked.connect(self._on_pause_mission)
         self.pause_button.setEnabled(False)
         controls_layout.addWidget(self.pause_button)
         
         self.finish_button = QToolButton()
         self.finish_button.setText("Finish")
-        self.finish_button.setIcon(self.style().standardIcon(QStyle.SP_DialogCloseButton))
+        self.finish_button.setIcon(self._standard_icon("SP_DialogCloseButton", "SP_DialogCancelButton"))
         self.finish_button.clicked.connect(self._on_finish_mission)
         self.finish_button.setEnabled(False)
         controls_layout.addWidget(self.finish_button)
@@ -500,7 +520,7 @@ class SARPanel(QDockWidget):
             self.pause_button.setEnabled(True)
             self.finish_button.setEnabled(True)
             self.pause_button.setText("Pause")
-            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self.pause_button.setIcon(self._standard_icon("SP_MediaPause", "SP_DialogApplyButton"))
             self.pause_flash_timer.stop()
             self._pause_flash = False
             self._set_button_state(self.pause_button, "flashOn", False)
@@ -512,7 +532,7 @@ class SARPanel(QDockWidget):
             self.pause_button.setEnabled(True)
             self.finish_button.setEnabled(True)
             self.pause_button.setText("Resume")
-            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            self.pause_button.setIcon(self._standard_icon("SP_MediaPlay", "SP_ArrowForward"))
             self.pause_flash_timer.start()
             self._set_button_state(self.start_button, "state", "active")
             self._set_button_state(self.pause_button, "state", "resume")
@@ -523,7 +543,7 @@ class SARPanel(QDockWidget):
             self.pause_button.setEnabled(False)
             self.finish_button.setEnabled(False)
             self.pause_button.setText("Pause")
-            self.pause_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            self.pause_button.setIcon(self._standard_icon("SP_MediaPause", "SP_DialogApplyButton"))
             self.pause_flash_timer.stop()
             self._pause_flash = False
             self._set_button_state(self.pause_button, "flashOn", False)

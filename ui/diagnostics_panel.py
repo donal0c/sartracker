@@ -23,6 +23,7 @@ from qgis.PyQt.QtWidgets import (
 from ..utils import capabilities
 from ..utils.qt_compat import dialog_exec, TextSelectableByMouse
 from ..utils.dialog_utils import BaseDialog
+from ..utils.dependency_guard import get_charset_guard_status
 
 
 class DiagnosticsPanel(BaseDialog):
@@ -127,6 +128,16 @@ class DiagnosticsPanel(BaseDialog):
         path_label.setWordWrap(True)
         path_label.setTextInteractionFlags(TextSelectableByMouse)
         form.addRow("<b>Plugin Path:</b>", path_label)
+
+        guard_status = get_charset_guard_status()
+        if guard_status["using_fallback"]:
+            fallback_text = ", ".join(guard_status["fallbacks"]) or "fallback modules"
+            guard_text = f"Active (bundled {fallback_text})"
+        elif guard_status["invoked"]:
+            guard_text = "Ready (system modules present)"
+        else:
+            guard_text = "Not invoked yet"
+        form.addRow("<b>Charset Guard:</b>", QLabel(guard_text))
 
         group.setLayout(form)
         return group
@@ -410,6 +421,15 @@ class DiagnosticsPanel(BaseDialog):
         lines.append(f"  Version:           {self._get_plugin_version()}")
         plugin_path = os.path.dirname(os.path.dirname(__file__))
         lines.append(f"  Path:              {plugin_path}")
+        guard_status = get_charset_guard_status()
+        if guard_status["using_fallback"]:
+            fallback_text = ", ".join(guard_status["fallbacks"]) or "fallback modules"
+            guard_line = f"  Charset Guard:     Active (bundled {fallback_text})"
+        elif guard_status["invoked"]:
+            guard_line = "  Charset Guard:     Ready (system modules present)"
+        else:
+            guard_line = "  Charset Guard:     Not invoked (providers not imported yet)"
+        lines.append(guard_line)
         lines.append("")
 
         # Compatibility

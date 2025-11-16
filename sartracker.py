@@ -42,7 +42,7 @@ from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
 from .utils.dialog_utils import BaseDialog
-from .utils.dependency_guard import ensure_requests_charset_modules
+from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
 from .config.keys import ConfigStore, SETTINGS_KEYS
 
 # Import our SAR tracking components with individual error tracking
@@ -3221,7 +3221,8 @@ class sartracker:
             'active_tasks_count': 0,  # Phase 0: Task manager health metric
             # NEW: Tool registry status (Issue #2 fix)
             'tool_registry_loaded': False,
-            'drawing_tools_available': False
+            'drawing_tools_available': False,
+            'charset_guard': get_charset_guard_status()
         }
 
         try:

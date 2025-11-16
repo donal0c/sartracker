@@ -86,6 +86,13 @@ git clone https://github.com/YOUR_USERNAME/sartracker.git
 
 ✅ You should now see a mountain icon (⛰️) in the QGIS toolbar!
 
+### Clean install checklist (recommended for team deployments)
+1. Close QGIS completely.
+2. Delete any existing `sartracker` or `sartracker-master` folder inside your plugins directory (keeps things clean).
+3. Extract the new ZIP and ensure the folder is named exactly `sartracker`.
+4. Copy the fresh `sartracker` folder into the plugins directory.
+5. Start QGIS, enable **SAR Tracker**, and run **Plugins → SAR Tracker → Diagnostics** to confirm the build number and “Charset Guard” status.
+
 ---
 
 ## 🎯 How to Use
