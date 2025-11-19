@@ -12,7 +12,7 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea, QComboBox, QStackedWidget,
     QToolButton, QMessageBox, QStyle
 )
-from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
+from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor, QFont, QIcon
 from datetime import datetime
 from typing import Optional, List, Dict, Any
@@ -141,6 +141,9 @@ class SARPanel(QDockWidget):
         focus_layout = QHBoxLayout()
         self.focus_mode_button = QToolButton()
         self.focus_mode_button.setText("Enter Focus Mode")
+        self.focus_mode_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.focus_mode_button.setAutoRaise(False)
+        self.focus_mode_button.setCursor(Qt.PointingHandCursor)
         self.focus_mode_button.setIcon(
             self._standard_icon("SP_TitleBarMaxButton", "SP_TitleBarNormalButton", "SP_DialogYesButton")
         )
@@ -662,11 +665,29 @@ class SARPanel(QDockWidget):
             return
         if self.focus_mode_active:
             self.focus_mode_button.setStyleSheet(
-                "QToolButton { background-color: #4066d6; color: #ffffff; padding: 6px 12px; border-radius: 4px; }"
+                "QToolButton {"
+                "  background-color: #4066d6;"
+                "  color: #ffffff;"
+                "  padding: 6px 14px;"
+                "  border-radius: 4px;"
+                "  border: 1px solid #2e4fb4;"
+                "  font-weight: 600;"
+                "}"
             )
         else:
             self.focus_mode_button.setStyleSheet(
-                "QToolButton { padding: 6px 12px; border-radius: 4px; }"
+                "QToolButton {"
+                "  padding: 6px 14px;"
+                "  border-radius: 4px;"
+                "  border: 1px solid #5b6da5;"
+                "  color: #1f2a44;"
+                "  background-color: #f5f7ff;"
+                "  font-weight: 600;"
+                "}"
+                "\n"
+                "QToolButton:hover {"
+                "  background-color: #e0e6ff;"
+                "}"
             )
     
     def _initialize_auto_settings(self):
