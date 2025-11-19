@@ -981,7 +981,7 @@ from .registry import registry, ProviderMetadata
 registry.register(
     ProviderMetadata(
         name='traccar_http',
-        display_name='Traccar Server (HTTP - Phase 4 MVP)',
+        display_name='Traccar Server (HTTP)',
         description='Optimized Traccar REST API polling with device caching and offline resilience',
         requires_config=True,
         config_schema={

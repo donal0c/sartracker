@@ -497,6 +497,20 @@ class SettingsPanel(QDockWidget):
                 int
             )
             if server_url and username and password:
+                # AUTOMATIC MIGRATION TO TRACCAR_HTTP (Phase 4.5)
+                print("[SETTINGS_PANEL] Automatically converting legacy http_traccar config to traccar_http")
+                legacy_config = {
+                    'server_url': server_url,
+                    'username': username,
+                    'password': password,
+                    'timeout': timeout
+                }
+                converted = self._convert_legacy_http_config(legacy_config)
+                if converted:
+                    # Return the converted config so UI populates as traccar_http
+                    return converted
+                
+                # Fallback if conversion fails (should not happen)
                 return {
                     'server_url': server_url,
                     'username': username,

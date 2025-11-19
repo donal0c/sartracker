@@ -290,6 +290,13 @@ class DiagnosticsPanel(BaseDialog):
                             except Exception:
                                 # If parsing fails, just show count
                                 pass
+                        
+                        # Phase 4.5: Cache Status (if available)
+                        if status.get('provider_type') == 'traccar_http':
+                            # Add cache indicator if last-good cache was used
+                            provider_msg = status.get('provider_status_message', '')
+                            if 'last-good cache' in str(provider_msg):
+                                data_source += " [OFFLINE CACHE]"
                     else:
                         data_source = "No data source loaded"
                 else:

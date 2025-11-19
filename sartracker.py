@@ -57,6 +57,7 @@ from .utils.exceptions import SARTrackerError
 from .utils.dialog_utils import BaseDialog
 from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
 from .config.keys import ConfigStore, SETTINGS_KEYS
+from .utils.secure_store import SecureStore
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -75,7 +76,7 @@ try:
     from .providers.registry import registry as provider_registry
     from .providers.base import Provider
     # Trigger provider registration by importing them
-    from .providers import csv, http_traccar, traccar_http
+    from .providers import csv, traccar_http
     # Note: provider_registry now contains registered providers (csv, http_traccar, traccar_http)
 except Exception as e:
     _imports_ok = False
@@ -534,6 +535,10 @@ class sartracker:
         from .utils.task_manager import TaskManager
         self.task_manager = TaskManager()
 
+        # Connect to application aboutToQuit signal for safe shutdown
+        # This prevents race conditions where tasks outlive the plugin during QGIS exit
+        QCoreApplication.instance().aboutToQuit.connect(self._on_app_about_to_quit)
+
         # Connection test tracking (Issue #2 fix)
         self._current_connection_task = None
         self._pending_provider_metadata = None
@@ -953,9 +958,27 @@ class sartracker:
             print(f"ERROR running smoke test: {e}")
             print(traceback.format_exc())
 
+    def _on_app_about_to_quit(self):
+        """
+        Handle application exit signal.
+        Cancels all tasks immediately to prevent race conditions during QGIS shutdown.
+        """
+        try:
+            if self.task_manager and self.task_manager.get_active_count() > 0:
+                print("[SARTRACKER] Application about to quit - forcing task cancellation")
+                self.task_manager.cancel_all()
+        except Exception as e:
+            print(f"[SARTRACKER] Error during early cleanup: {e}")
+
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
+            # Disconnect application aboutToQuit signal
+            try:
+                QCoreApplication.instance().aboutToQuit.disconnect(self._on_app_about_to_quit)
+            except Exception:
+                pass
+
             # ============================================================
             # CRITICAL: Disconnect signals FIRST (Issue #4 fix)
             # Do this BEFORE cleaning up widgets to prevent handlers from
@@ -2997,12 +3020,23 @@ class sartracker:
 
                     if auth_type == 'basic':
                         username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, None)
-                        password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
+                        
+                        # Try SecureStore first for password
+                        password = SecureStore.get_credential('traccar_http_basic', username)
+                        if not password:
+                            # Fallback to QSettings (migration scenario)
+                            password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
+
                         if username and password:
                             config['username'] = str(username)
                             config['password'] = str(password)
                     elif auth_type == 'bearer':
-                        token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
+                        # Try SecureStore first for token
+                        token = SecureStore.get_credential('traccar_http_bearer', 'token')
+                        if not token:
+                             # Fallback to QSettings
+                            token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
+                            
                         if token:
                             config['token'] = str(token)
 
@@ -3042,6 +3076,7 @@ class sartracker:
             'enable_last_good_cache': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT
         }
 
+        # Persist immediately so next load finds it
         self._persist_traccar_http_settings(converted)
         return converted
 
@@ -3052,11 +3087,22 @@ class sartracker:
         ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, config.get('timeout_s', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
         ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, config.get('cache_ttl', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT))
         ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT))
+        
         if config.get('auth_type') == 'basic':
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, config.get('username', ''))
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, config.get('password', ''))
+            username = config.get('username', '')
+            password = config.get('password', '')
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, username)
+            
+            # Save password to SecureStore
+            SecureStore.set_credential('traccar_http_basic', username, password)
+            
+            # Legacy fallback (optional, can be removed if SecureStore is 100% reliable)
+            # ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, password)
         else:
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, config.get('token', ''))
+            token = config.get('token', '')
+            # Save token to SecureStore
+            SecureStore.set_credential('traccar_http_bearer', 'token', token)
+            # ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, token)
 
     # Phase N1: _populate_provider_dropdown method removed
     # Provider dropdown is now populated in SettingsPanel during initialization (sartracker.py lines 682-696)
