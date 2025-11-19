@@ -25,7 +25,7 @@ from qgis.core import (
     QgsField
 )
 from qgis.PyQt.QtGui import QColor, QFont
-from qgis.PyQt.QtCore import Qt, QVariant
+from qgis.PyQt.QtCore import QVariant
 
 from .schema import LayerIds
 from .utilities import get_group_by_path

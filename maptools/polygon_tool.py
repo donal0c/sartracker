@@ -10,7 +10,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 
 from qgis.core import QgsPointXY, QgsGeometry, QgsWkbTypes
 from qgis.gui import QgsRubberBand
-from qgis.PyQt.QtCore import Qt, QTimer
+from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel,
@@ -19,7 +19,10 @@ from qgis.PyQt.QtWidgets import (
 )
 
 # Import Qt5/Qt6 compatible constants and functions
-from ..utils.qt_compat import LeftButton, RightButton, Key_Escape, dialog_exec, DialogAccepted
+from ..utils.qt_compat import (
+    LeftButton, RightButton, Key_Escape,
+    dialog_exec, DialogAccepted, AllEvents
+)
 from ..utils.dialog_utils import BaseDialog
 from ..utils.exceptions import DrawingError
 
@@ -427,9 +430,8 @@ class PolygonTool(BaseDrawingTool):
         result = dialog_exec(dialog)
 
         # CRITICAL: Force Qt to process all pending events from dialog
-        from qgis.PyQt.QtCore import QEventLoop
         from qgis.PyQt.QtWidgets import QApplication
-        QApplication.processEvents(QEventLoop.AllEvents, 100)
+        QApplication.processEvents(AllEvents, 100)
 
         if result == DialogAccepted and dialog.area_data:
             # User accepted - create feature immediately

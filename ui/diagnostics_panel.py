@@ -24,6 +24,7 @@ from ..utils import capabilities
 from ..utils.qt_compat import dialog_exec, TextSelectableByMouse
 from ..utils.dialog_utils import BaseDialog
 from ..utils.dependency_guard import get_charset_guard_status
+from ..utils.secure_store import SecureStore
 
 
 class DiagnosticsPanel(BaseDialog):
@@ -55,6 +56,10 @@ class DiagnosticsPanel(BaseDialog):
         # Plugin Section
         plugin_group = self._create_plugin_section()
         layout.addWidget(plugin_group)
+
+        # Security & Guards Section (Phase 3)
+        security_group = self._create_security_section()
+        layout.addWidget(security_group)
 
         # Compatibility Paths Section
         compat_group = self._create_compatibility_section()
@@ -129,15 +134,68 @@ class DiagnosticsPanel(BaseDialog):
         path_label.setTextInteractionFlags(TextSelectableByMouse)
         form.addRow("<b>Plugin Path:</b>", path_label)
 
+        group.setLayout(form)
+        return group
+
+    def _create_security_section(self):
+        """Create security and guard status section (Phase 3)."""
+        group = QGroupBox("Security & Hardening")
+        form = QFormLayout()
+
+        # Secure Store Status
+        backend = SecureStore.get_backend_name()
+        if SecureStore.is_secure():
+            # System keychain active
+            secure_icon = "✅"
+            backend_style = "color: green;"
+        else:
+            # File fallback
+            secure_icon = "⚠️"
+            backend_style = "color: orange;"
+        
+        backend_label = QLabel(f"{secure_icon} {backend}")
+        backend_label.setStyleSheet(backend_style)
+        form.addRow("<b>Credential Storage:</b>", backend_label)
+
+        # Vendor Bundle Status
+        # Check if requests is coming from vendor/
+        try:
+            import requests
+            import sartracker
+            plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+            vendor_dir = os.path.join(plugin_dir, 'vendor')
+            
+            if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                vendor_text = "✅ Active (Bundled)"
+                vendor_style = "color: green;"
+            else:
+                vendor_text = f"ℹ️ System ({requests.__file__})"
+                vendor_style = "color: black;"
+        except Exception:
+            vendor_text = "❓ Unknown"
+            vendor_style = "color: gray;"
+
+        vendor_label = QLabel(vendor_text)
+        vendor_label.setStyleSheet(vendor_style)
+        vendor_label.setToolTip("Ensures plugin works without installing python libraries")
+        form.addRow("<b>Dependency Bundle:</b>", vendor_label)
+
+        # Charset Guard Status (moved from Plugin section)
         guard_status = get_charset_guard_status()
         if guard_status["using_fallback"]:
             fallback_text = ", ".join(guard_status["fallbacks"]) or "fallback modules"
-            guard_text = f"Active (bundled {fallback_text})"
+            guard_text = f"✅ Active (Bundled {fallback_text})"
+            guard_style = "color: green;"
         elif guard_status["invoked"]:
-            guard_text = "Ready (system modules present)"
+            guard_text = "✅ Ready (System modules)"
+            guard_style = "color: green;"
         else:
-            guard_text = "Not invoked yet"
-        form.addRow("<b>Charset Guard:</b>", QLabel(guard_text))
+            guard_text = "⚪ Not invoked"
+            guard_style = "color: gray;"
+            
+        guard_label = QLabel(guard_text)
+        guard_label.setStyleSheet(guard_style)
+        form.addRow("<b>Charset Guard:</b>", guard_label)
 
         group.setLayout(form)
         return group
@@ -421,6 +479,24 @@ class DiagnosticsPanel(BaseDialog):
         lines.append(f"  Version:           {self._get_plugin_version()}")
         plugin_path = os.path.dirname(os.path.dirname(__file__))
         lines.append(f"  Path:              {plugin_path}")
+        
+        # Security
+        lines.append("")
+        lines.append("SECURITY & GUARDS:")
+        lines.append(f"  Credential Store:  {SecureStore.get_backend_name()}")
+        
+        try:
+            import requests
+            import sartracker
+            plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+            vendor_dir = os.path.join(plugin_dir, 'vendor')
+            if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                lines.append("  Dependency Bundle: Active (Bundled)")
+            else:
+                lines.append(f"  Dependency Bundle: System ({requests.__file__})")
+        except Exception as e:
+            lines.append(f"  Dependency Bundle: Check Failed ({e})")
+
         guard_status = get_charset_guard_status()
         if guard_status["using_fallback"]:
             fallback_text = ", ".join(guard_status["fallbacks"]) or "fallback modules"
@@ -428,7 +504,7 @@ class DiagnosticsPanel(BaseDialog):
         elif guard_status["invoked"]:
             guard_line = "  Charset Guard:     Ready (system modules present)"
         else:
-            guard_line = "  Charset Guard:     Not invoked (providers not imported yet)"
+            guard_line = "  Charset Guard:     Not invoked"
         lines.append(guard_line)
         lines.append("")
 

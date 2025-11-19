@@ -22,6 +22,19 @@
  ***************************************************************************/
 """
 from typing import Optional
+import sys
+import os
+
+# Phase 2: Vendor Dependency Injection
+# Ensure bundled dependencies are available before any other imports.
+# This guarantees we use our tested versions of requests, urllib3, etc.
+vendor_path = os.path.join(os.path.dirname(__file__), 'vendor', 'site-packages')
+if os.path.exists(vendor_path):
+    if vendor_path not in sys.path:
+        sys.path.insert(0, vendor_path)
+        print(f"[SAR Tracker] Injected vendor path: {vendor_path}")
+else:
+    print(f"[SAR Tracker] Warning: Vendor path not found: {vendor_path}")
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
@@ -834,6 +847,23 @@ class sartracker:
 
         Qt5/Qt6 Compatible: Uses utils.notify helpers and BaseDialog
         """
+        # LOGGING: Write errors to a file so user can find them even if dialog fails
+        try:
+            import tempfile
+            from datetime import datetime
+            log_path = os.path.join(tempfile.gettempdir(), f"sartracker_import_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+            with open(log_path, 'w') as f:
+                f.write("SAR TRACKER IMPORT ERRORS\n")
+                f.write("=========================\n")
+                for module_name, exc, tb in errors:
+                    f.write(f"Module: {module_name}\n")
+                    f.write(f"Error: {exc}\n")
+                    f.write(f"Traceback:\n{tb}\n")
+                    f.write("-" * 50 + "\n")
+            print(f"[SARTRACKER] Import errors written to: {log_path}")
+        except Exception as e:
+            print(f"[SARTRACKER] Failed to write error log: {e}")
+
         # Show persistent message bar warning
         error(
             self.iface.messageBar(),

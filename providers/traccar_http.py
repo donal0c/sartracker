@@ -653,12 +653,19 @@ class TraccarHttpProvider(Provider):
         device_id_str = str(device_id)
 
         # EXTRACT name
-        name = raw_device.get('name', '').strip()
-        if not name:
+        name_val = raw_device.get('name')
+        if isinstance(name_val, str) and name_val.strip():
+            name = name_val.strip()
+        else:
             name = f"Device {device_id_str}"
 
         # NORMALIZE status
-        raw_status = raw_device.get('status', '').lower().strip()
+        raw_status_val = raw_device.get('status')
+        if isinstance(raw_status_val, str):
+            raw_status = raw_status_val.lower().strip()
+        else:
+            raw_status = 'unknown'
+
         if raw_status == 'online':
             status = 'online'
         elif raw_status in ('offline', 'disabled'):
@@ -706,12 +713,15 @@ class TraccarHttpProvider(Provider):
             # Don't let cache save failures propagate - log and continue
             print(f"[TRACCAR_HTTP] Warning: Failed to save last-good cache: {e}")
 
-    def _load_last_good_cache(self) -> Optional[List[FeatureDict]]:
+    def _load_last_good_cache(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
         """
         Load last-good positions from cache file.
 
+        Args:
+            max_age_s: Maximum age of cache in seconds (default: 3600 = 1 hour)
+
         Returns:
-            List of feature dicts from cache, or None if cache unavailable
+            List of feature dicts from cache, or None if cache unavailable or expired
         """
         if not self.enable_last_good_cache:
             return None
@@ -732,9 +742,30 @@ class TraccarHttpProvider(Provider):
                 return None
 
             features = cache_data['features']
-            timestamp = cache_data.get('timestamp', 'unknown')
+            timestamp_str = cache_data.get('timestamp')
 
-            print(f"[TRACCAR_HTTP] Loaded {len(features)} positions from cache (saved: {timestamp})")
+            if not timestamp_str:
+                print("[TRACCAR_HTTP] Cache missing timestamp")
+                return None
+
+            # Enforce expiration
+            try:
+                cache_time = parse_iso(timestamp_str)
+                # Ensure aware comparison
+                if cache_time.tzinfo is None:
+                    cache_time = cache_time.replace(tzinfo=timezone.utc)
+                
+                now = datetime.now(timezone.utc)
+                age = (now - cache_time).total_seconds()
+
+                if age > max_age_s:
+                    print(f"[TRACCAR_HTTP] Cache expired (age={age:.1f}s > max={max_age_s}s), ignoring")
+                    return None
+            except Exception as e:
+                print(f"[TRACCAR_HTTP] Error verifying cache age: {e}")
+                return None
+
+            print(f"[TRACCAR_HTTP] Loaded {len(features)} positions from cache (saved: {timestamp_str})")
             return features
 
         except Exception as e:

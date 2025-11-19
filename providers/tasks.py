@@ -443,6 +443,78 @@ class ConnectionTestTask(QgsTask):
             return False
 
 
+class BreadcrumbProcessingTask(QgsTask):
+    """
+    Background task for processing raw breadcrumb data into QGIS features.
+    
+    This task takes raw position dictionaries and processes them into
+    lists of QgsFeature objects (or intermediate dicts optimized for rendering)
+    to offload heavy coordinate parsing and attribute mapping from the main thread.
+    
+    Phase 3.3 Optimization.
+    """
+    
+    def __init__(self, raw_breadcrumbs: List[Dict], device_colors: Dict[str, str], description: str = "Processing breadcrumbs"):
+        super().__init__(description, QgsTask.CanCancel)
+        self.raw_breadcrumbs = raw_breadcrumbs
+        self.device_colors = device_colors
+        self.processed_features = []
+        self.error_message = None
+        
+    def run(self) -> bool:
+        """
+        Process breadcrumbs in background.
+        """
+        try:
+            # We can't create QgsFeature objects safely in background thread easily 
+            # without care, but we CAN prepare all geometry and attributes 
+            # into a clean structure that the main thread can just dump into QgsFeatures.
+            #
+            # Actually, QgsFeature/QgsGeometry ARE implicitly shared and thread-safe 
+            # for creation detached from a layer.
+            
+            # Optimization: Sort by device then time
+            if self.isCanceled(): return False
+            self.raw_breadcrumbs.sort(key=lambda x: (x['device_id'], x['ts']))
+            
+            processed = []
+            total = len(self.raw_breadcrumbs)
+            
+            for i, pos in enumerate(self.raw_breadcrumbs):
+                if self.isCanceled(): return False
+                if i % 100 == 0:
+                    self.setProgress((i / total) * 100)
+                    
+                # Basic validation
+                try:
+                    lat = float(pos['lat'])
+                    lon = float(pos['lon'])
+                    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                        continue
+                        
+                    # Store pre-validated, typed data
+                    processed.append({
+                        'device_id': str(pos['device_id']),
+                        'name': str(pos['name']),
+                        'ts': pos['ts'],
+                        'lat': lat,
+                        'lon': lon,
+                        'altitude': pos.get('altitude'),
+                        'speed': pos.get('speed'),
+                        'battery': pos.get('battery'),
+                        'color': self.device_colors.get(str(pos['device_id']), "#000000")
+                    })
+                except (ValueError, TypeError):
+                    continue
+                    
+            self.processed_features = processed
+            return True
+            
+        except Exception as e:
+            self.error_message = str(e)
+            return False
+
+
 class TraccarRefreshTask(ProviderRefreshTask):
     """
     Traccar HTTP refresh task using Phase 4 optimized provider.

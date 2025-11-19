@@ -24,12 +24,13 @@ import os
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
-    Checked
+    Checked, PasswordEchoMode
 )
 from ..utils.notify import info, warning, error, success
 
 # Import centralized config keys
 from ..config.keys import SETTINGS_KEYS, ConfigStore
+from ..utils.secure_store import SecureStore
 
 
 class SettingsPanel(QDockWidget):
@@ -331,7 +332,7 @@ class SettingsPanel(QDockWidget):
         basic_auth_layout.addWidget(self.http_username_input)
         basic_auth_layout.addWidget(QLabel("Password:"))
         self.http_password_input = QLineEdit()
-        self.http_password_input.setEchoMode(QLineEdit.Password)
+        self.http_password_input.setEchoMode(PasswordEchoMode)
         self.http_password_input.setPlaceholderText("••••••••")
         self.http_password_input.setToolTip("Traccar API password")
         basic_auth_layout.addWidget(self.http_password_input)
@@ -344,7 +345,7 @@ class SettingsPanel(QDockWidget):
         bearer_auth_layout.setContentsMargins(0, 0, 0, 0)
         bearer_auth_layout.addWidget(QLabel("Bearer Token:"))
         self.http_token_input = QLineEdit()
-        self.http_token_input.setEchoMode(QLineEdit.Password)
+        self.http_token_input.setEchoMode(PasswordEchoMode)
         self.http_token_input.setPlaceholderText("Enter API token")
         self.http_token_input.setToolTip("Traccar API bearer token")
         bearer_auth_layout.addWidget(self.http_token_input)
@@ -477,7 +478,19 @@ class SettingsPanel(QDockWidget):
         if provider_name == 'http_traccar':
             server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, "")
             username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, "")
+            
+            # SECURE STORE MIGRATION (Phase 1.1)
+            # Check QSettings first (legacy)
             password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, "")
+            if password:
+                # Migrate to SecureStore
+                SecureStore.set_credential('http_traccar', username, password)
+                ConfigStore.remove(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD)
+                print("[SETTINGS_PANEL] Migrated http_traccar password to SecureStore")
+            else:
+                # Read from SecureStore
+                password = SecureStore.get_credential('http_traccar', username) or ""
+
             timeout = ConfigStore.get(
                 SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT,
                 SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT,
@@ -523,13 +536,30 @@ class SettingsPanel(QDockWidget):
 
             if auth_type == 'basic':
                 username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, "")
+                
+                # SECURE STORE MIGRATION (Phase 1.1)
                 password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, "")
+                if password:
+                    SecureStore.set_credential('traccar_http_basic', username, password)
+                    ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD)
+                    print("[SETTINGS_PANEL] Migrated traccar_http password to SecureStore")
+                else:
+                    password = SecureStore.get_credential('traccar_http_basic', username) or ""
+
                 if not username or not password:
                     return None
                 config['username'] = username
                 config['password'] = password
             else:
+                # SECURE STORE MIGRATION (Phase 1.1)
                 token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, "")
+                if token:
+                    SecureStore.set_credential('traccar_http_bearer', 'token', token)
+                    ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN)
+                    print("[SETTINGS_PANEL] Migrated traccar_http token to SecureStore")
+                else:
+                    token = SecureStore.get_credential('traccar_http_bearer', 'token') or ""
+
                 if not token:
                     return None
                 config['token'] = token
@@ -957,9 +987,15 @@ class SettingsPanel(QDockWidget):
         ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT))
         if config.get('auth_type') == 'basic':
             ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, config.get('username', ''))
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, config.get('password', ''))
+            # Save to SecureStore
+            SecureStore.set_credential('traccar_http_basic', config.get('username', ''), config.get('password', ''))
+            # Remove legacy plain text
+            ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD)
         else:
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, config.get('token', ''))
+            # Save to SecureStore
+            SecureStore.set_credential('traccar_http_bearer', 'token', config.get('token', ''))
+            # Remove legacy plain text
+            ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN)
 
     def _validate_provider_config(self, provider_name: str, config: dict) -> Optional[str]:
         """
@@ -1012,7 +1048,11 @@ class SettingsPanel(QDockWidget):
             elif provider_name == 'http_traccar':
                 ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, config.get('server_url', ''))
                 ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, config.get('username', ''))
-                ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, config.get('password', ''))
+                # Save to SecureStore
+                SecureStore.set_credential('http_traccar', config.get('username', ''), config.get('password', ''))
+                # Remove legacy
+                ConfigStore.remove(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD)
+                
                 ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT, config.get('timeout', 10))
 
             elif provider_name == 'traccar_http':
@@ -1024,9 +1064,13 @@ class SettingsPanel(QDockWidget):
 
                 if config.get('auth_type') == 'basic':
                     ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, config.get('username', ''))
-                    ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, config.get('password', ''))
+                    # Save to SecureStore
+                    SecureStore.set_credential('traccar_http_basic', config.get('username', ''), config.get('password', ''))
+                    ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD)
                 else:
-                    ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, config.get('token', ''))
+                    # Save to SecureStore
+                    SecureStore.set_credential('traccar_http_bearer', 'token', config.get('token', ''))
+                    ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN)
 
             print(f"[SETTINGS_PANEL] Saved provider config: {provider_name}")
 

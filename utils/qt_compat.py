@@ -87,6 +87,16 @@ Total: 78 exported symbols for Qt5/Qt6 compatibility
 """
 
 from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtWidgets import QLineEdit
+# =============================================================================
+# QLineEdit echo modes
+# =============================================================================
+try:
+    PasswordEchoMode = QLineEdit.EchoMode.Password
+    NormalEchoMode = QLineEdit.EchoMode.Normal
+except AttributeError:
+    PasswordEchoMode = QLineEdit.Password
+    NormalEchoMode = QLineEdit.Normal
 
 # Try to detect Qt version by checking for scoped enum attributes
 try:
@@ -336,6 +346,18 @@ except (AttributeError, ImportError):
     DialogRejected = 0
 
 
+try:
+    from qgis.PyQt.QtCore import QEventLoop
+    # Qt6 style
+    AllEvents = QEventLoop.ProcessEventsFlag.AllEvents
+    ExcludeUserInputEvents = QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+except (AttributeError, ImportError):
+    # Qt5 style
+    from qgis.PyQt.QtCore import QEventLoop
+    AllEvents = QEventLoop.AllEvents
+    ExcludeUserInputEvents = QEventLoop.ExcludeUserInputEvents
+
+
 # =============================================================================
 # Dialog exec compatibility
 # =============================================================================
@@ -511,4 +533,7 @@ __all__ = [
     'NonModal',
     'WindowModal',
     'ApplicationModal',
+    # EventLoop
+    'AllEvents',
+    'ExcludeUserInputEvents',
 ]

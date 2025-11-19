@@ -151,10 +151,12 @@ class HttpTraccarProvider(Provider):
         url = f"{self.server_url}{endpoint}"
 
         # Use provided session or create temporary one (backwards compatibility)
+        close_session = False
         if session is None:
             # Legacy path: create temporary session for synchronous calls
             # (e.g., test_connection, get_devices from main thread)
             session = self._create_session()
+            close_session = True
 
         try:
             response = session.get(url, params=params, timeout=self.timeout)
@@ -207,6 +209,12 @@ class HttpTraccarProvider(Provider):
                 provider_name='http_traccar',
                 recoverable=False
             )
+        finally:
+            if close_session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
 
     def _get_raw_devices(self, session: Optional[requests.Session] = None) -> List[Dict]:
         """

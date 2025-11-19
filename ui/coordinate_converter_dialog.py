@@ -10,7 +10,7 @@ from qgis.PyQt.QtWidgets import (
     QPushButton, QLineEdit, QLabel, QGroupBox, QRadioButton,
     QButtonGroup, QApplication
 )
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal
 
 from ..utils.dialog_utils import BaseDialog
 from qgis.core import (

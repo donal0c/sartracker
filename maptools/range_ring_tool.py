@@ -10,7 +10,6 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 
 from qgis.core import QgsPointXY, QgsGeometry, QgsWkbTypes
 from qgis.gui import QgsRubberBand
-from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel,
