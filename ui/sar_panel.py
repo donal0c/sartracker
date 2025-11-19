@@ -72,24 +72,6 @@ class SARPanel(QDockWidget):
 
         # Setup UI
         self._setup_ui()
-    def _standard_icon(self, *enum_names: str) -> QIcon:
-        """
-        Resolve a QStyle standard icon with graceful fallbacks.
-
-        Qt 6 distributions occasionally omit certain enum values (e.g.,
-        SP_TitleBarMaxButton). This helper tries each enum name in order and
-        falls back to an empty QIcon if none are available.
-        """
-        style = self.style()
-        for name in enum_names:
-            icon_enum = getattr(QStyle, name, None)
-            if icon_enum is None:
-                continue
-            icon = style.standardIcon(icon_enum)
-            if not icon.isNull():
-                return icon
-        return QIcon()
-
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
@@ -111,6 +93,42 @@ class SARPanel(QDockWidget):
         if self._mission_controller:
             self._mission_controller.mission_state_changed.connect(self._on_controller_state_changed)
             self._mission_controller.mission_timing_updated.connect(self.update_mission_timers)
+
+            # Ensure UI reflects existing mission state (e.g., after resume)
+            try:
+                controller_state = self._mission_controller.state
+                snapshot = self._mission_controller.status_snapshot()
+                context = {
+                    "mission_name": snapshot.get("mission_name"),
+                    "started_at": snapshot.get("started_at"),
+                    "paused_since": snapshot.get("paused_since")
+                }
+                self._on_controller_state_changed(controller_state, context)
+                self.update_mission_timers(
+                    snapshot.get("elapsed_seconds", 0.0),
+                    snapshot.get("active_seconds", 0.0)
+                )
+            except Exception as sync_error:
+                print(f"[SARPanel] Warning: Failed to sync mission state: {sync_error}")
+        self._refresh_mission_controls()
+
+    def _standard_icon(self, *enum_names: str) -> QIcon:
+        """
+        Resolve a QStyle standard icon with graceful fallbacks.
+
+        Qt 6 distributions occasionally omit certain enum values (e.g.,
+        SP_TitleBarMaxButton). This helper tries each enum name in order and
+        falls back to an empty QIcon if none are available.
+        """
+        style = self.style()
+        for name in enum_names:
+            icon_enum = getattr(QStyle, name, None)
+            if icon_enum is None:
+                continue
+            icon = style.standardIcon(icon_enum)
+            if not icon.isNull():
+                return icon
+        return QIcon()
         
     def _setup_ui(self):
         """Build the panel UI."""

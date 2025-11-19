@@ -55,13 +55,13 @@ from providers.csv import FileCSVProvider, _create_csv_provider
 from providers.registry import registry, ProviderMetadata
 from utils.exceptions import ProviderError, ProviderDataError
 
-# Import http_traccar to trigger its self-registration (optional - needs requests)
-HTTP_TRACCAR_AVAILABLE = False
+# Import traccar_http to trigger its self-registration (optional - needs requests)
+TRACCAR_HTTP_AVAILABLE = False
 try:
-    import providers.http_traccar  # noqa: F401
-    HTTP_TRACCAR_AVAILABLE = True
+    import providers.traccar_http  # noqa: F401
+    TRACCAR_HTTP_AVAILABLE = True
 except ImportError as e:
-    print(f"Warning: HTTP Traccar provider not available ({e}). Skipping HTTP tests.")
+    print(f"Warning: Traccar HTTP provider not available ({e}). Skipping HTTP tests.")
 
 
 # ============================================================================
@@ -252,35 +252,37 @@ def test_registry_csv_metadata_capabilities():
     assert metadata.auth_modes == []
 
 
-def test_registry_http_traccar_metadata_present():
-    """Test HTTP Traccar provider is registered with correct metadata."""
-    if not HTTP_TRACCAR_AVAILABLE:
+def test_registry_traccar_http_metadata_present():
+    """Test Traccar HTTP provider is registered with correct metadata."""
+    if not TRACCAR_HTTP_AVAILABLE:
         print("  (skipped - requests not available)")
         return
 
-    assert registry.is_registered('http_traccar')
+    assert registry.is_registered('traccar_http')
 
-    metadata = registry.get_metadata('http_traccar')
+    metadata = registry.get_metadata('traccar_http')
 
-    assert metadata.name == 'http_traccar'
+    assert metadata.name == 'traccar_http'
     assert metadata.display_name == 'Traccar Server (HTTP)'
     assert metadata.requires_config is True
-    assert 'server_url' in metadata.config_schema
-    assert 'username' in metadata.config_schema
-    assert 'password' in metadata.config_schema
+    assert 'base_url' in metadata.config_schema
+    assert 'auth_type' in metadata.config_schema
+    assert 'timeout_s' in metadata.config_schema
+    assert 'cache_ttl' in metadata.config_schema
+    assert 'enable_last_good_cache' in metadata.config_schema
 
 
-def test_registry_http_traccar_metadata_capabilities():
-    """Test HTTP Traccar provider metadata includes Phase 1 capabilities."""
-    if not HTTP_TRACCAR_AVAILABLE:
+def test_registry_traccar_http_metadata_capabilities():
+    """Test Traccar HTTP provider metadata includes Phase 1 capabilities."""
+    if not TRACCAR_HTTP_AVAILABLE:
         print("  (skipped - requests not available)")
         return
 
-    metadata = registry.get_metadata('http_traccar')
+    metadata = registry.get_metadata('traccar_http')
 
     assert metadata.supports_polling is True
     assert metadata.supports_streaming is False
-    assert metadata.auth_modes == ['basic']
+    assert metadata.auth_modes == ['basic', 'bearer']
 
 
 def test_registry_get_metadata_missing_provider():
@@ -305,11 +307,11 @@ def test_registry_list_providers_includes_both():
     provider_names = [p.name for p in providers]
     assert 'csv' in provider_names
 
-    # HTTP Traccar is only registered if requests module available
-    if HTTP_TRACCAR_AVAILABLE:
-        assert 'http_traccar' in provider_names
+    # Traccar HTTP is only registered if requests module available
+    if TRACCAR_HTTP_AVAILABLE:
+        assert 'traccar_http' in provider_names
     else:
-        print("  (http_traccar check skipped - requests not available)")
+        print("  (traccar_http check skipped - requests not available)")
 
 
 # ============================================================================
@@ -355,8 +357,8 @@ def run_all_tests():
         test_csv_factory_empty_csv_path,
         test_registry_csv_metadata_present,
         test_registry_csv_metadata_capabilities,
-        test_registry_http_traccar_metadata_present,
-        test_registry_http_traccar_metadata_capabilities,
+        test_registry_traccar_http_metadata_present,
+        test_registry_traccar_http_metadata_capabilities,
         test_registry_get_metadata_missing_provider,
         test_registry_list_providers_includes_both,
         test_provider_errors_inherit_from_base,
