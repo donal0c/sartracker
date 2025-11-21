@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import sys
+import concurrent.futures
 from pathlib import Path
 
 from .base import Provider, FeatureDict
@@ -219,32 +220,8 @@ class TraccarHttpProvider(Provider):
                         recoverable=False
                     )
 
-                # Build device map: {id: name}
-                device_map = {}
-                for device in data:
-                    if not isinstance(device, dict):
-                        print(f"[TRACCAR_HTTP] Warning: Skipping invalid device: {device}")
-                        continue
-
-                    # Extract device ID (prefer 'id', fallback to 'uniqueId')
-                    device_id = device.get('id')
-                    if device_id is None:
-                        print(f"[TRACCAR_HTTP] Warning: Device missing 'id': {device}")
-                        continue
-
-                    # Convert to string for consistent handling
-                    device_id_str = str(device_id)
-
-                    # Extract device name
-                    device_name = device.get('name', '').strip()
-                    if not device_name:
-                        device_name = f"Device {device_id_str}"
-
-                    device_map[device_id_str] = device_name
-
-                # Update cache
-                self._device_cache = device_map
-                self._device_cache_timestamp = now
+                device_map = self._build_device_map(data)
+                self._set_device_cache(device_map, timestamp=now)
 
                 print(f"[TRACCAR_HTTP] Device cache updated: {len(device_map)} devices")
                 return device_map
@@ -267,6 +244,47 @@ class TraccarHttpProvider(Provider):
                 provider_name='traccar_http',
                 recoverable=False
             )
+
+    def _set_device_cache(self, device_map: Dict[str, str], timestamp: Optional[datetime] = None):
+        """
+        Update the in-memory device cache with a normalized map.
+
+        Args:
+            device_map: Mapping of device IDs to names.
+            timestamp: Optional datetime to record as cache timestamp.
+        """
+        self._device_cache = device_map or {}
+        if timestamp is None:
+            timestamp = datetime.now(timezone.utc)
+        self._device_cache_timestamp = timestamp
+
+    def _build_device_map(self, raw_devices: List[Dict[str, Any]]) -> Dict[str, str]:
+        """
+        Build a {device_id: name} mapping from raw /api/devices payload.
+
+        Invalid entries are skipped with diagnostic logging.
+        """
+        device_map: Dict[str, str] = {}
+        for device in raw_devices or []:
+            if not isinstance(device, dict):
+                print(f"[TRACCAR_HTTP] Warning: Skipping invalid device: {device}")
+                continue
+
+            device_id = device.get('id')
+            if device_id is None:
+                print(f"[TRACCAR_HTTP] Warning: Device missing 'id': {device}")
+                continue
+
+            device_id_str = str(device_id)
+            name_val = device.get('name')
+            if isinstance(name_val, str) and name_val.strip():
+                device_name = name_val.strip()
+            else:
+                device_name = f"Device {device_id_str}"
+
+            device_map[device_id_str] = device_name
+
+        return device_map
 
     def get_current(self, session=None) -> List[FeatureDict]:
         """
@@ -353,16 +371,17 @@ class TraccarHttpProvider(Provider):
                     except Exception as e:
                         print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
 
-        except (ProviderAuthError, ProviderNetworkError, ProviderDataError) as e:
-            # Try loading from last-good cache on network errors
-            if self.enable_last_good_cache and isinstance(e, ProviderNetworkError):
-                print(f"[TRACCAR_HTTP] Network error, attempting to load last-good cache: {e}")
+        except ProviderAuthError:
+            # Auth errors must be surfaced to the operator immediately
+            raise
+        except (ProviderNetworkError, ProviderDataError) as e:
+            if self.enable_last_good_cache:
+                print(f"[TRACCAR_HTTP] {e.__class__.__name__} - loading last-good cache: {e}")
                 cached = self._load_last_good_cache()
                 if cached:
                     print(f"[TRACCAR_HTTP] Loaded {len(cached)} positions from last-good cache")
                     return cached
 
-            # Re-raise provider errors
             raise
         except Exception as e:
             # Wrap unexpected errors
@@ -423,10 +442,11 @@ class TraccarHttpProvider(Provider):
 
                 print(f"[TRACCAR_HTTP] Time window: {from_iso} to {to_iso}")
 
-                # Fetch breadcrumbs for each device
+                # Fetch breadcrumbs for each device in parallel
                 all_positions = []
 
-                for device_id_str, device_name in device_map.items():
+                # Helper function for parallel execution
+                def fetch_device_breadcrumbs(device_id_str, device_name):
                     try:
                         # Query parameters
                         params = {
@@ -436,29 +456,58 @@ class TraccarHttpProvider(Provider):
                         }
 
                         # Fetch positions for this device
-                        data = self.http_client.get("/api/positions", session=session, params=params, expect_json=True)
+                        # Note: session is thread-safe for read operations, but requests.Session isn't strictly thread-safe
+                        # if used concurrently. However, HttpClient.get creates a new Request.
+                        # To be perfectly safe with requests.Session in threads, we should ideally use separate sessions
+                        # or rely on the fact that we are just doing GETs which are usually safe.
+                        # BUT: requests.Session object is NOT thread-safe.
+                        # We should create a lightweight session for each thread or use the main one with a lock.
+                        # Given the overhead, let's create a new session inside the thread or use a pool.
+                        # Actually, TraccarHttpProvider._create_session() creates a new session.
+                        # Let's create a local session for the worker.
+                        
+                        # Re-using the passed 'session' in threads is NOT safe.
+                        # We will use the provider's http_client to make a raw request, 
+                        # but we need auth. 
+                        
+                        # Better approach: Create a new session for each worker.
+                        worker_session = self._create_session()
+                        try:
+                            data = self.http_client.get("/api/positions", session=worker_session, params=params, expect_json=True)
+                        finally:
+                            worker_session.close()
 
                         # Validate response type
                         if not isinstance(data, list):
                             print(f"[TRACCAR_HTTP] Warning: Invalid response for device {device_id_str}: expected list, got {type(data).__name__}")
-                            continue
+                            return []
 
                         # Normalize each position
+                        device_positions = []
                         for pos in data:
                             try:
                                 feature = self._normalize_position(pos, device_map)
-                                all_positions.append(feature)
+                                device_positions.append(feature)
                             except Exception as e:
-                                print(f"[TRACCAR_HTTP] Warning: Failed to normalize breadcrumb position for device {device_id_str}: {e}")
+                                # print(f"[TRACCAR_HTTP] Warning: Failed to normalize breadcrumb position for device {device_id_str}: {e}")
                                 continue
+                        return device_positions
 
-                    except (ProviderAuthError, ProviderNetworkError):
-                        # Network/auth errors are fatal - re-raise
-                        raise
                     except Exception as e:
-                        # Log error but continue with other devices (graceful degradation)
                         print(f"[TRACCAR_HTTP] Warning: Failed to fetch breadcrumbs for device {device_name}: {e}")
-                        continue
+                        return []
+
+                # Execute in parallel
+                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                    future_to_device = {
+                        executor.submit(fetch_device_breadcrumbs, d_id, d_name): d_id 
+                        for d_id, d_name in device_map.items()
+                    }
+                    
+                    for future in concurrent.futures.as_completed(future_to_device):
+                        results = future.result()
+                        if results:
+                            all_positions.extend(results)
 
                 # Sort by (device_id, timestamp)
                 all_positions.sort(key=lambda x: (x['device_id'], x['ts']))
@@ -531,6 +580,11 @@ class TraccarHttpProvider(Provider):
                         provider_name='traccar_http',
                         recoverable=False
                     )
+
+                # Update device cache so subsequent calls during this refresh don't re-fetch
+                device_map = self._build_device_map(data)
+                self._set_device_cache(device_map)
+                print(f"[TRACCAR_HTTP] Device cache updated via get_devices: {len(device_map)} devices")
 
                 # Normalize each device
                 devices = []

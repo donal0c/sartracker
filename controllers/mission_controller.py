@@ -67,6 +67,7 @@ class MissionController(QObject):
     SETTINGS_KEY_START = f"{SETTINGS_PREFIX}/mission_start_time"
     SETTINGS_KEY_PAUSED_SECONDS = f"{SETTINGS_PREFIX}/mission_paused_seconds"
     SETTINGS_KEY_PAUSE_STARTED = f"{SETTINGS_PREFIX}/mission_pause_started"
+    SETTINGS_KEY_RESUME_STATE = f"{SETTINGS_PREFIX}/mission_resume_state"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -122,6 +123,7 @@ class MissionController(QObject):
         self._emit_state_changed()
         self._emit_timing_update(force=True)
         self._clear_saved_state()
+        self._update_resume_state("active")
         return True
 
     def pause_mission(self) -> bool:
@@ -134,6 +136,7 @@ class MissionController(QObject):
         self._emit_state_changed()
         self._emit_timing_update(force=True)
         self._save_paused_state()
+        self._update_resume_state("paused")
         return True
 
     def resume_mission(self) -> bool:
@@ -155,6 +158,7 @@ class MissionController(QObject):
         self._emit_state_changed()
         self._emit_timing_update(force=True)
         self._clear_saved_state()
+        self._update_resume_state("active")
         return True
 
     def finish_mission(self) -> bool:
@@ -177,6 +181,7 @@ class MissionController(QObject):
 
         self._timer.stop()
         self._clear_saved_state()
+        self._update_resume_state("idle")
 
         # Reset timers for UI (emit zeroed values after finish event)
         self._mission_start_ts = None
@@ -201,6 +206,12 @@ class MissionController(QObject):
         if not paused:
             return None
 
+        resume_state = str(settings.value(self.SETTINGS_KEY_RESUME_STATE, "") or "").strip().lower()
+        if resume_state and resume_state != "paused":
+            # Stale or conflicting state found – clear persisted data and skip prompt
+            self.clear_saved_state()
+            return None
+
         mission_name = settings.value(self.SETTINGS_KEY_NAME, None)
         start_time_str = settings.value(self.SETTINGS_KEY_START, None)
         paused_seconds = settings.value(self.SETTINGS_KEY_PAUSED_SECONDS, 0.0)
@@ -220,6 +231,7 @@ class MissionController(QObject):
     def clear_saved_state(self):
         """Public helper for clearing persisted mission state."""
         self._clear_saved_state()
+        self._update_resume_state("idle")
 
     def restore_from_state(self, state: Dict[str, str]) -> bool:
         """Restore mission controller from saved state."""
@@ -356,12 +368,21 @@ class MissionController(QObject):
             self.SETTINGS_KEY_PAUSE_STARTED,
             self._pause_started_at.isoformat() if self._pause_started_at else ""
         )
+        settings.sync()
 
     def _clear_saved_state(self):
         settings = QSettings()
-        settings.remove(self.SETTINGS_KEY_PAUSED)
+        settings.setValue(self.SETTINGS_KEY_PAUSED, False)
         settings.remove(self.SETTINGS_KEY_NAME)
         settings.remove(self.SETTINGS_KEY_START)
         settings.remove(self.SETTINGS_KEY_PAUSED_SECONDS)
         settings.remove(self.SETTINGS_KEY_PAUSE_STARTED)
+        settings.sync()
+
+    def _update_resume_state(self, state: str):
+        """Persist high-level mission lifecycle state for resume guards."""
+        state_value = (state or "").strip().lower() or "idle"
+        settings = QSettings()
+        settings.setValue(self.SETTINGS_KEY_RESUME_STATE, state_value)
+        settings.sync()
 

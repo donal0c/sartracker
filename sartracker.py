@@ -1461,6 +1461,8 @@ class sartracker:
             current = results.get('current', [])
             breadcrumbs = results.get('breadcrumbs', [])
             devices = results.get('devices', [])
+            breadcrumb_processing = results.get('breadcrumb_processing')
+            breadcrumb_processing = results.get('breadcrumb_processing')
 
             print(
                 "[SARTRACKER] Refresh payload -> "
@@ -1489,7 +1491,10 @@ class sartracker:
                 traceback.print_exc()
 
             try:
-                self.layers_controller.update_breadcrumbs(breadcrumbs)
+                self.layers_controller.update_breadcrumbs(
+                    breadcrumbs,
+                    processed_segments=breadcrumb_processing
+                )
                 if not breadcrumbs:
                     print("[SARTRACKER] Breadcrumb payload is empty - clearing layer")
             except Exception as breadcrumb_err:
@@ -2114,8 +2119,11 @@ class sartracker:
             if current:
                 self.layers_controller.update_current_positions(current)
 
-            if breadcrumbs:
-                self.layers_controller.update_breadcrumbs(breadcrumbs)
+            if breadcrumbs or breadcrumb_processing:
+                self.layers_controller.update_breadcrumbs(
+                    breadcrumbs,
+                    processed_segments=breadcrumb_processing
+                )
 
             # Update device list in panel
             if self.sar_panel:

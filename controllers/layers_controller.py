@@ -14,7 +14,7 @@ actual layer management to specialized manager classes:
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 
 from .layer_managers.tracking_manager import TrackingLayerManager
@@ -115,20 +115,30 @@ class LayersController:
         # Delegate to manager - exceptions propagate with proper context
         return self.tracking.update_current_positions(positions)
 
-    def update_breadcrumbs(self, positions: List[Dict], time_gap_minutes: int = 5):
+    def update_breadcrumbs(
+        self,
+        positions: List[Dict],
+        time_gap_minutes: int = 5,
+        processed_segments: Optional[Dict[str, Any]] = None
+    ):
         """
         Update breadcrumb trails layer.
 
         Args:
             positions: List of position dicts from tracking provider
             time_gap_minutes: Minutes gap to break trail into segments (default: 5)
+            processed_segments: Optional provider-supplied segment payload
 
         Raises:
             ValueError: If position data is invalid (from manager)
             RuntimeError: If layer operations fail (from manager)
         """
         # Delegate to manager - exceptions propagate with proper context
-        return self.tracking.update_breadcrumbs(positions, time_gap_minutes)
+        return self.tracking.update_breadcrumbs(
+            positions,
+            time_gap_minutes,
+            processed_segments=processed_segments
+        )
 
     # =========================================================================
     # Marker Methods (delegate to marker manager)
