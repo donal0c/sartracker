@@ -24,7 +24,8 @@ from qgis.core import (
     QgsFillSymbol,
     QgsWkbTypes,
     QgsMapLayerStyle,
-    QgsVectorLayerExporter
+    QgsVectorLayerExporter,
+    QgsVectorFileWriter
 )
 
 from .schema import (
@@ -58,6 +59,41 @@ GEOMETRY_WKB_MAP = {
     "LineString": QgsWkbTypes.LineString,
     "Polygon": QgsWkbTypes.Polygon
 }
+
+_HAS_EXPORTER_SAVE_OPTIONS = hasattr(QgsVectorLayerExporter, "SaveVectorOptions")
+
+
+def _create_save_vector_options():
+    """Return a SaveVectorOptions instance compatible with the running QGIS version."""
+    if _HAS_EXPORTER_SAVE_OPTIONS:
+        return QgsVectorLayerExporter.SaveVectorOptions()
+    return QgsVectorFileWriter.SaveVectorOptions()
+
+
+def _export_layer(layer, path, options, transform_context):
+    """Export a layer using the best available writer API."""
+    if _HAS_EXPORTER_SAVE_OPTIONS:
+        return QgsVectorLayerExporter.exportLayer(layer, path, options, transform_context)
+    return QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, transform_context, options)
+
+
+_EXPORT_CREATE_OR_OVERWRITE = (
+    QgsVectorLayerExporter.CreateOrOverwriteLayer
+    if _HAS_EXPORTER_SAVE_OPTIONS
+    else QgsVectorFileWriter.CreateOrOverwriteLayer
+)
+
+_EXPORT_NO_ERROR = (
+    QgsVectorLayerExporter.NoError
+    if _HAS_EXPORTER_SAVE_OPTIONS
+    else QgsVectorFileWriter.NoError
+)
+
+
+def _set_option_if_available(options, attr_name, value):
+    """Safely set advanced exporter options that may not exist on older QGIS releases."""
+    if hasattr(options, attr_name):
+        setattr(options, attr_name, value)
 
 
 class LayerManager:
@@ -599,23 +635,23 @@ class LayerManager:
         self._ensure_mission_store_directory()
         template_layer = self._create_memory_layer(layer_def)
 
-        options = QgsVectorLayerExporter.SaveVectorOptions()
+        options = _create_save_vector_options()
         options.driverName = self.MISSION_STORE_DRIVER
         options.layerName = layer_def.layer_id
-        options.actionOnExistingFile = QgsVectorLayerExporter.CreateOrOverwriteLayer
+        options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE
         options.fileEncoding = "UTF-8"
         options.onlySelectedFeatures = False
-        options.includeMetadata = True
-        options.overwriteWithEmptyLayer = True
+        _set_option_if_available(options, "includeMetadata", True)
+        _set_option_if_available(options, "overwriteWithEmptyLayer", True)
 
-        result, error_message = QgsVectorLayerExporter.exportLayer(
+        result, error_message = _export_layer(
             template_layer,
             self._mission_store_path,
             options,
             QgsCoordinateTransformContext()
         )
 
-        if result != QgsVectorLayerExporter.NoError:
+        if result != _EXPORT_NO_ERROR:
             raise RuntimeError(
                 f"Failed to create persistent layer '{layer_def.layer_id}': {error_message}"
             )
@@ -802,21 +838,21 @@ class LayerManager:
         if not layer or layer.providerType() != "memory":
             raise ValueError("Only memory layers can be migrated")
 
-        options = QgsVectorLayerExporter.SaveVectorOptions()
+        options = _create_save_vector_options()
         options.driverName = self.MISSION_STORE_DRIVER
         options.layerName = layer_def.layer_id
-        options.actionOnExistingFile = QgsVectorLayerExporter.CreateOrOverwriteLayer
+        options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE
         options.fileEncoding = "UTF-8"
-        options.includeMetadata = True
+        _set_option_if_available(options, "includeMetadata", True)
 
-        result, error_message = QgsVectorLayerExporter.exportLayer(
+        result, error_message = _export_layer(
             layer,
             self._mission_store_path,
             options,
             self.project.transformContext()
         )
 
-        if result != QgsVectorLayerExporter.NoError:
+        if result != _EXPORT_NO_ERROR:
             raise RuntimeError(
                 f"Failed to migrate layer '{layer_def.layer_id}' to mission store: {error_message}"
             )

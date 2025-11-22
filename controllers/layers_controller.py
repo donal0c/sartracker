@@ -150,7 +150,10 @@ class LayersController:
 
     def add_ipp_lkp(self, name: str, lat: float, lon: float,
                     subject_category: str = "", description: str = "",
-                    irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                    irish_grid_e: float = None, irish_grid_n: float = None,
+                    coordinator_ids: Optional[str] = None,
+                    updated_by: Optional[str] = None,
+                    attachment_path: Optional[str] = None) -> str:
         """
         Add an IPP/LKP (Initial Planning Point / Last Known Position) marker.
 
@@ -162,19 +165,28 @@ class LayersController:
             description: Additional notes
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
+            coordinator_ids: CSV of coordinators responsible for this marker
+            updated_by: Identifier for the user entering the marker
+            attachment_path: Optional attachment stored for the marker
 
         Returns:
             str: UUID of added marker
         """
         return self.markers.add_ipp_lkp(
             name, lat, lon, subject_category, description,
-            irish_grid_e, irish_grid_n
+            irish_grid_e, irish_grid_n,
+            coordinator_ids=coordinator_ids,
+            updated_by=updated_by,
+            attachment_path=attachment_path
         )
 
     def add_clue(self, name: str, lat: float, lon: float,
                  clue_type: str = "", confidence: str = "Possible",
                  description: str = "",
-                 irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                 irish_grid_e: float = None, irish_grid_n: float = None,
+                 coordinator_ids: Optional[str] = None,
+                 updated_by: Optional[str] = None,
+                 attachment_path: Optional[str] = None) -> str:
         """
         Add a clue marker (evidence found during search).
 
@@ -187,19 +199,28 @@ class LayersController:
             description: Additional notes
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
+            coordinator_ids: CSV of coordinators responsible for this clue
+            updated_by: Identifier for the user entering the clue
+            attachment_path: Optional attachment stored with the clue
 
         Returns:
             str: UUID of added clue
         """
         return self.markers.add_clue(
             name, lat, lon, clue_type, confidence, description,
-            irish_grid_e, irish_grid_n
+            irish_grid_e, irish_grid_n,
+            coordinator_ids=coordinator_ids,
+            updated_by=updated_by,
+            attachment_path=attachment_path
         )
 
     def add_hazard(self, name: str, lat: float, lon: float,
                    hazard_type: str = "", severity: str = "Medium",
                    description: str = "",
-                   irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                   irish_grid_e: float = None, irish_grid_n: float = None,
+                   coordinator_ids: Optional[str] = None,
+                   updated_by: Optional[str] = None,
+                   attachment_path: Optional[str] = None) -> str:
         """
         Add a hazard marker (safety warning).
 
@@ -212,20 +233,29 @@ class LayersController:
             description: Additional notes
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
+            coordinator_ids: CSV of coordinators responsible for the hazard
+            updated_by: Identifier for the user entering the hazard
+            attachment_path: Optional attachment stored with the hazard
 
         Returns:
             str: UUID of added hazard
         """
         return self.markers.add_hazard(
             name, lat, lon, hazard_type, severity, description,
-            irish_grid_e, irish_grid_n
+            irish_grid_e, irish_grid_n,
+            coordinator_ids=coordinator_ids,
+            updated_by=updated_by,
+            attachment_path=attachment_path
         )
 
     def add_casualty(self, name: str, lat: float, lon: float,
                      condition: str = "", treatment: str = "",
                      evacuation_priority: str = "",
                      description: str = "", found_by: str = "",
-                     irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                     irish_grid_e: float = None, irish_grid_n: float = None,
+                     coordinator_ids: Optional[str] = None,
+                     updated_by: Optional[str] = None,
+                     attachment_path: Optional[str] = None) -> str:
         """
         Add a casualty marker (found injured or deceased person).
 
@@ -243,13 +273,19 @@ class LayersController:
             found_by: Team member or device ID who found the casualty
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
+            coordinator_ids: CSV of coordinators responsible for the casualty record
+            updated_by: Identifier for the user entering the casualty
+            attachment_path: Optional attachment stored with the casualty
 
         Returns:
             str: UUID of added casualty
         """
         return self.markers.add_casualty(
             name, lat, lon, condition, treatment, evacuation_priority,
-            description, found_by, irish_grid_e, irish_grid_n
+            description, found_by, irish_grid_e, irish_grid_n,
+            coordinator_ids=coordinator_ids,
+            updated_by=updated_by,
+            attachment_path=attachment_path
         )
 
     def list_markers(self) -> List[Dict[str, Any]]:
