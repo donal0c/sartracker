@@ -27,12 +27,14 @@ class MarkerLogWidget(QWidget):
         edit_requested(str marker_type, str marker_id)
         delete_requested(str marker_type, str marker_id)
         zoom_requested(float lat, float lon)
+        open_attachment_requested(str attachment_path)
         refresh_requested()
     """
 
     edit_requested = pyqtSignal(str, str)
     delete_requested = pyqtSignal(str, str)
     zoom_requested = pyqtSignal(float, float)
+    open_attachment_requested = pyqtSignal(str)
     refresh_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -90,6 +92,10 @@ class MarkerLogWidget(QWidget):
         self.zoom_button = QPushButton("Zoom")
         self.zoom_button.clicked.connect(self._emit_zoom)
         button_layout.addWidget(self.zoom_button)
+
+        self.open_attachment_button = QPushButton("Open Attachment")
+        self.open_attachment_button.clicked.connect(self._emit_open_attachment)
+        button_layout.addWidget(self.open_attachment_button)
 
         self.edit_button = QPushButton("Edit")
         self.edit_button.clicked.connect(self._emit_edit)
@@ -176,6 +182,7 @@ class MarkerLogWidget(QWidget):
         self.edit_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
         self.zoom_button.setEnabled(enabled and record.get("lat") is not None and record.get("lon") is not None)
+        self.open_attachment_button.setEnabled(enabled and bool(record.get("attachment_path")))
 
         if record:
             details = [
@@ -212,3 +219,7 @@ class MarkerLogWidget(QWidget):
         if record and record.get("lat") is not None and record.get("lon") is not None:
             self.zoom_requested.emit(record["lat"], record["lon"])
 
+    def _emit_open_attachment(self):
+        record = self._selected_record()
+        if record and record.get("attachment_path"):
+            self.open_attachment_requested.emit(record["attachment_path"])

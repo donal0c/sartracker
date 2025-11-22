@@ -42,7 +42,7 @@ else:
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
-from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QInputDialog
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsPointXY, QgsRectangle, QgsApplication
@@ -54,7 +54,7 @@ import os.path
 import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted
+from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
@@ -62,6 +62,7 @@ from .utils.dialog_utils import BaseDialog
 from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
 from .config.keys import ConfigStore, SETTINGS_KEYS
 from .utils.secure_store import SecureStore
+from .ui.mission_metadata_dialog import MissionMetadataDialog
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -107,6 +108,15 @@ except Exception as e:
     MissionController = None
     MissionState = None
     print(f"ERROR importing MissionController: {e}")
+
+# Import MarkerController (marker CRUD orchestration)
+try:
+    from .controllers.marker_controller import MarkerController
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('controllers.marker_controller.MarkerController', e, traceback.format_exc()))
+    MarkerController = None
+    print(f"ERROR importing MarkerController: {e}")
 
 # Import LayerManager (Phase N2)
 try:
@@ -590,9 +600,25 @@ class sartracker:
         self._mission_attachments_dir: Optional[Path] = None
         self._mission_backup_directory: Optional[Path] = None
         self._mission_gpkg_path: Optional[Path] = None
+        self._metadata_collected: bool = False
+        self._mission_coordinators_cache: str = ""
+        self._last_mission_state = None
+        self._is_finalizing: bool = False  # Race condition protection
 
         # Initialize layers controller
         self.layers_controller = LayersController(self.iface, layer_manager=self.layer_manager)
+
+        # Marker interaction controller (delegates marker CRUD workflows)
+        if MarkerController is not None and self.layers_controller:
+            self.marker_controller = MarkerController(
+                self.iface,
+                self.layers_controller,
+                ingest_attachment=self._ingest_attachment,
+                refresh_log=lambda: None,
+                get_mission_directory=lambda: self._mission_directory
+            )
+        else:
+            self.marker_controller = None
 
         # Initialize marker map tool
         self.marker_tool = MarkerMapTool(self.iface.mapCanvas())
@@ -691,6 +717,10 @@ class sartracker:
                 self.mission_controller = MissionController(parent=self.iface.mainWindow())
                 self.mission_controller.mission_state_changed.connect(self._on_mission_state_changed)
                 self.mission_controller.mission_timing_updated.connect(self._on_mission_timing_update)
+                try:
+                    self._last_mission_state = self.mission_controller.state
+                except Exception:
+                    self._last_mission_state = None
                 print("[SARTRACKER] Mission controller initialized")
             except Exception as e:
                 self.mission_controller = None
@@ -709,10 +739,21 @@ class sartracker:
                 self.sar_panel.refresh_marker_log()
             except Exception as log_error:
                 print(f"[SARTRACKER] Warning: Could not initialize marker log: {log_error}")
+        if self.marker_controller and self.sar_panel:
+            # Update marker controller refresh hook now that panel exists
+            self.marker_controller._refresh_log = self.sar_panel.refresh_marker_log
         if self.sar_panel:
-            self.sar_panel.marker_edit_requested.connect(self._on_marker_edit_requested)
-            self.sar_panel.marker_delete_requested.connect(self._on_marker_delete_requested)
-            self.sar_panel.marker_zoom_requested.connect(self._on_marker_zoom_requested)
+            if self.marker_controller:
+                self.sar_panel.marker_edit_requested.connect(self.marker_controller.handle_edit)
+                self.sar_panel.marker_delete_requested.connect(self.marker_controller.handle_delete)
+                self.sar_panel.marker_zoom_requested.connect(self.marker_controller.zoom_to_marker)
+                self.sar_panel.attachment_open_requested.connect(self.marker_controller.open_attachment)
+            else:
+                self.sar_panel.marker_edit_requested.connect(self._on_marker_edit_requested)
+                self.sar_panel.marker_delete_requested.connect(self._on_marker_delete_requested)
+                self.sar_panel.marker_zoom_requested.connect(self._on_marker_zoom_requested)
+            self.sar_panel.finalize_mission_requested.connect(self._on_finalize_mission_requested)
+            self.sar_panel.unlock_mission_requested.connect(self._on_unlock_mission_requested)
 
         # Connect SAR Panel signals
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
@@ -1341,20 +1382,30 @@ class sartracker:
     def _on_mission_state_changed(self, state, context):
         """Handle mission state transitions from MissionController."""
         mission_name = context.get('mission_name') or "Mission"
+        prev_state = self._last_mission_state
+        self._last_mission_state = state
 
         if state == MissionState.ACTIVE:
-            if context.get('paused_since'):
+            if prev_state == MissionState.PAUSED:
                 message = "Mission resumed"
                 self._handle_mission_resume_storage(mission_name)
             else:
                 message = f"Mission '{mission_name}' started"
                 self._prepare_new_mission_storage(mission_name)
+                self._metadata_collected = False
+                has_coords = bool(self._mission_coordinators_cache or (self.layer_manager and self.layer_manager.get_mission_coordinators()))
+                if not has_coords:
+                    self._collect_mission_metadata(mode="start", allow_resume_time=False)
             success(self.iface.messageBar(), "SAR Tracker", message, duration=3)
             if self.sar_panel:
                 self.sar_panel.refresh_marker_log()
+                # Hide finalize button during active mission
+                self.sar_panel.set_finalize_button_visible(visible=False)
         elif state == MissionState.PAUSED:
             warning(self.iface.messageBar(), "SAR Tracker", "Mission paused", duration=2)
             self._update_mission_storage_status(active=False)
+            if self.sar_panel:
+                self.sar_panel.set_finalize_button_visible(visible=False)
         elif state == MissionState.FINISHED:
             final_elapsed = context.get('final_elapsed_seconds')
             if final_elapsed:
@@ -1383,6 +1434,11 @@ class sartracker:
             if self.sar_panel:
                 self.sar_panel.refresh_marker_log()
 
+            # Show finalize button after mission ends (if not already finalized)
+            if self.sar_panel and self._mission_gpkg_path:
+                is_finalized = self._check_mission_finalized()
+                self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
+
     def _on_mission_timing_update(self, elapsed_seconds, active_seconds):
         """Relay timing updates to SARPanel."""
         if self.sar_panel:
@@ -1405,6 +1461,261 @@ class sartracker:
 
         self._update_mission_storage_status(active=False)
 
+    def _on_finalize_mission_requested(self):
+        """Handle finalize mission request from SAR Panel."""
+        # CRITICAL GUARD: Check components exist (async handler may fire during unload)
+        if not self.iface or not self.sar_panel or not self.layer_manager:
+            print("[SARTRACKER] Finalize requested after unload, ignoring")
+            return
+
+        # Race condition protection: prevent duplicate finalization
+        if self._is_finalizing:
+            info(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "Finalization already in progress, please wait.",
+                duration=3
+            )
+            return
+
+        if not self._mission_gpkg_path or not self._mission_directory:
+            error(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "No active mission store to finalize.",
+                duration=5
+            )
+            return
+
+        # Check if already finalized
+        if self._check_mission_finalized():
+            info(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "Mission is already finalized.",
+                duration=3
+            )
+            return
+
+        self._is_finalizing = True
+        try:
+            # Save project before archiving
+            project = QgsProject.instance()
+            if project.fileName():
+                if not project.write():
+                    raise RuntimeError("Failed to save QGIS project before finalization")
+            else:
+                error(
+                    self.iface.messageBar(),
+                    "Finalize Mission",
+                    "Please save the project before finalizing the mission.",
+                    duration=5
+                )
+                return
+
+            # Create archive
+            archive_path = self._create_mission_archive()
+
+            # Mark as finalized in project custom variables
+            self._mark_mission_finalized()
+
+            # Update UI
+            if self.sar_panel:
+                self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=True)
+
+            success(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                f"Mission finalized successfully. Archive saved to:\n{archive_path}",
+                duration=10
+            )
+
+        except Exception as exc:
+            error(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                f"Failed to finalize mission: {exc}",
+                duration=10
+            )
+            print(f"[SARTRACKER] Error finalizing mission: {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._is_finalizing = False
+
+    def _on_unlock_mission_requested(self):
+        """Handle admin unlock request for finalized missions."""
+        if not self.layer_manager or not self._check_mission_finalized():
+            info(self.iface.messageBar(), "Mission Unlock", "Mission is not finalized.", duration=4)
+            return
+
+        admin_roster = ConfigStore.get_admin_list()
+        prompt_text = "Enter admin name to unlock mission:"
+        if admin_roster:
+            prompt_text += f"\nAllowed: {', '.join(admin_roster)}"
+
+        admin_name, ok = QInputDialog.getText(
+            self.iface.mainWindow(),
+            "Unlock Finalized Mission",
+            prompt_text
+        )
+        if not ok:
+            return
+        admin_name = (admin_name or "").strip()
+        if admin_roster and admin_name not in admin_roster:
+            warning(self.iface.messageBar(), "Mission Unlock", "Admin not in roster.", duration=5)
+            return
+
+        try:
+            self.layer_manager.set_mission_finalized(False, finalized_by=admin_name)
+            info(self.iface.messageBar(), "Mission Unlock", "Mission unlocked. Editing is re-enabled.", duration=5)
+            if self.sar_panel:
+                self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=False)
+        except Exception as exc:
+            error(self.iface.messageBar(), "Mission Unlock", f"Failed to unlock mission: {exc}", duration=6)
+
+    def _create_mission_archive(self) -> Path:
+        """
+        Create a zip archive of the mission.
+
+        Returns:
+            Path to the created archive
+
+        Raises:
+            RuntimeError: If archive creation fails
+        """
+        import zipfile
+        from datetime import datetime
+
+        if not self._mission_directory or not self._mission_gpkg_path:
+            raise RuntimeError("Mission directory or GeoPackage path not set")
+
+        # Determine archive location (backup directory or same as mission directory)
+        if self._mission_backup_directory and self._mission_backup_directory.exists():
+            archive_dir = self._mission_backup_directory
+        else:
+            archive_dir = self._mission_directory.parent
+
+        # Create archive filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = f"{self._mission_folder_name}_finalized_{timestamp}.zip"
+        archive_path = archive_dir / archive_name
+
+        print(f"[SARTRACKER] Creating mission archive: {archive_path}")
+
+        try:
+            with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add GeoPackage
+                if self._mission_gpkg_path.exists():
+                    zipf.write(
+                        self._mission_gpkg_path,
+                        arcname=f"{self._mission_folder_name}/{self._mission_gpkg_path.name}"
+                    )
+                    print(f"[SARTRACKER] Added GeoPackage: {self._mission_gpkg_path.name}")
+                else:
+                    raise RuntimeError(
+                        f"Mission GeoPackage not found at {self._mission_gpkg_path}. "
+                        "Cannot create archive without mission data."
+                    )
+
+                # Add QGIS project file
+                project = QgsProject.instance()
+                project_path = Path(project.fileName())
+                if project_path.exists():
+                    zipf.write(
+                        project_path,
+                        arcname=f"{self._mission_folder_name}/{project_path.name}"
+                    )
+                    print(f"[SARTRACKER] Added project file: {project_path.name}")
+
+                # Add attachments directory if it exists
+                if self._mission_attachments_dir and self._mission_attachments_dir.exists():
+                    for attachment_file in self._mission_attachments_dir.rglob('*'):
+                        if attachment_file.is_file():
+                            rel_path = attachment_file.relative_to(self._mission_directory)
+                            zipf.write(
+                                attachment_file,
+                                arcname=f"{self._mission_folder_name}/{rel_path}"
+                            )
+                    print(f"[SARTRACKER] Added attachments from: {self._mission_attachments_dir}")
+
+            print(f"[SARTRACKER] Archive created successfully: {archive_path}")
+            return archive_path
+
+        except Exception as exc:
+            if archive_path.exists():
+                try:
+                    archive_path.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError(f"Failed to create archive: {exc}") from exc
+
+    def _mark_mission_finalized(self):
+        """Mark the current mission as finalized in project custom variables."""
+        if self.layer_manager:
+            try:
+                self.layer_manager.set_mission_finalized(True)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to mark mission as finalized: {exc}")
+
+    def _check_mission_finalized(self) -> bool:
+        """
+        Check if the current mission is finalized.
+
+        Returns:
+            True if mission is finalized, False otherwise
+        """
+        if self.layer_manager:
+            return self.layer_manager.is_mission_finalized()
+        return False
+
+    def _show_resume_mission_prompt(self, gpkg_path: Path) -> bool:
+        """
+        Show a dialog asking user whether to resume existing mission or start fresh.
+
+        Args:
+            gpkg_path: Path to the existing mission GeoPackage
+
+        Returns:
+            True if user chose to resume, False if user chose start fresh
+        """
+        from qgis.PyQt.QtWidgets import QMessageBox
+
+        mission_name = gpkg_path.parent.name
+
+        # Check if mission is finalized
+        is_finalized = self._check_mission_finalized()
+
+        if is_finalized:
+            message = (
+                f"Found finalized mission: <b>{mission_name}</b>\n\n"
+                f"Location: {gpkg_path.parent}\n\n"
+                f"This mission has been archived and is marked as read-only.\n\n"
+                f"<b>Resume:</b> View mission data (read-only mode)\n"
+                f"<b>Start Fresh:</b> Clear this mission and begin a new one"
+            )
+        else:
+            message = (
+                f"Found existing mission: <b>{mission_name}</b>\n\n"
+                f"Location: {gpkg_path.parent}\n\n"
+                f"<b>Resume:</b> Continue working on this mission\n"
+                f"<b>Start Fresh:</b> Clear this mission and begin a new one"
+            )
+
+        dialog = QMessageBox(self.iface.mainWindow())
+        dialog.setWindowTitle("Resume Mission?")
+        dialog.setText(message)
+        dialog.setIcon(QMessageBox.Question)
+
+        resume_button = dialog.addButton("Resume", QMessageBox.AcceptRole)
+        start_fresh_button = dialog.addButton("Start Fresh", QMessageBox.RejectRole)
+        dialog.setDefaultButton(resume_button)
+
+        dialog_exec(dialog)
+
+        clicked_button = dialog.clickedButton()
+        return clicked_button == resume_button
+
     def _sanitize_mission_name(self, name: str) -> str:
         """Generate filesystem-safe mission folder name."""
         sanitized = re.sub(r'[^A-Za-z0-9 _-]+', '', name or '').strip()
@@ -1420,10 +1731,108 @@ class sartracker:
         backup_root = Path(backup_root_str).expanduser() if backup_root_str else None
         return primary_root, backup_root
 
+    def _collect_mission_metadata(self, mode: str, allow_resume_time: bool, preselected: Optional[list] = None):
+        """Prompt for coordinators (and optional resume time) and persist to project."""
+        if not self.layer_manager:
+            return
+
+        roster = ConfigStore.get_coordinator_list()
+        existing_raw = self.layer_manager.get_mission_coordinators()
+        existing = []
+        if existing_raw:
+            for token in existing_raw.split(","):
+                name = token.strip()
+                if name:
+                    existing.append(name)
+        preselect = preselected or existing
+
+        dialog = MissionMetadataDialog(
+            coordinators=roster,
+            mode=mode,
+            allow_resume_time=allow_resume_time,
+            preselected=preselect,
+            parent=self.iface.mainWindow()
+        )
+        result = dialog_exec(dialog)
+        if result != DialogAccepted:
+            return
+
+        selected = dialog.selected_coordinators()
+        pending_entry = dialog.pending_entry()
+        updated_roster = dialog.updated_roster()
+
+        # Preserve existing selections if none were checked
+        if not selected and existing:
+            selected = existing
+
+        # If user typed but didn't press Add, capture that entry
+        if not selected and pending_entry:
+            selected = [pending_entry]
+            updated_roster = updated_roster or []
+            if pending_entry not in updated_roster:
+                updated_roster.append(pending_entry)
+
+        # If still empty, fall back to all entries in list (checked or not)
+        if not selected:
+            all_entries = dialog.all_entries()
+            if all_entries:
+                selected = all_entries
+
+        # Persist coordinators for mission and settings roster enrichment
+        try:
+            self.layer_manager.set_mission_coordinators(",".join(selected))
+            self._mission_coordinators_cache = ",".join(selected)
+        except Exception as exc:
+            warning(self.iface.messageBar(), "Mission Metadata", f"Failed to save coordinators: {exc}", duration=6)
+            print(f"[SARTRACKER] Warning: Failed to persist mission coordinators: {exc}")
+
+        if updated_roster:
+            ConfigStore.set_coordinator_roster("\n".join(updated_roster))
+
+        resume_dt = dialog.resume_timestamp()
+        if resume_dt:
+            try:
+                iso_ts = resume_dt.toUTC().toString(Qt.ISODate)
+                self.layer_manager.set_resume_timestamp(iso_ts)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to persist resume timestamp: {exc}")
+
+        # If still empty, use cache or global roster so we don't reprompt forever
+        if not selected:
+            fallback = []
+            if self._mission_coordinators_cache:
+                fallback = [name for name in self._mission_coordinators_cache.split(",") if name.strip()]
+            elif roster:
+                fallback = roster
+            if fallback:
+                selected = fallback
+                try:
+                    self.layer_manager.set_mission_coordinators(",".join(selected))
+                    self._mission_coordinators_cache = ",".join(selected)
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Failed to persist coordinator fallback: {exc}")
+
+        # Only treat metadata as collected if we have coordinators recorded; otherwise, suppress re-prompt loop
+        self._metadata_collected = bool(selected)
+
     def _prepare_new_mission_storage(self, mission_name: str):
         """Create mission storage directories + GeoPackage for a new mission."""
         if not self.layer_manager:
             return
+
+        # Clear finalized flag for new mission
+        try:
+            self.layer_manager.set_mission_finalized(False)
+        except Exception:
+            pass
+        # Reset mission metadata and clear cached coordinators/resume time
+        try:
+            self.layer_manager.set_mission_coordinators("")
+            self.layer_manager.set_resume_timestamp("")
+        except Exception:
+            pass
+        self._mission_coordinators_cache = ""
+        self._metadata_collected = False
 
         primary_root, backup_root = self._mission_roots_from_settings()
         sanitized_name = self._sanitize_mission_name(mission_name)
@@ -1444,6 +1853,7 @@ class sartracker:
         if self.layers_controller:
             self.layers_controller.clear_layers()
         self.layer_manager.ensure_structure(auto_migrate=False)
+        self._metadata_collected = False
         self._update_mission_storage_status(active=True)
 
         # CRITICAL: Refresh catalog cache (layers now backed by GeoPackage)
@@ -1479,6 +1889,14 @@ class sartracker:
         attachments_dir.mkdir(parents=True, exist_ok=True)
         self._mission_attachments_dir = attachments_dir
         self._mission_backup_directory = self._ensure_backup_directory(create=True)
+        # Load coordinators from project and cache them
+        try:
+            existing_coords = self.layer_manager.get_mission_coordinators() if self.layer_manager else ""
+            self._mission_coordinators_cache = existing_coords or ""
+            self._metadata_collected = bool(existing_coords)
+        except Exception:
+            self._mission_coordinators_cache = ""
+            self._metadata_collected = False
         self._update_mission_storage_status(active=True)
 
         # CRITICAL: Refresh catalog cache (layers now from GeoPackage)
@@ -1505,7 +1923,52 @@ class sartracker:
             self._update_mission_storage_status(active=False)
             return
 
+        # Show resume prompt if mission store exists
         gpkg_path = Path(store_path)
+        if gpkg_path.exists():
+            try:
+                should_resume = self._show_resume_mission_prompt(gpkg_path)
+            except Exception as prompt_error:
+                print(f"[SARTRACKER] ERROR in resume prompt: {prompt_error}")
+                import traceback
+                traceback.print_exc()
+
+                error(
+                    self.iface.messageBar(),
+                    "Mission Resume",
+                    f"Failed to show resume dialog. Starting fresh.",
+                    duration=5
+                )
+
+                # Safe fallback: start fresh
+                should_resume = False
+
+            if not should_resume:
+                # User chose "Start Fresh" - clear mission store
+                self.layer_manager.clear_mission_store()
+                try:
+                    self.layer_manager.set_mission_finalized(False)
+                    self.layer_manager.set_mission_coordinators("")
+                    self.layer_manager.set_resume_timestamp("")
+                except Exception:
+                    pass
+                self._mission_coordinators_cache = ""
+                self._metadata_collected = False
+                self._mission_gpkg_path = None
+                self._mission_directory = None
+                self._mission_folder_name = None
+                self._mission_backup_directory = None
+                self._mission_attachments_dir = None
+                self._update_mission_storage_status(active=False)
+                info(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    "Mission store cleared. Ready for new mission.",
+                    duration=3
+                )
+                return
+
+        # User chose resume or no prompt needed - continue loading
         self._mission_gpkg_path = gpkg_path
         self._mission_directory = gpkg_path.parent
         self._mission_folder_name = self._mission_directory.name
@@ -1516,8 +1979,31 @@ class sartracker:
             attachments_dir.mkdir(parents=True, exist_ok=True)
             self._mission_attachments_dir = attachments_dir
         self._mission_backup_directory = self._ensure_backup_directory(create=False)
+        try:
+            existing_coords = self.layer_manager.get_mission_coordinators() if self.layer_manager else ""
+            self._mission_coordinators_cache = existing_coords or ""
+            self._metadata_collected = bool(existing_coords)
+        except Exception:
+            self._mission_coordinators_cache = ""
+            self._metadata_collected = False
         is_active = self.mission_controller.is_active() if self.mission_controller else False
         self._update_mission_storage_status(active=is_active)
+
+        # If no coordinators recorded, prompt once on load
+        if not self._metadata_collected:
+            try:
+                self._collect_mission_metadata(
+                    mode="resume",
+                    allow_resume_time=True,
+                    preselected=None
+                )
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Coordinator collection failed on load: {exc}")
+
+        # Show finalize button if mission is not active (finished or idle with data)
+        if self.sar_panel and not is_active:
+            is_finalized = self._check_mission_finalized()
+            self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
 
     def _ensure_backup_directory(self, create: bool, folder_name: Optional[str] = None, backup_root: Optional[Path] = None):
         """Ensure backup directory exists when configured."""
@@ -1658,7 +2144,15 @@ class sartracker:
             return
         primary = str(self._mission_gpkg_path) if self._mission_gpkg_path else None
         backup = str(self._mission_backup_directory) if self._mission_backup_directory else None
-        self.sar_panel.update_mission_storage(primary, backup, active=active)
+        coordinators = ""
+        try:
+            if self.layer_manager:
+                coordinators = self.layer_manager.get_mission_coordinators()
+        except Exception:
+            coordinators = ""
+        # Render coordinators with semicolon separator for readability
+        coord_display = "; ".join([c.strip() for c in coordinators.split(",") if c.strip()]) if coordinators else ""
+        self.sar_panel.update_mission_storage(primary, backup, active=active, coordinators=coord_display)
 
     def _on_refresh_data(self):
         """
@@ -2622,104 +3116,16 @@ class sartracker:
             easting: Irish Grid Easting (ITM)
             northing: Irish Grid Northing (ITM)
         """
-        # Show marker dialog
-        dialog = MarkerDialog(lat, lon, easting, northing, self.iface.mainWindow())
-
-        # Pre-select marker type based on which button was clicked
-        if self.current_marker_type == 'clue':
-            dialog.clue_radio.setChecked(True)
-        elif self.current_marker_type == 'hazard':
-            dialog.hazard_radio.setChecked(True)
-        elif self.current_marker_type == 'casualty':
-            dialog.casualty_radio.setChecked(True)
+        if self.marker_controller:
+            self.marker_controller.handle_new_marker(
+                self.current_marker_type or "ipp_lkp",
+                lat,
+                lon,
+                easting,
+                northing
+            )
         else:
-            dialog.ipp_lkp_radio.setChecked(True)
-
-        # Show dialog and wait for user
-        result = dialog_exec(dialog)
-
-        if result == DialogAccepted:
-            # Get marker data from dialog
-            marker_data = dialog.get_marker_data()
-            marker_data['attachment_path'] = self._ingest_attachment(marker_data.get('attachment_path'))
-
-            try:
-                # Add marker to map based on type
-                if marker_data['type'] == 'ipp_lkp':
-                    marker_id = self.layers_controller.add_ipp_lkp(
-                        name=marker_data['name'],
-                        lat=marker_data['lat'],
-                        lon=marker_data['lon'],
-                        subject_category=marker_data.get('subject_category', ''),
-                        description=marker_data['description'],
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
-                        coordinator_ids=marker_data.get('coordinator_ids'),
-                        updated_by=marker_data.get('updated_by'),
-                        attachment_path=marker_data.get('attachment_path')
-                    )
-                    marker_type_str = "IPP/LKP"
-                elif marker_data['type'] == 'clue':
-                    marker_id = self.layers_controller.add_clue(
-                        name=marker_data['name'],
-                        lat=marker_data['lat'],
-                        lon=marker_data['lon'],
-                        clue_type=marker_data.get('clue_type', ''),
-                        confidence=marker_data.get('confidence', 'Possible'),
-                        description=marker_data['description'],
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
-                        coordinator_ids=marker_data.get('coordinator_ids'),
-                        updated_by=marker_data.get('updated_by'),
-                        attachment_path=marker_data.get('attachment_path')
-                    )
-                    marker_type_str = "Clue"
-                elif marker_data['type'] == 'casualty':
-                    marker_id = self.layers_controller.add_casualty(
-                        name=marker_data['name'],
-                        lat=marker_data['lat'],
-                        lon=marker_data['lon'],
-                        condition=marker_data.get('condition', ''),
-                        treatment=marker_data.get('treatment', ''),
-                        evacuation_priority=marker_data.get('evacuation_priority', ''),
-                        description=marker_data['description'],
-                        found_by=marker_data.get('found_by', ''),
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
-                        coordinator_ids=marker_data.get('coordinator_ids'),
-                        updated_by=marker_data.get('updated_by'),
-                        attachment_path=marker_data.get('attachment_path')
-                    )
-                    marker_type_str = "Casualty"
-                else:  # hazard
-                    marker_id = self.layers_controller.add_hazard(
-                        name=marker_data['name'],
-                        lat=marker_data['lat'],
-                        lon=marker_data['lon'],
-                        hazard_type=marker_data.get('hazard_type', ''),
-                        severity=marker_data.get('severity', 'Medium'),
-                        description=marker_data['description'],
-                        irish_grid_e=marker_data['easting'],
-                        irish_grid_n=marker_data['northing'],
-                        coordinator_ids=marker_data.get('coordinator_ids'),
-                        updated_by=marker_data.get('updated_by'),
-                        attachment_path=marker_data.get('attachment_path')
-                    )
-                    marker_type_str = "Hazard"
-
-                success(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"{marker_type_str} '{marker_data['name']}' added successfully",
-                    duration=3
-                )
-
-            except Exception as e:
-                QMessageBox.critical(
-                    self.iface.mainWindow(),
-                    "Error Adding Marker",
-                    f"An error occurred while adding the marker:\n\n{str(e)}"
-                )
+            warning(self.iface.messageBar(), "Markers", "Marker controller unavailable.", duration=4)
 
         # Deactivate marker tool (return to pan/zoom)
         self.iface.mapCanvas().unsetMapTool(self.marker_tool)

@@ -16,7 +16,7 @@ that must be preserved EXACTLY for accuracy (<1m error requirement).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import math
 import uuid
 import logging
@@ -28,14 +28,15 @@ logger = logging.getLogger(__name__)
 from qgis.core import (
     QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
     QgsPointXY, QgsDistanceArea, QgsProject, QgsLineSymbol,
-    QgsMarkerSymbol, QgsFeatureRequest
+    QgsMarkerSymbol, QgsFeatureRequest, QgsWkbTypes
 )
 from qgis.PyQt.QtCore import QVariant
+from qgis.core import NULL
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
-from ...utils.exceptions import LayerTransactionError
+from ...utils.exceptions import LayerTransactionError, LayerLockError
 
 
 class DrawingLayerManager(BaseLayerManager):
@@ -103,6 +104,32 @@ class DrawingLayerManager(BaseLayerManager):
         payload = extra if extra else None
         self._log_layer_snapshot(layer, f"{layer_type}::{action}", payload)
 
+    def _set_display_order(self, layer: QgsVectorLayer, feature_id: int):
+        """
+        Set display_order field to feature_id for deterministic ordering.
+
+        Safe to call even if the field is missing.
+        """
+        field_idx = layer.fields().indexFromName("display_order")
+        if field_idx == -1:
+            return
+        try:
+            layer.changeAttributeValue(feature_id, field_idx, int(feature_id))
+        except Exception as exc:
+            logger.warning(
+                "Failed to set display_order for %s feature %s: %s",
+                layer.name(),
+                feature_id,
+                exc
+            )
+
+    def _sort_records_by_display_order(self, records: List[Dict]) -> List[Dict]:
+        """Return records ordered by display_order if present."""
+        return sorted(
+            records,
+            key=lambda rec: rec.get('display_order', rec.get('feature_id', 0))
+        )
+
     # =========================================================================
     # Lines Layer
     # =========================================================================
@@ -149,6 +176,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("distance_m", QVariant.Double),   # Double - length in meters
             QgsField("created", QVariant.String),      # String - ISO timestamp
             QgsField("temporary_measure", QVariant.Bool),  # Bool - measurement overlay flag
+            QgsField("display_order", QVariant.Int),   # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -208,13 +236,19 @@ class DrawingLayerManager(BaseLayerManager):
             width,
             total_distance,
             datetime.now().isoformat(),
-            1 if temporary_measure else 0
+            1 if temporary_measure else 0,
+            None  # display_order (set after addFeature)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit line feature: {', '.join(errors)}")
@@ -289,6 +323,10 @@ class DrawingLayerManager(BaseLayerManager):
         if not ids_to_delete:
             return 0
 
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.deleteFeatures(ids_to_delete)
@@ -321,6 +359,193 @@ class DrawingLayerManager(BaseLayerManager):
             for feature in layer.getFeatures(QgsFeatureRequest())
             if bool(feature.attribute(field_idx))
         )
+
+    # -------------------------------------------------------------------------
+    # Lines - Full CRUD (Phase 2)
+    # -------------------------------------------------------------------------
+
+    def list_lines(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """List all line features."""
+        layer = self._get_or_create_lines_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        request = QgsFeatureRequest()
+
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+            if expressions:
+                request.setFilterExpression(' AND '.join(expressions))
+
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                rec = self._feature_to_record(feature, layer)
+                if rec:
+                    records.append(rec)
+        except Exception as exc:
+            logger.error("Error listing lines: %s", exc, exc_info=True)
+        return self._sort_records_by_display_order(records)
+
+    def get_line(self, feature_id: int) -> Optional[Dict]:
+        """Get a single line by feature id."""
+        layer = self._get_or_create_lines_layer()
+        if not layer or not layer.isValid():
+            return None
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+        return self._feature_to_record(feature, layer)
+
+    def update_line(self, feature_id: int, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
+        """Update attributes of a line feature."""
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_or_create_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Lines layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(layer_name=layer.name(), operation="start editing", details="startEditing() returned False")
+
+        try:
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            # Apply updates
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature_id, field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "LINES", "update", feature_id=feature_id)
+            return True
+
+        except Exception as exc:
+            layer.rollBack()
+            if isinstance(exc, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_line(self, feature_id: int, updated_by: Optional[str] = None) -> bool:
+        """Delete a single line feature."""
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Lines layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(layer_name=layer.name(), operation="start editing", details="delete operation")
+
+        try:
+            if not layer.deleteFeature(feature_id):
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "LINES", "delete", feature_id=feature_id)
+            return True
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_lines(self, feature_ids: List[int], updated_by: Optional[str] = None) -> int:
+        """Bulk delete lines."""
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Lines layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(layer_name=layer.name(), operation="start editing", details="bulk delete operation")
+
+        try:
+            deleted = 0
+            for fid in feature_ids:
+                if layer.deleteFeature(fid):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "LINES", "bulk_delete", deleted=deleted)
+            return deleted
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
 
     def _ensure_lines_layer_schema(self, layer: QgsVectorLayer):
         """Ensure legacy lines layers include measurement overlay field."""
@@ -395,6 +620,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("end_time", QVariant.String),        # String - ISO timestamp
             QgsField("notes", QVariant.String),           # String - additional notes
             QgsField("created", QVariant.String),         # String - ISO timestamp
+            QgsField("display_order", QVariant.Int),      # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -469,13 +695,19 @@ class DrawingLayerManager(BaseLayerManager):
             "",  # start_time - set when status changes to InProgress
             "",  # end_time - set when status changes to Completed
             notes,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            None  # display_order (set after feature is added)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit search area feature: {', '.join(errors)}")
@@ -550,6 +782,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("lpb_category", QVariant.String),    # String - LPB category if applicable
             QgsField("percentile", QVariant.Int),         # Int - LPB percentile (25, 50, 75, 95)
             QgsField("created", QVariant.String),         # String - ISO timestamp
+            QgsField("display_order", QVariant.Int),      # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -670,13 +903,19 @@ class DrawingLayerManager(BaseLayerManager):
             color,
             lpb_category,
             percentile,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            None  # display_order (set after addFeature)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit range ring feature: {', '.join(errors)}")
@@ -750,6 +989,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("label", QVariant.String),           # String - display label
             QgsField("color", QVariant.String),           # String - hex color
             QgsField("created", QVariant.String),         # String - ISO timestamp
+            QgsField("display_order", QVariant.Int),      # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -846,13 +1086,19 @@ class DrawingLayerManager(BaseLayerManager):
             distance_m,
             label,
             color,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            None  # display_order (set after addFeature)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit bearing line feature: {', '.join(errors)}")
@@ -927,6 +1173,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("priority", QVariant.String),        # String - High/Medium/Low
             QgsField("color", QVariant.String),           # String - hex color
             QgsField("created", QVariant.String),         # String - ISO timestamp
+            QgsField("display_order", QVariant.Int),      # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -1037,13 +1284,19 @@ class DrawingLayerManager(BaseLayerManager):
             area_sqkm,
             priority,
             color,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            None  # display_order (set after addFeature)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit sector feature: {', '.join(errors)}")
@@ -1072,6 +1325,205 @@ class DrawingLayerManager(BaseLayerManager):
             area_sqkm=area_sqkm
         )
         return feature.id()
+
+    # -------------------------------------------------------------------------
+    # Sectors - Full CRUD (Phase 2)
+    # -------------------------------------------------------------------------
+
+    def list_sectors(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """List all search sector features."""
+        layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        request = QgsFeatureRequest()
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+            if expressions:
+                request.setFilterExpression(' AND '.join(expressions))
+
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                rec = self._feature_to_record(feature, layer)
+                if rec:
+                    records.append(rec)
+        except Exception as exc:
+            logger.error("Error listing sectors: %s", exc, exc_info=True)
+        return self._sort_records_by_display_order(records)
+
+    def get_sector(self, feature_id: int) -> Optional[Dict]:
+        """Get a single search sector by feature id."""
+        layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            return None
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+        return self._feature_to_record(feature, layer)
+
+    def update_sector(self, feature_id: int, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
+        """Update a search sector feature."""
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Sectors layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature_id, field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SECTORS", "update", feature_id=feature_id)
+            return True
+
+        except Exception as exc:
+            layer.rollBack()
+            if isinstance(exc, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_sector(self, feature_id: int, updated_by: Optional[str] = None) -> bool:
+        """Delete a single search sector."""
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Sectors layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="delete operation"
+            )
+
+        try:
+            if not layer.deleteFeature(feature_id):
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SECTORS", "delete", feature_id=feature_id)
+            return True
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_sectors(self, feature_ids: List[int], updated_by: Optional[str] = None) -> int:
+        """Bulk delete search sectors."""
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Sectors layer not available")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="bulk delete operation"
+            )
+
+        try:
+            deleted = 0
+            for fid in feature_ids:
+                if layer.deleteFeature(fid):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SECTORS", "bulk_delete", deleted=deleted)
+            return deleted
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
 
     # =========================================================================
     # Text Labels Layer
@@ -1117,6 +1569,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("color", QVariant.String),           # String - text color
             QgsField("rotation", QVariant.Double),        # Double - rotation angle
             QgsField("created", QVariant.String),         # String - ISO timestamp
+            QgsField("display_order", QVariant.Int),      # Int - display order for UI (Phase 2)
         ])
         layer.updateFields()
 
@@ -1160,13 +1613,19 @@ class DrawingLayerManager(BaseLayerManager):
             font_size,
             color,
             rotation,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            None  # display_order (set after addFeature)
         ])
 
         # Add to layer with proper resource cleanup
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
         layer.startEditing()
         try:
             layer.addFeature(feature)
+            self._set_display_order(layer, feature.id())
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 raise RuntimeError(f"Failed to commit text label feature: {', '.join(errors)}")
@@ -1193,3 +1652,1319 @@ class DrawingLayerManager(BaseLayerManager):
             rotation=rotation
         )
         return feature.id()
+
+    # =========================================================================
+    # Phase 2: Full CRUD Operations for All Drawing Types
+    # =========================================================================
+
+    def _feature_to_record(self, feature: QgsFeature, layer: QgsVectorLayer) -> Dict[str, Any]:
+        """
+        Convert QgsFeature to dictionary record.
+
+        Handles NULL values, date parsing, geometry serialization.
+        CRITICAL: NULL value handling is essential for JSON serialization.
+
+        Args:
+            feature: QGIS feature to convert
+            layer: Parent layer (for field metadata)
+
+        Returns:
+            Dictionary with feature attributes
+        """
+        if not feature.isValid():
+            return {}
+
+        record = {}
+
+        # Extract all attributes
+        for field in layer.fields():
+            field_name = field.name()
+            value = feature.attribute(field_name)
+
+            # Handle NULL values (CRITICAL for JSON serialization)
+            if value is None or value == NULL:
+                record[field_name] = None
+                continue
+
+            # Handle numeric fields
+            if field.type() in (QVariant.Int, QVariant.LongLong):
+                record[field_name] = int(value) if value else 0
+            elif field.type() == QVariant.Double:
+                record[field_name] = float(value) if value else 0.0
+            elif field.type() == QVariant.Bool:
+                record[field_name] = bool(value) if value else False
+            else:
+                # String and other types
+                record[field_name] = str(value) if value else ""
+
+        # Add feature ID (not an attribute)
+        record['feature_id'] = feature.id()
+
+        # Add geometry summary (lightweight)
+        if feature.hasGeometry():
+            geom = feature.geometry()
+            record['geometry_type'] = QgsWkbTypes.displayString(geom.wkbType())
+
+            # Add computed geometry properties
+            if geom.type() == QgsWkbTypes.PolygonGeometry:
+                # Area calculation using WGS84 ellipsoid
+                distance_calc = QgsDistanceArea()
+                distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                distance_calc.setEllipsoid('WGS84')
+                area_m2 = distance_calc.measureArea(geom)
+                record['area_km2'] = area_m2 / 1_000_000
+            elif geom.type() == QgsWkbTypes.LineGeometry:
+                # Length calculation using WGS84 ellipsoid
+                distance_calc = QgsDistanceArea()
+                distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                distance_calc.setEllipsoid('WGS84')
+                length_m = distance_calc.measureLine(geom.asPolyline())
+                record['length_km'] = length_m / 1000
+        else:
+            record['geometry_type'] = None
+
+        return record
+
+    # =========================================================================
+    # SEARCH AREAS - Full CRUD Operations
+    # =========================================================================
+
+    def list_search_areas(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        List all search area features.
+
+        Args:
+            filters: Optional filters (e.g., {'status': 'Planned', 'team': 'Alpha'})
+
+        Returns:
+            List of feature dictionaries ordered by display_order (if field exists)
+        """
+        layer = self._get_or_create_search_areas_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        # Build feature request
+        request = QgsFeatureRequest()
+
+        # Apply filters if provided
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                # Validate field exists
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+
+                # Build expression based on value type
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+
+            if expressions:
+                filter_expr = ' AND '.join(expressions)
+                request.setFilterExpression(filter_expr)
+
+        # Fetch and serialize features
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                record = self._feature_to_record(feature, layer)
+                if record:
+                    records.append(record)
+        except Exception as e:
+            logger.error(f"Error listing search areas: {e}", exc_info=True)
+
+        return self._sort_records_by_display_order(records)
+
+    def get_search_area(self, feature_id: int) -> Optional[Dict]:
+        """
+        Get single search area by feature ID.
+
+        Args:
+            feature_id: Feature ID to retrieve
+
+        Returns:
+            Feature dictionary or None if not found
+        """
+        layer = self._get_or_create_search_areas_layer()
+        if not layer or not layer.isValid():
+            return None
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+
+        return self._feature_to_record(feature, layer)
+
+    def update_search_area(
+        self,
+        feature_id: int,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Update search area feature attributes.
+
+        CRITICAL: Transaction-safe pattern for life-safety system.
+        Follows mandatory pattern from phase2_supplement.md.
+
+        Args:
+            feature_id: Feature ID to update
+            updates: Dict of field->value pairs to update
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+
+        Raises:
+            ValueError: If feature_id invalid or updates malformed
+            LayerTransactionError: If commit fails
+        """
+        # ========================================================================
+        # STEP 1: VALIDATE INPUT (BEFORE touching layer)
+        # ========================================================================
+
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(
+                f"Invalid feature ID: {feature_id}. "
+                "Feature IDs must be positive integers. "
+                "Verify the ID was correctly retrieved from the search areas layer."
+            )
+
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        # Get layer
+        layer = self._get_or_create_search_areas_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Search areas layer not available")
+
+        # ========================================================================
+        # STEP 2: START TRANSACTION (BEFORE validation to prevent TOCTOU)
+        # ========================================================================
+        # CRITICAL: Start editing BEFORE feature validation to prevent race condition
+        # where feature could be deleted between validation and transaction start
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            # ====================================================================
+            # STEP 3: VALIDATE FEATURE EXISTS (inside transaction)
+            # ====================================================================
+
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found in search areas layer")
+
+            # ====================================================================
+            # STEP 4: VALIDATE ALL UPDATE FIELDS
+            # ====================================================================
+
+            # Get layer field names
+            field_names = [field.name() for field in layer.fields()]
+
+            for field_name, value in updates.items():
+                # Check field exists
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+                # Validate field-specific constraints
+                if field_name == 'name':
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError("name must be a non-empty string")
+                    if len(value) > 128:
+                        raise ValueError("name must be ≤ 128 characters")
+
+                elif field_name == 'status':
+                    valid_statuses = ['Planned', 'Assigned', 'InProgress', 'Completed', 'Cleared']
+                    if value not in valid_statuses:
+                        raise ValueError(f"status must be one of: {valid_statuses}")
+
+                elif field_name == 'priority':
+                    valid_priorities = ['High', 'Medium', 'Low']
+                    if value not in valid_priorities:
+                        raise ValueError(f"priority must be one of: {valid_priorities}")
+
+                elif field_name == 'area_sqkm':
+                    if not isinstance(value, (int, float)) or value <= 0:
+                        raise ValueError("area_sqkm must be a positive number")
+
+                elif field_name == 'POA':
+                    if not isinstance(value, (int, float)) or not (0 <= value <= 100):
+                        raise ValueError("POA must be between 0 and 100")
+            # ====================================================================
+            # STEP 5: APPLY UPDATES
+            # ====================================================================
+
+            # Add audit trail if updated_by provided
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            # Apply each update
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    # Field doesn't exist (might be audit field not in schema)
+                    continue
+
+                success = layer.changeAttributeValue(feature_id, field_index, value)
+                if not success:
+                    raise RuntimeError(f"Failed to update {field_name} on feature {feature_id}")
+
+            # ====================================================================
+            # STEP 6: COMMIT CHANGES
+            # ====================================================================
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed for {layer.name()}: {', '.join(errors)}")
+
+            # ====================================================================
+            # STEP 7: POST-COMMIT ACTIONS
+            # ====================================================================
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SEARCH_AREAS", "update", feature_id=feature_id, updates=updates)
+            logger.debug(f"Updated search area {feature_id}: {updates}")
+
+            return True
+
+        except Exception as e:
+            # ====================================================================
+            # STEP 8: ROLLBACK ON ANY ERROR
+            # ====================================================================
+
+            if layer.isEditable():
+                layer.rollBack()
+                logger.debug(f"Rolled back transaction due to error: {e}")
+
+            # Re-raise as LayerTransactionError with correct signature
+            if isinstance(e, LayerTransactionError):
+                raise
+            else:
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="update feature",
+                    details=str(e)
+                ) from e
+        finally:
+            # ====================================================================
+            # STEP 9: FINAL CLEANUP (CRITICAL for life-safety)
+            # ====================================================================
+
+            # Ensure layer NEVER left in edit mode (even if exception during rollback)
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass  # Layer already rolled back or deleted
+
+    def delete_search_area(
+        self,
+        feature_id: int,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Delete single search area.
+
+        Args:
+            feature_id: Feature ID to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+
+        Raises:
+            ValueError: If feature_id invalid
+            LayerTransactionError: If deletion fails
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_search_areas_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Search areas layer not available")
+
+        # Verify feature exists
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            raise ValueError(f"Feature {feature_id} not found")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Delete operation"
+            )
+
+        try:
+            success = layer.deleteFeature(feature_id)
+            if not success:
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SEARCH_AREAS", "delete", feature_id=feature_id)
+            logger.debug(f"Deleted search area {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_search_areas(
+        self,
+        feature_ids: List[int],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Bulk delete search areas.
+
+        Args:
+            feature_ids: List of feature IDs to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of features deleted
+
+        Raises:
+            ValueError: If feature_ids empty
+            LayerTransactionError: If deletion fails
+        """
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_search_areas_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Search areas layer not available")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Bulk delete operation"
+            )
+
+        try:
+            deleted = 0
+            for feature_id in feature_ids:
+                if layer.deleteFeature(feature_id):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "SEARCH_AREAS", "bulk_delete", deleted=deleted)
+            logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} search areas")
+
+            return deleted
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    # =========================================================================
+    # RANGE RINGS - Full CRUD Operations
+    # =========================================================================
+
+    def list_range_rings(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        List all range ring features.
+
+        Args:
+            filters: Optional filters (e.g., {'lpb_category': 'Lost Person'})
+
+        Returns:
+            List of feature dictionaries
+        """
+        layer = self._get_or_create_range_rings_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        request = QgsFeatureRequest()
+
+        # Apply filters if provided
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+
+            if expressions:
+                filter_expr = ' AND '.join(expressions)
+                request.setFilterExpression(filter_expr)
+
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                record = self._feature_to_record(feature, layer)
+                if record:
+                    records.append(record)
+        except Exception as e:
+            logger.error(f"Error listing range rings: {e}", exc_info=True)
+
+        return self._sort_records_by_display_order(records)
+
+    def get_range_ring(self, feature_id: int) -> Optional[Dict]:
+        """
+        Get single range ring by feature ID.
+
+        Args:
+            feature_id: Feature ID to retrieve
+
+        Returns:
+            Feature dictionary or None if not found
+        """
+        layer = self._get_or_create_range_rings_layer()
+        if not layer or not layer.isValid():
+            return None
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+
+        return self._feature_to_record(feature, layer)
+
+    def update_range_ring(
+        self,
+        feature_id: int,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Update range ring attributes.
+
+        Args:
+            feature_id: Feature ID to update
+            updates: Dict of field->value pairs
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+
+        Raises:
+            ValueError: If feature_id invalid or updates malformed
+            LayerTransactionError: If commit fails
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_or_create_range_rings_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Range rings layer not available")
+
+        # CRITICAL: Start editing BEFORE feature validation to prevent TOCTOU
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+
+                success = layer.changeAttributeValue(feature_id, field_index, value)
+                if not success:
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "RANGE_RINGS", "update", feature_id=feature_id)
+            logger.debug(f"Updated range ring {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            else:
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="update feature",
+                    details=str(e)
+                ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_range_ring(
+        self,
+        feature_id: int,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Delete single range ring.
+
+        Args:
+            feature_id: Feature ID to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_range_rings_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Range rings layer not available")
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            raise ValueError(f"Feature {feature_id} not found")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Delete operation"
+            )
+
+        try:
+            success = layer.deleteFeature(feature_id)
+            if not success:
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "RANGE_RINGS", "delete", feature_id=feature_id)
+            logger.debug(f"Deleted range ring {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_range_rings(
+        self,
+        feature_ids: List[int],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Bulk delete range rings.
+
+        Args:
+            feature_ids: List of feature IDs to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of features deleted
+        """
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_range_rings_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Range rings layer not available")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Bulk delete operation"
+            )
+
+        try:
+            deleted = 0
+            for feature_id in feature_ids:
+                if layer.deleteFeature(feature_id):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "RANGE_RINGS", "bulk_delete", deleted=deleted)
+            logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} range rings")
+
+            return deleted
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    # =========================================================================
+    # BEARING LINES - Full CRUD Operations
+    # =========================================================================
+
+    def list_bearing_lines(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        List all bearing line features.
+
+        Args:
+            filters: Optional filters
+
+        Returns:
+            List of feature dictionaries
+        """
+        layer = self._get_or_create_bearing_lines_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        request = QgsFeatureRequest()
+
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+
+            if expressions:
+                filter_expr = ' AND '.join(expressions)
+                request.setFilterExpression(filter_expr)
+
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                record = self._feature_to_record(feature, layer)
+                if record:
+                    records.append(record)
+        except Exception as e:
+            logger.error(f"Error listing bearing lines: {e}", exc_info=True)
+
+        return self._sort_records_by_display_order(records)
+
+    def get_bearing_line(self, feature_id: int) -> Optional[Dict]:
+        """
+        Get single bearing line by feature ID.
+
+        Args:
+            feature_id: Feature ID to retrieve
+
+        Returns:
+            Feature dictionary or None if not found
+        """
+        layer = self._get_or_create_bearing_lines_layer()
+        if not layer or not layer.isValid():
+            return None
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+
+        return self._feature_to_record(feature, layer)
+
+    def update_bearing_line(
+        self,
+        feature_id: int,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Update bearing line attributes.
+
+        Args:
+            feature_id: Feature ID to update
+            updates: Dict of field->value pairs
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_or_create_bearing_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Bearing lines layer not available")
+
+        # CRITICAL: Start editing BEFORE feature validation to prevent TOCTOU
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+
+                success = layer.changeAttributeValue(feature_id, field_index, value)
+                if not success:
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "BEARING_LINES", "update", feature_id=feature_id)
+            logger.debug(f"Updated bearing line {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            else:
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="update feature",
+                    details=str(e)
+                ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_bearing_line(
+        self,
+        feature_id: int,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Delete single bearing line.
+
+        Args:
+            feature_id: Feature ID to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_bearing_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Bearing lines layer not available")
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            raise ValueError(f"Feature {feature_id} not found")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Delete operation"
+            )
+
+        try:
+            success = layer.deleteFeature(feature_id)
+            if not success:
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "BEARING_LINES", "delete", feature_id=feature_id)
+            logger.debug(f"Deleted bearing line {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_bearing_lines(
+        self,
+        feature_ids: List[int],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Bulk delete bearing lines.
+
+        Args:
+            feature_ids: List of feature IDs to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of features deleted
+        """
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_bearing_lines_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Bearing lines layer not available")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Bulk delete operation"
+            )
+
+        try:
+            deleted = 0
+            for feature_id in feature_ids:
+                if layer.deleteFeature(feature_id):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "BEARING_LINES", "bulk_delete", deleted=deleted)
+            logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} bearing lines")
+
+            return deleted
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    # =========================================================================
+    # TEXT LABELS - Full CRUD Operations
+    # =========================================================================
+
+    def list_text_labels(self, filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        List all text label features.
+
+        Args:
+            filters: Optional filters
+
+        Returns:
+            List of feature dictionaries
+        """
+        layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            return []
+
+        request = QgsFeatureRequest()
+
+        if filters:
+            expressions = []
+            for field_name, value in filters.items():
+                if layer.fields().indexFromName(field_name) == -1:
+                    logger.warning(f"Unknown filter field {field_name}")
+                    continue
+
+                if isinstance(value, str):
+                    expressions.append(f'"{field_name}" = \'{value}\'')
+                elif isinstance(value, (int, float)):
+                    expressions.append(f'"{field_name}" = {value}')
+                elif value is None:
+                    expressions.append(f'"{field_name}" IS NULL')
+
+            if expressions:
+                filter_expr = ' AND '.join(expressions)
+                request.setFilterExpression(filter_expr)
+
+        records = []
+        try:
+            for feature in layer.getFeatures(request):
+                record = self._feature_to_record(feature, layer)
+                if record:
+                    records.append(record)
+        except Exception as e:
+            logger.error(f"Error listing text labels: {e}", exc_info=True)
+
+        return self._sort_records_by_display_order(records)
+
+    def get_text_label(self, feature_id: int) -> Optional[Dict]:
+        """
+        Get single text label by feature ID.
+
+        Args:
+            feature_id: Feature ID to retrieve
+
+        Returns:
+            Feature dictionary or None if not found
+        """
+        layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            return None
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            return None
+
+        return self._feature_to_record(feature, layer)
+
+    def update_text_label(
+        self,
+        feature_id: int,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Update text label attributes.
+
+        Args:
+            feature_id: Feature ID to update
+            updates: Dict of field->value pairs
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Text labels layer not available")
+
+        # CRITICAL: Start editing BEFORE feature validation to prevent TOCTOU
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = layer.getFeature(feature_id)
+            if not feature.isValid():
+                raise ValueError(f"Feature {feature_id} not found")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+
+                success = layer.changeAttributeValue(feature_id, field_index, value)
+                if not success:
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "TEXT_LABELS", "update", feature_id=feature_id)
+            logger.debug(f"Updated text label {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            else:
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="update feature",
+                    details=str(e)
+                ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_text_label(
+        self,
+        feature_id: int,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Delete single text label.
+
+        Args:
+            feature_id: Feature ID to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+        """
+        if not isinstance(feature_id, int) or feature_id <= 0:
+            raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Text labels layer not available")
+
+        feature = layer.getFeature(feature_id)
+        if not feature.isValid():
+            raise ValueError(f"Feature {feature_id} not found")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Delete operation"
+            )
+
+        try:
+            success = layer.deleteFeature(feature_id)
+            if not success:
+                raise RuntimeError(f"Failed to delete feature {feature_id}")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "TEXT_LABELS", "delete", feature_id=feature_id)
+            logger.debug(f"Deleted text label {feature_id}")
+
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="delete feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_text_labels(
+        self,
+        feature_ids: List[int],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Bulk delete text labels.
+
+        Args:
+            feature_ids: List of feature IDs to delete
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of features deleted
+        """
+        if not feature_ids:
+            return 0
+
+        layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Text labels layer not available")
+
+        # CRITICAL: Check for nested transactions
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Bulk delete operation"
+            )
+
+        try:
+            deleted = 0
+            for feature_id in feature_ids:
+                if layer.deleteFeature(feature_id):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            self._log_drawing_event(layer, "TEXT_LABELS", "bulk_delete", deleted=deleted)
+            logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} text labels")
+
+            return deleted
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass

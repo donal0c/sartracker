@@ -22,6 +22,7 @@ from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
+from ...utils.exceptions import LayerTransactionError
 
 
 class MarkerLayerManager(BaseLayerManager):
@@ -315,7 +316,11 @@ class MarkerLayerManager(BaseLayerManager):
             # Ensure layer is not left in editing state
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error adding {self.IPP_LKP_LAYER_NAME} marker '{name}': {str(e)}")
+            raise LayerTransactionError(
+                self.IPP_LKP_LAYER_NAME,
+                "add marker",
+                details=str(e)
+            )
 
     # =========================================================================
     # Clues Layer (Evidence found during search)
@@ -427,7 +432,11 @@ class MarkerLayerManager(BaseLayerManager):
             # Ensure layer is not left in editing state
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error adding {self.CLUES_LAYER_NAME} marker '{name}': {str(e)}")
+            raise LayerTransactionError(
+                self.CLUES_LAYER_NAME,
+                "add marker",
+                details=str(e)
+            )
 
     # =========================================================================
     # Hazards Layer (Safety warnings)
@@ -539,7 +548,11 @@ class MarkerLayerManager(BaseLayerManager):
             # Ensure layer is not left in editing state
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error adding {self.HAZARDS_LAYER_NAME} marker '{name}': {str(e)}")
+            raise LayerTransactionError(
+                self.HAZARDS_LAYER_NAME,
+                "add marker",
+                details=str(e)
+            )
 
     # =========================================================================
     # Casualties Layer (Found injured or deceased persons)
@@ -676,7 +689,11 @@ class MarkerLayerManager(BaseLayerManager):
             # Ensure layer is not left in editing state (Issue #3 fix)
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error adding {self.CASUALTIES_LAYER_NAME} marker '{name}': {str(e)}")
+            raise LayerTransactionError(
+                self.CASUALTIES_LAYER_NAME,
+                "add marker",
+                details=str(e)
+            )
 
     # =========================================================================
     # Marker listing / CRUD helpers
@@ -757,7 +774,11 @@ class MarkerLayerManager(BaseLayerManager):
         except Exception as exc:
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error updating marker '{marker_id}': {exc}") from exc
+            raise LayerTransactionError(
+                layer.name(),
+                "update marker",
+                details=str(exc)
+            ) from exc
         finally:
             if layer.isEditable():
                 layer.rollBack()
@@ -785,7 +806,11 @@ class MarkerLayerManager(BaseLayerManager):
         except Exception as exc:
             if layer.isEditable():
                 layer.rollBack()
-            raise RuntimeError(f"Error deleting marker '{marker_id}': {exc}") from exc
+            raise LayerTransactionError(
+                layer.name(),
+                "delete marker",
+                details=str(exc)
+            ) from exc
         finally:
             if layer.isEditable():
                 layer.rollBack()

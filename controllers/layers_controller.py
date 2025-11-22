@@ -23,6 +23,7 @@ from .layer_managers.drawing_manager import DrawingLayerManager
 from .layer_catalog import LayerCatalogService
 from ..layers.helicopter_manager import HelicopterLayerManager
 from ..layers import LayerManager as SchemaLayerManager, GroupNames, LayerIds
+from ..utils.exceptions import LayerTransactionError
 
 
 class LayersController:
@@ -120,6 +121,11 @@ class LayersController:
             import traceback
             traceback.print_exc()
 
+    def _assert_not_read_only(self, operation: str):
+        """Raise if mission is finalized/read-only."""
+        if self.layer_manager and self.layer_manager.is_read_only():
+            raise LayerTransactionError("mission data", operation, details="Mission is finalized (read-only)")
+
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
     # =========================================================================
@@ -135,7 +141,7 @@ class LayersController:
             ValueError: If position data is invalid (from manager)
             RuntimeError: If layer operations fail (from manager)
         """
-        # Delegate to manager - exceptions propagate with proper context
+        self._assert_not_read_only("update current positions")
         return self.tracking.update_current_positions(positions)
 
     def update_breadcrumbs(
@@ -156,7 +162,7 @@ class LayersController:
             ValueError: If position data is invalid (from manager)
             RuntimeError: If layer operations fail (from manager)
         """
-        # Delegate to manager - exceptions propagate with proper context
+        self._assert_not_read_only("update breadcrumbs")
         return self.tracking.update_breadcrumbs(
             positions,
             time_gap_minutes,
@@ -208,6 +214,7 @@ class LayersController:
         Returns:
             str: UUID of added marker
         """
+        self._assert_not_read_only("add marker")
         marker_id = self.markers.add_ipp_lkp(
             name, lat, lon, subject_category, description,
             irish_grid_e, irish_grid_n,
@@ -244,6 +251,7 @@ class LayersController:
         Returns:
             str: UUID of added clue
         """
+        self._assert_not_read_only("add marker")
         clue_id = self.markers.add_clue(
             name, lat, lon, clue_type, confidence, description,
             irish_grid_e, irish_grid_n,
@@ -280,6 +288,7 @@ class LayersController:
         Returns:
             str: UUID of added hazard
         """
+        self._assert_not_read_only("add marker")
         hazard_id = self.markers.add_hazard(
             name, lat, lon, hazard_type, severity, description,
             irish_grid_e, irish_grid_n,
@@ -322,6 +331,7 @@ class LayersController:
         Returns:
             str: UUID of added casualty
         """
+        self._assert_not_read_only("add marker")
         casualty_id = self.markers.add_casualty(
             name, lat, lon, condition, treatment, evacuation_priority,
             description, found_by, irish_grid_e, irish_grid_n,
@@ -361,6 +371,7 @@ class LayersController:
             updates: Attribute payload keyed by field name
             updated_by: Optional operator name for audit trail
         """
+        self._assert_not_read_only("update marker")
         updated = self.markers.update_marker(marker_type, marker_id, updates, updated_by=updated_by)
         layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
         if updated and layer_id:
@@ -375,6 +386,7 @@ class LayersController:
             marker_type: Marker category
             marker_id: UUID string
         """
+        self._assert_not_read_only("delete marker")
         deleted = self.markers.delete_marker(marker_type, marker_id)
         layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
         if deleted and layer_id:
@@ -404,6 +416,7 @@ class LayersController:
         Returns:
             int: Feature ID of added line
         """
+        self._assert_not_read_only("add drawing")
         line_id = self.drawings.add_line(
             name,
             points_wgs84,
@@ -431,6 +444,7 @@ class LayersController:
         Returns:
             int: Feature ID
         """
+        self._assert_not_read_only("add measurement")
         overlay_id = self.drawings.add_measurement_overlay(
             name=name,
             points_wgs84=points_wgs84,
@@ -448,6 +462,7 @@ class LayersController:
         Returns:
             int: Number of overlays deleted
         """
+        self._assert_not_read_only("clear measurement overlays")
         removed = self.drawings.clear_measurement_overlays()
         if removed:
             self._refresh_catalog_for_layer(LayerIds.LINES)
@@ -480,6 +495,7 @@ class LayersController:
         Returns:
             int: Feature ID of added search area
         """
+        self._assert_not_read_only("add search area")
         area_id = self.drawings.add_search_area(
             name, polygon_wgs84, team, status, priority, POA,
             terrain, search_method, color, notes
@@ -507,6 +523,7 @@ class LayersController:
         Returns:
             int: Feature ID of added ring
         """
+        self._assert_not_read_only("add range ring")
         ring_id = self.drawings.add_range_ring(
             name, center_wgs84, radius_m, label, color,
             lpb_category, percentile
@@ -533,6 +550,7 @@ class LayersController:
         Returns:
             int: Feature ID of added bearing line
         """
+        self._assert_not_read_only("add bearing line")
         bearing_id = self.drawings.add_bearing_line(
             name, origin_wgs84, bearing, distance_m, label, color
         )
@@ -557,6 +575,7 @@ class LayersController:
         Returns:
             int: Feature ID of added sector
         """
+        self._assert_not_read_only("add sector")
         sector_id = self.drawings.add_sector(
             name, center_wgs84, start_bearing, end_bearing, radius_m,
             priority, color
@@ -580,6 +599,7 @@ class LayersController:
         Returns:
             int: Feature ID of added label
         """
+        self._assert_not_read_only("add text label")
         label_id = self.drawings.add_text_label(
             text, location_wgs84, font_size, color, rotation
         )
@@ -606,6 +626,7 @@ class LayersController:
 
         Clears the entire SAR Tracking group and all device colors atomically.
         """
+        self._assert_not_read_only("clear layers")
         group = self.project.layerTreeRoot().findGroup(self.LAYER_GROUP_NAME)
         if group:
             self.project.layerTreeRoot().removeChildNode(group)
@@ -617,6 +638,348 @@ class LayersController:
         self.tracking.reset_state()
         self.markers.reset_state()
         self.drawings.reset_state()
+
+    # =========================================================================
+    # Phase 2 - Bulk Operations (CalTopo Console Support)
+    # =========================================================================
+
+    def bulk_delete_features(
+        self,
+        layer_id: str,
+        feature_ids: List[int],
+        confirmed: bool = False,
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Delete multiple features from a layer.
+
+        LIFE-SAFETY CRITICAL: Requires explicit confirmation for large deletions.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            feature_ids: List of feature IDs to delete
+            confirmed: Must be True if count > 10 (safety check)
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of features deleted
+
+        Raises:
+            ValueError: If not confirmed for large deletion
+            LayerTransactionError: If deletion fails
+        """
+        from ..utils.exceptions import LayerTransactionError
+        self._assert_not_read_only("bulk delete")
+
+        # Validate
+        if not feature_ids:
+            return 0
+
+        if len(feature_ids) > 10 and not confirmed:
+            raise ValueError(
+                f"Bulk delete of {len(feature_ids)} features requires explicit confirmation"
+            )
+
+        # Get appropriate manager based on layer_id
+        # Search areas, range rings, bearing lines, text labels
+        if layer_id in [LayerIds.SEARCH_AREAS, LayerIds.RANGE_RINGS,
+                        LayerIds.BEARING_LINES, LayerIds.TEXT_LABELS,
+                        LayerIds.LINES, LayerIds.SEARCH_SECTORS]:
+            # Use DrawingLayerManager bulk delete methods
+            if layer_id == LayerIds.SEARCH_AREAS:
+                deleted = self.drawings.delete_search_areas(feature_ids, updated_by)
+            elif layer_id == LayerIds.RANGE_RINGS:
+                deleted = self.drawings.delete_range_rings(feature_ids, updated_by)
+            elif layer_id == LayerIds.BEARING_LINES:
+                deleted = self.drawings.delete_bearing_lines(feature_ids, updated_by)
+            elif layer_id == LayerIds.TEXT_LABELS:
+                deleted = self.drawings.delete_text_labels(feature_ids, updated_by)
+            elif layer_id == LayerIds.LINES:
+                deleted = self.drawings.delete_lines(feature_ids, updated_by)
+            elif layer_id == LayerIds.SEARCH_SECTORS:
+                deleted = self.drawings.delete_sectors(feature_ids, updated_by)
+            else:
+                raise ValueError(f"Unsupported layer_id: {layer_id}")
+
+            # Refresh catalog
+            self._refresh_catalog_for_layer(layer_id)
+            return deleted
+
+        # Prevent misuse on marker/tracking layers (must go through their managers)
+        marker_layers = {
+            LayerIds.MARKERS_IPP_LKP,
+            LayerIds.MARKERS_CLUES,
+            LayerIds.MARKERS_HAZARDS,
+            LayerIds.MARKERS_CASUALTIES
+        }
+        tracking_layers = {LayerIds.CURRENT_ACTIVE, LayerIds.BREADCRUMBS}
+        if layer_id in marker_layers or layer_id in tracking_layers:
+            raise ValueError(f"Bulk delete for {layer_id} must use the dedicated manager API")
+
+        # For other layers, fall back to direct layer manipulation
+        layer = self.layer_manager.get_layer(layer_id)
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Layer {layer_id} not available")
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Bulk delete operation"
+            )
+
+        deleted = 0
+        try:
+            for feature_id in feature_ids:
+                if layer.deleteFeature(feature_id):
+                    deleted += 1
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            print(f"[LayersController] Bulk deleted {deleted}/{len(feature_ids)} features from {layer_id}")
+
+        except Exception as e:
+            if layer.isEditable():
+                layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="bulk delete features",
+                details=str(e)
+            ) from e
+        finally:
+            # CRITICAL: Ensure layer NEVER left in edit mode (even if exception during rollback)
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass  # Layer already rolled back or deleted
+
+            # Move catalog refresh outside transaction scope to ensure it happens
+            # even if there are issues during commit
+            try:
+                self._refresh_catalog_for_layer(layer_id)
+            except Exception as refresh_error:
+                # Log but don't fail the operation if catalog refresh fails
+                print(f"[LayersController] Warning: Catalog refresh failed for {layer_id}: {refresh_error}")
+
+        return deleted
+
+    # =========================================================================
+    # Phase 2 - Move/Reorder Operations (CalTopo Console Support)
+    # =========================================================================
+
+    def move_search_area_to_section(
+        self,
+        feature_id: int,
+        target_section: str,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Move search area between sections by updating status field.
+
+        Args:
+            feature_id: Search area feature ID
+            target_section: Target section ('planning', 'active', 'reserve', 'completed')
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+
+        Raises:
+            ValueError: If target_section invalid
+            LayerTransactionError: If update fails
+        """
+        # Map section names to status values
+        section_to_status = {
+            'planning': 'Planned',
+            'active': 'InProgress',
+            'active_teams': 'InProgress',
+            'reserves': 'Planned',
+            'reserve': 'Planned',
+            'completed': 'Completed'
+        }
+
+        # Validate target_section
+        if target_section not in section_to_status:
+            raise ValueError(
+                f"Invalid target_section: {target_section}. "
+                f"Must be one of: {list(section_to_status.keys())}"
+            )
+
+        new_status = section_to_status[target_section]
+
+        # Update status field using DrawingLayerManager
+        success = self.drawings.update_search_area(
+            feature_id=feature_id,
+            updates={'status': new_status},
+            updated_by=updated_by
+        )
+
+        if success:
+            self._refresh_catalog_for_layer(LayerIds.SEARCH_AREAS)
+
+        return success
+
+    def reorder_features(
+        self,
+        layer_id: str,
+        feature_ids_in_order: List[int],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Set display_order for features based on list order.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            feature_ids_in_order: Feature IDs in desired display order (top to bottom)
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            True on success
+
+        Raises:
+            ValueError: If layer_id invalid or feature_ids empty
+            LayerTransactionError: If update fails
+        """
+        self._assert_not_read_only("reorder features")
+        from ..utils.exceptions import LayerTransactionError, LayerLockError
+
+        # Validate
+        if not feature_ids_in_order:
+            raise ValueError("feature_ids_in_order cannot be empty")
+
+        layer = self.layer_manager.get_layer(layer_id)
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Layer {layer_id} not available")
+
+        # Check display_order field exists
+        if layer.fields().indexFromName('display_order') == -1:
+            raise ValueError(f"Layer {layer_id} does not have display_order field")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        # Start transaction
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="Reorder features"
+            )
+
+        try:
+            # Set display_order = index for each feature
+            field_index = layer.fields().indexFromName('display_order')
+            updated_count = 0
+
+            for order, feature_id in enumerate(feature_ids_in_order):
+                # Verify feature exists
+                feature = layer.getFeature(feature_id)
+                if not feature.isValid():
+                    print(f"[LayersController] Warning: Feature {feature_id} not found, skipping")
+                    continue
+
+                # Update display_order
+                success = layer.changeAttributeValue(feature_id, field_index, order)
+                if success:
+                    updated_count += 1
+                else:
+                    print(f"[LayersController] Warning: Failed to update display_order for {feature_id}")
+
+            # Commit changes
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            # Refresh catalog
+            self._refresh_catalog_for_layer(layer_id)
+
+            print(f"[LayersController] Reordered {updated_count} features in {layer_id}")
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="reorder features",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    # =========================================================================
+    # Phase 2 - Visibility and Layer Management Helpers
+    # =========================================================================
+
+    def set_layer_visibility(
+        self,
+        layer_id: str,
+        is_visible: bool
+    ) -> bool:
+        """
+        Toggle layer visibility in QGIS layer tree.
+
+        Updates both QGIS state and catalog cache.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            is_visible: True to show, False to hide
+
+        Returns:
+            True on success
+        """
+        layer = self.layer_manager.get_layer(layer_id)
+        if not layer or not layer.isValid():
+            return False
+
+        # Get layer tree node
+        root = self.project.layerTreeRoot()
+        node = root.findLayer(layer.id())
+
+        if node:
+            node.setItemVisibilityChecked(is_visible)
+            # Refresh catalog
+            self._refresh_catalog_for_layer(layer_id)
+            return True
+
+        return False
+
+    def get_all_diagnostics(self) -> Dict[str, Any]:
+        """
+        Aggregate diagnostics from all managers and catalog.
+
+        Returns:
+            Dict with diagnostic information from all components
+        """
+        diagnostics = {}
+
+        # Catalog diagnostics
+        if self.catalog:
+            try:
+                snapshot = self.catalog.get_catalog_snapshot()
+                diagnostics['catalog'] = {
+                    'status': 'operational',
+                    'layer_count': snapshot.get('layer_count', 0),
+                    'warnings': snapshot.get('warnings', [])
+                }
+            except Exception as e:
+                diagnostics['catalog'] = {'status': 'error', 'error': str(e)}
+        else:
+            diagnostics['catalog'] = {'status': 'not_available'}
+
+        # Manager diagnostics
+        # Note: Managers would need get_diagnostics() methods for full implementation
+        diagnostics['tracking'] = {'status': 'operational'}
+        diagnostics['markers'] = {'status': 'operational'}
+        diagnostics['drawings'] = {'status': 'operational'}
+
+        return diagnostics
 
     def cleanup(self):
         """
@@ -635,8 +998,25 @@ class LayersController:
                 print(f"[LayersController] Catalog cleanup error: {e}")
             self.catalog = None
 
-        # Clean up specialized managers
-        # Note: Individual managers don't currently have cleanup methods,
-        # but catalog cleanup is critical for signal lifecycle management
+        # MEMORY LEAK FIX: Clear shared device color cache (unbounded growth issue)
+        # This dict accumulates entries for every device ever seen, but never removes them
+        # Over 8-hour operations, this can grow to hundreds of orphaned entries
+        if hasattr(self, '_shared_device_colors') and self._shared_device_colors:
+            print(f"[LayersController] Clearing device color cache ({len(self._shared_device_colors)} entries)")
+            self._shared_device_colors.clear()
+
+        # LIFECYCLE FIX: Explicitly clear manager references for clean garbage collection
+        # While Python GC should handle this, explicit cleanup is safer for life-safety systems
+        try:
+            if hasattr(self, 'tracking') and self.tracking:
+                self.tracking = None
+            if hasattr(self, 'markers') and self.markers:
+                self.markers = None
+            if hasattr(self, 'drawings') and self.drawings:
+                self.drawings = None
+            if hasattr(self, 'helicopters') and self.helicopters:
+                self.helicopters = None
+        except Exception as e:
+            print(f"[LayersController] Manager cleanup error: {e}")
 
         print("[LayersController] Cleanup complete")

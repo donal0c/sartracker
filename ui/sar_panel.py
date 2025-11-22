@@ -56,6 +56,9 @@ class SARPanel(QDockWidget):
     marker_edit_requested = pyqtSignal(str, str)
     marker_delete_requested = pyqtSignal(str, str)
     marker_zoom_requested = pyqtSignal(float, float)
+    attachment_open_requested = pyqtSignal(str)
+    unlock_mission_requested = pyqtSignal()
+    finalize_mission_requested = pyqtSignal()  # Request to finalize and archive mission
 
     # Phase N1: Provider signals removed - configuration moved to Settings Panel
 
@@ -76,6 +79,7 @@ class SARPanel(QDockWidget):
         self.focus_mode_active = False
         self.hidden_panels = []  # Track which panels we hid
         self._pause_flash = False
+        self._is_finalized = False
 
         # Setup UI
         self._setup_ui()
@@ -89,6 +93,9 @@ class SARPanel(QDockWidget):
             )
             self.marker_log_widget.zoom_requested.connect(
                 lambda lat, lon: self.marker_zoom_requested.emit(lat, lon)
+            )
+            self.marker_log_widget.open_attachment_requested.connect(
+                lambda path: self._on_open_attachment_requested(path)
             )
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
@@ -129,6 +136,10 @@ class SARPanel(QDockWidget):
             except Exception as sync_error:
                 print(f"[SARPanel] Warning: Failed to sync mission state: {sync_error}")
         self._refresh_mission_controls()
+
+    def _on_open_attachment_requested(self, path: str):
+        """Bubble attachment open requests to the plugin."""
+        self.attachment_open_requested.emit(path)
 
     def _standard_icon(self, *enum_names: str) -> QIcon:
         """
@@ -228,13 +239,26 @@ class SARPanel(QDockWidget):
         controls_layout.addWidget(self.pause_button)
         
         self.finish_button = QToolButton()
-        self.finish_button.setText("Finish")
+        self.finish_button.setText("End Mission")
         self.finish_button.setIcon(self._standard_icon("SP_DialogCloseButton", "SP_DialogCancelButton"))
         self.finish_button.clicked.connect(self._on_finish_mission)
         self.finish_button.setEnabled(False)
         controls_layout.addWidget(self.finish_button)
-        
+
         mission_layout.addLayout(controls_layout)
+
+        # Finalize Mission button (shown only when mission ended and not yet finalized)
+        finalize_layout = QHBoxLayout()
+        self.finalize_button = QPushButton("Finalize Mission (Archive & Lock)")
+        self.finalize_button.setIcon(self._standard_icon("SP_FileDialogDetailedView", "SP_DirIcon"))
+        self.finalize_button.clicked.connect(self._on_finalize_mission)
+        self.finalize_button.setVisible(False)  # Hidden until mission ends
+        self.finalize_button.setToolTip(
+            "Create archive of mission data (.qgz + .gpkg + attachments)\n"
+            "and mark as read-only. Use this after mission is complete."
+        )
+        finalize_layout.addWidget(self.finalize_button)
+        mission_layout.addLayout(finalize_layout)
         self._apply_mission_button_styles()
 
         # Mission storage status
@@ -521,15 +545,20 @@ class SARPanel(QDockWidget):
             self._mission_controller.pause_mission()
         
     def _on_finish_mission(self):
-        """Handle finish mission button click."""
+        """Handle finish mission button click (End Mission)."""
         if not self._mission_controller:
             return
 
         confirm = QMessageBox.question(
             self,
-            "Finish Mission",
-            "Are you sure you want to finish this mission?\n\n"
-            "This will reset timers and deactivate mission controls.",
+            "End Mission",
+            "Are you sure you want to end this mission?\n\n"
+            "This will:\n"
+            "• Stop mission timers\n"
+            "• Keep all mission data editable in the current project\n"
+            "• Reset UI for the next mission\n\n"
+            "Mission data remains saved in the GeoPackage.\n"
+            "Use 'Finalize Mission' later to archive and lock the data.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -538,7 +567,34 @@ class SARPanel(QDockWidget):
             return
 
         self._mission_controller.finish_mission()
-        
+
+    def _on_finalize_mission(self):
+        """Handle finalize mission button click."""
+        if self._is_finalized:
+            self.unlock_mission_requested.emit()
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Finalize Mission",
+            "This will create an archive of the mission and mark it as read-only.\n\n"
+            "The archive will include:\n"
+            "• QGIS project file (.qgz)\n"
+            "• Mission GeoPackage (.gpkg)\n"
+            "• All attachments\n\n"
+            "After finalization, the mission data cannot be edited without\n"
+            "admin override.\n\n"
+            "Continue with finalization?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+
+        if confirm != QMessageBox.Yes:
+            return
+
+        # Emit signal to sartracker.py to handle archiving
+        self.finalize_mission_requested.emit()
+
     def _on_controller_state_changed(self, state: MissionState, context: dict):
         """React to mission controller state updates."""
         self._mission_state = state
@@ -975,7 +1031,7 @@ class SARPanel(QDockWidget):
         self.measurements_status_label.setText(f"{label}: {count}")
         self.clear_measurements_button.setEnabled(count > 0)
 
-    def update_mission_storage(self, primary_path: Optional[str], backup_path: Optional[str] = None, active: bool = True):
+    def update_mission_storage(self, primary_path: Optional[str], backup_path: Optional[str] = None, active: bool = True, coordinators: str = ""):
         """
         Update the mission storage status label.
 
@@ -983,15 +1039,44 @@ class SARPanel(QDockWidget):
             primary_path: Path to the primary mission GeoPackage
             backup_path: Path to the backup mirror directory (if any)
             active: Whether the mission storage is currently active
+            coordinators: Optional coordinator roster string
         """
         if not primary_path:
             text = "Storage: <i>Not initialized</i>"
         else:
             state = "active" if active else "idle"
             text = f"Storage ({state}): {primary_path}"
+            if coordinators:
+                text += f" | Coordinators: {coordinators}"
             if backup_path:
                 text += f" | Backup: {backup_path}"
         self.mission_storage_label.setText(text)
+
+    def set_finalize_button_visible(self, visible: bool, is_finalized: bool = False):
+        """
+        Show or hide the finalize mission button.
+
+        Args:
+            visible: Whether to show the button
+            is_finalized: If True, show "Already Finalized" disabled state
+        """
+        if not hasattr(self, 'finalize_button'):
+            return
+
+        if is_finalized:
+            self._is_finalized = True
+            self.finalize_button.setText("Unlock Mission (Admin)")
+            self.finalize_button.setToolTip("Mission is finalized. Admin unlock required to edit.")
+            self.finalize_button.setEnabled(True)
+            self.finalize_button.setVisible(True)
+        else:
+            self._is_finalized = False
+            self.finalize_button.setText("Finalize Mission (Archive & Lock)")
+            self.finalize_button.setToolTip(
+                "Archive mission data and mark it read-only. Admin unlock required to edit afterwards."
+            )
+            self.finalize_button.setEnabled(True)
+            self.finalize_button.setVisible(visible)
 
     def disable_drawing_tools(self, reason: str = "Drawing tools unavailable"):
         """

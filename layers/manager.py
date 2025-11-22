@@ -29,7 +29,8 @@ from qgis.core import (
     QgsWkbTypes,
     QgsMapLayerStyle,
     QgsVectorLayerExporter,
-    QgsVectorFileWriter
+    QgsVectorFileWriter,
+    QgsDataSourceUri
 )
 
 from .schema import (
@@ -136,6 +137,11 @@ class LayerManager(QObject):
     MISSION_STORE_VAR = "sartracker:mission_store_path"
     MISSION_STORE_DRIVER = "GPKG"
     MISSION_STORE_PROVIDER = "ogr"
+    MISSION_FINALIZED_VAR = "sartracker:mission_finalized"
+    MISSION_FINALIZED_BY_VAR = "sartracker:finalized_by"
+    MISSION_FINALIZED_AT_VAR = "sartracker:finalized_at"
+    MISSION_COORDINATORS_VAR = "sartracker:mission_coordinators"
+    MISSION_RESUME_TIME_VAR = "sartracker:mission_resume_time"
 
     def __init__(self, iface):
         """
@@ -221,6 +227,85 @@ class LayerManager(QObject):
         self._mission_store_path = None
         self._layer_provider_uris.clear()
         self._layer_cache.clear()
+
+    def set_mission_finalized(self, finalized: bool, finalized_by: str = "", finalized_at: Optional[str] = None):
+        """
+        Persist mission finalized flag and metadata.
+
+        Args:
+            finalized: True to mark finalized, False to clear.
+            finalized_by: Operator/admin name.
+            finalized_at: ISO timestamp (optional, defaults to now when setting).
+        """
+        project = QgsProject.instance()
+        try:
+            if finalized:
+                timestamp = finalized_at or datetime.now(timezone.utc).isoformat()
+                self._set_project_variable(self.MISSION_FINALIZED_VAR, "true")
+                self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, finalized_by or "")
+                self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, timestamp)
+                self._set_layers_read_only(True)
+            else:
+                self._set_project_variable(self.MISSION_FINALIZED_VAR, "")
+                self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, "")
+                self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, "")
+                self._set_layers_read_only(False)
+            project.write()
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to persist finalized flag: {exc}")
+
+    def is_mission_finalized(self) -> bool:
+        """Return True if project is marked finalized."""
+        project = QgsProject.instance()
+        try:
+            value = project.customVariables().get(self.MISSION_FINALIZED_VAR)
+            return str(value).lower() == "true"
+        except Exception:
+            return False
+
+    def is_read_only(self) -> bool:
+        """Alias for finalized state to simplify controllers."""
+        return self.is_mission_finalized()
+
+    def _set_layers_read_only(self, read_only: bool):
+        """
+        Apply read-only state to all managed layers for extra defense in depth.
+        Controllers also guard mutations, but layer flags prevent UI edits.
+        """
+        try:
+            for layer in self.project.mapLayers().values():
+                if isinstance(layer, QgsVectorLayer):
+                    layer.setReadOnly(read_only)
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to set layer read-only={read_only}: {exc}")
+
+    def set_mission_coordinators(self, coordinators: str):
+        """Persist coordinator roster for the current mission (comma-delimited)."""
+        try:
+            self._set_project_variable(self.MISSION_COORDINATORS_VAR, coordinators or "")
+            QgsProject.instance().write()
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to persist mission coordinators: {exc}")
+
+    def get_mission_coordinators(self) -> str:
+        try:
+            return QgsProject.instance().customVariables().get(self.MISSION_COORDINATORS_VAR, "") or ""
+        except Exception:
+            return ""
+
+    def set_resume_timestamp(self, resume_iso: Optional[str]):
+        """Persist custom resume timestamp (ISO format) if provided."""
+        try:
+            self._set_project_variable(self.MISSION_RESUME_TIME_VAR, resume_iso or "")
+            QgsProject.instance().write()
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to persist resume timestamp: {exc}")
+
+    def get_resume_timestamp(self) -> str:
+        try:
+            return QgsProject.instance().customVariables().get(self.MISSION_RESUME_TIME_VAR, "") or ""
+        except Exception:
+            return ""
 
     def _mission_store_enabled(self) -> bool:
         return bool(self._mission_store_path)
@@ -331,6 +416,9 @@ class LayerManager(QObject):
                 # Schema version matches - verify structure
                 valid = self._verify_structure()
                 self._organize_existing_layers()
+                # Run migrations even when schema version matches to pick up
+                # additive fields such as display_order.
+                self._run_migrations()
                 return valid
 
         except Exception as e:
@@ -459,8 +547,8 @@ class LayerManager(QObject):
             structure = get_expected_structure()
             self._create_group_recursive(structure)
 
-            # Could add version-specific migration logic here
-            # For now, just ensure structure exists
+            # Run any additive migrations (e.g., new fields)
+            self._run_migrations()
 
             return True
 
@@ -537,6 +625,28 @@ class LayerManager(QObject):
             return True
         except:
             return False
+
+    def _run_migrations(self):
+        """
+        Run pending migrations on existing layers.
+
+        Additive migrations are safe to re-run; each migration should be
+        idempotent and skip if already applied.
+        """
+        try:
+            from .migrations.add_display_order import run_migration
+        except Exception as exc:  # ImportError or runtime issues
+            print(f"[LayerManager] Warning: Could not import migrations: {exc}")
+            return
+
+        try:
+            results = run_migration(self)
+            if results.get('migrated'):
+                print(f"[LayerManager] Ran migrations on: {results['migrated']}")
+            if results.get('failed'):
+                print(f"[LayerManager] WARNING: Migrations failed for: {results['failed']}")
+        except Exception as exc:
+            print(f"[LayerManager] WARNING: Migration run failed: {exc}")
 
     def ensure_vector_layer(
         self,
@@ -675,7 +785,15 @@ class LayerManager(QObject):
         if not self._mission_store_path:
             raise RuntimeError("Mission store path is not configured")
 
-        uri = f"{self._mission_store_path}|layername={layer_def.layer_id}"
+        try:
+            ds = QgsDataSourceUri()
+            ds.setDatabase(self._mission_store_path)
+            ds.setDataSource("", layer_def.layer_id, None)
+            uri = ds.uri()
+        except Exception:
+            # Fallback to legacy formatting if QgsDataSourceUri fails for any reason
+            uri = f"{self._mission_store_path}|layername={layer_def.layer_id}"
+
         self._layer_provider_uris[layer_def.layer_id] = uri
         return uri
 

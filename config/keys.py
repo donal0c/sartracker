@@ -99,9 +99,13 @@ class SETTINGS_KEYS:
     # ========================================================================
     MISSION_PRIMARY_ROOT = "SARTracker/Missions/primary_root"
     MISSION_BACKUP_ROOT = "SARTracker/Missions/backup_root"
+    MISSION_COORDINATOR_ROSTER = "SARTracker/Missions/coordinators"
+    MISSION_ADMIN_ROSTER = "SARTracker/Missions/admins"
 
     MISSION_PRIMARY_ROOT_DEFAULT = os.path.join(os.path.expanduser("~"), "SAR Tracker Missions")
     MISSION_BACKUP_ROOT_DEFAULT = ""
+    MISSION_COORDINATOR_ROSTER_DEFAULT = ""
+    MISSION_ADMIN_ROSTER_DEFAULT = ""
 
     # ========================================================================
     # UI STATE (Phase N1)
@@ -240,6 +244,67 @@ class ConfigStore:
     @staticmethod
     def set_mission_backup_root(path: str):
         ConfigStore.set(SETTINGS_KEYS.MISSION_BACKUP_ROOT, path or "")
+
+    @staticmethod
+    def get_coordinator_roster() -> str:
+        """Return configured coordinator roster as raw string (newline/comma-delimited)."""
+        roster = ConfigStore.get(
+            SETTINGS_KEYS.MISSION_COORDINATOR_ROSTER,
+            SETTINGS_KEYS.MISSION_COORDINATOR_ROSTER_DEFAULT
+        )
+        if not isinstance(roster, str):
+            return ""
+        return roster
+
+    @staticmethod
+    def set_coordinator_roster(roster: str):
+        ConfigStore.set(SETTINGS_KEYS.MISSION_COORDINATOR_ROSTER, roster or "")
+
+    @staticmethod
+    def get_admin_roster() -> str:
+        """Return configured admin roster as raw string (newline/comma-delimited)."""
+        roster = ConfigStore.get(
+            SETTINGS_KEYS.MISSION_ADMIN_ROSTER,
+            SETTINGS_KEYS.MISSION_ADMIN_ROSTER_DEFAULT
+        )
+        if not isinstance(roster, str):
+            return ""
+        return roster
+
+    @staticmethod
+    def set_admin_roster(roster: str):
+        ConfigStore.set(SETTINGS_KEYS.MISSION_ADMIN_ROSTER, roster or "")
+
+    # ------------------------------------------------------------------
+    # Roster helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _parse_roster(raw: str) -> list:
+        """Split roster string on newlines/commas and return trimmed unique entries."""
+        if not raw:
+            return []
+        tokens = []
+        for line in raw.splitlines():
+            for part in line.split(","):
+                name = part.strip()
+                if name:
+                    tokens.append(name)
+        # Preserve order while removing duplicates
+        seen = set()
+        unique = []
+        for name in tokens:
+            if name not in seen:
+                unique.append(name)
+                seen.add(name)
+        return unique
+
+    @staticmethod
+    def get_coordinator_list() -> list:
+        return ConfigStore._parse_roster(ConfigStore.get_coordinator_roster())
+
+    @staticmethod
+    def get_admin_list() -> list:
+        return ConfigStore._parse_roster(ConfigStore.get_admin_roster())
 
     @staticmethod
     def remove(key: str):

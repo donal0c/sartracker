@@ -180,9 +180,19 @@ class BaseLayerManager(ABC):
 
         Derived classes should call super().cleanup() if they override this.
         """
-        # Clear project reference
+        # MEMORY LEAK FIX: Clear device color cache reference
+        # Don't clear the dict itself (it's shared), just remove our reference
+        # The orchestrator (LayersController) will clear the shared dict
+        if hasattr(self, 'device_colors'):
+            self.device_colors = None
+
+        # Clear project and interface references
         self.project = None
         self.iface = None
+
+        # Clear layer manager reference
+        if hasattr(self, 'layer_manager'):
+            self.layer_manager = None
 
     def _ensure_group_path(self, path: List[str]) -> QgsLayerTreeGroup:
         """Ensure a group path exists and return the terminal group."""

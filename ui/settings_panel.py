@@ -14,7 +14,7 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QSpinBox, QCheckBox,
     QFileDialog, QLineEdit, QScrollArea, QComboBox, QStackedWidget,
-    QMessageBox
+    QMessageBox, QPlainTextEdit
 )
 from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QFont
@@ -188,6 +188,23 @@ class SettingsPanel(QDockWidget):
         browse_backup.clicked.connect(self._browse_backup_root)
         backup_layout.addWidget(browse_backup)
         defaults_layout.addLayout(backup_layout)
+
+        # Roster configuration
+        roster_layout = QGridLayout()
+        roster_layout.setVerticalSpacing(6)
+        roster_layout.addWidget(QLabel("Coordinator roster (one per line or comma-separated):"), 0, 0)
+        self.coordinator_roster_input = QPlainTextEdit()
+        self.coordinator_roster_input.setPlaceholderText("Jane Doe, John Smith")
+        self.coordinator_roster_input.textChanged.connect(self._on_coordinator_roster_changed)
+        roster_layout.addWidget(self.coordinator_roster_input, 1, 0)
+
+        roster_layout.addWidget(QLabel("Admin roster (admin unlock authority):"), 2, 0)
+        self.admin_roster_input = QPlainTextEdit()
+        self.admin_roster_input.setPlaceholderText("On-duty coordinators with unlock rights")
+        self.admin_roster_input.textChanged.connect(self._on_admin_roster_changed)
+        roster_layout.addWidget(self.admin_roster_input, 3, 0)
+
+        defaults_layout.addLayout(roster_layout)
 
         defaults_group.setLayout(defaults_layout)
         layout.addWidget(defaults_group)
@@ -443,6 +460,8 @@ class SettingsPanel(QDockWidget):
             # Mission storage roots
             self.mission_primary_input.setText(ConfigStore.get_mission_primary_root())
             self.mission_backup_input.setText(ConfigStore.get_mission_backup_root())
+            self.coordinator_roster_input.setPlainText(ConfigStore.get_coordinator_roster())
+            self.admin_roster_input.setPlainText(ConfigStore.get_admin_roster())
 
             # Load provider auto-connect setting
             auto_connect = ConfigStore.get_provider_auto_connect()
@@ -723,6 +742,14 @@ class SettingsPanel(QDockWidget):
         if path:
             self.mission_backup_input.setText(path)
 
+    def _on_coordinator_roster_changed(self):
+        """Handle coordinator roster edits."""
+        self.apply_button.setEnabled(True)
+
+    def _on_admin_roster_changed(self):
+        """Handle admin roster edits."""
+        self.apply_button.setEnabled(True)
+
     def _on_repair_layers_clicked(self):
         """Emit signal to request layer structure repair."""
         self.repair_layers_requested.emit()
@@ -880,6 +907,8 @@ class SettingsPanel(QDockWidget):
             backup_root = self.mission_backup_input.text().strip()
             ConfigStore.set_mission_primary_root(primary_root or SETTINGS_KEYS.MISSION_PRIMARY_ROOT_DEFAULT)
             ConfigStore.set_mission_backup_root(backup_root)
+            ConfigStore.set_coordinator_roster(self.coordinator_roster_input.toPlainText().strip())
+            ConfigStore.set_admin_roster(self.admin_roster_input.toPlainText().strip())
 
             # Disable Apply button
             self.apply_button.setEnabled(False)
@@ -892,7 +921,9 @@ class SettingsPanel(QDockWidget):
                 'auto_save_interval': self.autosave_interval_spin.value(),
                 'provider_auto_connect': self.auto_connect_checkbox.isChecked(),
                 'mission_primary_root': ConfigStore.get_mission_primary_root(),
-                'mission_backup_root': ConfigStore.get_mission_backup_root()
+                'mission_backup_root': ConfigStore.get_mission_backup_root(),
+                'coordinators': ConfigStore.get_coordinator_list(),
+                'admins': ConfigStore.get_admin_list()
             })
 
             # Show success message (import iface locally to avoid circular imports)

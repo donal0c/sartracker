@@ -123,7 +123,8 @@ IPP_LKP_FIELDS = [
     {"name": "subject_category", "type": "String", "length": 60},
     {"name": "description", "type": "String", "length": 255},
     *MARKER_COMMON_GEO_FIELDS,
-    *MARKER_AUDIT_FIELDS
+    *MARKER_AUDIT_FIELDS,
+    {"name": "display_order", "type": "Int"}
 ]
 
 CLUE_FIELDS = [
@@ -133,7 +134,8 @@ CLUE_FIELDS = [
     {"name": "confidence", "type": "String", "length": 20},
     {"name": "description", "type": "String", "length": 255},
     *MARKER_COMMON_GEO_FIELDS,
-    *MARKER_AUDIT_FIELDS
+    *MARKER_AUDIT_FIELDS,
+    {"name": "display_order", "type": "Int"}
 ]
 
 HAZARD_FIELDS = [
@@ -143,7 +145,8 @@ HAZARD_FIELDS = [
     {"name": "severity", "type": "String", "length": 20},
     {"name": "description", "type": "String", "length": 255},
     *MARKER_COMMON_GEO_FIELDS,
-    *MARKER_AUDIT_FIELDS
+    *MARKER_AUDIT_FIELDS,
+    {"name": "display_order", "type": "Int"}
 ]
 
 CASUALTY_FIELDS = [
@@ -155,7 +158,8 @@ CASUALTY_FIELDS = [
     {"name": "description", "type": "String", "length": 255},
     {"name": "found_by", "type": "String", "length": 120},
     *MARKER_COMMON_GEO_FIELDS,
-    *MARKER_AUDIT_FIELDS
+    *MARKER_AUDIT_FIELDS,
+    {"name": "display_order", "type": "Int"}
 ]
 
 # ---------------------------------------------------------------------------
@@ -173,7 +177,8 @@ CURRENT_POSITION_FIELDS = [
 
 BREADCRUMB_FIELDS = [
     {"name": "device_id", "type": "String", "length": 50},
-    {"name": "name", "type": "String", "length": 100}
+    {"name": "name", "type": "String", "length": 100},
+    {"name": "timestamp", "type": "String", "length": 40}
 ]
 
 # ---------------------------------------------------------------------------
@@ -188,7 +193,8 @@ LINES_FIELDS = [
     {"name": "width", "type": "Int"},
     {"name": "distance_m", "type": "Double"},
     {"name": "created", "type": "String", "length": 40},
-    {"name": "temporary_measure", "type": "Bool"}
+    {"name": "temporary_measure", "type": "Bool"},
+    {"name": "display_order", "type": "Int"}
 ]
 
 SEARCH_AREA_FIELDS = [
@@ -206,7 +212,8 @@ SEARCH_AREA_FIELDS = [
     {"name": "start_time", "type": "String", "length": 40},
     {"name": "end_time", "type": "String", "length": 40},
     {"name": "notes", "type": "String", "length": 255},
-    {"name": "created", "type": "String", "length": 40}
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "display_order", "type": "Int"}
 ]
 
 RANGE_RING_FIELDS = [
@@ -219,7 +226,8 @@ RANGE_RING_FIELDS = [
     {"name": "color", "type": "String", "length": 16},
     {"name": "lpb_category", "type": "String", "length": 60},
     {"name": "percentile", "type": "Int"},
-    {"name": "created", "type": "String", "length": 40}
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "display_order", "type": "Int"}
 ]
 
 BEARING_LINE_FIELDS = [
@@ -231,7 +239,8 @@ BEARING_LINE_FIELDS = [
     {"name": "distance_m", "type": "Double"},
     {"name": "label", "type": "String", "length": 60},
     {"name": "color", "type": "String", "length": 16},
-    {"name": "created", "type": "String", "length": 40}
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "display_order", "type": "Int"}
 ]
 
 SEARCH_SECTOR_FIELDS = [
@@ -245,7 +254,8 @@ SEARCH_SECTOR_FIELDS = [
     {"name": "area_sqkm", "type": "Double"},
     {"name": "priority", "type": "String", "length": 20},
     {"name": "color", "type": "String", "length": 16},
-    {"name": "created", "type": "String", "length": 40}
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "display_order", "type": "Int"}
 ]
 
 TEXT_LABEL_FIELDS = [
@@ -256,7 +266,8 @@ TEXT_LABEL_FIELDS = [
     {"name": "font_size", "type": "Int"},
     {"name": "color", "type": "String", "length": 16},
     {"name": "rotation", "type": "Double"},
-    {"name": "created", "type": "String", "length": 40}
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "display_order", "type": "Int"}
 ]
 
 

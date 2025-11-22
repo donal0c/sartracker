@@ -10,15 +10,20 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 
 from typing import List, Dict, Optional, Any
 from datetime import datetime
+from datetime import timedelta
+import os
+import tempfile
 from collections import defaultdict
 
 from qgis.core import (
-    QgsVectorLayer, QgsFeature, QgsGeometry,
+    QgsVectorLayer, QgsFeature, QgsGeometry, QgsField,
     QgsPointXY, QgsCategorizedSymbolRenderer, QgsRendererCategory,
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
-    QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings
+    QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
+    QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext
 )
 from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtCore import QVariant
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
@@ -337,12 +342,49 @@ class TrackingLayerManager(BaseLayerManager):
             LayerIds.BREADCRUMBS,
             fallback_name=self.BREADCRUMBS_LAYER_NAME
         )
+        self._ensure_breadcrumbs_schema(layer)
         if layer.customProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, None) is None:
             layer.setCustomProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, True)
         if layer.customProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, None) is None:
             layer.setCustomProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, False)
         self._log_tracking_event(layer, "BREADCRUMBS", "ensure")
         return layer
+
+    def _ensure_breadcrumbs_schema(self, layer: QgsVectorLayer):
+        """
+        Ensure breadcrumbs layer has required fields (timestamp).
+
+        Add missing fields in-place using a safe transaction.
+        """
+        if not layer or not layer.isValid():
+            return
+
+        if layer.fields().indexFromName("timestamp") != -1:
+            return
+
+        # Add timestamp field if missing
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            print(f"[TrackingManager] Warning: Could not start editing {layer.name()} to add timestamp field")
+            return
+
+        try:
+            if not layer.addAttribute(QgsField("timestamp", QVariant.String, len=40)):
+                raise RuntimeError("Failed to add timestamp field")
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+        except Exception as exc:
+            layer.rollBack()
+            print(f"[TrackingManager] Warning: Could not update breadcrumbs schema: {exc}")
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
 
     def update_breadcrumbs(
         self,
@@ -625,7 +667,22 @@ class TrackingLayerManager(BaseLayerManager):
                 feature.setGeometry(geom)
                 device_id = segment.get('device_id', '')
                 device_name = segment.get('name') or device_id
-                feature.setAttributes([device_id, device_name])
+                points_payload = segment.get('points', [])
+                ts_value = ""
+                if points_payload:
+                    last_ts = points_payload[-1].get('ts')
+                    if isinstance(last_ts, str):
+                        ts_value = last_ts
+
+                attr_map = {
+                    'device_id': device_id,
+                    'name': device_name,
+                    'timestamp': ts_value
+                }
+                for field_name, value in attr_map.items():
+                    idx = layer.fields().indexFromName(field_name)
+                    if idx != -1:
+                        feature.setAttribute(idx, value)
                 if not layer.addFeature(feature):
                     raise RuntimeError(f"Failed to add breadcrumb segment for device {device_id}")
 
@@ -740,3 +797,277 @@ class TrackingLayerManager(BaseLayerManager):
             renderer = QgsCategorizedSymbolRenderer('device_id', categories)
             layer.setRenderer(renderer)
             layer.setCustomProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, True)
+
+    def delete_device_positions(
+        self,
+        device_ids: List[str],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Delete all current positions for given device IDs.
+
+        Args:
+            device_ids: List of device IDs to remove
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of positions deleted
+
+        Raises:
+            ValueError: If device_ids invalid
+            LayerTransactionError: If deletion fails
+        """
+        # Validate input
+        if not isinstance(device_ids, list) or not device_ids:
+            raise ValueError("device_ids must be a non-empty list")
+
+        layer = self._get_or_create_current_layer()
+
+        # Find features to delete
+        device_id_field_idx = layer.fields().indexFromName('device_id')
+        if device_id_field_idx == -1:
+            raise RuntimeError("device_id field not found")
+
+        feature_ids_to_delete = []
+        for feature in layer.getFeatures(QgsFeatureRequest()):
+            if feature.attribute(device_id_field_idx) in device_ids:
+                feature_ids_to_delete.append(feature.id())
+
+        if not feature_ids_to_delete:
+            return 0
+
+        # Delete features
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=self.CURRENT_LAYER_NAME,
+                operation="start editing",
+                details="delete device positions"
+            )
+
+        try:
+            if not layer.deleteFeatures(feature_ids_to_delete):
+                raise RuntimeError("Failed to delete features")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            print(f"[TrackingManager] Deleted {len(feature_ids_to_delete)} positions for {len(device_ids)} devices")
+            return len(feature_ids_to_delete)
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=self.CURRENT_LAYER_NAME,
+                operation="delete device positions",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+    def delete_device_breadcrumbs(
+        self,
+        device_ids: List[str],
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Delete breadcrumbs for given device IDs.
+
+        Args:
+            device_ids: List of device IDs to remove
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of breadcrumb segments deleted
+        """
+        if not isinstance(device_ids, list) or not device_ids:
+            raise ValueError("device_ids must be a non-empty list")
+
+        layer = self._get_or_create_breadcrumbs_layer()
+
+        device_id_field_idx = layer.fields().indexFromName('device_id')
+        if device_id_field_idx == -1:
+            raise RuntimeError("device_id field not found")
+
+        feature_ids_to_delete = []
+        for feature in layer.getFeatures(QgsFeatureRequest()):
+            if feature.attribute(device_id_field_idx) in device_ids:
+                feature_ids_to_delete.append(feature.id())
+
+        if not feature_ids_to_delete:
+            return 0
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=self.BREADCRUMBS_LAYER_NAME,
+                operation="start editing",
+                details="delete device breadcrumbs"
+            )
+
+        try:
+            if not layer.deleteFeatures(feature_ids_to_delete):
+                raise RuntimeError("Failed to delete breadcrumbs")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            print(f"[TrackingManager] Deleted {len(feature_ids_to_delete)} breadcrumb segments for {len(device_ids)} devices")
+            return len(feature_ids_to_delete)
+
+        except Exception as e:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=self.BREADCRUMBS_LAYER_NAME,
+                operation="delete device breadcrumbs",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+    def prune_old_breadcrumbs(
+        self,
+        older_than_hours: int = 24,
+        updated_by: Optional[str] = None
+    ) -> int:
+        """
+        Delete breadcrumbs older than specified hours.
+
+        Performance optimization for long missions.
+
+        Args:
+            older_than_hours: Age threshold in hours
+            updated_by: Coordinator name for audit trail
+
+        Returns:
+            Number of breadcrumb segments deleted
+        """
+        if not isinstance(older_than_hours, (int, float)) or older_than_hours <= 0:
+            raise ValueError(f"older_than_hours must be positive number, got: {older_than_hours}")
+
+        layer = self._get_or_create_breadcrumbs_layer()
+        if not layer or not layer.isValid():
+            return 0
+
+        ts_idx = layer.fields().indexFromName("timestamp")
+        if ts_idx == -1:
+            print(f"[TrackingManager] WARNING: Breadcrumbs layer missing timestamp field; cannot prune")
+            return 0
+
+        threshold = datetime.utcnow() - timedelta(hours=float(older_than_hours))
+        feature_ids = []
+        for feature in layer.getFeatures(QgsFeatureRequest()):
+            ts_val = feature.attribute(ts_idx)
+            if not ts_val:
+                continue
+            try:
+                ts = self._parse_iso_timestamp(str(ts_val))
+            except Exception:
+                continue
+            if ts < threshold:
+                feature_ids.append(feature.id())
+
+        if not feature_ids:
+            return 0
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=self.BREADCRUMBS_LAYER_NAME,
+                operation="start editing",
+                details="prune breadcrumbs"
+            )
+
+        try:
+            if not layer.deleteFeatures(feature_ids):
+                raise RuntimeError("Failed to delete old breadcrumbs")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+
+            layer.triggerRepaint()
+            print(f"[TrackingManager] Pruned {len(feature_ids)} breadcrumb segments older than {older_than_hours}h")
+            return len(feature_ids)
+
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(
+                layer_name=self.BREADCRUMBS_LAYER_NAME,
+                operation="prune breadcrumbs",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def export_device_track(
+        self,
+        device_id: str,
+        format: str = "geojson"
+    ) -> str:
+        """
+        Export a single device track (breadcrumbs) to a file.
+
+        Args:
+            device_id: Device identifier to export
+            format: Output format (currently only 'geojson')
+
+        Returns:
+            Path to exported file
+        """
+        if not device_id or not isinstance(device_id, str):
+            raise ValueError("device_id must be a non-empty string")
+        if format.lower() != "geojson":
+            raise ValueError("Only GeoJSON export is supported currently")
+
+        layer = self._get_or_create_breadcrumbs_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Breadcrumbs layer not available")
+
+        # Filter features for device
+        device_field_idx = layer.fields().indexFromName("device_id")
+        if device_field_idx == -1:
+            raise RuntimeError("Breadcrumbs layer missing device_id field")
+
+        export_layer = QgsVectorLayer(f"LineString?crs={layer.crs().authid()}", f"{device_id}_track", "memory")
+        export_layer.dataProvider().addAttributes(layer.fields())
+        export_layer.updateFields()
+
+        for feature in layer.getFeatures(QgsFeatureRequest()):
+            if feature.attribute(device_field_idx) != device_id:
+                continue
+            new_feature = QgsFeature(export_layer.fields())
+            new_feature.setGeometry(feature.geometry())
+            new_feature.setAttributes([feature.attribute(i) for i in range(len(layer.fields()))])
+            if not export_layer.dataProvider().addFeature(new_feature):
+                raise RuntimeError(f"Failed to copy feature {feature.id()} for export")
+
+        if export_layer.featureCount() == 0:
+            raise ValueError(f"No breadcrumbs found for device {device_id}")
+
+        temp_dir = tempfile.mkdtemp(prefix="sartracker_export_")
+        path = os.path.join(temp_dir, f"{device_id}_track.geojson")
+
+        options = QgsVectorFileWriter.SaveVectorOptions()
+        options.driverName = "GeoJSON"
+        result, error_message = QgsVectorFileWriter.writeAsVectorFormatV2(
+            export_layer,
+            path,
+            QgsCoordinateTransformContext(),
+            options
+        )
+        if result != QgsVectorFileWriter.NoError:
+            raise RuntimeError(f"Export failed: {error_message}")
+
+        print(f"[TrackingManager] Exported track for {device_id} to {path}")
+        return path
