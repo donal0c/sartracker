@@ -15,7 +15,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor, QFont, QIcon
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Callable
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
@@ -24,6 +24,7 @@ from ..utils.qt_compat import (
 from ..utils.notify import info, warning, error
 from ..config.keys import ConfigStore, SETTINGS_KEYS
 from ..controllers.mission_controller import MissionState
+from .marker_log_widget import MarkerLogWidget
 
 
 class SARPanel(QDockWidget):
@@ -33,6 +34,9 @@ class SARPanel(QDockWidget):
     Signals:
         refresh_requested: Emitted when manual refresh requested
         csv_load_requested: Emitted when user wants to load CSV (file_path: str)
+        marker_edit_requested: Emitted when user requests marker edit
+        marker_delete_requested: Emitted when user requests marker delete
+        marker_zoom_requested: Emitted when user wants to zoom to marker
     """
     
     refresh_requested = pyqtSignal()
@@ -49,6 +53,9 @@ class SARPanel(QDockWidget):
     measure_distance_requested = pyqtSignal()
     autosave_requested = pyqtSignal()  # Request to save project
     clear_measurements_requested = pyqtSignal()
+    marker_edit_requested = pyqtSignal(str, str)
+    marker_delete_requested = pyqtSignal(str, str)
+    marker_zoom_requested = pyqtSignal(float, float)
 
     # Phase N1: Provider signals removed - configuration moved to Settings Panel
 
@@ -72,6 +79,17 @@ class SARPanel(QDockWidget):
 
         # Setup UI
         self._setup_ui()
+
+        if hasattr(self, "marker_log_widget"):
+            self.marker_log_widget.edit_requested.connect(
+                lambda marker_type, marker_id: self.marker_edit_requested.emit(marker_type, marker_id)
+            )
+            self.marker_log_widget.delete_requested.connect(
+                lambda marker_type, marker_id: self.marker_delete_requested.emit(marker_type, marker_id)
+            )
+            self.marker_log_widget.zoom_requested.connect(
+                lambda lat, lon: self.marker_zoom_requested.emit(lat, lon)
+            )
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
@@ -219,6 +237,11 @@ class SARPanel(QDockWidget):
         mission_layout.addLayout(controls_layout)
         self._apply_mission_button_styles()
 
+        # Mission storage status
+        self.mission_storage_label = QLabel("Storage: <i>Not initialized</i>")
+        self.mission_storage_label.setWordWrap(True)
+        mission_layout.addWidget(self.mission_storage_label)
+
         badge_layout = QHBoxLayout()
         self.auto_refresh_status_label = QLabel("Auto Refresh: OFF")
         self.autosave_status_label = QLabel("Auto Save: OFF")
@@ -228,6 +251,14 @@ class SARPanel(QDockWidget):
         mission_layout.addLayout(badge_layout)
         mission_group.setLayout(mission_layout)
         layout.addWidget(mission_group)
+
+        # Marker Log Section
+        marker_group = QGroupBox("Marker Log")
+        marker_layout = QVBoxLayout()
+        self.marker_log_widget = MarkerLogWidget()
+        marker_layout.addWidget(self.marker_log_widget)
+        marker_group.setLayout(marker_layout)
+        layout.addWidget(marker_group)
         
         # Devices Section
         devices_group = QGroupBox("Devices")
@@ -654,6 +685,16 @@ class SARPanel(QDockWidget):
         self.start_button.setStyleSheet(start_style)
         self.pause_button.setStyleSheet(pause_style)
         self.finish_button.setStyleSheet(finish_style)
+
+    def configure_marker_log(self, fetcher: Callable[[], List[Dict[str, object]]]):
+        """Provide data fetcher for marker log widget."""
+        if hasattr(self, "marker_log_widget") and self.marker_log_widget:
+            self.marker_log_widget.set_data_fetcher(fetcher)
+
+    def refresh_marker_log(self):
+        """Refresh marker log widget."""
+        if hasattr(self, "marker_log_widget") and self.marker_log_widget:
+            self.marker_log_widget.refresh()
         self._set_button_state(self.start_button, "state", "idle")
         self._set_button_state(self.pause_button, "state", "pause")
         self._set_button_state(self.pause_button, "flashOn", False)
@@ -933,6 +974,24 @@ class SARPanel(QDockWidget):
         label = "Measurement pinned" if count == 1 else "Measurements pinned"
         self.measurements_status_label.setText(f"{label}: {count}")
         self.clear_measurements_button.setEnabled(count > 0)
+
+    def update_mission_storage(self, primary_path: Optional[str], backup_path: Optional[str] = None, active: bool = True):
+        """
+        Update the mission storage status label.
+
+        Args:
+            primary_path: Path to the primary mission GeoPackage
+            backup_path: Path to the backup mirror directory (if any)
+            active: Whether the mission storage is currently active
+        """
+        if not primary_path:
+            text = "Storage: <i>Not initialized</i>"
+        else:
+            state = "active" if active else "idle"
+            text = f"Storage ({state}): {primary_path}"
+            if backup_path:
+                text += f" | Backup: {backup_path}"
+        self.mission_storage_label.setText(text)
 
     def disable_drawing_tools(self, reason: str = "Drawing tools unavailable"):
         """

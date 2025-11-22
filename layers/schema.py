@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 
 # Schema version - increment when structure changes
-SAR_LAYER_SCHEMA_VERSION = 1
+SAR_LAYER_SCHEMA_VERSION = 3
 
 # Root group name
 ROOT_GROUP_NAME = "SAR Tracker"
@@ -106,7 +106,15 @@ MARKER_COMMON_GEO_FIELDS = [
     {"name": "lon", "type": "Double"},
     {"name": "irish_grid_e", "type": "Double"},
     {"name": "irish_grid_n", "type": "Double"},
-    {"name": "created", "type": "DateTime"}
+    {"name": "created", "type": "String", "length": 40}
+]
+
+MARKER_AUDIT_FIELDS = [
+    {"name": "created_at", "type": "String", "length": 40},
+    {"name": "updated_at", "type": "String", "length": 40},
+    {"name": "updated_by", "type": "String", "length": 120},
+    {"name": "coordinator_ids", "type": "String", "length": 255},
+    {"name": "attachment_path", "type": "String", "length": 255}
 ]
 
 IPP_LKP_FIELDS = [
@@ -114,7 +122,8 @@ IPP_LKP_FIELDS = [
     {"name": "name", "type": "String", "length": 120},
     {"name": "subject_category", "type": "String", "length": 60},
     {"name": "description", "type": "String", "length": 255},
-    *MARKER_COMMON_GEO_FIELDS
+    *MARKER_COMMON_GEO_FIELDS,
+    *MARKER_AUDIT_FIELDS
 ]
 
 CLUE_FIELDS = [
@@ -123,7 +132,8 @@ CLUE_FIELDS = [
     {"name": "clue_type", "type": "String", "length": 60},
     {"name": "confidence", "type": "String", "length": 20},
     {"name": "description", "type": "String", "length": 255},
-    *MARKER_COMMON_GEO_FIELDS
+    *MARKER_COMMON_GEO_FIELDS,
+    *MARKER_AUDIT_FIELDS
 ]
 
 HAZARD_FIELDS = [
@@ -132,7 +142,8 @@ HAZARD_FIELDS = [
     {"name": "hazard_type", "type": "String", "length": 60},
     {"name": "severity", "type": "String", "length": 20},
     {"name": "description", "type": "String", "length": 255},
-    *MARKER_COMMON_GEO_FIELDS
+    *MARKER_COMMON_GEO_FIELDS,
+    *MARKER_AUDIT_FIELDS
 ]
 
 CASUALTY_FIELDS = [
@@ -143,7 +154,109 @@ CASUALTY_FIELDS = [
     {"name": "evacuation_priority", "type": "String", "length": 30},
     {"name": "description", "type": "String", "length": 255},
     {"name": "found_by", "type": "String", "length": 120},
-    *MARKER_COMMON_GEO_FIELDS
+    *MARKER_COMMON_GEO_FIELDS,
+    *MARKER_AUDIT_FIELDS
+]
+
+# ---------------------------------------------------------------------------
+# Tracking layer field definitions
+# ---------------------------------------------------------------------------
+
+CURRENT_POSITION_FIELDS = [
+    {"name": "device_id", "type": "String", "length": 50},
+    {"name": "name", "type": "String", "length": 100},
+    {"name": "timestamp", "type": "String", "length": 40},
+    {"name": "altitude", "type": "Double"},
+    {"name": "speed", "type": "Double"},
+    {"name": "battery", "type": "Double"}
+]
+
+BREADCRUMB_FIELDS = [
+    {"name": "device_id", "type": "String", "length": 50},
+    {"name": "name", "type": "String", "length": 100}
+]
+
+# ---------------------------------------------------------------------------
+# Drawing / overlay layer field definitions
+# ---------------------------------------------------------------------------
+
+LINES_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "name", "type": "String", "length": 120},
+    {"name": "description", "type": "String", "length": 255},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "width", "type": "Int"},
+    {"name": "distance_m", "type": "Double"},
+    {"name": "created", "type": "String", "length": 40},
+    {"name": "temporary_measure", "type": "Bool"}
+]
+
+SEARCH_AREA_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "name", "type": "String", "length": 120},
+    {"name": "team", "type": "String", "length": 120},
+    {"name": "status", "type": "String", "length": 40},
+    {"name": "priority", "type": "String", "length": 20},
+    {"name": "area_sqkm", "type": "Double"},
+    {"name": "POA", "type": "Double"},
+    {"name": "POD", "type": "Double"},
+    {"name": "terrain", "type": "String", "length": 120},
+    {"name": "search_method", "type": "String", "length": 120},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "start_time", "type": "String", "length": 40},
+    {"name": "end_time", "type": "String", "length": 40},
+    {"name": "notes", "type": "String", "length": 255},
+    {"name": "created", "type": "String", "length": 40}
+]
+
+RANGE_RING_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "name", "type": "String", "length": 120},
+    {"name": "center_lat", "type": "Double"},
+    {"name": "center_lon", "type": "Double"},
+    {"name": "radius_m", "type": "Double"},
+    {"name": "label", "type": "String", "length": 60},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "lpb_category", "type": "String", "length": 60},
+    {"name": "percentile", "type": "Int"},
+    {"name": "created", "type": "String", "length": 40}
+]
+
+BEARING_LINE_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "name", "type": "String", "length": 120},
+    {"name": "origin_lat", "type": "Double"},
+    {"name": "origin_lon", "type": "Double"},
+    {"name": "bearing", "type": "Double"},
+    {"name": "distance_m", "type": "Double"},
+    {"name": "label", "type": "String", "length": 60},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "created", "type": "String", "length": 40}
+]
+
+SEARCH_SECTOR_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "name", "type": "String", "length": 120},
+    {"name": "center_lat", "type": "Double"},
+    {"name": "center_lon", "type": "Double"},
+    {"name": "start_bearing", "type": "Double"},
+    {"name": "end_bearing", "type": "Double"},
+    {"name": "radius_m", "type": "Double"},
+    {"name": "area_sqkm", "type": "Double"},
+    {"name": "priority", "type": "String", "length": 20},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "created", "type": "String", "length": 40}
+]
+
+TEXT_LABEL_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},
+    {"name": "text", "type": "String", "length": 255},
+    {"name": "lat", "type": "Double"},
+    {"name": "lon", "type": "Double"},
+    {"name": "font_size", "type": "Int"},
+    {"name": "color", "type": "String", "length": 16},
+    {"name": "rotation", "type": "Double"},
+    {"name": "created", "type": "String", "length": 40}
 ]
 
 
@@ -181,14 +294,7 @@ def get_expected_structure() -> GroupDefinition:
                         layer_id=LayerIds.CURRENT_ACTIVE,
                         name="Current – Active",
                         geometry_type="Point",
-                        fields=[
-                            {"name": "device_id", "type": "String", "length": 50},
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "timestamp", "type": "DateTime"},
-                            {"name": "altitude", "type": "Double"},
-                            {"name": "speed", "type": "Double"},
-                            {"name": "battery", "type": "Double"}
-                        ],
+                        fields=CURRENT_POSITION_FIELDS,
                         metadata={"sartracker:type": "current_position"}
                     )
                 ]
@@ -204,12 +310,7 @@ def get_expected_structure() -> GroupDefinition:
                         layer_id=LayerIds.BREADCRUMBS,
                         name="Breadcrumbs",
                         geometry_type="LineString",
-                        fields=[
-                            {"name": "device_id", "type": "String", "length": 50},
-                            {"name": "device_name", "type": "String", "length": 100},
-                            {"name": "start_time", "type": "DateTime"},
-                            {"name": "end_time", "type": "DateTime"}
-                        ],
+                        fields=BREADCRUMB_FIELDS,
                         metadata={"sartracker:type": "breadcrumb"}
                     )
                 ]
@@ -225,23 +326,14 @@ def get_expected_structure() -> GroupDefinition:
                         layer_id=LayerIds.LINES,
                         name="Lines",
                         geometry_type="LineString",
-                        fields=[
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "description", "type": "String", "length": 255},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=LINES_FIELDS,
                         metadata={"sartracker:type": "line"}
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.BEARING_LINES,
                         name="Bearing Lines",
                         geometry_type="LineString",
-                        fields=[
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "bearing", "type": "Double"},
-                            {"name": "distance", "type": "Double"},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=BEARING_LINE_FIELDS,
                         metadata={"sartracker:type": "bearing_line"}
                     )
                 ]
@@ -257,11 +349,7 @@ def get_expected_structure() -> GroupDefinition:
                         layer_id=LayerIds.RANGE_RINGS,
                         name="Range Rings",
                         geometry_type="Polygon",
-                        fields=[
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "radius", "type": "Double"},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=RANGE_RING_FIELDS,
                         metadata={"sartracker:type": "range_ring"}
                     )
                 ]
@@ -364,33 +452,21 @@ def get_expected_structure() -> GroupDefinition:
                         layer_id=LayerIds.SEARCH_AREAS,
                         name="Search Areas",
                         geometry_type="Polygon",
-                        fields=[
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "area_type", "type": "String", "length": 50},
-                            {"name": "description", "type": "String", "length": 255},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=SEARCH_AREA_FIELDS,
                         metadata={"sartracker:type": "search_area"}
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.SEARCH_SECTORS,
                         name="Search Sectors",
                         geometry_type="Polygon",
-                        fields=[
-                            {"name": "name", "type": "String", "length": 100},
-                            {"name": "sector_id", "type": "String", "length": 50},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=SEARCH_SECTOR_FIELDS,
                         metadata={"sartracker:type": "search_sector"}
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.TEXT_LABELS,
                         name="Text Labels",
                         geometry_type="Point",
-                        fields=[
-                            {"name": "text", "type": "String", "length": 255},
-                            {"name": "created", "type": "DateTime"}
-                        ],
+                        fields=TEXT_LABEL_FIELDS,
                         metadata={"sartracker:type": "text_label"}
                     )
                 ]

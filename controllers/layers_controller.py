@@ -21,6 +21,7 @@ from .layer_managers.tracking_manager import TrackingLayerManager
 from .layer_managers.marker_manager import MarkerLayerManager
 from .layer_managers.drawing_manager import DrawingLayerManager
 from ..layers.helicopter_manager import HelicopterLayerManager
+from ..layers import LayerManager as SchemaLayerManager, GroupNames
 
 
 class LayersController:
@@ -53,9 +54,9 @@ class LayersController:
     """
 
     # Layer group name (shared across all managers)
-    LAYER_GROUP_NAME = "SAR Tracking"
+    LAYER_GROUP_NAME = GroupNames.ROOT
 
-    def __init__(self, iface):
+    def __init__(self, iface, layer_manager: Optional[SchemaLayerManager] = None):
         """
         Initialize layers controller.
 
@@ -75,20 +76,23 @@ class LayersController:
         # Same device ID will always get same color in all layers
         self._shared_device_colors = {}
 
+        # Shared LayerManager (GeoPackage-aware)
+        self.layer_manager = layer_manager or SchemaLayerManager(iface)
+
         # Initialize specialized managers with shared color registry
         # Managers must be initialized in this order (no dependencies between them currently)
         try:
-            self.tracking = TrackingLayerManager(iface, self._shared_device_colors)
+            self.tracking = TrackingLayerManager(iface, self._shared_device_colors, self.layer_manager)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize TrackingLayerManager: {e}")
 
         try:
-            self.markers = MarkerLayerManager(iface, self._shared_device_colors)
+            self.markers = MarkerLayerManager(iface, self._shared_device_colors, self.layer_manager)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize MarkerLayerManager: {e}")
 
         try:
-            self.drawings = DrawingLayerManager(iface, self._shared_device_colors)
+            self.drawings = DrawingLayerManager(iface, self._shared_device_colors, self.layer_manager)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize DrawingLayerManager: {e}")
 
@@ -247,6 +251,47 @@ class LayersController:
             name, lat, lon, condition, treatment, evacuation_priority,
             description, found_by, irish_grid_e, irish_grid_n
         )
+
+    def list_markers(self) -> List[Dict[str, Any]]:
+        """
+        Return flattened list of all markers for UI consumption.
+
+        Returns:
+            List of dicts with marker metadata
+        """
+        return self.markers.list_markers()
+
+    def get_marker_feature(self, marker_type: str, marker_id: str):
+        """
+        Fetch a marker feature by type/id.
+
+        Args:
+            marker_type: 'ipp_lkp', 'clue', 'hazard', or 'casualty'
+            marker_id: UUID string stored in 'id' attribute
+        """
+        return self.markers.get_marker_feature(marker_type, marker_id)
+
+    def update_marker(self, marker_type: str, marker_id: str, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
+        """
+        Update a marker feature in-place.
+
+        Args:
+            marker_type: Marker category
+            marker_id: UUID string
+            updates: Attribute payload keyed by field name
+            updated_by: Optional operator name for audit trail
+        """
+        return self.markers.update_marker(marker_type, marker_id, updates, updated_by=updated_by)
+
+    def delete_marker(self, marker_type: str, marker_id: str) -> bool:
+        """
+        Delete a marker by UUID.
+
+        Args:
+            marker_type: Marker category
+            marker_id: UUID string
+        """
+        return self.markers.delete_marker(marker_type, marker_id)
 
     # =========================================================================
     # Drawing Methods (delegate to drawing manager)

@@ -19,7 +19,7 @@ def test_schema_import():
     """Test that schema module can be imported."""
     try:
         from layers import schema
-        assert schema.SAR_LAYER_SCHEMA_VERSION == 1
+        assert schema.SAR_LAYER_SCHEMA_VERSION == 3
         assert schema.ROOT_GROUP_NAME == "SAR Tracker"
         print("✓ Schema module imported successfully")
         return True
@@ -164,19 +164,23 @@ def test_marker_layer_fields_match_manager():
         expected_fields = {
             LayerIds.MARKERS_IPP_LKP: [
                 "id", "name", "subject_category", "description",
-                "lat", "lon", "irish_grid_e", "irish_grid_n", "created"
+                "lat", "lon", "irish_grid_e", "irish_grid_n", "created",
+                "created_at", "updated_at", "updated_by", "coordinator_ids", "attachment_path"
             ],
             LayerIds.MARKERS_CLUES: [
                 "id", "name", "clue_type", "confidence",
-                "description", "lat", "lon", "irish_grid_e", "irish_grid_n", "created"
+                "description", "lat", "lon", "irish_grid_e", "irish_grid_n", "created",
+                "created_at", "updated_at", "updated_by", "coordinator_ids", "attachment_path"
             ],
             LayerIds.MARKERS_HAZARDS: [
                 "id", "name", "hazard_type", "severity",
-                "description", "lat", "lon", "irish_grid_e", "irish_grid_n", "created"
+                "description", "lat", "lon", "irish_grid_e", "irish_grid_n", "created",
+                "created_at", "updated_at", "updated_by", "coordinator_ids", "attachment_path"
             ],
             LayerIds.MARKERS_CASUALTIES: [
                 "id", "name", "condition", "treatment", "evacuation_priority",
-                "description", "found_by", "lat", "lon", "irish_grid_e", "irish_grid_n", "created"
+                "description", "found_by", "lat", "lon", "irish_grid_e", "irish_grid_n", "created",
+                "created_at", "updated_at", "updated_by", "coordinator_ids", "attachment_path"
             ]
         }
 
@@ -191,6 +195,61 @@ def test_marker_layer_fields_match_manager():
         return True
     except Exception as e:
         print(f"✗ Marker layer schema alignment test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def test_tracking_and_drawing_layer_fields():
+    """Ensure tracking and drawing schemas match manager expectations."""
+    try:
+        from layers.schema import get_layer_by_id, LayerIds
+
+        expectations = {
+            LayerIds.CURRENT_ACTIVE: [
+                "device_id", "name", "timestamp", "altitude", "speed", "battery"
+            ],
+            LayerIds.BREADCRUMBS: [
+                "device_id", "name"
+            ],
+            LayerIds.LINES: [
+                "id", "name", "description", "color", "width",
+                "distance_m", "created", "temporary_measure"
+            ],
+            LayerIds.RANGE_RINGS: [
+                "id", "name", "center_lat", "center_lon", "radius_m",
+                "label", "color", "lpb_category", "percentile", "created"
+            ],
+            LayerIds.SEARCH_AREAS: [
+                "id", "name", "team", "status", "priority", "area_sqkm", "POA",
+                "POD", "terrain", "search_method", "color", "start_time",
+                "end_time", "notes", "created"
+            ],
+            LayerIds.SEARCH_SECTORS: [
+                "id", "name", "center_lat", "center_lon",
+                "start_bearing", "end_bearing", "radius_m",
+                "area_sqkm", "priority", "color", "created"
+            ],
+            LayerIds.TEXT_LABELS: [
+                "id", "text", "lat", "lon", "font_size", "color", "rotation", "created"
+            ],
+            LayerIds.BEARING_LINES: [
+                "id", "name", "origin_lat", "origin_lon",
+                "bearing", "distance_m", "label", "color", "created"
+            ],
+        }
+
+        for layer_id, field_names in expectations.items():
+            layer_def = get_layer_by_id(layer_id)
+            assert layer_def is not None, f"Missing definition for {layer_id}"
+            assert layer_def.fields is not None, f"No fields defined for {layer_id}"
+            actual = [field['name'] for field in layer_def.fields]
+            assert actual == field_names, f"{layer_id} schema mismatch: {actual}"
+
+        print("✓ Tracking and drawing layer schemas align with managers")
+        return True
+    except Exception as e:
+        print(f"✗ Tracking/drawing schema alignment test failed: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -289,6 +348,7 @@ def run_all_tests():
         ("Expected Structure", test_expected_structure),
         ("Helicopter Fields", test_helicopter_fields),
         ("Marker Layer Fields", test_marker_layer_fields_match_manager),
+        ("Tracking & Drawing Layer Fields", test_tracking_and_drawing_layer_fields),
         ("Layer Lookup by ID", test_layer_by_id_lookup),
         ("Artifact Layer Map", test_artifact_layer_map),
         ("Helicopter Colors", test_helicopter_manager_colors)

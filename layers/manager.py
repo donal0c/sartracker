@@ -9,6 +9,7 @@ persistent layer structure across plugin sessions.
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
+from pathlib import Path
 from typing import Dict, List, Optional, Callable
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import (
@@ -17,9 +18,13 @@ from qgis.core import (
     QgsField,
     QgsLayerTreeGroup,
     QgsCoordinateReferenceSystem,
+    QgsCoordinateTransformContext,
     QgsMarkerSymbol,
     QgsLineSymbol,
-    QgsFillSymbol
+    QgsFillSymbol,
+    QgsWkbTypes,
+    QgsMapLayerStyle,
+    QgsVectorLayerExporter
 )
 
 from .schema import (
@@ -44,7 +49,14 @@ QT_TYPE_MAP = {
     "String": QVariant.String,
     "Int": QVariant.Int,
     "Double": QVariant.Double,
-    "DateTime": QVariant.DateTime
+    "DateTime": QVariant.DateTime,
+    "Bool": QVariant.Bool
+}
+
+GEOMETRY_WKB_MAP = {
+    "Point": QgsWkbTypes.Point,
+    "LineString": QgsWkbTypes.LineString,
+    "Polygon": QgsWkbTypes.Polygon
 }
 
 
@@ -64,6 +76,10 @@ class LayerManager:
         _signals_connected: Whether project signals are connected
     """
 
+    MISSION_STORE_VAR = "sartracker:mission_store_path"
+    MISSION_STORE_DRIVER = "GPKG"
+    MISSION_STORE_PROVIDER = "ogr"
+
     def __init__(self, iface):
         """
         Initialize the LayerManager.
@@ -76,6 +92,8 @@ class LayerManager:
         self._layer_cache: Dict[str, QgsVectorLayer] = {}
         self._group_cache: Dict[str, QgsLayerTreeGroup] = {}
         self._signals_connected = False
+        self._mission_store_path: Optional[str] = self._load_mission_store_path()
+        self._layer_provider_uris: Dict[str, str] = {}
 
         # Connect to project signals for cache management
         self._connect_signals()
@@ -88,6 +106,57 @@ class LayerManager:
                 self._signals_connected = True
             except Exception as e:
                 print(f"[LayerManager] Warning: Could not connect signals: {e}")
+
+    def _load_mission_store_path(self) -> Optional[str]:
+        """Read mission store path from project custom variables."""
+        try:
+            value = self.project.customVariables().get(self.MISSION_STORE_VAR)
+            if value:
+                return str(Path(value).expanduser())
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Could not load mission store path: {exc}")
+        return None
+
+    def set_mission_store(self, path: str):
+        """
+        Configure the mission store GeoPackage path.
+
+        Args:
+            path: Absolute path to the mission GeoPackage file.
+        """
+        if not path or not isinstance(path, str):
+            raise ValueError("Mission store path must be a non-empty string")
+
+        normalized = str(Path(path).expanduser())
+        target_dir = Path(normalized).parent
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self.project.setCustomVariable(self.MISSION_STORE_VAR, normalized)
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to persist mission store path: {exc}")
+
+        self._mission_store_path = normalized
+        self._layer_provider_uris.clear()
+        self._layer_cache.clear()
+
+    def get_mission_store(self) -> Optional[str]:
+        """Return the configured mission store path, if any."""
+        return self._mission_store_path
+
+    def clear_mission_store(self):
+        """Remove the mission store association from the project."""
+        try:
+            self.project.setCustomVariable(self.MISSION_STORE_VAR, "")
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Failed to clear mission store variable: {exc}")
+
+        self._mission_store_path = None
+        self._layer_provider_uris.clear()
+        self._layer_cache.clear()
+
+    def _mission_store_enabled(self) -> bool:
+        return bool(self._mission_store_path)
 
     def disconnect_signals(self):
         """Disconnect from project signals on cleanup."""
@@ -439,6 +508,12 @@ class LayerManager:
         return layer
 
     def _create_vector_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
+        """Create a layer backed by memory or the mission store."""
+        if self._mission_store_enabled():
+            return self._ensure_persistent_layer(layer_def)
+        return self._create_memory_layer(layer_def)
+
+    def _create_memory_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
         """
         Create a QgsVectorLayer from a layer definition.
 
@@ -486,6 +561,75 @@ class LayerManager:
                 if layer.isEditable():
                     layer.rollBack()
 
+        return layer
+
+    def _ensure_mission_store_directory(self):
+        """Ensure the directory containing the mission store exists."""
+        if not self._mission_store_path:
+            raise RuntimeError("Mission store path is not configured")
+        Path(self._mission_store_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _build_mission_store_uri(self, layer_def: LayerDefinition) -> str:
+        """Construct and cache the provider URI for a mission-store layer."""
+        if layer_def.layer_id in self._layer_provider_uris:
+            return self._layer_provider_uris[layer_def.layer_id]
+
+        if not self._mission_store_path:
+            raise RuntimeError("Mission store path is not configured")
+
+        uri = f"{self._mission_store_path}|layername={layer_def.layer_id}"
+        self._layer_provider_uris[layer_def.layer_id] = uri
+        return uri
+
+    def _load_persistent_layer(self, layer_def: LayerDefinition) -> Optional[QgsVectorLayer]:
+        """Try to load an existing GeoPackage layer."""
+        if not self._mission_store_path:
+            return None
+
+        uri = self._build_mission_store_uri(layer_def)
+        layer = QgsVectorLayer(uri, layer_def.name, self.MISSION_STORE_PROVIDER)
+        if layer.isValid():
+            layer.setCustomProperty('sartracker:layer_id', layer_def.layer_id)
+            return layer
+
+        return None
+
+    def _create_persistent_table(self, layer_def: LayerDefinition):
+        """Create an empty GeoPackage table for the layer definition."""
+        self._ensure_mission_store_directory()
+        template_layer = self._create_memory_layer(layer_def)
+
+        options = QgsVectorLayerExporter.SaveVectorOptions()
+        options.driverName = self.MISSION_STORE_DRIVER
+        options.layerName = layer_def.layer_id
+        options.actionOnExistingFile = QgsVectorLayerExporter.CreateOrOverwriteLayer
+        options.fileEncoding = "UTF-8"
+        options.onlySelectedFeatures = False
+        options.includeMetadata = True
+        options.overwriteWithEmptyLayer = True
+
+        result, error_message = QgsVectorLayerExporter.exportLayer(
+            template_layer,
+            self._mission_store_path,
+            options,
+            QgsCoordinateTransformContext()
+        )
+
+        if result != QgsVectorLayerExporter.NoError:
+            raise RuntimeError(
+                f"Failed to create persistent layer '{layer_def.layer_id}': {error_message}"
+            )
+
+    def _ensure_persistent_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
+        """Ensure a GeoPackage-backed layer exists and return it."""
+        layer = self._load_persistent_layer(layer_def)
+        if layer:
+            return layer
+
+        self._create_persistent_table(layer_def)
+        layer = self._load_persistent_layer(layer_def)
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Persistent layer '{layer_def.layer_id}' could not be loaded")
         return layer
 
     def _create_field(self, field_def: Dict) -> QgsField:
@@ -564,6 +708,23 @@ class LayerManager:
 
         return layer
 
+    def ensure_persistent_layer(self, layer_id: str) -> QgsVectorLayer:
+        """
+        Ensure a mission-store backed layer exists and return it.
+
+        Args:
+            layer_id: SAR Tracker layer ID
+
+        Returns:
+            QgsVectorLayer backed by the mission store
+        """
+        layer_def = get_layer_by_id(layer_id)
+        if not layer_def:
+            raise ValueError(f"Unknown layer id: {layer_id}")
+        if not self._mission_store_enabled():
+            raise RuntimeError("Mission store is not configured")
+        return self._ensure_persistent_layer(layer_def)
+
     def get_helicopter_layer(self, slot: int) -> Optional[QgsVectorLayer]:
         """
         Get a helicopter layer by slot number (1-4).
@@ -624,6 +785,54 @@ class LayerManager:
             traceback.print_exc()
             return False
 
+    def migrate_memory_layer_to_store(self, layer: QgsVectorLayer, layer_def: LayerDefinition) -> QgsVectorLayer:
+        """
+        Export an existing memory layer into the mission store.
+
+        Args:
+            layer: Source memory-backed layer
+            layer_def: Target schema definition
+
+        Returns:
+            The newly created persistent layer
+        """
+        if not self._mission_store_enabled():
+            raise RuntimeError("Mission store is not configured")
+
+        if not layer or layer.providerType() != "memory":
+            raise ValueError("Only memory layers can be migrated")
+
+        options = QgsVectorLayerExporter.SaveVectorOptions()
+        options.driverName = self.MISSION_STORE_DRIVER
+        options.layerName = layer_def.layer_id
+        options.actionOnExistingFile = QgsVectorLayerExporter.CreateOrOverwriteLayer
+        options.fileEncoding = "UTF-8"
+        options.includeMetadata = True
+
+        result, error_message = QgsVectorLayerExporter.exportLayer(
+            layer,
+            self._mission_store_path,
+            options,
+            self.project.transformContext()
+        )
+
+        if result != QgsVectorLayerExporter.NoError:
+            raise RuntimeError(
+                f"Failed to migrate layer '{layer_def.layer_id}' to mission store: {error_message}"
+            )
+
+        persistent_layer = self._load_persistent_layer(layer_def)
+        if not persistent_layer:
+            raise RuntimeError(f"Persistent layer '{layer_def.layer_id}' could not be loaded after migration")
+
+        style = QgsMapLayerStyle()
+        if style.readFromLayer(layer):
+            style.writeToLayer(persistent_layer)
+
+        persistent_layer.setCustomProperty('sartracker:layer_id', layer_def.layer_id)
+        persistent_layer.triggerRepaint()
+        return persistent_layer
+
     def route_feature(self, category: str, feature):
         """
         Route a feature to the appropriate layer based on category.
@@ -665,6 +874,45 @@ class LayerManager:
             # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
             if layer.isEditable():
                 layer.rollBack()
+
+    def validate_persistence(self, quiet: bool = False) -> Dict[str, str]:
+        """
+        Validate that managed layers are backed by non-memory providers.
+
+        Returns:
+            Dict mapping layer_ids to issue description (empty if healthy)
+        """
+        issues: Dict[str, str] = {}
+        if not self._mission_store_enabled():
+            if not quiet:
+                warning(self.iface.messageBar(),
+                        "Mission Store",
+                        "Mission store is not configured; layers remain in memory.")
+            issues["mission_store"] = "not_configured"
+            return issues
+
+        for layer_def in self._collect_layer_definitions():
+            layer = self.get_layer(layer_def.layer_id)
+            if not layer:
+                issues[layer_def.layer_id] = "missing"
+                continue
+
+            provider = (layer.providerType() or "").lower()
+            if provider == "memory":
+                issues[layer_def.layer_id] = "memory"
+
+        if issues:
+            if not quiet:
+                warning(self.iface.messageBar(),
+                        "Persistence Diagnostics",
+                        f"{len(issues)} layer(s) still use memory providers.")
+        else:
+            if not quiet:
+                info(self.iface.messageBar(),
+                     "Persistence Diagnostics",
+                     "All managed layers use persistent providers.")
+
+        return issues
 
     def clear_cache(self):
         """Clear all cached layer and group references."""
@@ -758,3 +1006,18 @@ class LayerManager:
 
         existing = {field.name() for field in layer.fields()}
         return all(field in existing for field in required_fields)
+
+    def _collect_layer_definitions(self) -> List[LayerDefinition]:
+        """Return a flat list of all layer definitions in the schema."""
+        structure = get_expected_structure()
+        collected: List[LayerDefinition] = []
+
+        def _walk(group: GroupDefinition):
+            if group.layers:
+                collected.extend(group.layers)
+            if group.subgroups:
+                for subgroup in group.subgroups:
+                    _walk(subgroup)
+
+        _walk(structure)
+        return collected

@@ -8,7 +8,7 @@ Dialog for adding/editing SAR markers: IPP/LKP, Clues, and Hazards.
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLineEdit, QTextEdit, QComboBox,
-    QLabel, QGroupBox, QRadioButton, QButtonGroup
+    QLabel, QGroupBox, QRadioButton, QButtonGroup, QFileDialog
 )
 
 from ..utils.dialog_utils import BaseDialog
@@ -27,7 +27,7 @@ class MarkerDialog(BaseDialog):
     Shows coordinates in both WGS84 and Irish Grid (ITM).
     """
 
-    def __init__(self, lat, lon, easting, northing, parent=None):
+    def __init__(self, lat, lon, easting, northing, parent=None, existing_data=None):
         super().__init__(parent)
 
         self.lat = lat
@@ -35,13 +35,16 @@ class MarkerDialog(BaseDialog):
         self.easting = easting
         self.northing = northing
 
-        self.marker_type = "ipp_lkp"  # or "clue" or "hazard" or "casualty"
+        self.existing_data = existing_data or {}
+        self.edit_mode = bool(self.existing_data)
+        self.marker_id = self.existing_data.get('id')
+        self.marker_type = self.existing_data.get('type', "ipp_lkp")  # or "clue" or "hazard" or "casualty"
 
         self._setup_ui()
         
     def _setup_ui(self):
         """Build the dialog UI."""
-        self.setWindowTitle("Add Marker")
+        self.setWindowTitle("Update Marker" if self.edit_mode else "Add Marker")
         self.setMinimumWidth(500)
         
         layout = QVBoxLayout()
@@ -53,7 +56,7 @@ class MarkerDialog(BaseDialog):
         self.type_button_group = QButtonGroup()
 
         self.ipp_lkp_radio = QRadioButton("IPP/LKP")
-        self.ipp_lkp_radio.setChecked(True)
+        self.ipp_lkp_radio.setChecked(self.marker_type == "ipp_lkp")
         self.ipp_lkp_radio.setToolTip(
             "Initial Planning Point / Last Known Position\n"
             "The starting point for search planning, typically where the\n"
@@ -64,6 +67,7 @@ class MarkerDialog(BaseDialog):
         type_layout.addWidget(self.ipp_lkp_radio)
 
         self.clue_radio = QRadioButton("Clue")
+        self.clue_radio.setChecked(self.marker_type == "clue")
         self.clue_radio.setToolTip(
             "Evidence or clues found during search:\n"
             "Footprints, clothing, equipment, witness sightings, etc."
@@ -73,6 +77,7 @@ class MarkerDialog(BaseDialog):
         type_layout.addWidget(self.clue_radio)
 
         self.hazard_radio = QRadioButton("Hazard")
+        self.hazard_radio.setChecked(self.marker_type == "hazard")
         self.hazard_radio.setToolTip(
             "Safety hazard marking:\n"
             "Cliffs, water hazards, bogs, dense vegetation, etc."
@@ -82,6 +87,7 @@ class MarkerDialog(BaseDialog):
         type_layout.addWidget(self.hazard_radio)
 
         self.casualty_radio = QRadioButton("Casualty")
+        self.casualty_radio.setChecked(self.marker_type == "casualty")
         self.casualty_radio.setToolTip(
             "Found injured or deceased person:\n"
             "CRITICAL: Use for actual casualties requiring medical response,\n"
@@ -172,6 +178,20 @@ class MarkerDialog(BaseDialog):
         self.hazard_type_label = QLabel("Hazard Type:")
         details_layout.addRow(self.hazard_type_label, self.hazard_type_combo)
 
+        # Hazard Severity (only for Hazard)
+        self.severity_combo = QComboBox()
+        self.severity_combo.addItems([
+            "Critical",
+            "High",
+            "Medium",
+            "Low"
+        ])
+        default_severity_index = self.severity_combo.findText("Medium")
+        if default_severity_index != -1:
+            self.severity_combo.setCurrentIndex(default_severity_index)
+        self.severity_label = QLabel("Severity:")
+        details_layout.addRow(self.severity_label, self.severity_combo)
+
         # Casualty Condition (only for Casualty)
         self.condition_combo = QComboBox()
         self.condition_combo.addItems([
@@ -213,6 +233,26 @@ class MarkerDialog(BaseDialog):
         self.description_input.setPlaceholderText("Enter additional notes...")
         self.description_input.setMaximumHeight(100)
         details_layout.addRow("Notes:", self.description_input)
+
+        # Updated By / Operator
+        self.updated_by_input = QLineEdit()
+        self.updated_by_input.setPlaceholderText("Operator / updated by")
+        details_layout.addRow("Updated By:", self.updated_by_input)
+
+        # Coordinator IDs
+        self.coordinator_input = QLineEdit()
+        self.coordinator_input.setPlaceholderText("Coordinator IDs (comma-separated)")
+        details_layout.addRow("Coordinator IDs:", self.coordinator_input)
+
+        # Attachment path (optional)
+        attachment_layout = QHBoxLayout()
+        self.attachment_input = QLineEdit()
+        self.attachment_input.setPlaceholderText("Attachment path or URL...")
+        attachment_layout.addWidget(self.attachment_input)
+        self.attachment_button = QPushButton("Browse…")
+        self.attachment_button.clicked.connect(self._on_browse_attachment)
+        attachment_layout.addWidget(self.attachment_button)
+        details_layout.addRow("Attachment:", attachment_layout)
         
         details_group.setLayout(details_layout)
         layout.addWidget(details_group)
@@ -226,7 +266,7 @@ class MarkerDialog(BaseDialog):
         
         buttons_layout.addStretch()
         
-        self.save_button = QPushButton("Add Marker")
+        self.save_button = QPushButton("Update Marker" if self.edit_mode else "Add Marker")
         self.save_button.setDefault(True)
         self.save_button.clicked.connect(self._on_save)
         buttons_layout.addWidget(self.save_button)
@@ -237,6 +277,8 @@ class MarkerDialog(BaseDialog):
         
         # Initial state
         self._on_type_changed()
+        if self.edit_mode:
+            self._load_existing_data()
         
     def _on_type_changed(self):
         """Handle marker type change - show/hide relevant fields."""
@@ -269,6 +311,8 @@ class MarkerDialog(BaseDialog):
         # Hazard fields
         self.hazard_type_label.setVisible(is_hazard)
         self.hazard_type_combo.setVisible(is_hazard)
+        self.severity_label.setVisible(is_hazard)
+        self.severity_combo.setVisible(is_hazard)
 
         # Casualty fields
         self.condition_label.setVisible(is_casualty)
@@ -314,10 +358,84 @@ class MarkerDialog(BaseDialog):
             data['confidence'] = self.confidence_combo.currentText()
         elif self.marker_type == 'hazard':
             data['hazard_type'] = self.hazard_type_combo.currentText()
+            data['severity'] = self.severity_combo.currentText()
         elif self.marker_type == 'casualty':
             data['condition'] = self.condition_combo.currentText()
             data['treatment'] = self.treatment_input.text().strip()
             data['evacuation_priority'] = self.evacuation_priority_combo.currentText()
             data['found_by'] = self.found_by_input.text().strip()
 
+        data['updated_by'] = self.updated_by_input.text().strip()
+        data['coordinator_ids'] = self.coordinator_input.text().strip()
+        data['attachment_path'] = self.attachment_input.text().strip()
+
+        if self.edit_mode and self.marker_id:
+            data['id'] = self.marker_id
+
         return data
+
+    # ------------------------------------------------------------------
+    # Attachment helpers / edit mode
+    # ------------------------------------------------------------------
+
+    def _on_browse_attachment(self):
+        """Open file picker for attachment path."""
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Attachment", "", "All Files (*)")
+        if file_path:
+            self.attachment_input.setText(file_path)
+
+    def _load_existing_data(self):
+        """Populate form with existing marker details."""
+        data = self.existing_data
+        self.name_input.setText(data.get('name', ''))
+        self.description_input.setPlainText(data.get('description', ''))
+        self.updated_by_input.setText(data.get('updated_by', ''))
+        self.coordinator_input.setText(data.get('coordinator_ids', ''))
+        self.attachment_input.setText(data.get('attachment_path', ''))
+
+        # Type-specific fields
+        if self.marker_type == 'ipp_lkp':
+            subject = data.get('subject_category')
+            if subject:
+                index = self.subject_category_combo.findText(subject)
+                if index != -1:
+                    self.subject_category_combo.setCurrentIndex(index)
+        elif self.marker_type == 'clue':
+            clue_type = data.get('clue_type')
+            confidence = data.get('confidence')
+            if clue_type:
+                idx = self.clue_type_combo.findText(clue_type)
+                if idx != -1:
+                    self.clue_type_combo.setCurrentIndex(idx)
+            if confidence:
+                idx = self.confidence_combo.findText(confidence)
+                if idx != -1:
+                    self.confidence_combo.setCurrentIndex(idx)
+        elif self.marker_type == 'hazard':
+            hazard_type = data.get('hazard_type')
+            severity = data.get('severity')
+            if hazard_type:
+                idx = self.hazard_type_combo.findText(hazard_type)
+                if idx != -1:
+                    self.hazard_type_combo.setCurrentIndex(idx)
+            if severity:
+                idx = self.severity_combo.findText(severity)
+                if idx != -1:
+                    self.severity_combo.setCurrentIndex(idx)
+        elif self.marker_type == 'casualty':
+            condition = data.get('condition')
+            evacuation = data.get('evacuation_priority')
+            found_by = data.get('found_by')
+            treatment = data.get('treatment')
+            if condition:
+                idx = self.condition_combo.findText(condition)
+                if idx != -1:
+                    self.condition_combo.setCurrentIndex(idx)
+            if evacuation:
+                idx = self.evacuation_priority_combo.findText(evacuation)
+                if idx != -1:
+                    self.evacuation_priority_combo.setCurrentIndex(idx)
+            if treatment:
+                self.treatment_input.setText(treatment)
+            if found_by:
+                self.found_by_input.setText(found_by)

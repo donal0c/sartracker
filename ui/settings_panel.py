@@ -161,6 +161,34 @@ class SettingsPanel(QDockWidget):
         save_interval_layout.addStretch()
         defaults_layout.addLayout(save_interval_layout)
 
+        defaults_layout.addSpacing(10)
+
+        # Mission Storage Settings
+        storage_header = QLabel("<b>Mission Storage</b>")
+        defaults_layout.addWidget(storage_header)
+
+        primary_layout = QHBoxLayout()
+        primary_layout.addWidget(QLabel("Primary mission root:"))
+        self.mission_primary_input = QLineEdit()
+        self.mission_primary_input.setPlaceholderText("~/SAR Tracker Missions")
+        self.mission_primary_input.textChanged.connect(self._on_primary_root_changed)
+        primary_layout.addWidget(self.mission_primary_input)
+        browse_primary = QPushButton("Browse…")
+        browse_primary.clicked.connect(self._browse_primary_root)
+        primary_layout.addWidget(browse_primary)
+        defaults_layout.addLayout(primary_layout)
+
+        backup_layout = QHBoxLayout()
+        backup_layout.addWidget(QLabel("Backup mirror root (optional):"))
+        self.mission_backup_input = QLineEdit()
+        self.mission_backup_input.setPlaceholderText("Select backup folder or leave blank")
+        self.mission_backup_input.textChanged.connect(self._on_backup_root_changed)
+        backup_layout.addWidget(self.mission_backup_input)
+        browse_backup = QPushButton("Browse…")
+        browse_backup.clicked.connect(self._browse_backup_root)
+        backup_layout.addWidget(browse_backup)
+        defaults_layout.addLayout(backup_layout)
+
         defaults_group.setLayout(defaults_layout)
         layout.addWidget(defaults_group)
 
@@ -411,6 +439,10 @@ class SettingsPanel(QDockWidget):
 
             auto_save_interval = ConfigStore.get_auto_save_interval()
             self.autosave_interval_spin.setValue(auto_save_interval)
+
+            # Mission storage roots
+            self.mission_primary_input.setText(ConfigStore.get_mission_primary_root())
+            self.mission_backup_input.setText(ConfigStore.get_mission_backup_root())
 
             # Load provider auto-connect setting
             auto_connect = ConfigStore.get_provider_auto_connect()
@@ -671,6 +703,26 @@ class SettingsPanel(QDockWidget):
         """Handle auto-connect checkbox change."""
         self.apply_button.setEnabled(True)
 
+    def _on_primary_root_changed(self, text):
+        """Handle mission primary root edits."""
+        self.apply_button.setEnabled(True)
+
+    def _browse_primary_root(self):
+        """Browse for mission primary root directory."""
+        path = QFileDialog.getExistingDirectory(self, "Select Primary Mission Root", self.mission_primary_input.text() or "")
+        if path:
+            self.mission_primary_input.setText(path)
+
+    def _on_backup_root_changed(self, text):
+        """Handle mission backup root edits."""
+        self.apply_button.setEnabled(True)
+
+    def _browse_backup_root(self):
+        """Browse for mission backup mirror directory."""
+        path = QFileDialog.getExistingDirectory(self, "Select Mission Backup Root", self.mission_backup_input.text() or "")
+        if path:
+            self.mission_backup_input.setText(path)
+
     def _on_repair_layers_clicked(self):
         """Emit signal to request layer structure repair."""
         self.repair_layers_requested.emit()
@@ -824,6 +876,10 @@ class SettingsPanel(QDockWidget):
                 SETTINGS_KEYS.PROVIDER_AUTO_CONNECT,
                 self.auto_connect_checkbox.isChecked()
             )
+            primary_root = self.mission_primary_input.text().strip()
+            backup_root = self.mission_backup_input.text().strip()
+            ConfigStore.set_mission_primary_root(primary_root or SETTINGS_KEYS.MISSION_PRIMARY_ROOT_DEFAULT)
+            ConfigStore.set_mission_backup_root(backup_root)
 
             # Disable Apply button
             self.apply_button.setEnabled(False)
@@ -834,7 +890,9 @@ class SettingsPanel(QDockWidget):
                 'auto_refresh_interval': self.refresh_interval_spin.value(),
                 'auto_save_enabled': self.auto_save_checkbox.isChecked(),
                 'auto_save_interval': self.autosave_interval_spin.value(),
-                'provider_auto_connect': self.auto_connect_checkbox.isChecked()
+                'provider_auto_connect': self.auto_connect_checkbox.isChecked(),
+                'mission_primary_root': ConfigStore.get_mission_primary_root(),
+                'mission_backup_root': ConfigStore.get_mission_backup_root()
             })
 
             # Show success message (import iface locally to avoid circular imports)

@@ -13,15 +13,15 @@ from datetime import datetime
 from collections import defaultdict
 
 from qgis.core import (
-    QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
+    QgsVectorLayer, QgsFeature, QgsGeometry,
     QgsPointXY, QgsCategorizedSymbolRenderer, QgsRendererCategory,
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings
 )
-from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
+from ...layers import LayerIds
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 
 
@@ -45,9 +45,9 @@ class TrackingLayerManager(BaseLayerManager):
     BREADCRUMB_STYLE_MANAGED_PROP = "sartracker:breadcrumbs_style_managed"
     BREADCRUMB_STYLE_INITIALIZED_PROP = "sartracker:breadcrumbs_style_initialized"
 
-    def __init__(self, iface, shared_device_colors=None):
+    def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize tracking layer manager."""
-        super().__init__(iface, shared_device_colors)
+        super().__init__(iface, shared_device_colors, layer_manager)
         self.first_load = True  # Track if this is first data load for auto-zoom
 
     def get_managed_layer_names(self):
@@ -58,6 +58,11 @@ class TrackingLayerManager(BaseLayerManager):
         """Reset manager state (called after clearing layers)."""
         super().reset_state()
         self.first_load = True  # Reset auto-zoom flag
+
+    def _log_tracking_event(self, layer: QgsVectorLayer, layer_type: str, action: str, **extra):
+        """Emit diagnostics for tracking layers when enabled."""
+        payload = extra if extra else None
+        self._log_layer_snapshot(layer, f"{layer_type}::{action}", payload)
 
     # =========================================================================
     # Current Positions Layer
@@ -70,34 +75,11 @@ class TrackingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Current positions layer
         """
-        # Check if exists
-        layers = self.project.mapLayersByName(self.CURRENT_LAYER_NAME)
-        if layers:
-            return layers[0]
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using QVariant types
-        layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",
-            self.CURRENT_LAYER_NAME,
-            "memory"
+        layer = self._ensure_schema_layer(
+            LayerIds.CURRENT_ACTIVE,
+            fallback_name=self.CURRENT_LAYER_NAME
         )
-
-        # Add fields
-        provider = layer.dataProvider()
-        provider.addAttributes([
-            QgsField("device_id", QVariant.String),  # String
-            QgsField("name", QVariant.String),       # String
-            QgsField("timestamp", QVariant.String),  # String
-            QgsField("altitude", QVariant.Double),   # Double
-            QgsField("speed", QVariant.Double),      # Double
-            QgsField("battery", QVariant.Double)     # Double
-        ])
-        layer.updateFields()
-
-        # Add to project in SAR group (position 2 - below markers)
-        self._add_layer_to_group(layer, position=2)
-
+        self._log_tracking_event(layer, "CURRENT", "ensure")
         return layer
 
     def update_current_positions(self, positions: List[Dict]):
@@ -240,6 +222,13 @@ class TrackingLayerManager(BaseLayerManager):
             # Just repaint the layer, not the whole canvas
             layer.triggerRepaint()
 
+        self._log_tracking_event(
+            layer,
+            "CURRENT",
+            "update",
+            payload_items=len(positions)
+        )
+
     def _apply_current_positions_style(self, layer: QgsVectorLayer):
         """
         Apply or update categorized style to current positions.
@@ -344,32 +333,15 @@ class TrackingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Breadcrumbs layer
         """
-        layers = self.project.mapLayersByName(self.BREADCRUMBS_LAYER_NAME)
-        if layers:
-            return layers[0]
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using integer type codes
-        layer = QgsVectorLayer(
-            "LineString?crs=EPSG:4326",
-            self.BREADCRUMBS_LAYER_NAME,
-            "memory"
+        layer = self._ensure_schema_layer(
+            LayerIds.BREADCRUMBS,
+            fallback_name=self.BREADCRUMBS_LAYER_NAME
         )
-
-        provider = layer.dataProvider()
-        provider.addAttributes([
-            QgsField("device_id", QVariant.String),  # String
-            QgsField("name", QVariant.String)        # String
-        ])
-        layer.updateFields()
-
-        # Add to project in SAR group (position 3 - below current positions)
-        self._add_layer_to_group(layer, position=3)
-
-        # Track that SAR Tracker manages the initial style for this layer
-        layer.setCustomProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, True)
-        layer.setCustomProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, False)
-
+        if layer.customProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, None) is None:
+            layer.setCustomProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, True)
+        if layer.customProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, None) is None:
+            layer.setCustomProperty(self.BREADCRUMB_STYLE_INITIALIZED_PROP, False)
+        self._log_tracking_event(layer, "BREADCRUMBS", "ensure")
         return layer
 
     def update_breadcrumbs(
@@ -416,6 +388,12 @@ class TrackingLayerManager(BaseLayerManager):
             print(f"Warning: Failed to apply styling to {self.BREADCRUMBS_LAYER_NAME}: {str(e)}")
 
         layer.triggerRepaint()
+        self._log_tracking_event(
+            layer,
+            "BREADCRUMBS",
+            "update",
+            segments=len(segments or [])
+        )
 
     def _sanitize_breadcrumb_positions(self, positions: List[Dict]) -> List[Dict[str, Any]]:
         """Validate and normalize raw breadcrumb payloads."""

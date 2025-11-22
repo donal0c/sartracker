@@ -34,6 +34,7 @@ from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
+from ...layers import LayerIds
 from ...utils.exceptions import LayerTransactionError
 
 
@@ -53,9 +54,9 @@ class DrawingLayerManager(BaseLayerManager):
     SECTORS_LAYER_NAME = "Search Sectors"
     TEXT_LABELS_LAYER_NAME = "Text Labels"
 
-    def __init__(self, iface, shared_device_colors=None):
+    def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize drawing layer manager."""
-        super().__init__(iface, shared_device_colors)
+        super().__init__(iface, shared_device_colors, layer_manager)
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -68,6 +69,40 @@ class DrawingLayerManager(BaseLayerManager):
             self.TEXT_LABELS_LAYER_NAME
         ]
 
+    def _style_lines_layer(self, layer: QgsVectorLayer):
+        symbol = QgsLineSymbol.createSimple({'color': 'red', 'width': '2'})
+        layer.renderer().setSymbol(symbol)
+
+    def _style_search_areas_layer(self, layer: QgsVectorLayer):
+        symbol = layer.renderer().symbol()
+        symbol.setColor(QColor(0, 100, 255, 80))
+        symbol.symbolLayer(0).setStrokeColor(QColor(0, 100, 255))
+        symbol.symbolLayer(0).setStrokeWidth(2)
+
+    def _style_range_rings_layer(self, layer: QgsVectorLayer):
+        symbol = layer.renderer().symbol()
+        symbol.setColor(QColor(255, 165, 0, 40))
+        symbol.symbolLayer(0).setStrokeColor(QColor(255, 165, 0))
+        symbol.symbolLayer(0).setStrokeWidth(1.5)
+
+    def _style_bearing_lines_layer(self, layer: QgsVectorLayer):
+        symbol = QgsLineSymbol.createSimple({'color': 'purple', 'width': '2'})
+        layer.renderer().setSymbol(symbol)
+
+    def _style_sectors_layer(self, layer: QgsVectorLayer):
+        symbol = layer.renderer().symbol()
+        symbol.setColor(QColor(255, 100, 100, 60))
+        symbol.symbolLayer(0).setStrokeColor(QColor(255, 100, 100))
+        symbol.symbolLayer(0).setStrokeWidth(2)
+
+    def _style_text_labels_layer(self, layer: QgsVectorLayer):
+        layer.renderer().symbol().setSize(0)
+
+    def _log_drawing_event(self, layer: QgsVectorLayer, layer_type: str, action: str, **extra):
+        """Emit diagnostics for drawing layers when enabled."""
+        payload = extra if extra else None
+        self._log_layer_snapshot(layer, f"{layer_type}::{action}", payload)
+
     # =========================================================================
     # Lines Layer
     # =========================================================================
@@ -79,10 +114,21 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Lines layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.LINES,
+                fallback_name=self.LINES_LAYER_NAME,
+                style_factory=self._style_lines_layer
+            )
+            self._ensure_lines_layer_schema(layer)
+            self._log_drawing_event(layer, "LINES", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.LINES_LAYER_NAME)
         if layers:
             layer = layers[0]
             self._ensure_lines_layer_schema(layer)
+            self._log_drawing_event(layer, "LINES", "reused")
             return layer
 
         # Create memory layer with WGS84 CRS
@@ -113,6 +159,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "LINES", "created")
         return layer
 
     def add_line(self, name: str, points_wgs84: List[QgsPointXY],
@@ -185,6 +232,15 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "LINES",
+            "add",
+            name=name,
+            points=len(points_wgs84),
+            distance_m=total_distance,
+            temporary=temporary_measure
+        )
         return feature.id()
 
     def add_measurement_overlay(self, name: str, points_wgs84: List[QgsPointXY],
@@ -251,6 +307,7 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(layer, "LINES", "clear_overlays", deleted=len(ids_to_delete))
         return len(ids_to_delete)
 
     def count_measurement_overlays(self) -> int:
@@ -298,9 +355,20 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Search Areas layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.SEARCH_AREAS,
+                fallback_name=self.SEARCH_AREAS_LAYER_NAME,
+                style_factory=self._style_search_areas_layer
+            )
+            self._log_drawing_event(layer, "SEARCH_AREAS", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.SEARCH_AREAS_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._log_drawing_event(layer, "SEARCH_AREAS", "reused")
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes
@@ -339,6 +407,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "SEARCH_AREAS", "created")
         return layer
 
     def add_search_area(self, name: str, polygon_wgs84: List[QgsPointXY],
@@ -424,6 +493,15 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "SEARCH_AREAS",
+            "add",
+            name=name,
+            area_sqkm=area_sqkm,
+            team=team,
+            status=status
+        )
         return feature.id()
 
     # =========================================================================
@@ -437,9 +515,20 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Range Rings layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.RANGE_RINGS,
+                fallback_name=self.RANGE_RINGS_LAYER_NAME,
+                style_factory=self._style_range_rings_layer
+            )
+            self._log_drawing_event(layer, "RANGE_RINGS", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.RANGE_RINGS_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._log_drawing_event(layer, "RANGE_RINGS", "reused")
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes
@@ -473,6 +562,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "RANGE_RINGS", "created")
         return layer
 
     def add_range_ring(self, name: str, center_wgs84: QgsPointXY, radius_m: float,
@@ -604,6 +694,15 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "RANGE_RINGS",
+            "add",
+            name=name,
+            radius_m=radius_m,
+            lpb_category=lpb_category,
+            percentile=percentile
+        )
         return feature.id()
 
     # =========================================================================
@@ -617,9 +716,20 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Bearing Lines layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.BEARING_LINES,
+                fallback_name=self.BEARING_LINES_LAYER_NAME,
+                style_factory=self._style_bearing_lines_layer
+            )
+            self._log_drawing_event(layer, "BEARING_LINES", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.BEARING_LINES_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._log_drawing_event(layer, "BEARING_LINES", "reused")
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes
@@ -650,6 +760,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "BEARING_LINES", "created")
         return layer
 
     def add_bearing_line(self, name: str, origin_wgs84: QgsPointXY,
@@ -759,6 +870,14 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "BEARING_LINES",
+            "add",
+            name=name,
+            bearing=bearing,
+            distance_m=distance_m
+        )
         return feature.id()
 
     # =========================================================================
@@ -772,9 +891,20 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Sectors layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.SEARCH_SECTORS,
+                fallback_name=self.SECTORS_LAYER_NAME,
+                style_factory=self._style_sectors_layer
+            )
+            self._log_drawing_event(layer, "SECTORS", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.SECTORS_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._log_drawing_event(layer, "SECTORS", "reused")
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes
@@ -809,6 +939,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "SECTORS", "created")
         return layer
 
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
@@ -930,6 +1061,16 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "SECTORS",
+            "add",
+            name=name,
+            start_bearing=start_bearing,
+            end_bearing=end_bearing,
+            radius_m=radius_m,
+            area_sqkm=area_sqkm
+        )
         return feature.id()
 
     # =========================================================================
@@ -943,9 +1084,20 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Text Labels layer
         """
+        if self.layer_manager:
+            layer = self._ensure_schema_layer(
+                LayerIds.TEXT_LABELS,
+                fallback_name=self.TEXT_LABELS_LAYER_NAME,
+                style_factory=self._style_text_labels_layer
+            )
+            self._log_drawing_event(layer, "TEXT_LABELS", "ensure")
+            return layer
+
         layers = self.project.mapLayersByName(self.TEXT_LABELS_LAYER_NAME)
         if layers:
-            return layers[0]
+            layer = layers[0]
+            self._log_drawing_event(layer, "TEXT_LABELS", "reused")
+            return layer
 
         # Create memory layer with WGS84 CRS
         # Qt5/Qt6 Compatible: Using integer type codes
@@ -975,6 +1127,7 @@ class DrawingLayerManager(BaseLayerManager):
         # Add to project in layer group
         self._add_layer_to_group(layer, position=0)
 
+        self._log_drawing_event(layer, "TEXT_LABELS", "created")
         return layer
 
     def add_text_label(self, text: str, location_wgs84: QgsPointXY,
@@ -1031,4 +1184,12 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
+        self._log_drawing_event(
+            layer,
+            "TEXT_LABELS",
+            "add",
+            text=text,
+            font_size=font_size,
+            rotation=rotation
+        )
         return feature.id()

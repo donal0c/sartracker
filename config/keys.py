@@ -16,6 +16,9 @@ Usage:
 """
 
 
+import os
+
+
 class SETTINGS_KEYS:
     """
     Centralized QSettings key definitions.
@@ -90,6 +93,15 @@ class SETTINGS_KEYS:
     MISSION_PAUSED = "SAR_Tracker/mission_paused"  # Legacy key format
     MISSION_NAME = "SAR_Tracker/mission_name"      # Legacy key format
     MISSION_START_TIME = "SAR_Tracker/mission_start_time"  # Legacy key format
+
+    # ========================================================================
+    # MISSION STORAGE CONFIGURATION
+    # ========================================================================
+    MISSION_PRIMARY_ROOT = "SARTracker/Missions/primary_root"
+    MISSION_BACKUP_ROOT = "SARTracker/Missions/backup_root"
+
+    MISSION_PRIMARY_ROOT_DEFAULT = os.path.join(os.path.expanduser("~"), "SAR Tracker Missions")
+    MISSION_BACKUP_ROOT_DEFAULT = ""
 
     # ========================================================================
     # UI STATE (Phase N1)
@@ -203,6 +215,31 @@ class ConfigStore:
         from qgis.PyQt.QtCore import QSettings
         settings = QSettings()
         settings.setValue(key, value)
+
+    @staticmethod
+    def get_mission_primary_root() -> str:
+        """Return configured mission primary root or default."""
+        path = ConfigStore.get(SETTINGS_KEYS.MISSION_PRIMARY_ROOT, SETTINGS_KEYS.MISSION_PRIMARY_ROOT_DEFAULT)
+        if not isinstance(path, str):
+            return SETTINGS_KEYS.MISSION_PRIMARY_ROOT_DEFAULT
+        path = path.strip()
+        return path or SETTINGS_KEYS.MISSION_PRIMARY_ROOT_DEFAULT
+
+    @staticmethod
+    def set_mission_primary_root(path: str):
+        ConfigStore.set(SETTINGS_KEYS.MISSION_PRIMARY_ROOT, path or "")
+
+    @staticmethod
+    def get_mission_backup_root() -> str:
+        """Return configured mission backup root (empty if not set)."""
+        path = ConfigStore.get(SETTINGS_KEYS.MISSION_BACKUP_ROOT, SETTINGS_KEYS.MISSION_BACKUP_ROOT_DEFAULT)
+        if not isinstance(path, str):
+            return ""
+        return path.strip()
+
+    @staticmethod
+    def set_mission_backup_root(path: str):
+        ConfigStore.set(SETTINGS_KEYS.MISSION_BACKUP_ROOT, path or "")
 
     @staticmethod
     def remove(key: str):

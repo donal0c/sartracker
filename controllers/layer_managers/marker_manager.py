@@ -10,17 +10,18 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 
 from datetime import datetime
 import uuid
+from typing import Dict, List, Optional
 
 from qgis.core import (
-    QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
+    QgsVectorLayer, QgsFeature, QgsGeometry,
     QgsPointXY, QgsMarkerSymbol, QgsPalLayerSettings,
-    QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings
+    QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
+    QgsFeatureRequest
 )
-from qgis.PyQt.QtCore import QVariant
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
-from ...layers import LAYER_FIELD_CHECKS
+from ...layers import LayerIds
 
 
 class MarkerLayerManager(BaseLayerManager):
@@ -42,9 +43,32 @@ class MarkerLayerManager(BaseLayerManager):
     HAZARDS_LAYER_NAME = "Hazards"
     CASUALTIES_LAYER_NAME = "Casualties"
 
-    def __init__(self, iface, shared_device_colors=None):
+    MARKER_TYPE_MAP = {
+        "ipp_lkp": {
+            "layer_id": LayerIds.MARKERS_IPP_LKP,
+            "fallback": IPP_LKP_LAYER_NAME,
+            "style_fn": "_style_ipp_lkp_layer"
+        },
+        "clue": {
+            "layer_id": LayerIds.MARKERS_CLUES,
+            "fallback": CLUES_LAYER_NAME,
+            "style_fn": "_style_clues_layer"
+        },
+        "hazard": {
+            "layer_id": LayerIds.MARKERS_HAZARDS,
+            "fallback": HAZARDS_LAYER_NAME,
+            "style_fn": "_style_hazards_layer"
+        },
+        "casualty": {
+            "layer_id": LayerIds.MARKERS_CASUALTIES,
+            "fallback": CASUALTIES_LAYER_NAME,
+            "style_fn": "_style_casualties_layer"
+        }
+    }
+
+    def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize marker layer manager."""
-        super().__init__(iface, shared_device_colors)
+        super().__init__(iface, shared_device_colors, layer_manager)
         self._invalid_layer_warnings = set()
 
     def get_managed_layer_names(self):
@@ -60,71 +84,125 @@ class MarkerLayerManager(BaseLayerManager):
     # Internal helpers
     # ---------------------------------------------------------------------
 
-    def _candidate_layer_names(self, layer_name: str):
-        """Return possible legacy aliases for a layer name."""
-        if layer_name == self.IPP_LKP_LAYER_NAME:
-            return [self.IPP_LKP_LAYER_NAME, "IPP / LKP"]
-        return [layer_name]
+    def _log_marker_event(self, layer: QgsVectorLayer, marker_type: str, action: str, **extra):
+        """Proxy to BaseLayerManager diagnostics helper."""
+        payload = extra if extra else None
+        self._log_layer_snapshot(layer, f"{marker_type}::{action}", payload)
 
-    def _required_fields_for_layer(self, layer_name: str):
-        """Get required field names for a managed layer."""
-        fields = set(LAYER_FIELD_CHECKS.get(layer_name, []))
-        if fields:
-            return fields
-        # Handle legacy IPP naming
-        if layer_name == self.IPP_LKP_LAYER_NAME:
-            return set(LAYER_FIELD_CHECKS.get("IPP / LKP", []))
-        return set()
+    def _current_timestamp(self) -> str:
+        """Return ISO timestamp for audit fields."""
+        return datetime.utcnow().isoformat()
 
-    def _log_invalid_layer(self, layer, layer_name: str, missing_fields):
-        """Log a warning once per invalid layer to aid troubleshooting."""
-        layer_id = layer.id()
-        if layer_id in self._invalid_layer_warnings:
-            return
-        self._invalid_layer_warnings.add(layer_id)
-        print(
-            f"[MarkerLayerManager] Ignoring layer '{layer.name()}' ({layer_id}) "
-            f"for '{layer_name}' markers - missing fields: {', '.join(sorted(missing_fields))}"
+    def _get_marker_layer(self, marker_type: str) -> QgsVectorLayer:
+        """Return persistent layer for a marker type."""
+        meta = self.MARKER_TYPE_MAP.get(marker_type)
+        if not meta:
+            raise ValueError(f"Unknown marker type: {marker_type}")
+        style_factory = getattr(self, meta["style_fn"])
+        return self._ensure_schema_layer(
+            meta["layer_id"],
+            fallback_name=meta["fallback"],
+            style_factory=style_factory
         )
 
-    def _get_existing_layer(self, layer_name: str):
-        """
-        Find an existing plugin-managed layer with the required schema.
+    def _marker_log_label(self, marker_type: str) -> str:
+        """Return standardized label used in diagnostics."""
+        meta = self.MARKER_TYPE_MAP.get(marker_type, {})
+        fallback = meta.get("fallback", marker_type)
+        return fallback.replace(" ", "_").replace("/", "_").upper()
 
-        Returns:
-            QgsVectorLayer or None
-        """
-        required_fields = self._required_fields_for_layer(layer_name)
-        candidate_names = self._candidate_layer_names(layer_name)
-
-        for name in candidate_names:
-            layers = self.project.mapLayersByName(name)
-            if not layers:
-                continue
-
-            for layer in layers:
-                # No schema requirements -> accept first match
-                if not required_fields:
-                    if name != layer_name:
-                        try:
-                            layer.setName(layer_name)
-                        except Exception:
-                            pass
-                    return layer
-
-                existing_fields = {field.name() for field in layer.fields()}
-                if required_fields.issubset(existing_fields):
-                    if name != layer_name:
-                        try:
-                            layer.setName(layer_name)
-                        except Exception:
-                            pass
-                    return layer
-
-                missing = required_fields - existing_fields
-                self._log_invalid_layer(layer, layer_name, missing)
-
+    def _marker_type_for_layer(self, layer_id: str) -> Optional[str]:
+        """Reverse lookup marker type from layer id."""
+        for marker_type, meta in self.MARKER_TYPE_MAP.items():
+            if meta["layer_id"] == layer_id:
+                return marker_type
         return None
+
+    def _apply_feature_attributes(self, layer: QgsVectorLayer, feature: QgsFeature, data: Dict[str, object]):
+        """Set feature attributes by field name safely."""
+        fields = layer.fields()
+        for key, value in data.items():
+            idx = fields.indexOf(key)
+            if idx == -1:
+                continue
+            feature.setAttribute(idx, value)
+
+    def _build_audit_attributes(
+        self,
+        *,
+        include_created: bool = True,
+        updated_by: Optional[str] = None,
+        coordinator_ids: Optional[str] = None,
+        attachment_path: Optional[str] = None
+    ) -> Dict[str, object]:
+        """Return audit metadata payload for marker rows."""
+        timestamp = self._current_timestamp()
+        data: Dict[str, object] = {
+            "updated_at": timestamp,
+            "updated_by": (updated_by or "").strip(),
+            "coordinator_ids": (coordinator_ids or "").strip(),
+            "attachment_path": (attachment_path or "").strip()
+        }
+        if include_created:
+            data["created_at"] = timestamp
+        return data
+
+    def _feature_request_for_marker(self, marker_id: str) -> QgsFeatureRequest:
+        """Build feature request filtering by marker UUID."""
+        safe_id = marker_id.replace("'", "''")
+        return QgsFeatureRequest().setFilterExpression(f"\"id\" = '{safe_id}'")
+
+    def _get_feature_by_id(self, layer: QgsVectorLayer, marker_id: str) -> Optional[QgsFeature]:
+        """Return first feature that matches marker id."""
+        request = self._feature_request_for_marker(marker_id)
+        for feature in layer.getFeatures(request):
+            return feature
+        return None
+
+    def _style_ipp_lkp_layer(self, layer: QgsVectorLayer):
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'star',
+            'color': '#0066FF',
+            'size': '7',
+            'outline_color': 'black',
+            'outline_width': '0.5'
+        })
+        layer.renderer().setSymbol(symbol)
+        self._apply_marker_labels(layer, QColor('#0066FF'))
+
+    def _style_clues_layer(self, layer: QgsVectorLayer):
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'triangle',
+            'color': '#FFD700',
+            'size': '6',
+            'outline_color': 'black',
+            'outline_width': '0.5'
+        })
+        layer.renderer().setSymbol(symbol)
+        self._apply_marker_labels(layer, QColor('#806600'))
+
+    def _style_hazards_layer(self, layer: QgsVectorLayer):
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'filled_arrowhead',
+            'color': '#FF0000',
+            'size': '7',
+            'outline_color': 'black',
+            'outline_width': '0.5',
+            'angle': '180'
+        })
+        layer.renderer().setSymbol(symbol)
+        self._apply_marker_labels(layer, QColor('#8B0000'))
+
+    def _style_casualties_layer(self, layer: QgsVectorLayer):
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'cross2',
+            'color': '#DC143C',
+            'size': '8',
+            'outline_color': 'black',
+            'outline_width': '0.8'
+        })
+        layer.renderer().setSymbol(symbol)
+        self._apply_marker_labels(layer, QColor('#8B0000'))
 
     # =========================================================================
     # IPP/LKP Layer (Initial Planning Point / Last Known Position)
@@ -141,54 +219,16 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: IPP/LKP layer
         """
-        # Check if layer already exists
-        layer = self._get_existing_layer(self.IPP_LKP_LAYER_NAME)
-        if layer:
-            return layer
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using QVariant types
-        layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",
-            self.IPP_LKP_LAYER_NAME,
-            "memory"
-        )
-
-        # Add fields
-        layer.dataProvider().addAttributes([
-            QgsField("id", QVariant.String),                # String - UUID
-            QgsField("name", QVariant.String),              # String - marker name
-            QgsField("subject_category", QVariant.String),  # String - subject type (Child, Hiker, etc.)
-            QgsField("description", QVariant.String),       # String - additional notes
-            QgsField("lat", QVariant.Double),               # Double - WGS84 latitude
-            QgsField("lon", QVariant.Double),               # Double - WGS84 longitude
-            QgsField("irish_grid_e", QVariant.Double),      # Double - ITM easting
-            QgsField("irish_grid_n", QVariant.Double),      # Double - ITM northing
-            QgsField("created", QVariant.String),           # String - ISO timestamp
-        ])
-        layer.updateFields()
-
-        # Apply styling - Blue star/target symbol
-        symbol = QgsMarkerSymbol.createSimple({
-            'name': 'star',
-            'color': '#0066FF',  # Blue
-            'size': '7',
-            'outline_color': 'black',
-            'outline_width': '0.5'
-        })
-        layer.renderer().setSymbol(symbol)
-
-        # Apply labels
-        self._apply_marker_labels(layer, QColor('#0066FF'))
-
-        # Add to project in SAR group (position 0 - on top)
-        self._add_layer_to_group(layer, position=0)
-
+        layer = self._get_marker_layer("ipp_lkp")
+        self._log_marker_event(layer, self._marker_log_label("ipp_lkp"), "ensure")
         return layer
 
     def add_ipp_lkp(self, name: str, lat: float, lon: float,
                     subject_category: str = "", description: str = "",
-                    irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                    irish_grid_e: float = None, irish_grid_n: float = None,
+                    coordinator_ids: Optional[str] = None,
+                    updated_by: Optional[str] = None,
+                    attachment_path: Optional[str] = None) -> str:
         """
         Add an IPP/LKP marker to the map.
 
@@ -233,18 +273,25 @@ class MarkerLayerManager(BaseLayerManager):
         # Generate UUID
         marker_id = str(uuid.uuid4())
 
-        # Set attributes
-        feature.setAttributes([
-            marker_id,
-            name,
-            subject_category,
-            description,
-            lat,
-            lon,
-            irish_grid_e,
-            irish_grid_n,
-            datetime.now().isoformat()
-        ])
+        created_ts = datetime.now().isoformat()
+        attributes = {
+            "id": marker_id,
+            "name": name,
+            "subject_category": subject_category,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
 
         # Add to layer with error handling
         try:
@@ -261,6 +308,7 @@ class MarkerLayerManager(BaseLayerManager):
             # Force immediate visual update
             layer.triggerRepaint()
 
+            self._log_marker_event(layer, self._marker_log_label("ipp_lkp"), "add", marker_id=marker_id, name=name)
             return marker_id
 
         except Exception as e:
@@ -283,56 +331,17 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Clues layer
         """
-        # Check if layer already exists
-        layer = self._get_existing_layer(self.CLUES_LAYER_NAME)
-        if layer:
-            return layer
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
-        layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",
-            self.CLUES_LAYER_NAME,
-            "memory"
-        )
-
-        # Add fields
-        layer.dataProvider().addAttributes([
-            QgsField("id", QVariant.String),           # String - UUID
-            QgsField("name", QVariant.String),         # String - clue name
-            QgsField("clue_type", QVariant.String),    # String - Footprint, Clothing, Witness Sighting, etc.
-            QgsField("confidence", QVariant.String),   # String - Confirmed, Probable, Possible
-            QgsField("description", QVariant.String),  # String - additional notes
-            QgsField("lat", QVariant.Double),          # Double - WGS84 latitude
-            QgsField("lon", QVariant.Double),          # Double - WGS84 longitude
-            QgsField("irish_grid_e", QVariant.Double), # Double - ITM easting
-            QgsField("irish_grid_n", QVariant.Double), # Double - ITM northing
-            QgsField("created", QVariant.String),      # String - ISO timestamp
-        ])
-        layer.updateFields()
-
-        # Apply styling - Yellow triangle/flag symbol
-        symbol = QgsMarkerSymbol.createSimple({
-            'name': 'triangle',
-            'color': '#FFD700',  # Gold/Yellow
-            'size': '6',
-            'outline_color': 'black',
-            'outline_width': '0.5'
-        })
-        layer.renderer().setSymbol(symbol)
-
-        # Apply labels
-        self._apply_marker_labels(layer, QColor('#806600'))  # Dark yellow-brown for contrast
-
-        # Add to project in SAR group (position 1)
-        self._add_layer_to_group(layer, position=1)
-
+        layer = self._get_marker_layer("clue")
+        self._log_marker_event(layer, self._marker_log_label("clue"), "ensure")
         return layer
 
     def add_clue(self, name: str, lat: float, lon: float,
                  clue_type: str = "", confidence: str = "Possible",
                  description: str = "",
-                 irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                 irish_grid_e: float = None, irish_grid_n: float = None,
+                 coordinator_ids: Optional[str] = None,
+                 updated_by: Optional[str] = None,
+                 attachment_path: Optional[str] = None) -> str:
         """
         Add a clue marker to the map.
 
@@ -371,26 +380,30 @@ class MarkerLayerManager(BaseLayerManager):
 
         layer = self._get_or_create_clues_layer()
 
-        # Create feature
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
-        # Generate UUID
         marker_id = str(uuid.uuid4())
-
-        # Set attributes
-        feature.setAttributes([
-            marker_id,
-            name,
-            clue_type,
-            confidence,
-            description,
-            lat,
-            lon,
-            irish_grid_e,
-            irish_grid_n,
-            datetime.now().isoformat()
-        ])
+        created_ts = datetime.now().isoformat()
+        attributes = {
+            "id": marker_id,
+            "name": name,
+            "clue_type": clue_type,
+            "confidence": confidence,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
 
         # Add to layer with error handling
         try:
@@ -407,6 +420,7 @@ class MarkerLayerManager(BaseLayerManager):
             # Force immediate visual update
             layer.triggerRepaint()
 
+            self._log_marker_event(layer, self._marker_log_label("clue"), "add", marker_id=marker_id, name=name)
             return marker_id
 
         except Exception as e:
@@ -429,57 +443,17 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Hazards layer
         """
-        # Check if layer already exists
-        layer = self._get_existing_layer(self.HAZARDS_LAYER_NAME)
-        if layer:
-            return layer
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using integer type codes (10=String, 2=Int, 6=Double)
-        layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",
-            self.HAZARDS_LAYER_NAME,
-            "memory"
-        )
-
-        # Add fields
-        layer.dataProvider().addAttributes([
-            QgsField("id", QVariant.String),            # String - UUID
-            QgsField("name", QVariant.String),          # String - hazard name
-            QgsField("hazard_type", QVariant.String),   # String - Cliff, Water, Bog, etc.
-            QgsField("severity", QVariant.String),      # String - Critical, High, Medium, Low
-            QgsField("description", QVariant.String),   # String - additional notes
-            QgsField("lat", QVariant.Double),           # Double - WGS84 latitude
-            QgsField("lon", QVariant.Double),           # Double - WGS84 longitude
-            QgsField("irish_grid_e", QVariant.Double),  # Double - ITM easting
-            QgsField("irish_grid_n", QVariant.Double),  # Double - ITM northing
-            QgsField("created", QVariant.String),       # String - ISO timestamp
-        ])
-        layer.updateFields()
-
-        # Apply styling - Red warning symbol
-        symbol = QgsMarkerSymbol.createSimple({
-            'name': 'filled_arrowhead',  # Warning/exclamation-like symbol
-            'color': '#FF0000',  # Red
-            'size': '7',
-            'outline_color': 'black',
-            'outline_width': '0.5',
-            'angle': '180'  # Point upward
-        })
-        layer.renderer().setSymbol(symbol)
-
-        # Apply labels
-        self._apply_marker_labels(layer, QColor('#8B0000'))  # Dark red for labels
-
-        # Add to project in SAR group (position 2)
-        self._add_layer_to_group(layer, position=2)
-
+        layer = self._get_marker_layer("hazard")
+        self._log_marker_event(layer, self._marker_log_label("hazard"), "ensure")
         return layer
 
     def add_hazard(self, name: str, lat: float, lon: float,
                    hazard_type: str = "", severity: str = "Medium",
                    description: str = "",
-                   irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                   irish_grid_e: float = None, irish_grid_n: float = None,
+                   coordinator_ids: Optional[str] = None,
+                   updated_by: Optional[str] = None,
+                   attachment_path: Optional[str] = None) -> str:
         """
         Add a hazard marker to the map.
 
@@ -518,26 +492,30 @@ class MarkerLayerManager(BaseLayerManager):
 
         layer = self._get_or_create_hazards_layer()
 
-        # Create feature
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
-        # Generate UUID
         marker_id = str(uuid.uuid4())
-
-        # Set attributes
-        feature.setAttributes([
-            marker_id,
-            name,
-            hazard_type,
-            severity,
-            description,
-            lat,
-            lon,
-            irish_grid_e,
-            irish_grid_n,
-            datetime.now().isoformat()
-        ])
+        created_ts = datetime.now().isoformat()
+        attributes = {
+            "id": marker_id,
+            "name": name,
+            "hazard_type": hazard_type,
+            "severity": severity,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
 
         # Add to layer with error handling
         try:
@@ -554,6 +532,7 @@ class MarkerLayerManager(BaseLayerManager):
             # Force immediate visual update
             layer.triggerRepaint()
 
+            self._log_marker_event(layer, self._marker_log_label("hazard"), "add", marker_id=marker_id, name=name)
             return marker_id
 
         except Exception as e:
@@ -577,59 +556,18 @@ class MarkerLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer: Casualties layer
         """
-        # Check if layer already exists
-        layer = self._get_existing_layer(self.CASUALTIES_LAYER_NAME)
-        if layer:
-            return layer
-
-        # Create new memory layer with WGS84 CRS
-        # Qt5/Qt6 Compatible: Using QVariant types
-        layer = QgsVectorLayer(
-            "Point?crs=EPSG:4326",
-            self.CASUALTIES_LAYER_NAME,
-            "memory"
-        )
-
-        # Add fields - casualty-specific attributes for medical and legal documentation
-        layer.dataProvider().addAttributes([
-            QgsField("id", QVariant.String),                    # String - UUID
-            QgsField("name", QVariant.String),                  # String - person identifier
-            QgsField("condition", QVariant.String),             # String - Injured, Deceased, Unresponsive
-            QgsField("treatment", QVariant.String),             # String - First aid administered
-            QgsField("evacuation_priority", QVariant.String),   # String - Immediate, Urgent, Delayed
-            QgsField("description", QVariant.String),           # String - additional notes
-            QgsField("found_by", QVariant.String),              # String - team member/device who found
-            QgsField("lat", QVariant.Double),                   # Double - WGS84 latitude
-            QgsField("lon", QVariant.Double),                   # Double - WGS84 longitude
-            QgsField("irish_grid_e", QVariant.Double),          # Double - ITM easting
-            QgsField("irish_grid_n", QVariant.Double),          # Double - ITM northing
-            QgsField("created", QVariant.String),               # String - ISO timestamp
-        ])
-        layer.updateFields()
-
-        # Apply styling - Red cross/medical symbol for high visibility
-        symbol = QgsMarkerSymbol.createSimple({
-            'name': 'cross2',  # Medical cross symbol
-            'color': '#DC143C',  # Crimson red
-            'size': '8',
-            'outline_color': 'black',
-            'outline_width': '0.8'
-        })
-        layer.renderer().setSymbol(symbol)
-
-        # Apply labels - red color for high visibility
-        self._apply_marker_labels(layer, QColor('#8B0000'))  # Dark red for labels
-
-        # Add to project in SAR group (position 3 - after hazards)
-        self._add_layer_to_group(layer, position=3)
-
+        layer = self._get_marker_layer("casualty")
+        self._log_marker_event(layer, self._marker_log_label("casualty"), "ensure")
         return layer
 
     def add_casualty(self, name: str, lat: float, lon: float,
                      condition: str = "", treatment: str = "",
                      evacuation_priority: str = "",
                      description: str = "", found_by: str = "",
-                     irish_grid_e: float = None, irish_grid_n: float = None) -> str:
+                     irish_grid_e: float = None, irish_grid_n: float = None,
+                     coordinator_ids: Optional[str] = None,
+                     updated_by: Optional[str] = None,
+                     attachment_path: Optional[str] = None) -> str:
         """
         Add a casualty marker to the map.
 
@@ -681,28 +619,32 @@ class MarkerLayerManager(BaseLayerManager):
 
         layer = self._get_or_create_casualties_layer()
 
-        # Create feature
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
-        # Generate UUID
         marker_id = str(uuid.uuid4())
-
-        # Set attributes
-        feature.setAttributes([
-            marker_id,
-            name,
-            condition,
-            treatment,
-            evacuation_priority,
-            description,
-            found_by,
-            lat,
-            lon,
-            irish_grid_e,
-            irish_grid_n,
-            datetime.now().isoformat()
-        ])
+        created_ts = datetime.now().isoformat()
+        attributes = {
+            "id": marker_id,
+            "name": name,
+            "condition": condition,
+            "treatment": treatment,
+            "evacuation_priority": evacuation_priority,
+            "description": description,
+            "found_by": found_by,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
 
         # Add to layer with proper transaction handling (Issue #3 pattern)
         try:
@@ -719,6 +661,15 @@ class MarkerLayerManager(BaseLayerManager):
             # Force immediate visual update
             layer.triggerRepaint()
 
+            self._log_marker_event(
+                layer,
+                self._marker_log_label("casualty"),
+                "add",
+                marker_id=marker_id,
+                name=name,
+                condition=condition,
+                evacuation_priority=evacuation_priority
+            )
             return marker_id
 
         except Exception as e:
@@ -726,6 +677,122 @@ class MarkerLayerManager(BaseLayerManager):
             if layer.isEditable():
                 layer.rollBack()
             raise RuntimeError(f"Error adding {self.CASUALTIES_LAYER_NAME} marker '{name}': {str(e)}")
+
+    # =========================================================================
+    # Marker listing / CRUD helpers
+    # =========================================================================
+
+    def _feature_to_record(self, marker_type: str, layer: QgsVectorLayer, feature: QgsFeature) -> Dict[str, object]:
+        """Convert QgsFeature to lightweight dict for UI consumption."""
+        lat = feature["lat"]
+        lon = feature["lon"]
+        if (lat is None or lon is None) and feature.geometry() and not feature.geometry().isEmpty():
+            point = feature.geometry().asPoint()
+            if point:
+                lat = lat or point.y()
+                lon = lon or point.x()
+
+        return {
+            "id": feature["id"],
+            "type": marker_type,
+            "name": feature["name"],
+            "description": feature["description"],
+            "created": feature["created"],
+            "created_at": feature["created_at"],
+            "updated_at": feature["updated_at"],
+            "updated_by": feature["updated_by"],
+            "coordinator_ids": feature["coordinator_ids"],
+            "attachment_path": feature["attachment_path"],
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": feature["irish_grid_e"],
+            "irish_grid_n": feature["irish_grid_n"],
+            "layer_id": layer.id(),
+            "feature_id": feature.id()
+        }
+
+    def list_markers(self) -> List[Dict[str, object]]:
+        """Return all markers across managed layers."""
+        records: List[Dict[str, object]] = []
+        for marker_type in self.MARKER_TYPE_MAP.keys():
+            layer = self._get_marker_layer(marker_type)
+            for feature in layer.getFeatures():
+                try:
+                    records.append(self._feature_to_record(marker_type, layer, feature))
+                except Exception as exc:
+                    print(f"[MarkerLayerManager] Warning: Failed to serialize marker {feature['id']}: {exc}")
+        return records
+
+    def get_marker_feature(self, marker_type: str, marker_id: str) -> Optional[QgsFeature]:
+        """Return feature for marker id."""
+        layer = self._get_marker_layer(marker_type)
+        return self._get_feature_by_id(layer, marker_id)
+
+    def update_marker(self, marker_type: str, marker_id: str, updates: Dict[str, object], updated_by: Optional[str] = None) -> bool:
+        """Update marker attributes."""
+        layer = self._get_marker_layer(marker_type)
+        feature = self._get_feature_by_id(layer, marker_id)
+        if not feature:
+            raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
+
+        layer.startEditing()
+        try:
+            if updates:
+                self._apply_feature_attributes(layer, feature, updates)
+            audit_attrs = self._build_audit_attributes(
+                include_created=False,
+                updated_by=updated_by or updates.get("updated_by"),
+                coordinator_ids=updates.get("coordinator_ids"),
+                attachment_path=updates.get("attachment_path")
+            )
+            self._apply_feature_attributes(layer, feature, audit_attrs)
+
+            if not layer.updateFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to update marker '{marker_id}'")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit marker update: {', '.join(errors)}")
+        except Exception as exc:
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error updating marker '{marker_id}': {exc}") from exc
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        layer.triggerRepaint()
+        self._log_marker_event(layer, self._marker_log_label(marker_type), "update", marker_id=marker_id)
+        return True
+
+    def delete_marker(self, marker_type: str, marker_id: str) -> bool:
+        """Delete marker by id."""
+        layer = self._get_marker_layer(marker_type)
+        feature = self._get_feature_by_id(layer, marker_id)
+        if not feature:
+            raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
+
+        layer.startEditing()
+        try:
+            if not layer.deleteFeature(feature.id()):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to delete marker '{marker_id}'")
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(f"Failed to commit marker deletion: {', '.join(errors)}")
+        except Exception as exc:
+            if layer.isEditable():
+                layer.rollBack()
+            raise RuntimeError(f"Error deleting marker '{marker_id}': {exc}") from exc
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        layer.triggerRepaint()
+        self._log_marker_event(layer, self._marker_log_label(marker_type), "delete", marker_id=marker_id)
+        return True
 
     # =========================================================================
     # Common Helper Methods
