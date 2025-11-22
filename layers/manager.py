@@ -9,14 +9,18 @@ persistent layer structure across plugin sessions.
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
+import json
 from pathlib import Path
-from typing import Dict, List, Optional, Callable
-from qgis.PyQt.QtCore import QVariant
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Callable, Any
+from threading import RLock
+from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal
 from qgis.core import (
     QgsProject,
     QgsVectorLayer,
     QgsField,
     QgsLayerTreeGroup,
+    QgsLayerTreeLayer,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransformContext,
     QgsMarkerSymbol,
@@ -77,10 +81,16 @@ def _export_layer(layer, path, options, transform_context):
     return QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, transform_context, options)
 
 
-_EXPORT_CREATE_OR_OVERWRITE = (
+_EXPORT_CREATE_OR_OVERWRITE_LAYER = (
     QgsVectorLayerExporter.CreateOrOverwriteLayer
     if _HAS_EXPORTER_SAVE_OPTIONS
     else QgsVectorFileWriter.CreateOrOverwriteLayer
+)
+
+_EXPORT_CREATE_OR_OVERWRITE_FILE = (
+    getattr(QgsVectorLayerExporter, "CreateOrOverwriteFile", _EXPORT_CREATE_OR_OVERWRITE_LAYER)
+    if _HAS_EXPORTER_SAVE_OPTIONS
+    else getattr(QgsVectorFileWriter, "CreateOrOverwriteFile", _EXPORT_CREATE_OR_OVERWRITE_LAYER)
 )
 
 _EXPORT_NO_ERROR = (
@@ -96,7 +106,15 @@ def _set_option_if_available(options, attr_name, value):
         setattr(options, attr_name, value)
 
 
-class LayerManager:
+# Build valid layer IDs set from schema (for HIGH-2 validation)
+VALID_LAYER_IDS = {
+    getattr(LayerIds, attr)
+    for attr in dir(LayerIds)
+    if not attr.startswith('_') and isinstance(getattr(LayerIds, attr), str)
+}
+
+
+class LayerManager(QObject):
     """
     Manages the SAR Tracker layer hierarchy with idempotent operations.
 
@@ -112,6 +130,9 @@ class LayerManager:
         _signals_connected: Whether project signals are connected
     """
 
+    # Qt SIGNALS (HIGH-7)
+    mission_store_changed = pyqtSignal(str)  # Emits new path (empty string if cleared)
+
     MISSION_STORE_VAR = "sartracker:mission_store_path"
     MISSION_STORE_DRIVER = "GPKG"
     MISSION_STORE_PROVIDER = "ogr"
@@ -123,6 +144,9 @@ class LayerManager:
         Args:
             iface: QGIS interface instance
         """
+        # CRITICAL: Initialize QObject parent FIRST (HIGH-7)
+        super().__init__()
+
         self.iface = iface
         self.project = QgsProject.instance()
         self._layer_cache: Dict[str, QgsVectorLayer] = {}
@@ -130,6 +154,7 @@ class LayerManager:
         self._signals_connected = False
         self._mission_store_path: Optional[str] = self._load_mission_store_path()
         self._layer_provider_uris: Dict[str, str] = {}
+        self._metadata_lock = RLock()  # Thread-safety for metadata operations
 
         # Connect to project signals for cache management
         self._connect_signals()
@@ -168,13 +193,19 @@ class LayerManager:
         target_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            self.project.setCustomVariable(self.MISSION_STORE_VAR, normalized)
-        except Exception as exc:
-            print(f"[LayerManager] Warning: Failed to persist mission store path: {exc}")
+            self._set_project_variable(self.MISSION_STORE_VAR, normalized)
+        except RuntimeError as exc:
+            print(f"[LayerManager] Warning: {exc}")
 
+        old_path = self._mission_store_path
         self._mission_store_path = normalized
         self._layer_provider_uris.clear()
         self._layer_cache.clear()
+
+        # HIGH-7: Emit signal if path changed
+        if old_path != normalized:
+            print(f"[LayerManager] Mission store changed: {old_path} → {normalized}")
+            self.mission_store_changed.emit(normalized)
 
     def get_mission_store(self) -> Optional[str]:
         """Return the configured mission store path, if any."""
@@ -183,9 +214,9 @@ class LayerManager:
     def clear_mission_store(self):
         """Remove the mission store association from the project."""
         try:
-            self.project.setCustomVariable(self.MISSION_STORE_VAR, "")
-        except Exception as exc:
-            print(f"[LayerManager] Warning: Failed to clear mission store variable: {exc}")
+            self._set_project_variable(self.MISSION_STORE_VAR, "")
+        except RuntimeError as exc:
+            print(f"[LayerManager] Warning: {exc}")
 
         self._mission_store_path = None
         self._layer_provider_uris.clear()
@@ -193,6 +224,37 @@ class LayerManager:
 
     def _mission_store_enabled(self) -> bool:
         return bool(self._mission_store_path)
+
+    def _set_project_variable(self, key: str, value: Optional[str]):
+        """
+        Backwards-compatible helper to set/clear project custom variables.
+        """
+        try:
+            setter = getattr(self.project, "setCustomVariable", None)
+            if setter:
+                setter(key, value or "")
+                return
+
+            variables = dict(self.project.customVariables() or {})
+            if value:
+                variables[key] = value
+            else:
+                variables.pop(key, None)
+            self.project.setCustomVariables(variables)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to persist project variable '{key}': {exc}")
+
+    def _get_layer_tree_node(self, layer_id: str) -> Optional[QgsLayerTreeLayer]:
+        """Return the layer tree node for a managed layer, if available."""
+        layer = self.get_layer(layer_id)
+        if not layer:
+            return None
+
+        root = self.project.layerTreeRoot()
+        if not root:
+            return None
+
+        return root.findLayer(layer.id())
 
     def disconnect_signals(self):
         """Disconnect from project signals on cleanup."""
@@ -303,10 +365,10 @@ class LayerManager:
             version: Schema version number to set
         """
         try:
-            self.project.setCustomVariable('sar_layer_schema', version)
+            self._set_project_variable('sar_layer_schema', str(version))
             print(f"[LayerManager] Set schema version to {version}")
-        except Exception as e:
-            print(f"[LayerManager] Warning: Could not set schema version: {e}")
+        except RuntimeError as e:
+            print(f"[LayerManager] Warning: {e}")
 
     def _create_structure(self) -> bool:
         """
@@ -638,18 +700,37 @@ class LayerManager:
         options = _create_save_vector_options()
         options.driverName = self.MISSION_STORE_DRIVER
         options.layerName = layer_def.layer_id
-        options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE
         options.fileEncoding = "UTF-8"
         options.onlySelectedFeatures = False
         _set_option_if_available(options, "includeMetadata", True)
         _set_option_if_available(options, "overwriteWithEmptyLayer", True)
 
-        result, error_message = _export_layer(
+        mission_store_exists = Path(self._mission_store_path).exists()
+        if hasattr(options, "actionOnExistingFile"):
+            if mission_store_exists:
+                options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE_LAYER
+            else:
+                options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE_FILE
+
+        export_result = _export_layer(
             template_layer,
             self._mission_store_path,
             options,
             QgsCoordinateTransformContext()
         )
+
+        if isinstance(export_result, tuple):
+            if len(export_result) == 3:
+                result, error_message, _ = export_result
+            elif len(export_result) == 2:
+                result, error_message = export_result
+            else:
+                # Unexpected signature; best effort
+                result = export_result[0]
+                error_message = export_result[1] if len(export_result) > 1 else ""
+        else:
+            result = export_result
+            error_message = ""
 
         if result != _EXPORT_NO_ERROR:
             raise RuntimeError(
@@ -841,7 +922,8 @@ class LayerManager:
         options = _create_save_vector_options()
         options.driverName = self.MISSION_STORE_DRIVER
         options.layerName = layer_def.layer_id
-        options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE
+        if hasattr(options, "actionOnExistingFile"):
+            options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE_LAYER
         options.fileEncoding = "UTF-8"
         _set_option_if_available(options, "includeMetadata", True)
 
@@ -955,6 +1037,376 @@ class LayerManager:
         self._layer_cache.clear()
         self._group_cache.clear()
         print("[LayerManager] Cleared layer cache")
+
+    # ------------------------------------------------------------------
+    # Catalog Metadata Management (Phase 1 - CalTopo Console)
+    # ------------------------------------------------------------------
+
+    def get_layer_metadata(self, layer_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve catalog metadata for a layer (thread-safe, with sync verification).
+
+        Checks both storage locations and repairs sync drift if detected.
+        Layer properties are the source of truth.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+
+        Returns:
+            Dictionary with metadata or None if not found
+
+        Example return value:
+            {
+                "alias": "Initial Info",
+                "display_order": 10,
+                "favorite": True,
+                "last_user": "Coordinator Smith",
+                "updated_at": "2025-02-10T21:03:54Z"
+            }
+        """
+        with self._metadata_lock:
+            layer_metadata = None
+            project_metadata = None
+
+            # Read from layer tree node custom property (new source of truth)
+            node = self._get_layer_tree_node(layer_id)
+            if node:
+                metadata_json = node.customProperty('sartracker:catalog_meta')
+                if metadata_json:
+                    try:
+                        layer_metadata = json.loads(metadata_json)
+                        layer_metadata = self._migrate_datetime_timezone(layer_metadata, layer_id)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[LayerManager] Failed to parse layer tree metadata for {layer_id}: {e}")
+
+            # Read from layer custom property (legacy storage for backward compatibility)
+            layer = self.get_layer(layer_id)
+            if layer:
+                metadata_json = layer.customProperty('sartracker:catalog_meta')
+                if metadata_json and not layer_metadata:
+                    try:
+                        layer_metadata = json.loads(metadata_json)
+                        # CRITICAL FIX: Migrate naive datetimes to timezone-aware
+                        layer_metadata = self._migrate_datetime_timezone(layer_metadata, layer_id)
+                        # Migrate legacy location into layer tree node for persistence
+                        if node and layer_metadata:
+                            try:
+                                node.setCustomProperty('sartracker:catalog_meta', json.dumps(layer_metadata))
+                            except Exception as migrate_exc:
+                                print(f"[LayerManager] Warning: Could not migrate metadata to layer tree: {migrate_exc}")
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[LayerManager] Failed to parse layer metadata for {layer_id}: {e}")
+
+            # Read from project variable (fallback storage)
+            project = QgsProject.instance()
+            if project:
+                var_name = f"sartracker:layer_meta:{layer_id}"
+                metadata_json = project.readEntry("SARTracker", var_name)[0]
+                if metadata_json:
+                    try:
+                        project_metadata = json.loads(metadata_json)
+                        # CRITICAL FIX: Migrate naive datetimes to timezone-aware
+                        project_metadata = self._migrate_datetime_timezone(project_metadata, layer_id)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        print(f"[LayerManager] Failed to parse project metadata for {layer_id}: {e}")
+
+            # CRITICAL FIX: Check for sync drift and repair
+            if layer_metadata and project_metadata:
+                if layer_metadata != project_metadata:
+                    print(f"[LayerManager] WARNING: Metadata out of sync for {layer_id}")
+                    print(f"  Layer property: {layer_metadata}")
+                    print(f"  Project variable: {project_metadata}")
+
+                    # Layer property is source of truth - repair project variable
+                    try:
+                        self._repair_project_metadata(layer_id, layer_metadata)
+                    except Exception as e:
+                        print(f"[LayerManager] Warning: Could not repair sync: {e}")
+
+            # Return layer metadata (source of truth) or fall back to project
+            return layer_metadata or project_metadata
+
+    def set_layer_metadata(self, layer_id: str, metadata: Dict[str, Any]) -> None:
+        """
+        Store catalog metadata for a layer (thread-safe).
+
+        Writes to BOTH layer custom properties and project variables
+        for redundancy.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            metadata: Dictionary with metadata to store
+
+        Raises:
+            ValueError: If layer_id is invalid or metadata is malformed
+            RuntimeError: If write fails
+        """
+        with self._metadata_lock:
+            # Validate inputs
+            if not layer_id or not isinstance(layer_id, str):
+                raise ValueError("layer_id must be a non-empty string")
+
+            # HIGH-2: Validate layer_id against schema
+            if layer_id not in VALID_LAYER_IDS:
+                raise ValueError(
+                    f"Unknown layer_id: '{layer_id}'. "
+                    f"Must be one of: {', '.join(sorted(VALID_LAYER_IDS)[:5])}... "
+                    f"(see layers.schema.LayerIds)"
+                )
+
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata must be a dictionary")
+
+            # CRITICAL-8: Sanitize metadata for JSON serialization
+            metadata_to_save = self._sanitize_metadata(metadata.copy())
+
+            # Add timestamp if not present (using timezone-aware datetime)
+            if 'updated_at' not in metadata_to_save:
+                metadata_to_save['updated_at'] = datetime.now(timezone.utc).isoformat()
+
+            # Serialize to JSON (should never fail after sanitization)
+            try:
+                metadata_json = json.dumps(metadata_to_save)
+            except (TypeError, ValueError) as e:
+                # This should rarely happen after sanitization
+                # Try to identify problematic field
+                problem_fields = []
+                for key, value in metadata_to_save.items():
+                    try:
+                        json.dumps({key: value})
+                    except (TypeError, ValueError):
+                        problem_fields.append(f"{key} ({type(value).__name__})")
+
+                error_msg = f"Failed to serialize metadata: {e}"
+                if problem_fields:
+                    error_msg += f"\nProblematic fields: {', '.join(problem_fields)}"
+                error_msg += "\nEnsure all values are JSON-serializable (str, int, float, bool, list, dict, None)"
+                raise ValueError(error_msg)
+
+            # BEST-EFFORT WRITE: Track success for all storage locations
+            layer_tree_write_success = False
+            layer_write_success = False
+            project_write_success = False
+
+            # Write to layer tree node custom property (primary storage)
+            node = self._get_layer_tree_node(layer_id)
+            if node:
+                try:
+                    node.setCustomProperty('sartracker:catalog_meta', metadata_json)
+                    layer_tree_write_success = True
+                    print(f"[LayerManager] Wrote catalog metadata to layer tree node {layer_id}")
+                except Exception as e:
+                    print(f"[LayerManager] ERROR: Failed to write layer tree custom property: {e}")
+            else:
+                print(f"[LayerManager] Warning: Layer tree node not found for {layer_id}")
+
+            # Write to layer custom property (legacy compatibility)
+            layer = self.get_layer(layer_id)
+            if layer:
+                try:
+                    layer.setCustomProperty('sartracker:catalog_meta', metadata_json)
+                    layer_write_success = True
+                    print(f"[LayerManager] Wrote catalog metadata to layer {layer_id}")
+                except Exception as e:
+                    print(f"[LayerManager] ERROR: Failed to write layer custom property: {e}")
+            else:
+                print(f"[LayerManager] Warning: Layer {layer_id} not found, only writing to project variables")
+
+            # Write to project variable (fallback storage)
+            project = QgsProject.instance()
+            if project:
+                try:
+                    var_name = f"sartracker:layer_meta:{layer_id}"
+                    project.writeEntry("SARTracker", var_name, metadata_json)
+                    project_write_success = True
+                    print(f"[LayerManager] Wrote catalog metadata to project variable {var_name}")
+                except Exception as e:
+                    print(f"[LayerManager] ERROR: Failed to write project variable: {e}")
+
+            # Check results - fail only if ALL writes failed
+            if not layer_tree_write_success and not layer_write_success and not project_write_success:
+                raise RuntimeError(f"Failed to write metadata to ANY storage location for {layer_id}")
+
+            # Warn if storage is out of sync
+            if (layer_tree_write_success != layer_write_success) or (layer_tree_write_success != project_write_success):
+                print(f"[LayerManager] WARNING: Metadata storage out of sync for {layer_id}")
+                print(f"  Layer tree: {'written' if layer_tree_write_success else 'FAILED'}")
+                print(f"  Layer property: {'written' if layer_write_success else 'FAILED'}")
+                print(f"  Project variable: {'written' if project_write_success else 'FAILED'}")
+                print(f"  CRITICAL-7 sync repair will fix this on next read")
+                # Don't raise - allow partial success (life-safety: better than complete failure)
+
+    def clear_layer_metadata(self, layer_id: str) -> None:
+        """
+        Clear catalog metadata for a layer (thread-safe).
+
+        Removes from both layer properties and project variables.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+        """
+        with self._metadata_lock:
+            # Clear layer tree property
+            node = self._get_layer_tree_node(layer_id)
+            if node:
+                try:
+                    node.removeCustomProperty('sartracker:catalog_meta')
+                    print(f"[LayerManager] Cleared catalog metadata from layer tree node {layer_id}")
+                except Exception as e:
+                    print(f"[LayerManager] Warning: Failed to clear layer tree property: {e}")
+
+            # Clear layer custom property (legacy)
+            layer = self.get_layer(layer_id)
+            if layer:
+                try:
+                    layer.removeCustomProperty('sartracker:catalog_meta')
+                    print(f"[LayerManager] Cleared catalog metadata from layer {layer_id}")
+                except Exception as e:
+                    print(f"[LayerManager] Warning: Failed to clear layer property: {e}")
+
+            # Clear project variable
+            project = QgsProject.instance()
+            if project:
+                try:
+                    var_name = f"sartracker:layer_meta:{layer_id}"
+                    project.removeEntry("SARTracker", var_name)
+                    print(f"[LayerManager] Cleared catalog metadata from project variable {var_name}")
+                except Exception as e:
+                    print(f"[LayerManager] Warning: Failed to clear project variable: {e}")
+
+    def _repair_project_metadata(self, layer_id: str, correct_metadata: Dict[str, Any]) -> None:
+        """
+        Repair out-of-sync project variable metadata.
+
+        When layer property and project variable are out of sync, this method
+        repairs the project variable to match the layer property (source of truth).
+
+        Args:
+            layer_id: Layer identifier
+            correct_metadata: Correct metadata from layer property (source of truth)
+        """
+        project = QgsProject.instance()
+        if not project:
+            return
+
+        try:
+            var_name = f"sartracker:layer_meta:{layer_id}"
+            metadata_json = json.dumps(correct_metadata)
+            project.writeEntry("SARTracker", var_name, metadata_json)
+            print(f"[LayerManager] Repaired project variable for {layer_id}")
+        except Exception as e:
+            print(f"[LayerManager] Failed to repair project metadata: {e}")
+
+    def _sanitize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sanitize metadata for JSON serialization.
+
+        Converts non-serializable types to serializable equivalents.
+        Skips fields that cannot be converted.
+
+        Args:
+            metadata: Metadata dictionary (may contain non-serializable types)
+
+        Returns:
+            Sanitized metadata dictionary (all values JSON-serializable)
+        """
+        sanitized = {}
+
+        for key, value in metadata.items():
+            # Handle datetime objects
+            if isinstance(value, datetime):
+                sanitized[key] = value.isoformat()
+
+            # Handle basic JSON-serializable types
+            elif isinstance(value, (str, int, float, bool, type(None))):
+                sanitized[key] = value
+
+            # Handle lists (recursive sanitization)
+            elif isinstance(value, list):
+                try:
+                    sanitized[key] = [self._sanitize_value(item) for item in value]
+                except ValueError:
+                    print(f"[LayerManager] Warning: Skipping non-serializable list field '{key}'")
+
+            # Handle dicts (recursive sanitization)
+            elif isinstance(value, dict):
+                try:
+                    sanitized[key] = self._sanitize_metadata(value)
+                except ValueError:
+                    print(f"[LayerManager] Warning: Skipping non-serializable dict field '{key}'")
+
+            # Handle other types - try to serialize, skip if fails
+            else:
+                try:
+                    json.dumps(value)
+                    sanitized[key] = value
+                except (TypeError, ValueError):
+                    print(f"[LayerManager] Warning: Skipping non-serializable field '{key}' of type {type(value).__name__}")
+
+        return sanitized
+
+    def _sanitize_value(self, value: Any) -> Any:
+        """
+        Sanitize a single value for JSON serialization.
+
+        Args:
+            value: Value to sanitize
+
+        Returns:
+            Sanitized value
+
+        Raises:
+            ValueError: If value is not serializable
+        """
+        if isinstance(value, datetime):
+            return value.isoformat()
+        elif isinstance(value, (str, int, float, bool, type(None))):
+            return value
+        elif isinstance(value, (list, dict)):
+            # Test if serializable
+            json.dumps(value)
+            return value
+        else:
+            raise ValueError(f"Non-serializable type: {type(value).__name__}")
+
+    def _migrate_datetime_timezone(self, metadata: Dict[str, Any], layer_id: str) -> Dict[str, Any]:
+        """
+        Migrate naive datetimes to timezone-aware UTC (CRITICAL FIX).
+
+        In multi-timezone SAR operations, naive datetimes are ambiguous and dangerous.
+        This migrates old metadata with naive timestamps to UTC timezone-aware format.
+
+        Args:
+            metadata: Metadata dictionary (may contain naive datetimes)
+            layer_id: Layer ID (for logging)
+
+        Returns:
+            Metadata with timezone-aware datetimes
+        """
+        if 'updated_at' in metadata:
+            try:
+                # Parse existing datetime
+                dt_str = metadata['updated_at']
+                if isinstance(dt_str, str):
+                    dt = datetime.fromisoformat(dt_str)
+
+                    # Check if naive (no timezone info)
+                    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+                        print(f"[LayerManager] Migrating naive datetime for {layer_id}: {dt_str}")
+                        # Assume UTC for existing naive timestamps
+                        dt_aware = dt.replace(tzinfo=timezone.utc)
+                        metadata['updated_at'] = dt_aware.isoformat()
+
+                        # Write back to storage to persist migration
+                        try:
+                            self.set_layer_metadata(layer_id, metadata)
+                            print(f"[LayerManager] Migrated timestamp persisted for {layer_id}")
+                        except Exception as e:
+                            print(f"[LayerManager] Warning: Could not persist migrated timestamp: {e}")
+            except (ValueError, TypeError, AttributeError) as e:
+                print(f"[LayerManager] Warning: Could not migrate datetime for {layer_id}: {e}")
+
+        return metadata
 
     # ------------------------------------------------------------------
     # Legacy structure helpers

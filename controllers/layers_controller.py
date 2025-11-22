@@ -20,8 +20,9 @@ from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 from .layer_managers.tracking_manager import TrackingLayerManager
 from .layer_managers.marker_manager import MarkerLayerManager
 from .layer_managers.drawing_manager import DrawingLayerManager
+from .layer_catalog import LayerCatalogService
 from ..layers.helicopter_manager import HelicopterLayerManager
-from ..layers import LayerManager as SchemaLayerManager, GroupNames
+from ..layers import LayerManager as SchemaLayerManager, GroupNames, LayerIds
 
 
 class LayersController:
@@ -55,6 +56,12 @@ class LayersController:
 
     # Layer group name (shared across all managers)
     LAYER_GROUP_NAME = GroupNames.ROOT
+    MARKER_TYPE_TO_LAYER_ID = {
+        "ipp_lkp": LayerIds.MARKERS_IPP_LKP,
+        "clue": LayerIds.MARKERS_CLUES,
+        "hazard": LayerIds.MARKERS_HAZARDS,
+        "casualty": LayerIds.MARKERS_CASUALTIES
+    }
 
     def __init__(self, iface, layer_manager: Optional[SchemaLayerManager] = None):
         """
@@ -101,6 +108,18 @@ class LayersController:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize HelicopterLayerManager: {e}")
 
+        # Initialize catalog service (Phase 1 - CalTopo Console)
+        # NON-FATAL: Catalog is optional, core SAR functionality works without it
+        try:
+            self.catalog = LayerCatalogService(iface, self.layer_manager)
+            print("[LayersController] Catalog service initialized successfully")
+        except Exception as e:
+            self.catalog = None
+            print(f"[LayersController] WARNING: Failed to initialize catalog service: {e}")
+            print("[LayersController] Plugin will continue without catalog (core functionality unaffected)")
+            import traceback
+            traceback.print_exc()
+
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
     # =========================================================================
@@ -145,6 +164,23 @@ class LayersController:
         )
 
     # =========================================================================
+    # Catalog Methods
+    # =========================================================================
+
+    def rescan_catalog(self):
+        """Force catalog to rescan all layers (HIGH-5)."""
+        if self.catalog:
+            self.catalog.rescan_layers()
+
+    def _refresh_catalog_for_layer(self, layer_id: str):
+        """Helper to refresh catalog feature count (HIGH-6)."""
+        if self.catalog:
+            try:
+                self.catalog.refresh_layer(layer_id, full=False)
+            except Exception as e:
+                print(f"[LayersController] Warning: Catalog refresh failed for {layer_id}: {e}")
+
+    # =========================================================================
     # Marker Methods (delegate to marker manager)
     # =========================================================================
 
@@ -172,13 +208,15 @@ class LayersController:
         Returns:
             str: UUID of added marker
         """
-        return self.markers.add_ipp_lkp(
+        marker_id = self.markers.add_ipp_lkp(
             name, lat, lon, subject_category, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
             updated_by=updated_by,
             attachment_path=attachment_path
         )
+        self._refresh_catalog_for_layer(LayerIds.MARKERS_IPP_LKP)
+        return marker_id
 
     def add_clue(self, name: str, lat: float, lon: float,
                  clue_type: str = "", confidence: str = "Possible",
@@ -206,13 +244,15 @@ class LayersController:
         Returns:
             str: UUID of added clue
         """
-        return self.markers.add_clue(
+        clue_id = self.markers.add_clue(
             name, lat, lon, clue_type, confidence, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
             updated_by=updated_by,
             attachment_path=attachment_path
         )
+        self._refresh_catalog_for_layer(LayerIds.MARKERS_CLUES)
+        return clue_id
 
     def add_hazard(self, name: str, lat: float, lon: float,
                    hazard_type: str = "", severity: str = "Medium",
@@ -240,13 +280,15 @@ class LayersController:
         Returns:
             str: UUID of added hazard
         """
-        return self.markers.add_hazard(
+        hazard_id = self.markers.add_hazard(
             name, lat, lon, hazard_type, severity, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
             updated_by=updated_by,
             attachment_path=attachment_path
         )
+        self._refresh_catalog_for_layer(LayerIds.MARKERS_HAZARDS)
+        return hazard_id
 
     def add_casualty(self, name: str, lat: float, lon: float,
                      condition: str = "", treatment: str = "",
@@ -280,13 +322,15 @@ class LayersController:
         Returns:
             str: UUID of added casualty
         """
-        return self.markers.add_casualty(
+        casualty_id = self.markers.add_casualty(
             name, lat, lon, condition, treatment, evacuation_priority,
             description, found_by, irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
             updated_by=updated_by,
             attachment_path=attachment_path
         )
+        self._refresh_catalog_for_layer(LayerIds.MARKERS_CASUALTIES)
+        return casualty_id
 
     def list_markers(self) -> List[Dict[str, Any]]:
         """
@@ -317,7 +361,11 @@ class LayersController:
             updates: Attribute payload keyed by field name
             updated_by: Optional operator name for audit trail
         """
-        return self.markers.update_marker(marker_type, marker_id, updates, updated_by=updated_by)
+        updated = self.markers.update_marker(marker_type, marker_id, updates, updated_by=updated_by)
+        layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
+        if updated and layer_id:
+            self._refresh_catalog_for_layer(layer_id)
+        return updated
 
     def delete_marker(self, marker_type: str, marker_id: str) -> bool:
         """
@@ -327,7 +375,11 @@ class LayersController:
             marker_type: Marker category
             marker_id: UUID string
         """
-        return self.markers.delete_marker(marker_type, marker_id)
+        deleted = self.markers.delete_marker(marker_type, marker_id)
+        layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
+        if deleted and layer_id:
+            self._refresh_catalog_for_layer(layer_id)
+        return deleted
 
     # =========================================================================
     # Drawing Methods (delegate to drawing manager)
@@ -352,7 +404,7 @@ class LayersController:
         Returns:
             int: Feature ID of added line
         """
-        return self.drawings.add_line(
+        line_id = self.drawings.add_line(
             name,
             points_wgs84,
             description,
@@ -360,6 +412,8 @@ class LayersController:
             width,
             temporary_measure=temporary_measure
         )
+        self._refresh_catalog_for_layer(LayerIds.LINES)
+        return line_id
 
     def add_measurement_overlay(self, name: str, points_wgs84: List[QgsPointXY],
                                 description: str, color: str = "#FFD447",
@@ -377,13 +431,15 @@ class LayersController:
         Returns:
             int: Feature ID
         """
-        return self.drawings.add_measurement_overlay(
+        overlay_id = self.drawings.add_measurement_overlay(
             name=name,
             points_wgs84=points_wgs84,
             description=description,
             color=color,
             width=width
         )
+        self._refresh_catalog_for_layer(LayerIds.LINES)
+        return overlay_id
 
     def clear_measurement_overlays(self) -> int:
         """
@@ -392,7 +448,10 @@ class LayersController:
         Returns:
             int: Number of overlays deleted
         """
-        return self.drawings.clear_measurement_overlays()
+        removed = self.drawings.clear_measurement_overlays()
+        if removed:
+            self._refresh_catalog_for_layer(LayerIds.LINES)
+        return removed
 
     def count_measurement_overlays(self) -> int:
         """Return number of active measurement overlays."""
@@ -421,10 +480,12 @@ class LayersController:
         Returns:
             int: Feature ID of added search area
         """
-        return self.drawings.add_search_area(
+        area_id = self.drawings.add_search_area(
             name, polygon_wgs84, team, status, priority, POA,
             terrain, search_method, color, notes
         )
+        self._refresh_catalog_for_layer(LayerIds.SEARCH_AREAS)
+        return area_id
 
     def add_range_ring(self, name: str, center_wgs84: QgsPointXY, radius_m: float,
                        label: str = "", color: str = "#FFA500",
@@ -446,10 +507,12 @@ class LayersController:
         Returns:
             int: Feature ID of added ring
         """
-        return self.drawings.add_range_ring(
+        ring_id = self.drawings.add_range_ring(
             name, center_wgs84, radius_m, label, color,
             lpb_category, percentile
         )
+        self._refresh_catalog_for_layer(LayerIds.RANGE_RINGS)
+        return ring_id
 
     def add_bearing_line(self, name: str, origin_wgs84: QgsPointXY,
                          bearing: float, distance_m: float,
@@ -470,9 +533,11 @@ class LayersController:
         Returns:
             int: Feature ID of added bearing line
         """
-        return self.drawings.add_bearing_line(
+        bearing_id = self.drawings.add_bearing_line(
             name, origin_wgs84, bearing, distance_m, label, color
         )
+        self._refresh_catalog_for_layer(LayerIds.BEARING_LINES)
+        return bearing_id
 
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
                    start_bearing: float, end_bearing: float, radius_m: float,
@@ -492,10 +557,12 @@ class LayersController:
         Returns:
             int: Feature ID of added sector
         """
-        return self.drawings.add_sector(
+        sector_id = self.drawings.add_sector(
             name, center_wgs84, start_bearing, end_bearing, radius_m,
             priority, color
         )
+        self._refresh_catalog_for_layer(LayerIds.SEARCH_SECTORS)
+        return sector_id
 
     def add_text_label(self, text: str, location_wgs84: QgsPointXY,
                        font_size: int = 12, color: str = "#000000",
@@ -513,9 +580,11 @@ class LayersController:
         Returns:
             int: Feature ID of added label
         """
-        return self.drawings.add_text_label(
+        label_id = self.drawings.add_text_label(
             text, location_wgs84, font_size, color, rotation
         )
+        self._refresh_catalog_for_layer(LayerIds.TEXT_LABELS)
+        return label_id
 
     # =========================================================================
     # Common Methods
@@ -548,3 +617,26 @@ class LayersController:
         self.tracking.reset_state()
         self.markers.reset_state()
         self.drawings.reset_state()
+
+    def cleanup(self):
+        """
+        Clean up resources on plugin unload.
+
+        CRITICAL: This is called from sartracker.py unload().
+        Must clean up catalog first (it depends on other managers).
+        """
+        print("[LayersController] Starting cleanup...")
+
+        # Clean up catalog FIRST (it depends on other managers)
+        if hasattr(self, 'catalog') and self.catalog:
+            try:
+                self.catalog.cleanup()
+            except Exception as e:
+                print(f"[LayersController] Catalog cleanup error: {e}")
+            self.catalog = None
+
+        # Clean up specialized managers
+        # Note: Individual managers don't currently have cleanup methods,
+        # but catalog cleanup is critical for signal lifecycle management
+
+        print("[LayersController] Cleanup complete")

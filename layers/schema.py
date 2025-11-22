@@ -295,7 +295,8 @@ def get_expected_structure() -> GroupDefinition:
                         name="Current – Active",
                         geometry_type="Point",
                         fields=CURRENT_POSITION_FIELDS,
-                        metadata={"sartracker:type": "current_position"}
+                        metadata={"sartracker:type": "current_position"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -311,7 +312,8 @@ def get_expected_structure() -> GroupDefinition:
                         name="Breadcrumbs",
                         geometry_type="LineString",
                         fields=BREADCRUMB_FIELDS,
-                        metadata={"sartracker:type": "breadcrumb"}
+                        metadata={"sartracker:type": "breadcrumb"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -327,14 +329,16 @@ def get_expected_structure() -> GroupDefinition:
                         name="Lines",
                         geometry_type="LineString",
                         fields=LINES_FIELDS,
-                        metadata={"sartracker:type": "line"}
+                        metadata={"sartracker:type": "line"},
+                        auto_create=True
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.BEARING_LINES,
                         name="Bearing Lines",
                         geometry_type="LineString",
                         fields=BEARING_LINE_FIELDS,
-                        metadata={"sartracker:type": "bearing_line"}
+                        metadata={"sartracker:type": "bearing_line"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -350,7 +354,8 @@ def get_expected_structure() -> GroupDefinition:
                         name="Range Rings",
                         geometry_type="Polygon",
                         fields=RANGE_RING_FIELDS,
-                        metadata={"sartracker:type": "range_ring"}
+                        metadata={"sartracker:type": "range_ring"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -366,21 +371,24 @@ def get_expected_structure() -> GroupDefinition:
                         name="IPP/LKP",
                         geometry_type="Point",
                         fields=IPP_LKP_FIELDS,
-                        metadata={"sartracker:type": "marker_ipp_lkp"}
+                        metadata={"sartracker:type": "marker_ipp_lkp"},
+                        auto_create=True
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.MARKERS_HAZARDS,
                         name="Hazards",
                         geometry_type="Point",
                         fields=HAZARD_FIELDS,
-                        metadata={"sartracker:type": "marker_hazard"}
+                        metadata={"sartracker:type": "marker_hazard"},
+                        auto_create=True
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.MARKERS_CASUALTIES,
                         name="Casualties",
                         geometry_type="Point",
                         fields=CASUALTY_FIELDS,
-                        metadata={"sartracker:type": "marker_casualty"}
+                        metadata={"sartracker:type": "marker_casualty"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -396,7 +404,8 @@ def get_expected_structure() -> GroupDefinition:
                         name="Clues",
                         geometry_type="Point",
                         fields=CLUE_FIELDS,
-                        metadata={"sartracker:type": "marker_clue"}
+                        metadata={"sartracker:type": "marker_clue"},
+                        auto_create=True
                     )
                 ]
             ),
@@ -453,21 +462,24 @@ def get_expected_structure() -> GroupDefinition:
                         name="Search Areas",
                         geometry_type="Polygon",
                         fields=SEARCH_AREA_FIELDS,
-                        metadata={"sartracker:type": "search_area"}
+                        metadata={"sartracker:type": "search_area"},
+                        auto_create=True
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.SEARCH_SECTORS,
                         name="Search Sectors",
                         geometry_type="Polygon",
                         fields=SEARCH_SECTOR_FIELDS,
-                        metadata={"sartracker:type": "search_sector"}
+                        metadata={"sartracker:type": "search_sector"},
+                        auto_create=True
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.TEXT_LABELS,
                         name="Text Labels",
                         geometry_type="Point",
                         fields=TEXT_LABEL_FIELDS,
-                        metadata={"sartracker:type": "text_label"}
+                        metadata={"sartracker:type": "text_label"},
+                        auto_create=True
                     )
                 ]
             )

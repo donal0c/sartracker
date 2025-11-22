@@ -1149,16 +1149,35 @@ class sartracker:
                 self.tool_registry = None
 
             # ============================================================
+            # PHASE N1: Clean up Layers Controller (Phase 1 - CalTopo Console)
+            # ============================================================
+            # CRITICAL FIX: Disconnect layer_manager signals FIRST (prevent catalog from receiving signals)
+            if self.layer_manager:
+                try:
+                    print("[SARTRACKER] Disconnecting layer manager signals...")
+                    self.layer_manager.disconnect_signals()
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Layer manager signal disconnect error: {e}")
+
+            # THEN cleanup layers controller (catalog safe - no layer signals will fire)
+            if self.layers_controller:
+                try:
+                    print("[SARTRACKER] Cleaning up layers controller...")
+                    self.layers_controller.cleanup()
+                    print("[SARTRACKER] Layers controller cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during layers controller cleanup: {e}")
+                finally:
+                    self.layers_controller = None
+            # ============================================================
+
+            # ============================================================
             # PHASE N2: Clean up Layer Manager
             # ============================================================
             if self.layer_manager:
                 try:
-                    # Disconnect project signals
-                    self.layer_manager.disconnect_signals()
-
-                    # Clear caches
+                    # Clear caches (signals already disconnected above)
                     self.layer_manager.clear_cache()
-
                     print("[SARTRACKER] Layer manager cleaned up")
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Error during layer manager cleanup: {e}")
@@ -1351,6 +1370,16 @@ class sartracker:
             else:
                 success(self.iface.messageBar(), "SAR Tracker", "Mission finished", duration=3)
             self._handle_mission_finished_cleanup()
+
+            # CRITICAL: Refresh catalog after mission completion
+            if self.layers_controller and self.layers_controller.catalog:
+                try:
+                    print("[SARTRACKER] Refreshing catalog after mission completion...")
+                    self.layers_controller.catalog._build_cache()
+                    print("[SARTRACKER] Catalog refreshed successfully")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
+
             if self.sar_panel:
                 self.sar_panel.refresh_marker_log()
 
@@ -1417,6 +1446,15 @@ class sartracker:
         self.layer_manager.ensure_structure(auto_migrate=False)
         self._update_mission_storage_status(active=True)
 
+        # CRITICAL: Refresh catalog cache (layers now backed by GeoPackage)
+        if self.layers_controller and self.layers_controller.catalog:
+            try:
+                print("[SARTRACKER] Refreshing catalog for new mission...")
+                self.layers_controller.catalog._build_cache()
+                print("[SARTRACKER] Catalog refreshed successfully")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
+
     def _handle_mission_resume_storage(self, mission_name: str):
         """Restore mission storage metadata when resuming a paused mission."""
         if not self.layer_manager:
@@ -1442,6 +1480,15 @@ class sartracker:
         self._mission_attachments_dir = attachments_dir
         self._mission_backup_directory = self._ensure_backup_directory(create=True)
         self._update_mission_storage_status(active=True)
+
+        # CRITICAL: Refresh catalog cache (layers now from GeoPackage)
+        if self.layers_controller and self.layers_controller.catalog:
+            try:
+                print("[SARTRACKER] Refreshing catalog for resumed mission...")
+                self.layers_controller.catalog._build_cache()
+                print("[SARTRACKER] Catalog refreshed successfully")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
 
     def _load_existing_mission_storage_state(self):
         """Initialize mission storage label based on current LayerManager state."""
