@@ -236,6 +236,7 @@ if QT_VERSION == 6:
     Key_Backspace = Qt.Key.Key_Backspace
     Key_Tab = Qt.Key.Key_Tab
     Key_Space = Qt.Key.Key_Space
+    Key_F5 = Qt.Key.Key_F5
     # Arrow keys for navigation
     Key_Left = Qt.Key.Key_Left
     Key_Right = Qt.Key.Key_Right
@@ -249,6 +250,7 @@ else:  # Qt5
     Key_Backspace = Qt.Key_Backspace
     Key_Tab = Qt.Key_Tab
     Key_Space = Qt.Key_Space
+    Key_F5 = Qt.Key_F5
     # Arrow keys for navigation
     Key_Left = Qt.Key_Left
     Key_Right = Qt.Key_Right
@@ -524,6 +526,7 @@ __all__ = [
     'Key_Backspace',
     'Key_Tab',
     'Key_Space',
+    'Key_F5',
     'Key_Left',
     'Key_Right',
     'Key_Up',

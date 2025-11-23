@@ -111,11 +111,26 @@ class SETTINGS_KEYS:
     # UI STATE (Phase N1)
     # ========================================================================
     SETTINGS_MIGRATION_NOTICE_SHOWN = "SARTracker/UI/settings_migration_notice_shown"
-    LAYER_CONSOLE_EXPANDED_GROUPS = "SARTracker/LayerConsole/expanded_groups"
-    LAYER_CONSOLE_COLUMN_WIDTHS = "SARTracker/LayerConsole/column_widths"
-    LAYER_CONSOLE_FILTER_STATE = "SARTracker/LayerConsole/filter_state"
-    LAYER_CONSOLE_SELECTED_LAYER = "SARTracker/LayerConsole/selected_layer"
-    LAYER_CONSOLE_SELECTED_FEATURE = "SARTracker/LayerConsole/selected_feature"
+    # Layer Console (Phase 4 canonical keys)
+    LAYER_CONSOLE_EXPANDED_GROUPS = "sartracker/layer_console/expanded_groups"
+    LAYER_CONSOLE_COLUMN_WIDTHS = "sartracker/layer_console/column_widths"
+    LAYER_CONSOLE_FILTER_STATE = "sartracker/layer_console/filter_state"  # index-based for current UI
+    LAYER_CONSOLE_FILTER_TYPE = "sartracker/layer_console/filter_type"
+    LAYER_CONSOLE_SEARCH_TEXT = "sartracker/layer_console/search_text"
+    LAYER_CONSOLE_SHOW_HIDDEN = "sartracker/layer_console/show_hidden"
+    LAYER_CONSOLE_SELECTED_LAYER = "sartracker/layer_console/selected_layer"
+    LAYER_CONSOLE_SELECTED_FEATURE = "sartracker/layer_console/selected_feature"
+    LAYER_CONSOLE_LAST_SELECTION = "sartracker/layer_console/last_selection"
+
+    # Defaults (Issue #4.6)
+    LAYER_CONSOLE_SHOW_HIDDEN_DEFAULT = False
+
+    # Legacy Phase 3 keys retained for compatibility
+    LAYER_CONSOLE_EXPANDED_GROUPS_LEGACY = "SARTracker/LayerConsole/expanded_groups"
+    LAYER_CONSOLE_COLUMN_WIDTHS_LEGACY = "SARTracker/LayerConsole/column_widths"
+    LAYER_CONSOLE_FILTER_STATE_LEGACY = "SARTracker/LayerConsole/filter_state"
+    LAYER_CONSOLE_SELECTED_LAYER_LEGACY = "SARTracker/LayerConsole/selected_layer"
+    LAYER_CONSOLE_SELECTED_FEATURE_LEGACY = "SARTracker/LayerConsole/selected_feature"
 
     # ========================================================================
     # FEATURE FLAGS

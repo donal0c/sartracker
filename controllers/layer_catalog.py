@@ -330,7 +330,7 @@ class LayerCatalogService(QObject):
         Args:
             layer_id: Layer identifier
             filters: Optional filters (e.g., {'name': 'Test'}) (not yet implemented)
-            limit: Optional limit on results (default: 1000, max: 10000)
+            limit: Optional limit on results (default: 1000, max: 500 for life-safety)
 
         Returns:
             List of FeatureSummary objects (empty list on error)
@@ -342,14 +342,14 @@ class LayerCatalogService(QObject):
         if not layer_id or not isinstance(layer_id, str):
             raise ValueError("layer_id must be a non-empty string")
 
-        # Validate limit
+        # CRITICAL FIX: Issue #1.14 - Validate limit bounds (life-safety: prevent UI freeze)
         if limit is not None:
             if not isinstance(limit, int):
                 raise ValueError(f"limit must be an integer, got {type(limit).__name__}")
             if limit <= 0:
                 raise ValueError(f"limit must be positive, got {limit}")
-            if limit > 10000:
-                raise ValueError(f"limit too large ({limit}), maximum is 10000")
+            if limit > 500:
+                raise ValueError(f"limit too large ({limit}), maximum is 500 for life-safety systems")
 
         # Validate filters
         if filters is not None:
@@ -466,19 +466,34 @@ class LayerCatalogService(QObject):
             import traceback
             traceback.print_exc()
 
+        try:
+            summaries.sort(key=lambda s: (s.display_order if s.display_order is not None else 0, str(s.id)))
+        except Exception:
+            pass
+
         return summaries
 
     def get_console_model(
         self,
         include_features: bool = True,
-        feature_limit: int = 500
+        feature_limit: int = 500,
+        show_hidden: bool = True,
+        filter_favorites_only: bool = False
     ) -> Dict[str, Any]:
         """
         Build hierarchical payload for LayerConsoleWidget.
 
+        CRITICAL FIX: Issue #2.5 - feature_limit is now GLOBAL budget across all layers.
+        Previously: 300 limit per layer × 20 layers = 6000 features (16× too many).
+        Now: 300 limit total across all layers.
+
+        PERFORMANCE FIX: Issue #3.4 - Push filters to catalog to avoid fetching unused data.
+
         Args:
             include_features: Include feature summaries for each layer
-            feature_limit: Maximum features to return per layer (None = no limit)
+            feature_limit: GLOBAL maximum features to return across ALL layers (None = no limit)
+            show_hidden: Include hidden (non-visible) layers (default: True)
+            filter_favorites_only: Only include favorite layers (default: False)
 
         Returns:
             Dictionary with group/layer/feature structure
@@ -489,6 +504,9 @@ class LayerCatalogService(QObject):
 
         if self._cleanup_in_progress:
             return {"groups": []}
+
+        # CRITICAL FIX: Issue #2.5 - Track remaining budget globally
+        remaining_budget = feature_limit if feature_limit else float('inf')
 
         # Sort groups by defined order, skip root container
         try:
@@ -519,6 +537,12 @@ class LayerCatalogService(QObject):
                 pass
 
             for layer_info in child_layers:
+                # PERFORMANCE FIX: Issue #3.4 - Skip layers early based on filters
+                if not show_hidden and not layer_info.visible:
+                    continue  # Skip hidden layers if filter active
+                if filter_favorites_only and not layer_info.favorite:
+                    continue  # Skip non-favorites if filter active
+
                 layer_entry: Dict[str, Any] = {
                     "layer_id": layer_info.id,
                     "name": layer_info.canonical_name,
@@ -533,9 +557,15 @@ class LayerCatalogService(QObject):
 
                 # Feature summaries (optional for performance)
                 features_payload: List[Dict[str, Any]] = []
-                if include_features:
+                if include_features and remaining_budget > 0:
                     try:
-                        summaries = self.list_features(layer_info.id, limit=feature_limit)
+                        # CRITICAL FIX: Issue #2.5 - Use remaining budget for this layer
+                        # Allocate min of (remaining budget, reasonable per-layer max)
+                        layer_limit = min(int(remaining_budget), feature_limit) if feature_limit else None
+                        summaries = self.list_features(layer_info.id, limit=layer_limit)
+
+                        # Deduct what we actually got from budget
+                        remaining_budget -= len(summaries)
                         for summary in summaries:
                             created_val = summary.created_at
                             if isinstance(created_val, datetime):
@@ -556,6 +586,15 @@ class LayerCatalogService(QObject):
                                 "type": summary.type,
                                 "attributes": summary.attributes
                             })
+                        try:
+                            features_payload.sort(
+                                key=lambda f: (
+                                    f.get("display_order", 0),
+                                    str(f.get("business_id") or f.get("feature_id") or f.get("id"))
+                                )
+                            )
+                        except Exception:
+                            pass
                     except Exception as exc:
                         print(f"[LayerCatalogService] Warning: Failed to build feature list for {layer_info.id}: {exc}")
                         import traceback
@@ -604,6 +643,12 @@ class LayerCatalogService(QObject):
                 alias = None  # Empty string = clear alias
             elif len(alias) > 128:
                 raise ValueError("Alias must be ≤ 128 characters")
+            else:
+                # ISSUE #4.4: Check for duplicate aliases
+                for lid, layer_info in self._layers.items():
+                    if lid != layer_id and layer_info.alias == alias:
+                        print(f"[LayerCatalog] Warning: Alias '{alias}' already used by layer '{lid}'")
+                        # Don't raise error, just warn - allow duplicates but notify user
 
         # Get current metadata
         metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
@@ -1184,6 +1229,10 @@ class LayerCatalogService(QObject):
         if self._cleanup_in_progress:
             return
 
+        # CRITICAL FIX: Check if timer still exists (guard against race condition)
+        if not hasattr(self, '_refresh_timer') or self._refresh_timer is None:
+            return
+
         # DEFENSIVE GUARD - Check all required components exist
         if not self.layer_manager or not self._layers:
             return
@@ -1399,7 +1448,17 @@ class LayerCatalogService(QObject):
         self._cleanup_in_progress = True
         print("[LayerCatalogService] Starting cleanup...")
 
-        # CRITICAL FIX: Disconnect signals FIRST (prevent new events)
+        # CRITICAL FIX: Stop timer IMMEDIATELY after setting cleanup flag
+        # This prevents race condition where timer fires between flag set and signal disconnect
+        if self._refresh_timer:
+            try:
+                if self._refresh_timer.isActive():
+                    self._refresh_timer.stop()  # Stop BEFORE disconnect
+                print("[LayerCatalogService] Stopped refresh timer")
+            except (RuntimeError, TypeError):
+                pass
+
+        # CRITICAL FIX: Disconnect signals SECOND (after timer stopped)
         if hasattr(self, '_signal_connections'):
             for signal_obj, signal_name, handler in self._signal_connections:
                 self._safe_disconnect(signal_obj, handler, label=signal_name)
@@ -1412,14 +1471,14 @@ class LayerCatalogService(QObject):
         if self._refresh_timer:
             self._safe_disconnect(self._refresh_timer.timeout, self._execute_refresh, label="refresh_timer.timeout")
 
-        # THEN stop and delete timer (safe - no handlers can start it)
+        # THEN delete timer (safe - stopped and disconnected)
         if self._refresh_timer:
             try:
-                self._refresh_timer.stop()
                 self._refresh_timer.deleteLater()
             except (RuntimeError, TypeError):
                 pass
-            self._refresh_timer = None
+            finally:
+                self._refresh_timer = None
 
         # Clear cache (in-place to break external references)
         self._groups.clear()

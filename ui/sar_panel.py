@@ -12,10 +12,13 @@ from qgis.PyQt.QtWidgets import (
     QScrollArea, QComboBox, QStackedWidget,
     QToolButton, QMessageBox, QStyle
 )
-from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
+from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QObject
 from qgis.PyQt.QtGui import QColor, QFont, QIcon
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable, Tuple
+import json
+import os
+import getpass
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
@@ -84,6 +87,7 @@ class SARPanel(QDockWidget):
         self._pause_flash = False
         self._is_finalized = False
         self._layer_console_connections: List[Tuple[Any, Any]] = []
+        self._mission_controller_connections: List[Tuple[Any, Callable]] = []
         self._marker_layer_to_type = {}
         if self._layers_controller and hasattr(self._layers_controller, "MARKER_TYPE_TO_LAYER_ID"):
             self._marker_layer_to_type = {
@@ -127,8 +131,14 @@ class SARPanel(QDockWidget):
 
         # Bind mission controller signals if available
         if self._mission_controller:
-            self._mission_controller.mission_state_changed.connect(self._on_controller_state_changed)
-            self._mission_controller.mission_timing_updated.connect(self.update_mission_timers)
+            # Track connections for proper cleanup (CRITICAL FIX: Issue #1.8)
+            conn1 = (self._mission_controller.mission_state_changed, self._on_controller_state_changed)
+            conn1[0].connect(conn1[1])
+            self._mission_controller_connections.append(conn1)
+
+            conn2 = (self._mission_controller.mission_timing_updated, self.update_mission_timers)
+            conn2[0].connect(conn2[1])
+            self._mission_controller_connections.append(conn2)
 
             # Ensure UI reflects existing mission state (e.g., after resume)
             try:
@@ -151,6 +161,89 @@ class SARPanel(QDockWidget):
     def _on_open_attachment_requested(self, path: str):
         """Bubble attachment open requests to the plugin."""
         self.attachment_open_requested.emit(path)
+
+    def _current_user_name(self) -> str:
+        """Get the current user name for audit logging.
+
+        Returns:
+            User name from QGIS or system, or "Unknown" if unavailable
+        """
+        try:
+            from qgis.core import QgsApplication
+            user = QgsApplication.userFullName()
+            if user:
+                return user
+        except Exception:
+            pass
+
+        try:
+            user = getpass.getuser()
+            if user:
+                return user
+        except Exception:
+            pass
+
+        return "Unknown"
+
+    def _get_audit_log_path(self) -> Optional[str]:
+        """Get path to audit log file.
+
+        Returns:
+            Path to logs/audit.jsonl, or None if cannot determine
+        """
+        try:
+            from qgis.core import QgsProject
+            project = QgsProject.instance()
+            project_path = project.fileName()
+
+            if not project_path:
+                # No project loaded, use plugin directory
+                plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                logs_dir = os.path.join(plugin_dir, "logs")
+            else:
+                # Use project directory
+                project_dir = os.path.dirname(project_path)
+                logs_dir = os.path.join(project_dir, "logs")
+
+            # Create logs directory if it doesn't exist
+            os.makedirs(logs_dir, exist_ok=True)
+
+            return os.path.join(logs_dir, "audit.jsonl")
+        except Exception as e:
+            print(f"[SARPanel] Warning: Could not determine audit log path: {e}")
+            return None
+
+    def _log_audit(self, operation: str, layer_id: str, count: int, **kwargs):
+        """Log an audit entry to the audit log file.
+
+        Args:
+            operation: Operation type (e.g., "bulk_delete")
+            layer_id: Layer identifier
+            count: Number of items affected
+            **kwargs: Additional context to log
+        """
+        audit_path = self._get_audit_log_path()
+        if not audit_path:
+            print(f"[SARPanel] Warning: Audit logging disabled (no path available)")
+            return
+
+        try:
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "user": self._current_user_name(),
+                "operation": operation,
+                "layer_id": layer_id,
+                "count": count
+            }
+            entry.update(kwargs)
+
+            # Append to audit log (JSONL format - one JSON object per line)
+            with open(audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
+            print(f"[SARPanel] Audit: {operation} on {layer_id} by {entry['user']} (count={count})")
+        except Exception as e:
+            print(f"[SARPanel] ERROR: Failed to write audit log: {e}")
 
     def _standard_icon(self, *enum_names: str) -> QIcon:
         """
@@ -549,19 +642,32 @@ class SARPanel(QDockWidget):
         try:
             self._mission_controller.start_mission(mission_name)
         except ValueError as exc:
+            print(f"[SARPanel] Mission start validation failed: {exc}")
             QMessageBox.warning(self, "Mission Control", str(exc))
         except RuntimeError as exc:
+            print(f"[SARPanel] Mission start error: {exc}")
             QMessageBox.information(self, "Mission Control", str(exc))
+        except Exception as exc:
+            print(f"[SARPanel] CRITICAL: Unexpected mission start error: {exc}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Mission Control", f"Unexpected error: {exc}")
         
     def _on_pause_mission(self):
         """Handle pause/resume button click."""
         if not self._mission_controller:
             return
 
-        if self._mission_state == MissionState.PAUSED:
-            self._mission_controller.resume_mission()
-        else:
-            self._mission_controller.pause_mission()
+        try:
+            if self._mission_state == MissionState.PAUSED:
+                self._mission_controller.resume_mission()
+            else:
+                self._mission_controller.pause_mission()
+        except Exception as exc:
+            print(f"[SARPanel] CRITICAL: Mission pause/resume error: {exc}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Mission Control", f"Error pausing/resuming mission: {exc}")
         
     def _on_finish_mission(self):
         """Handle finish mission button click (End Mission)."""
@@ -585,7 +691,13 @@ class SARPanel(QDockWidget):
         if confirm != QMessageBox.Yes:
             return
 
-        self._mission_controller.finish_mission()
+        try:
+            self._mission_controller.finish_mission()
+        except Exception as exc:
+            print(f"[SARPanel] CRITICAL: Mission finish error: {exc}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Mission Control", f"Error finishing mission: {exc}")
 
     def _on_finalize_mission(self):
         """Handle finalize mission button click."""
@@ -780,21 +892,37 @@ class SARPanel(QDockWidget):
         if not hasattr(self, "layer_console_widget") or not self.layer_console_widget:
             return
 
-        # Widget signals
-        self.layer_console_widget.layer_visibility_toggled.connect(self._on_layer_visibility_toggled)
-        self.layer_console_widget.layer_delete_requested.connect(self._on_layer_delete_requested)
-        self.layer_console_widget.layer_zoom_requested.connect(self._on_layer_zoom_requested)
-        self.layer_console_widget.layer_rename_requested.connect(self._on_layer_rename_requested)
-        self.layer_console_widget.layer_duplicate_requested.connect(self._on_layer_duplicate_requested)
-        self.layer_console_widget.layer_export_requested.connect(self._on_layer_export_requested)
-        self.layer_console_widget.bulk_delete_requested.connect(self._on_bulk_delete_requested)
-        self.layer_console_widget.bulk_assign_team_requested.connect(self._on_bulk_assign_team_requested)
-        self.layer_console_widget.bulk_export_requested.connect(self._on_bulk_export_requested)
-        self.layer_console_widget.refresh_requested.connect(self._on_layer_console_refresh)
+        # Widget signals - track connections for proper cleanup
+        connections = [
+            (self.layer_console_widget.visibility_toggled, self._on_layer_visibility_toggled),
+            (self.layer_console_widget.layer_alias_change_requested, self._on_layer_alias_change_requested),
+            (self.layer_console_widget.layer_favorite_toggled, self._on_layer_favorite_toggled),
+            (self.layer_console_widget.move_to_section_requested, self._on_move_to_section_requested),
+            (self.layer_console_widget.reorder_requested, self._on_reorder_requested),
+            (self.layer_console_widget.feature_delete_requested, self._on_layer_delete_requested),
+            (self.layer_console_widget.feature_zoom_requested, self._on_layer_zoom_requested),
+            (self.layer_console_widget.feature_rename_requested, self._on_layer_rename_requested),
+            (self.layer_console_widget.layer_duplicate_requested, self._on_layer_duplicate_requested),
+            (self.layer_console_widget.layer_export_requested, self._on_layer_export_requested),
+            (self.layer_console_widget.bulk_delete_requested, self._on_bulk_delete_requested),
+            (self.layer_console_widget.bulk_assign_team_requested, self._on_bulk_assign_team_requested),
+            (self.layer_console_widget.bulk_export_requested, self._on_bulk_export_requested),
+            (self.layer_console_widget.refresh_requested, self._on_layer_console_refresh),
+        ]
+
+        # Connect and track each signal
+        for signal, handler in connections:
+            signal.connect(handler)
+            self._layer_console_connections.append((signal, handler))
 
         if self._layers_controller and getattr(self._layers_controller, "catalog", None):
+            try:
+                self.layer_console_widget.set_catalog(self._layers_controller.catalog)
+            except Exception as exc:
+                print(f"[SARPanel] Warning: failed to set catalog on console: {exc}")
+        elif self._layers_controller:
+            # Fallback to legacy fetcher if catalog not available
             self.layer_console_widget.set_catalog_fetcher(self._get_layer_console_data)
-            self._attach_catalog_signals()
             self.layer_console_widget.refresh(full=True)
 
     def _attach_catalog_signals(self):
@@ -988,6 +1116,76 @@ class SARPanel(QDockWidget):
                 print(f"[SARPanel] Warning: Catalog rescan failed: {exc}")
         self._refresh_layer_console(full=True)
 
+    def _on_layer_alias_change_requested(self, layer_id: str, new_alias: str):
+        """Handle alias changes from console."""
+        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
+            return
+        try:
+            alias_value = new_alias.strip() if new_alias is not None else ""
+            alias_value = alias_value or None
+            self._layers_controller.catalog.set_layer_alias(layer_id, alias_value)
+            self._notify(success, "Alias Updated", f"Alias set for {layer_id}")
+        except ValueError as exc:
+            self._notify(error, "Alias Error", str(exc))
+        except Exception as exc:
+            self._notify(error, "Alias Error", f"Failed to update alias: {exc}")
+
+    def _on_layer_favorite_toggled(self, layer_id: str, is_favorite: bool):
+        """Handle favorite toggle from console."""
+        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
+            return
+        try:
+            self._layers_controller.catalog.set_layer_favorite(layer_id, is_favorite)
+            msg = "Marked favorite" if is_favorite else "Favorite cleared"
+            self._notify(success, "Favorite", f"{msg} for {layer_id}")
+        except ValueError as exc:
+            self._notify(error, "Favorite Error", str(exc))
+        except Exception as exc:
+            self._notify(error, "Favorite Error", f"Failed to update favorite: {exc}")
+
+    def _on_move_to_section_requested(self, feature_id: int, section: str):
+        """Handle search area section move requests."""
+        if not self._layers_controller:
+            return
+        try:
+            moved = self._layers_controller.move_search_area_to_section(
+                feature_id=feature_id,
+                target_section=section,
+                updated_by=self._current_user_name()
+            )
+            if moved:
+                self._notify(success, "Search Area Moved", f"Moved to {section.title()}")
+            else:
+                self._notify(warning, "Move Section", "Move did not complete")
+        except ValueError as exc:
+            self._notify(error, "Move Section Error", str(exc))
+        except Exception as exc:
+            self._notify(error, "Move Section Error", f"Failed to move search area: {exc}")
+
+    def _on_reorder_requested(self, layer_id: str, feature_ids_in_order: List):
+        """Handle reorder request from console."""
+        if not self._layers_controller:
+            return
+        try:
+            coerced_ids = []
+            for fid in feature_ids_in_order or []:
+                try:
+                    coerced_ids.append(int(str(fid)))
+                except Exception:
+                    coerced_ids.append(fid)
+            if not coerced_ids:
+                return
+            self._layers_controller.reorder_features(
+                layer_id=layer_id,
+                feature_ids_in_order=coerced_ids,
+                updated_by=self._current_user_name()
+            )
+            self._notify(success, "Reordered", f"Reordered {len(coerced_ids)} feature(s)")
+        except ValueError as exc:
+            self._notify(error, "Reorder Error", str(exc))
+        except Exception as exc:
+            self._notify(error, "Reorder Error", f"Failed to reorder: {exc}")
+
     def _on_layer_visibility_toggled(self, layer_id: str, visible: bool):
         if not self._layers_controller:
             return
@@ -1034,12 +1232,6 @@ class SARPanel(QDockWidget):
                         except RuntimeError:
                             pass
                     raise
-                finally:
-                    if layer.isEditable():
-                        try:
-                            layer.rollBack()
-                        except RuntimeError:
-                            pass
 
             if getattr(self._layers_controller, "catalog", None):
                 try:
@@ -1131,6 +1323,8 @@ class SARPanel(QDockWidget):
             return
         try:
             deleted = 0
+            user_name = self._current_user_name()
+
             if layer_id in self._marker_layer_to_type:
                 marker_type = self._marker_layer_to_type[layer_id]
                 for fid in feature_ids:
@@ -1142,7 +1336,7 @@ class SARPanel(QDockWidget):
                     layer_id=layer_id,
                     feature_ids=ids,
                     confirmed=True,
-                    updated_by="Layer Console"
+                    updated_by=user_name
                 )
             if getattr(self._layers_controller, "catalog", None):
                 try:
@@ -1150,7 +1344,37 @@ class SARPanel(QDockWidget):
                 except Exception:
                     pass
             self._refresh_layer_console(layer_id, full=False)
-            self._notify(success, "Bulk Delete", f"Deleted {deleted} feature(s)")
+
+            # CRITICAL FIX: Issue #1.10 - Log audit trail
+            self._log_audit(
+                operation="bulk_delete",
+                layer_id=layer_id,
+                count=deleted,
+                requested=len(feature_ids),
+                success=(deleted == len(feature_ids))
+            )
+
+            # CRITICAL FIX: Issue #2.9 - Distinguish partial vs full delete success
+            requested_count = len(feature_ids)
+            if deleted < requested_count:
+                # Partial failure - warn user
+                failed = requested_count - deleted
+                self._notify(
+                    warning,
+                    "Partial Delete",
+                    f"Deleted {deleted} of {requested_count} features.\n"
+                    f"{failed} features could not be deleted (may be locked/corrupted)."
+                )
+            elif deleted == requested_count:
+                # Complete success
+                self._notify(success, "Bulk Delete", f"Deleted {deleted} feature(s)")
+            else:
+                # Should never happen - deleted more than requested?
+                self._notify(
+                    error,
+                    "Delete Error",
+                    f"Unexpected: deleted {deleted} but requested {requested_count}"
+                )
         except Exception as exc:
             self._notify(error, "Bulk Delete Error", str(exc))
             print(f"[SARPanel] Bulk delete failed for {layer_id}: {exc}")
@@ -1683,23 +1907,41 @@ class SARPanel(QDockWidget):
         Qt5/Qt6 Compatible: Uses standard QTimer methods (isActive, stop).
         """
         try:
-            # CRITICAL: Disconnect layer console signals BEFORE cleanup to prevent segfault
-            if hasattr(self, 'layer_console_widget') and self.layer_console_widget:
+            # CRITICAL: Disconnect tracked layer console signals to prevent segfault
+            # Use targeted disconnection - only disconnect our handlers, not all handlers
+            for signal, handler in list(self._layer_console_connections):
                 try:
-                    # Disconnect all signals from SARPanel to layer console widget
-                    self.layer_console_widget.layer_visibility_toggled.disconnect()
-                    self.layer_console_widget.layer_delete_requested.disconnect()
-                    self.layer_console_widget.layer_zoom_requested.disconnect()
-                    self.layer_console_widget.layer_rename_requested.disconnect()
-                    self.layer_console_widget.layer_duplicate_requested.disconnect()
-                    self.layer_console_widget.layer_export_requested.disconnect()
-                    self.layer_console_widget.bulk_delete_requested.disconnect()
-                    self.layer_console_widget.bulk_assign_team_requested.disconnect()
-                    self.layer_console_widget.bulk_export_requested.disconnect()
-                    self.layer_console_widget.refresh_requested.disconnect()
+                    # CRITICAL FIX: Check if signal parent still exists before disconnect
+                    # Attempting to disconnect from a deleted QObject causes segfault
+                    parent = getattr(signal, '__self__', None)
+                    if parent and isinstance(parent, QObject):
+                        try:
+                            # Try to access a basic property - will fail if object deleted
+                            _ = parent.objectName()
+                        except (RuntimeError, AttributeError):
+                            # Object deleted, skip disconnect
+                            continue
+                    signal.disconnect(handler)
                 except (TypeError, RuntimeError, AttributeError):
                     # Signal already disconnected or widget destroyed
                     pass
+            self._layer_console_connections = []
+
+            # CRITICAL FIX: Disconnect mission controller signals (Issue #1.8)
+            if hasattr(self, '_mission_controller_connections'):
+                for signal, handler in list(self._mission_controller_connections):
+                    try:
+                        # CRITICAL FIX: Check if signal parent still exists before disconnect
+                        parent = getattr(signal, '__self__', None)
+                        if parent and isinstance(parent, QObject):
+                            try:
+                                _ = parent.objectName()
+                            except (RuntimeError, AttributeError):
+                                continue
+                        signal.disconnect(handler)
+                    except (TypeError, RuntimeError, AttributeError):
+                        pass
+                self._mission_controller_connections = []
 
             if hasattr(self, '_detach_catalog_signals'):
                 self._detach_catalog_signals()
@@ -1773,3 +2015,10 @@ class SARPanel(QDockWidget):
         super().closeEvent(event)
 
         print("[SARTRACKER] SARPanel: closeEvent handled, timers stopped")
+
+    def _current_user_name(self) -> str:
+        """Retrieve coordinator name for audit trail."""
+        try:
+            return QSettings().value("sartracker/coordinator_name", "Unknown") or "Unknown"
+        except Exception:
+            return "Unknown"
