@@ -11,6 +11,10 @@ Usage:
     run_tests()
 """
 
+import pytest
+
+pytest.importorskip("qgis", reason="QGIS not available; mission resume test requires QGIS runtime")
+
 from datetime import datetime
 from qgis.PyQt.QtCore import QSettings
 

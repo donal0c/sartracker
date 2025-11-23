@@ -17,7 +17,6 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
 from typing import List, Optional, Dict, Any
-import math
 import uuid
 import logging
 from datetime import datetime
@@ -36,7 +35,22 @@ from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
+from ...utils.drawing_math import (
+    geodesic_bearing_endpoint,
+    geodesic_circle_points,
+    geodesic_sector_points
+)
+from ...utils.drawing_validation import (
+    validate_point,
+    validate_point_sequence,
+    validate_positive_number,
+    validate_bearing,
+    validate_color_hex,
+    validate_font_size,
+    validate_width
+)
 from ...utils.exceptions import LayerTransactionError, LayerLockError
+from ...utils.notify import error as notify_error
 
 
 class DrawingLayerManager(BaseLayerManager):
@@ -54,6 +68,7 @@ class DrawingLayerManager(BaseLayerManager):
     BEARING_LINES_LAYER_NAME = "Bearing Lines"
     SECTORS_LAYER_NAME = "Search Sectors"
     TEXT_LABELS_LAYER_NAME = "Text Labels"
+    MAX_SYNC_FEATURES = 500  # Hint threshold for bulk operations
 
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize drawing layer manager."""
@@ -104,6 +119,39 @@ class DrawingLayerManager(BaseLayerManager):
         payload = extra if extra else None
         self._log_layer_snapshot(layer, f"{layer_type}::{action}", payload)
 
+    def _require_valid_layer(self, layer: QgsVectorLayer, layer_name: str) -> QgsVectorLayer:
+        """Raise if layer is invalid to avoid operating on a bad reference."""
+        if not layer or not layer.isValid():
+            raise LayerTransactionError(
+                layer_name=layer_name,
+                operation="layer access",
+                details="Layer not available or invalid"
+            )
+        return layer
+
+    def _notify_error(self, title: str, message: str):
+        """Show a user-facing error if iface/messageBar is available."""
+        if not getattr(self, "iface", None):
+            return
+        try:
+            bar = self.iface.messageBar() if hasattr(self.iface, "messageBar") else None
+            if bar:
+                notify_error(bar, title, message)
+        except Exception:
+            # Avoid raising from UI notification paths
+            logger.debug("Notification suppressed for %s: %s", title, message)
+
+    def _safe_commit(self, layer: QgsVectorLayer, operation: str, layer_type: str, context: Dict[str, Any]) -> None:
+        """
+        Commit edits and raise typed error with user notification on failure.
+        """
+        if not layer.commitChanges():
+            errors = layer.commitErrors()
+            msg = f"Commit failed: {', '.join(errors)}"
+            self._notify_error(f"{operation} Failed", msg)
+            raise RuntimeError(msg)
+        self._log_drawing_event(layer, layer_type, operation, **context)
+
     def _set_display_order(self, layer: QgsVectorLayer, feature_id: int):
         """
         Set display_order field to feature_id for deterministic ordering.
@@ -130,6 +178,31 @@ class DrawingLayerManager(BaseLayerManager):
             key=lambda rec: rec.get('display_order', rec.get('feature_id', 0))
         )
 
+    def _build_filter_request(self, layer: QgsVectorLayer, filters: Optional[Dict]) -> QgsFeatureRequest:
+        """Safely build a QgsFeatureRequest with simple equality filters."""
+        request = QgsFeatureRequest()
+        if not filters:
+            return request
+
+        expressions = []
+        for field_name, value in filters.items():
+            if layer.fields().indexFromName(field_name) == -1:
+                logger.warning("Unknown filter field %s on layer %s", field_name, layer.name())
+                continue
+            if isinstance(value, str):
+                expressions.append(f'"{field_name}" = \'{value}\'')
+            elif isinstance(value, (int, float)):
+                expressions.append(f'"{field_name}" = {value}')
+            elif value is None:
+                expressions.append(f'"{field_name}" IS NULL')
+
+        if expressions:
+            try:
+                request.setFilterExpression(' AND '.join(expressions))
+            except Exception as exc:
+                logger.warning("Invalid filter expression on %s: %s", layer.name(), exc)
+        return request
+
     # =========================================================================
     # Lines Layer
     # =========================================================================
@@ -147,6 +220,7 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.LINES_LAYER_NAME,
                 style_factory=self._style_lines_layer
             )
+            layer = self._require_valid_layer(layer, self.LINES_LAYER_NAME)
             self._ensure_lines_layer_schema(layer)
             self._log_drawing_event(layer, "LINES", "ensure")
             return layer
@@ -154,6 +228,7 @@ class DrawingLayerManager(BaseLayerManager):
         layers = self.project.mapLayersByName(self.LINES_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.LINES_LAYER_NAME)
             self._ensure_lines_layer_schema(layer)
             self._log_drawing_event(layer, "LINES", "reused")
             return layer
@@ -188,7 +263,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "LINES", "created")
-        return layer
+        return self._require_valid_layer(layer, self.LINES_LAYER_NAME)
 
     def add_line(self, name: str, points_wgs84: List[QgsPointXY],
                  description: str = "", color: str = "#FF0000", width: int = 2,
@@ -206,6 +281,15 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added line
         """
+        try:
+            points_wgs84 = list(points_wgs84)
+            validate_point_sequence(points_wgs84, min_points=2, name="points_wgs84")
+            validate_color_hex(color, "color")
+            validate_width(width, "width")
+        except Exception as exc:
+            self._notify_error("Add Line Failed", str(exc))
+            raise
+
         layer = self._get_or_create_lines_layer()
         self._ensure_lines_layer_schema(layer)
 
@@ -249,9 +333,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit line feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "LINES", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -330,9 +412,7 @@ class DrawingLayerManager(BaseLayerManager):
         layer.startEditing()
         try:
             layer.deleteFeatures(ids_to_delete)
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to delete overlays: {', '.join(errors)}")
+            self._safe_commit(layer, "clear_overlays", "LINES", {"deleted": len(ids_to_delete)})
         except Exception as exc:
             layer.rollBack()
             raise LayerTransactionError(
@@ -345,7 +425,6 @@ class DrawingLayerManager(BaseLayerManager):
                 layer.rollBack()
 
         layer.triggerRepaint()
-        self._log_drawing_event(layer, "LINES", "clear_overlays", deleted=len(ids_to_delete))
         return len(ids_to_delete)
 
     def count_measurement_overlays(self) -> int:
@@ -370,22 +449,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        request = QgsFeatureRequest()
-
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-            if expressions:
-                request.setFilterExpression(' AND '.join(expressions))
+        request = self._build_filter_request(layer, filters)
 
         records = []
         try:
@@ -434,20 +498,22 @@ class DrawingLayerManager(BaseLayerManager):
                 if field_name not in field_names:
                     raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
 
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'width' in updates:
+                validate_width(updates['width'], "width")
+
             # Apply updates
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
                     continue
-                if not layer.changeAttributeValue(feature_id, field_index, value):
-                    raise RuntimeError(f"Failed to update {field_name}")
+            if not layer.changeAttributeValue(feature_id, field_index, value):
+                raise RuntimeError(f"Failed to update {field_name}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "LINES", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "LINES", "update", feature_id=feature_id)
             return True
 
         except Exception as exc:
@@ -484,12 +550,9 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             if not layer.deleteFeature(feature_id):
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "LINES", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "LINES", "delete", feature_id=feature_id)
             return True
         except Exception as exc:
             layer.rollBack()
@@ -510,6 +573,9 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s line features synchronously; consider background task", len(feature_ids))
+
         layer = self._get_or_create_lines_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Lines layer not available")
@@ -526,12 +592,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(fid):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "LINES", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "LINES", "bulk_delete", deleted=deleted)
             return deleted
         except Exception as exc:
             layer.rollBack()
@@ -549,6 +612,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def _ensure_lines_layer_schema(self, layer: QgsVectorLayer):
         """Ensure legacy lines layers include measurement overlay field."""
+        layer = self._require_valid_layer(layer, self.LINES_LAYER_NAME)
         if layer.fields().indexFromName("temporary_measure") != -1:
             return
 
@@ -556,9 +620,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             if not layer.addAttribute(QgsField("temporary_measure", QVariant.Bool)):
                 raise RuntimeError("Failed to add temporary_measure field")
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit schema update: {', '.join(errors)}")
+            self._safe_commit(layer, "schema_update", "LINES", {"field": "temporary_measure"})
         except Exception as exc:
             layer.rollBack()
             logger.warning(
@@ -586,12 +648,14 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.SEARCH_AREAS_LAYER_NAME,
                 style_factory=self._style_search_areas_layer
             )
+            layer = self._require_valid_layer(layer, self.SEARCH_AREAS_LAYER_NAME)
             self._log_drawing_event(layer, "SEARCH_AREAS", "ensure")
             return layer
 
         layers = self.project.mapLayersByName(self.SEARCH_AREAS_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.SEARCH_AREAS_LAYER_NAME)
             self._log_drawing_event(layer, "SEARCH_AREAS", "reused")
             return layer
 
@@ -634,7 +698,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "SEARCH_AREAS", "created")
-        return layer
+        return self._require_valid_layer(layer, self.SEARCH_AREAS_LAYER_NAME)
 
     def add_search_area(self, name: str, polygon_wgs84: List[QgsPointXY],
                         team: str = "Unassigned", status: str = "Planned",
@@ -659,6 +723,14 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added search area
         """
+        try:
+            polygon_wgs84 = list(polygon_wgs84)
+            validate_point_sequence(polygon_wgs84, min_points=3, name="polygon_wgs84")
+            validate_color_hex(color, "color")
+        except Exception as exc:
+            self._notify_error("Add Search Area Failed", str(exc))
+            raise
+
         layer = self._get_or_create_search_areas_layer()
 
         # Calculate area in square kilometers using WGS84 ellipsoid
@@ -708,9 +780,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit search area feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "SEARCH_AREAS", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -753,12 +823,14 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.RANGE_RINGS_LAYER_NAME,
                 style_factory=self._style_range_rings_layer
             )
+            layer = self._require_valid_layer(layer, self.RANGE_RINGS_LAYER_NAME)
             self._log_drawing_event(layer, "RANGE_RINGS", "ensure")
             return layer
 
         layers = self.project.mapLayersByName(self.RANGE_RINGS_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.RANGE_RINGS_LAYER_NAME)
             self._log_drawing_event(layer, "RANGE_RINGS", "reused")
             return layer
 
@@ -796,7 +868,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "RANGE_RINGS", "created")
-        return layer
+        return self._require_valid_layer(layer, self.RANGE_RINGS_LAYER_NAME)
 
     def add_range_ring(self, name: str, center_wgs84: QgsPointXY, radius_m: float,
                        label: str = "", color: str = "#FFA500",
@@ -819,72 +891,18 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added ring
         """
+        try:
+            validate_point(center_wgs84, "center_wgs84")
+            validate_positive_number(radius_m, "radius_m")
+            validate_color_hex(color, "color")
+        except Exception as exc:
+            self._notify_error("Add Range Ring Failed", str(exc))
+            raise
+
         layer = self._get_or_create_range_rings_layer()
 
-        # Create circle geometry using geodesic calculations
-        # Use proper WGS84 ellipsoid parameters for accuracy
-        # CRITICAL: This code was carefully tuned for <1m accuracy
-        # Bug fix from Day 7 audit - DO NOT MODIFY
-
-        # Number of segments for smooth circle
-        segments = 64
-        points = []
-
-        # WGS84 ellipsoid parameters (more accurate than sphere)
-        # Semi-major axis (equatorial radius)
-        a = 6378137.0  # meters
-        # Flattening
-        f = 1 / 298.257223563
-        # Semi-minor axis (polar radius)
-        b = a * (1 - f)
-
-        # Use mean Earth radius adjusted for latitude
-        lat_rad = math.radians(center_wgs84.y())
-        # Radius at given latitude (more accurate than constant radius)
-        cos_lat = math.cos(lat_rad)
-        sin_lat = math.sin(lat_rad)
-
-        # Calculate radius of curvature at this latitude
-        # This accounts for Earth's oblate spheroid shape
-        numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
-        denominator = (a * cos_lat)**2 + (b * sin_lat)**2
-
-        # Prevent division by zero at poles
-        if denominator < 1e-10:
-            # At poles, use polar radius
-            earth_radius = b
-            logger.debug(f"Range ring at pole (lat={center_wgs84.y():.6f}): using polar radius {earth_radius:.2f}m")
-        else:
-            earth_radius = math.sqrt(numerator / denominator)
-            logger.debug(f"Range ring: lat={center_wgs84.y():.6f}, radius_m={radius_m:.2f}, earth_radius={earth_radius:.2f}m")
-
-        # Create circle points using geodesic calculations
-        for i in range(segments + 1):
-            # Calculate bearing in degrees
-            bearing = (360.0 * i) / segments
-
-            # Convert to radians
-            bearing_rad = math.radians(bearing)
-            lon_rad = math.radians(center_wgs84.x())
-
-            # Calculate angular distance
-            angular_distance = radius_m / earth_radius
-
-            # Calculate destination point using haversine formula
-            # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
-            sin_lat2 = (math.sin(lat_rad) * math.cos(angular_distance) +
-                       math.cos(lat_rad) * math.sin(angular_distance) * math.cos(bearing_rad))
-            sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
-            lat2 = math.asin(sin_lat2)
-
-            lon2 = lon_rad + math.atan2(
-                math.sin(bearing_rad) * math.sin(angular_distance) * math.cos(lat_rad),
-                math.cos(angular_distance) - math.sin(lat_rad) * math.sin(lat2)
-            )
-
-            # Convert back to degrees
-            point = QgsPointXY(math.degrees(lon2), math.degrees(lat2))
-            points.append(point)
+        circle_points = geodesic_circle_points(center_wgs84.x(), center_wgs84.y(), radius_m, segments=64)
+        points = [QgsPointXY(lon, lat) for lon, lat in circle_points]
 
         # Create polygon geometry from points
         circle_geom = QgsGeometry.fromPolygonXY([points])
@@ -916,9 +934,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit range ring feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "RANGE_RINGS", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -961,12 +977,14 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.BEARING_LINES_LAYER_NAME,
                 style_factory=self._style_bearing_lines_layer
             )
+            layer = self._require_valid_layer(layer, self.BEARING_LINES_LAYER_NAME)
             self._log_drawing_event(layer, "BEARING_LINES", "ensure")
             return layer
 
         layers = self.project.mapLayersByName(self.BEARING_LINES_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.BEARING_LINES_LAYER_NAME)
             self._log_drawing_event(layer, "BEARING_LINES", "reused")
             return layer
 
@@ -1001,7 +1019,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "BEARING_LINES", "created")
-        return layer
+        return self._require_valid_layer(layer, self.BEARING_LINES_LAYER_NAME)
 
     def add_bearing_line(self, name: str, origin_wgs84: QgsPointXY,
                          bearing: float, distance_m: float,
@@ -1023,52 +1041,28 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added bearing line
         """
+        try:
+            validate_point(origin_wgs84, "origin_wgs84")
+            validate_bearing(bearing)
+            validate_positive_number(distance_m, "distance_m")
+            validate_color_hex(color, "color")
+        except Exception as exc:
+            self._notify_error("Add Bearing Line Failed", str(exc))
+            raise
+
         layer = self._get_or_create_bearing_lines_layer()
 
         # Calculate endpoint using bearing and distance
         # CRITICAL: This code was carefully tuned for <1m accuracy
         # Bug fix from Day 7 audit - DO NOT MODIFY
 
-        # Convert bearing to radians for calculation
-        bearing_rad = math.radians(bearing)
-
-        # Calculate endpoint using WGS84 ellipsoid parameters
-        lat1 = math.radians(origin_wgs84.y())
-        lon1 = math.radians(origin_wgs84.x())
-
-        # WGS84 ellipsoid parameters
-        a = 6378137.0  # Semi-major axis (equatorial radius) in meters
-        f = 1 / 298.257223563  # Flattening
-        b = a * (1 - f)  # Semi-minor axis (polar radius)
-
-        # Calculate radius of curvature at origin latitude
-        cos_lat = math.cos(lat1)
-        sin_lat = math.sin(lat1)
-        numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
-        denominator = (a * cos_lat)**2 + (b * sin_lat)**2
-
-        # Prevent division by zero at poles
-        if denominator < 1e-10:
-            # At poles, use polar radius
-            earth_radius = b
-            logger.debug(f"Bearing line at pole (lat={origin_wgs84.y():.6f}): using polar radius {earth_radius:.2f}m")
-        else:
-            earth_radius = math.sqrt(numerator / denominator)
-            logger.debug(f"Bearing line: lat={origin_wgs84.y():.6f}, bearing={bearing:.1f}°, distance={distance_m:.2f}m, earth_radius={earth_radius:.2f}m")
-
-        # Angular distance
-        angular_dist = distance_m / earth_radius
-
-        # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
-        sin_lat2 = (math.sin(lat1) * math.cos(angular_dist) +
-                   math.cos(lat1) * math.sin(angular_dist) * math.cos(bearing_rad))
-        sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
-        lat2 = math.asin(sin_lat2)
-
-        lon2 = lon1 + math.atan2(math.sin(bearing_rad) * math.sin(angular_dist) * math.cos(lat1),
-                                  math.cos(angular_dist) - math.sin(lat1) * math.sin(lat2))
-
-        endpoint = QgsPointXY(math.degrees(lon2), math.degrees(lat2))
+        endpoint_lon, endpoint_lat = geodesic_bearing_endpoint(
+            origin_wgs84.x(),
+            origin_wgs84.y(),
+            bearing,
+            distance_m
+        )
+        endpoint = QgsPointXY(endpoint_lon, endpoint_lat)
 
         # Create line geometry
         line_geom = QgsGeometry.fromPolylineXY([origin_wgs84, endpoint])
@@ -1099,9 +1093,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit bearing line feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "BEARING_LINES", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -1143,12 +1135,14 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.SECTORS_LAYER_NAME,
                 style_factory=self._style_sectors_layer
             )
+            layer = self._require_valid_layer(layer, self.SECTORS_LAYER_NAME)
             self._log_drawing_event(layer, "SECTORS", "ensure")
             return layer
 
         layers = self.project.mapLayersByName(self.SECTORS_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.SECTORS_LAYER_NAME)
             self._log_drawing_event(layer, "SECTORS", "reused")
             return layer
 
@@ -1187,7 +1181,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "SECTORS", "created")
-        return layer
+        return self._require_valid_layer(layer, self.SECTORS_LAYER_NAME)
 
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
                    start_bearing: float, end_bearing: float, radius_m: float,
@@ -1207,56 +1201,27 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added sector
         """
+        try:
+            validate_point(center_wgs84, "center_wgs84")
+            validate_bearing(start_bearing, "start_bearing")
+            validate_bearing(end_bearing, "end_bearing")
+            validate_positive_number(radius_m, "radius_m")
+            validate_color_hex(color, "color")
+        except Exception as exc:
+            self._notify_error("Add Sector Failed", str(exc))
+            raise
+
         layer = self._get_or_create_sectors_layer()
 
-        # Create sector geometry using proper WGS84 ellipsoid calculations
-        # Create arc with 36 segments
-        num_segments = 36
-        angle_range = end_bearing - start_bearing
-        if angle_range < 0:
-            angle_range += 360
-
-        # WGS84 ellipsoid parameters (same as range rings and bearing lines)
-        a = 6378137.0  # Semi-major axis (equatorial radius) in meters
-        f = 1 / 298.257223563  # Flattening
-        b = a * (1 - f)  # Semi-minor axis (polar radius)
-
-        # Calculate Earth radius at center latitude
-        lat1 = math.radians(center_wgs84.y())
-        lon1 = math.radians(center_wgs84.x())
-        cos_lat = math.cos(lat1)
-        sin_lat = math.sin(lat1)
-
-        numerator = (a * a * cos_lat)**2 + (b * b * sin_lat)**2
-        denominator = (a * cos_lat)**2 + (b * sin_lat)**2
-
-        # Prevent division by zero at poles
-        if denominator < 1e-10:
-            earth_radius = b
-        else:
-            earth_radius = math.sqrt(numerator / denominator)
-
-        angular_dist = radius_m / earth_radius
-
-        points = [center_wgs84]  # Start from center
-
-        for i in range(num_segments + 1):
-            angle = start_bearing + (angle_range * i / num_segments)
-            angle_rad = math.radians(angle)
-
-            # Calculate point using WGS84 ellipsoid
-            # Clamp the argument to [-1, 1] to prevent domain errors from floating point rounding
-            sin_lat2 = (math.sin(lat1) * math.cos(angular_dist) +
-                       math.cos(lat1) * math.sin(angular_dist) * math.cos(angle_rad))
-            sin_lat2 = max(-1.0, min(1.0, sin_lat2))  # Clamp to valid range
-            lat2 = math.asin(sin_lat2)
-
-            lon2 = lon1 + math.atan2(math.sin(angle_rad) * math.sin(angular_dist) * math.cos(lat1),
-                                     math.cos(angular_dist) - math.sin(lat1) * math.sin(lat2))
-
-            points.append(QgsPointXY(math.degrees(lon2), math.degrees(lat2)))
-
-        points.append(center_wgs84)  # Close the sector
+        points_deg = geodesic_sector_points(
+            center_wgs84.x(),
+            center_wgs84.y(),
+            start_bearing,
+            end_bearing,
+            radius_m,
+            num_segments=36
+        )
+        points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
 
         sector_geom = QgsGeometry.fromPolygonXY([points])
 
@@ -1297,9 +1262,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit sector feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "SECTORS", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -1336,21 +1299,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        request = QgsFeatureRequest()
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-            if expressions:
-                request.setFilterExpression(' AND '.join(expressions))
+        request = self._build_filter_request(layer, filters)
 
         records = []
         try:
@@ -1403,6 +1352,23 @@ class DrawingLayerManager(BaseLayerManager):
                 if field_name not in field_names:
                     raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
 
+            if 'start_bearing' in updates:
+                validate_bearing(updates['start_bearing'], "start_bearing")
+            if 'end_bearing' in updates:
+                validate_bearing(updates['end_bearing'], "end_bearing")
+            if 'radius_m' in updates:
+                validate_positive_number(updates['radius_m'], "radius_m")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'center_lat' in updates:
+                lat = float(updates['center_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("center_lat must be between -90 and 90")
+            if 'center_lon' in updates:
+                lon = float(updates['center_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("center_lon must be between -180 and 180")
+
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
@@ -1410,12 +1376,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if not layer.changeAttributeValue(feature_id, field_index, value):
                     raise RuntimeError(f"Failed to update {field_name}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "SECTORS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SECTORS", "update", feature_id=feature_id)
             return True
 
         except Exception as exc:
@@ -1457,12 +1420,9 @@ class DrawingLayerManager(BaseLayerManager):
             if not layer.deleteFeature(feature_id):
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "SECTORS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SECTORS", "delete", feature_id=feature_id)
             return True
         except Exception as exc:
             layer.rollBack()
@@ -1482,6 +1442,9 @@ class DrawingLayerManager(BaseLayerManager):
         """Bulk delete search sectors."""
         if not feature_ids:
             return 0
+
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s sector features synchronously; consider background task", len(feature_ids))
 
         layer = self._get_or_create_sectors_layer()
         if not layer or not layer.isValid():
@@ -1503,12 +1466,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(fid):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "SECTORS", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SECTORS", "bulk_delete", deleted=deleted)
             return deleted
         except Exception as exc:
             layer.rollBack()
@@ -1542,12 +1502,14 @@ class DrawingLayerManager(BaseLayerManager):
                 fallback_name=self.TEXT_LABELS_LAYER_NAME,
                 style_factory=self._style_text_labels_layer
             )
+            layer = self._require_valid_layer(layer, self.TEXT_LABELS_LAYER_NAME)
             self._log_drawing_event(layer, "TEXT_LABELS", "ensure")
             return layer
 
         layers = self.project.mapLayersByName(self.TEXT_LABELS_LAYER_NAME)
         if layers:
             layer = layers[0]
+            layer = self._require_valid_layer(layer, self.TEXT_LABELS_LAYER_NAME)
             self._log_drawing_event(layer, "TEXT_LABELS", "reused")
             return layer
 
@@ -1581,7 +1543,7 @@ class DrawingLayerManager(BaseLayerManager):
         self._add_layer_to_group(layer, position=0)
 
         self._log_drawing_event(layer, "TEXT_LABELS", "created")
-        return layer
+        return self._require_valid_layer(layer, self.TEXT_LABELS_LAYER_NAME)
 
     def add_text_label(self, text: str, location_wgs84: QgsPointXY,
                        font_size: int = 12, color: str = "#000000",
@@ -1599,6 +1561,14 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added label
         """
+        try:
+            validate_point(location_wgs84, "location_wgs84")
+            validate_font_size(font_size, "font_size")
+            validate_color_hex(color, "color")
+        except Exception as exc:
+            self._notify_error("Add Text Label Failed", str(exc))
+            raise
+
         layer = self._get_or_create_text_labels_layer()
 
         # Create feature
@@ -1626,9 +1596,7 @@ class DrawingLayerManager(BaseLayerManager):
         try:
             layer.addFeature(feature)
             self._set_display_order(layer, feature.id())
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit text label feature: {', '.join(errors)}")
+            self._safe_commit(layer, "add", "TEXT_LABELS", {})
         except Exception as e:
             layer.rollBack()
             # Raise typed exception for error handler (Issue #3)
@@ -1705,21 +1673,29 @@ class DrawingLayerManager(BaseLayerManager):
             geom = feature.geometry()
             record['geometry_type'] = QgsWkbTypes.displayString(geom.wkbType())
 
-            # Add computed geometry properties
-            if geom.type() == QgsWkbTypes.PolygonGeometry:
-                # Area calculation using WGS84 ellipsoid
-                distance_calc = QgsDistanceArea()
-                distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
-                distance_calc.setEllipsoid('WGS84')
-                area_m2 = distance_calc.measureArea(geom)
-                record['area_km2'] = area_m2 / 1_000_000
-            elif geom.type() == QgsWkbTypes.LineGeometry:
-                # Length calculation using WGS84 ellipsoid
-                distance_calc = QgsDistanceArea()
-                distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
-                distance_calc.setEllipsoid('WGS84')
-                length_m = distance_calc.measureLine(geom.asPolyline())
-                record['length_km'] = length_m / 1000
+            try:
+                # Add computed geometry properties
+                if geom.type() == QgsWkbTypes.PolygonGeometry:
+                    # Area calculation using WGS84 ellipsoid
+                    distance_calc = QgsDistanceArea()
+                    distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                    distance_calc.setEllipsoid('WGS84')
+                    area_m2 = distance_calc.measureArea(geom)
+                    record['area_km2'] = area_m2 / 1_000_000
+                elif geom.type() == QgsWkbTypes.LineGeometry:
+                    # Length calculation using WGS84 ellipsoid
+                    distance_calc = QgsDistanceArea()
+                    distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                    distance_calc.setEllipsoid('WGS84')
+                    length_m = distance_calc.measureLine(geom.asPolyline())
+                    record['length_km'] = length_m / 1000
+            except Exception as exc:
+                logger.warning(
+                    "Geometry summary failed for %s feature %s: %s",
+                    layer.name(),
+                    feature.id(),
+                    exc
+                )
         else:
             record['geometry_type'] = None
 
@@ -1743,29 +1719,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        # Build feature request
-        request = QgsFeatureRequest()
-
-        # Apply filters if provided
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                # Validate field exists
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-
-                # Build expression based on value type
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-
-            if expressions:
-                filter_expr = ' AND '.join(expressions)
-                request.setFilterExpression(filter_expr)
+        request = self._build_filter_request(layer, filters)
 
         # Fetch and serialize features
         records = []
@@ -1903,6 +1857,8 @@ class DrawingLayerManager(BaseLayerManager):
                 elif field_name == 'POA':
                     if not isinstance(value, (int, float)) or not (0 <= value <= 100):
                         raise ValueError("POA must be between 0 and 100")
+                elif field_name == 'color':
+                    validate_color_hex(value, "color")
             # ====================================================================
             # STEP 5: APPLY UPDATES
             # ====================================================================
@@ -1927,16 +1883,13 @@ class DrawingLayerManager(BaseLayerManager):
             # STEP 6: COMMIT CHANGES
             # ====================================================================
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed for {layer.name()}: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "SEARCH_AREAS", {"feature_id": feature_id})
 
             # ====================================================================
             # STEP 7: POST-COMMIT ACTIONS
             # ====================================================================
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SEARCH_AREAS", "update", feature_id=feature_id, updates=updates)
             logger.debug(f"Updated search area {feature_id}: {updates}")
 
             return True
@@ -2018,12 +1971,9 @@ class DrawingLayerManager(BaseLayerManager):
             if not success:
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "SEARCH_AREAS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SEARCH_AREAS", "delete", feature_id=feature_id)
             logger.debug(f"Deleted search area {feature_id}")
 
             return True
@@ -2064,6 +2014,9 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s search area features synchronously; consider background task", len(feature_ids))
+
         layer = self._get_or_create_search_areas_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Search areas layer not available")
@@ -2085,12 +2038,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(feature_id):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "SEARCH_AREAS", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "SEARCH_AREAS", "bulk_delete", deleted=deleted)
             logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} search areas")
 
             return deleted
@@ -2127,26 +2077,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        request = QgsFeatureRequest()
-
-        # Apply filters if provided
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-
-            if expressions:
-                filter_expr = ' AND '.join(expressions)
-                request.setFilterExpression(filter_expr)
+        request = self._build_filter_request(layer, filters)
 
         records = []
         try:
@@ -2234,6 +2165,34 @@ class DrawingLayerManager(BaseLayerManager):
                 updates['updated_by'] = updated_by
                 updates['updated_at'] = datetime.now().isoformat()
 
+            if 'bearing' in updates:
+                validate_bearing(updates['bearing'], "bearing")
+            if 'distance_m' in updates:
+                validate_positive_number(updates['distance_m'], "distance_m")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'origin_lat' in updates:
+                lat = float(updates['origin_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("origin_lat must be between -90 and 90")
+            if 'origin_lon' in updates:
+                lon = float(updates['origin_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("origin_lon must be between -180 and 180")
+
+            if 'radius_m' in updates:
+                validate_positive_number(updates['radius_m'], "radius_m")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'center_lat' in updates:
+                lat = float(updates['center_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("center_lat must be between -90 and 90")
+            if 'center_lon' in updates:
+                lon = float(updates['center_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("center_lon must be between -180 and 180")
+
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
@@ -2243,12 +2202,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if not success:
                     raise RuntimeError(f"Failed to update {field_name}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "RANGE_RINGS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "RANGE_RINGS", "update", feature_id=feature_id)
             logger.debug(f"Updated range ring {feature_id}")
 
             return True
@@ -2312,12 +2268,9 @@ class DrawingLayerManager(BaseLayerManager):
             if not success:
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "RANGE_RINGS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "RANGE_RINGS", "delete", feature_id=feature_id)
             logger.debug(f"Deleted range ring {feature_id}")
 
             return True
@@ -2354,6 +2307,9 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s range ring features synchronously; consider background task", len(feature_ids))
+
         layer = self._get_or_create_range_rings_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Range rings layer not available")
@@ -2375,12 +2331,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(feature_id):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "RANGE_RINGS", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "RANGE_RINGS", "bulk_delete", deleted=deleted)
             logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} range rings")
 
             return deleted
@@ -2417,25 +2370,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        request = QgsFeatureRequest()
-
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-
-            if expressions:
-                filter_expr = ' AND '.join(expressions)
-                request.setFilterExpression(filter_expr)
+        request = self._build_filter_request(layer, filters)
 
         records = []
         try:
@@ -2519,6 +2454,11 @@ class DrawingLayerManager(BaseLayerManager):
                 updates['updated_by'] = updated_by
                 updates['updated_at'] = datetime.now().isoformat()
 
+            if 'font_size' in updates:
+                validate_font_size(updates['font_size'], "font_size")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
@@ -2528,12 +2468,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if not success:
                     raise RuntimeError(f"Failed to update {field_name}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "BEARING_LINES", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "BEARING_LINES", "update", feature_id=feature_id)
             logger.debug(f"Updated bearing line {feature_id}")
 
             return True
@@ -2597,12 +2534,9 @@ class DrawingLayerManager(BaseLayerManager):
             if not success:
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "BEARING_LINES", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "BEARING_LINES", "delete", feature_id=feature_id)
             logger.debug(f"Deleted bearing line {feature_id}")
 
             return True
@@ -2639,6 +2573,9 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s bearing line features synchronously; consider background task", len(feature_ids))
+
         layer = self._get_or_create_bearing_lines_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Bearing lines layer not available")
@@ -2660,12 +2597,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(feature_id):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "BEARING_LINES", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "BEARING_LINES", "bulk_delete", deleted=deleted)
             logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} bearing lines")
 
             return deleted
@@ -2702,25 +2636,7 @@ class DrawingLayerManager(BaseLayerManager):
         if not layer or not layer.isValid():
             return []
 
-        request = QgsFeatureRequest()
-
-        if filters:
-            expressions = []
-            for field_name, value in filters.items():
-                if layer.fields().indexFromName(field_name) == -1:
-                    logger.warning(f"Unknown filter field {field_name}")
-                    continue
-
-                if isinstance(value, str):
-                    expressions.append(f'"{field_name}" = \'{value}\'')
-                elif isinstance(value, (int, float)):
-                    expressions.append(f'"{field_name}" = {value}')
-                elif value is None:
-                    expressions.append(f'"{field_name}" IS NULL')
-
-            if expressions:
-                filter_expr = ' AND '.join(expressions)
-                request.setFilterExpression(filter_expr)
+        request = self._build_filter_request(layer, filters)
 
         records = []
         try:
@@ -2813,12 +2729,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if not success:
                     raise RuntimeError(f"Failed to update {field_name}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "update", "TEXT_LABELS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "TEXT_LABELS", "update", feature_id=feature_id)
             logger.debug(f"Updated text label {feature_id}")
 
             return True
@@ -2882,12 +2795,9 @@ class DrawingLayerManager(BaseLayerManager):
             if not success:
                 raise RuntimeError(f"Failed to delete feature {feature_id}")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "delete", "TEXT_LABELS", {"feature_id": feature_id})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "TEXT_LABELS", "delete", feature_id=feature_id)
             logger.debug(f"Deleted text label {feature_id}")
 
             return True
@@ -2924,6 +2834,9 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
+        if len(feature_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s text label features synchronously; consider background task", len(feature_ids))
+
         layer = self._get_or_create_text_labels_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Text labels layer not available")
@@ -2945,12 +2858,9 @@ class DrawingLayerManager(BaseLayerManager):
                 if layer.deleteFeature(feature_id):
                     deleted += 1
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+            self._safe_commit(layer, "bulk_delete", "TEXT_LABELS", {"deleted": deleted})
 
             layer.triggerRepaint()
-            self._log_drawing_event(layer, "TEXT_LABELS", "bulk_delete", deleted=deleted)
             logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} text labels")
 
             return deleted
