@@ -418,12 +418,38 @@ class DiagnosticsPanel(BaseDialog):
                     device_count = detail_status.get('devices_count')
                     if device_count:
                         provider_details_lines.append(f"Devices: {device_count}")
+                    refresh_duration_ms = detail_status.get('provider_refresh_duration_ms') or detail_status.get('last_refresh_duration_ms')
+                    if refresh_duration_ms:
+                        provider_details_lines.append(f"Last Refresh Duration: {refresh_duration_ms:.0f} ms")
+                    poll_interval = detail_status.get('provider_poll_interval')
+                    poll_active = detail_status.get('provider_poll_active')
+                    if poll_interval:
+                        provider_details_lines.append(f"Polling: every {poll_interval}s" + (" (active)" if poll_active else " (paused)"))
+                    elif poll_active:
+                        provider_details_lines.append("Polling: active")
                     last_error = detail_status.get('provider_last_error')
                     if last_error:
                         provider_details_lines.append(f"Last Error: {last_error}")
                     status_message = detail_status.get('provider_status_message')
                     if status_message:
                         provider_details_lines.append(f"Status: {status_message}")
+                    cache_stats = detail_status.get('provider_cache_stats') or {}
+                    if cache_stats:
+                        ttl = cache_stats.get('cache_ttl_s')
+                        if ttl is not None:
+                            provider_details_lines.append(f"Device Cache TTL: {ttl}s")
+                        dc_size = cache_stats.get('device_cache_size')
+                        dc_age = cache_stats.get('device_cache_age_s')
+                        if dc_size is not None:
+                            provider_details_lines.append(f"Device Cache: {dc_size} entries" + (f" (age {dc_age:.0f}s)" if dc_age is not None else ""))
+                        lg_age = cache_stats.get('last_good_cache_age_s')
+                        lg_ts = cache_stats.get('last_good_cache_ts')
+                        lg_pos = cache_stats.get('last_good_positions')
+                        lg_bc = cache_stats.get('last_good_breadcrumbs')
+                        if lg_pos is not None:
+                            provider_details_lines.append(f"Last-Good Positions: {lg_pos}" + (f" (age {lg_age:.0f}s)" if lg_age is not None else ""))
+                        if lg_bc:
+                            provider_details_lines.append(f"Last-Good Breadcrumbs: {lg_bc}" + (f" (age {lg_age:.0f}s)" if lg_age is not None else ""))
         except Exception as detail_error:
             print(f"[DIAGNOSTICS] Error reading provider details: {detail_error}")
 

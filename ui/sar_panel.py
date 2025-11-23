@@ -1707,6 +1707,8 @@ class SARPanel(QDockWidget):
         devices_count = status_dict.get('devices_count', 0)
         last_refresh = status_dict.get('last_refresh', 'Never')
         poll_active = status_dict.get('poll_active', False)
+        poll_interval = status_dict.get('poll_interval')
+        last_error = status_dict.get('last_error')
 
         # Format last refresh time
         if last_refresh and last_refresh != 'Never':
@@ -1722,7 +1724,10 @@ class SARPanel(QDockWidget):
         if last_refresh != 'Never':
             status_parts.append(f"Last Refresh: {last_refresh}")
         if poll_active:
-            status_parts.append("🔄 Polling")
+            if poll_interval:
+                status_parts.append(f"🔄 Polling ({poll_interval}s)")
+            else:
+                status_parts.append("🔄 Polling")
 
         # Add state indicator
         if state == 'ok':
@@ -1733,6 +1738,9 @@ class SARPanel(QDockWidget):
             status_parts.append("⏳ Testing...")
         elif state == 'connecting':
             status_parts.append("⏳ Connecting...")
+
+        if last_error and state == 'error':
+            status_parts.append(f"Last Error: {last_error}")
 
         status_text = " | ".join(status_parts)
         self.provider_status_label.setText(status_text)

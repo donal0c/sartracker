@@ -90,6 +90,7 @@ class ProviderController(QObject):
         self._cached_device_count = 0
         self._last_refresh_time: Optional[str] = None
         self._last_error_message: Optional[str] = None
+        self._last_refresh_duration_ms: Optional[float] = None
         self._last_status_dict = self._build_status_dict('ok', 'No provider loaded')
 
     def set_provider(self, provider_name: str, config: Dict[str, Any], test_only: bool = False):
@@ -532,22 +533,25 @@ class ProviderController(QObject):
             'devices_count': self._cached_device_count,
             'last_refresh': self._last_refresh_time,
             'provider_base_url': self._get_provider_base_url(),
-            'last_error': self._last_error_message
+            'last_error': self._last_error_message,
+            'last_refresh_duration_ms': self._last_refresh_duration_ms
         }
         return status_dict
 
-    def update_refresh_stats(self, devices_count: int, refresh_time: str):
+    def update_refresh_stats(self, devices_count: int, refresh_time: str, refresh_duration_ms: Optional[float] = None):
         """
         Update cached refresh statistics.
 
         Args:
             devices_count: Number of devices in last refresh
             refresh_time: ISO timestamp of last refresh
+            refresh_duration_ms: Optional refresh duration in milliseconds
 
         Qt5/Qt6 Compatible: Pure Python types.
         """
         self._cached_device_count = devices_count
         self._last_refresh_time = refresh_time
+        self._last_refresh_duration_ms = refresh_duration_ms
 
         # Emit status update
         self._emit_status('ok', f'Last refresh: {devices_count} devices')

@@ -493,6 +493,106 @@ class TestTraccarHttpProvider(unittest.TestCase):
                 lon=-6.2603
             )
 
+    def test_save_last_good_cache_persists_breadcrumbs(self):
+        """Ensure breadcrumbs are persisted alongside positions."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        features = [{'device_id': '1', 'name': 'A', 'lat': 1.0, 'lon': 1.0, 'ts': '2025-11-15T10:00:00Z'}]
+        breadcrumbs = [{'device_id': '1', 'name': 'A', 'lat': 1.0, 'lon': 1.0, 'ts': '2025-11-15T09:55:00Z'}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = os.path.join(tmpdir, "cache.json")
+            with patch('providers.traccar_http._CACHE_DIR', tmpdir), patch('providers.traccar_http._CACHE_FILE', cache_file):
+                provider._save_last_good_cache(features, breadcrumbs)
+                loaded_breadcrumbs = provider._load_last_good_breadcrumbs(max_age_s=9999)
+                self.assertEqual(len(loaded_breadcrumbs), 1)
+                self.assertEqual(loaded_breadcrumbs[0]['ts'], breadcrumbs[0]['ts'])
+
+    @patch('providers.traccar_http.TraccarHttpProvider._load_devices')
+    def test_get_breadcrumbs_uses_cache_on_error(self, mock_load_devices):
+        """Breadcrumb fetch falls back to cached breadcrumbs on network error."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        mock_load_devices.side_effect = ProviderNetworkError(
+            "offline",
+            provider_name='traccar_http',
+            recoverable=True
+        )
+
+        cached = [{'device_id': '1', 'name': 'Device 1', 'lat': 1.0, 'lon': 1.0, 'ts': '2025-11-15T10:00:00Z'}]
+        with patch.object(provider, '_load_last_good_breadcrumbs', return_value=cached):
+            breadcrumbs = provider.get_breadcrumbs(session=Mock())
+            self.assertEqual(breadcrumbs, cached)
+
+    def test_bulk_breadcrumbs_path(self):
+        """When enabled, bulk breadcrumb fetch should be attempted."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password,
+            enable_bulk_breadcrumbs=True
+        )
+
+        provider._load_devices = Mock(return_value={'1': 'Device 1'})
+        provider.http_client = Mock()
+        provider.http_client.get.return_value = [
+            {
+                'deviceId': 1,
+                'latitude': 53.0,
+                'longitude': -6.0,
+                'fixTime': '2025-11-15T10:00:00Z',
+                'attributes': {}
+            }
+        ]
+
+        breadcrumbs = provider.get_breadcrumbs(session=Mock())
+        self.assertEqual(len(breadcrumbs), 1)
+        provider.http_client.get.assert_called_once()
+        args, kwargs = provider.http_client.get.call_args
+        self.assertEqual(args[0], "/api/positions")
+        self.assertIn('params', kwargs)
+        self.assertNotIn('deviceId', kwargs['params'])
+
+    def test_cache_stats_reports_last_good(self):
+        """Cache stats include last-good positions and breadcrumbs counts."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        provider._device_cache = {'1': 'Device 1'}
+        from datetime import datetime, timezone
+        provider._device_cache_timestamp = datetime.now(timezone.utc)
+
+        cache_payload = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'features': [{'device_id': '1'}],
+            'breadcrumbs': [{'device_id': '1'}]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = os.path.join(tmpdir, "cache.json")
+            with patch('providers.traccar_http._CACHE_DIR', tmpdir), patch('providers.traccar_http._CACHE_FILE', cache_file):
+                with open(cache_file, 'w', encoding='utf-8') as fh:
+                    json.dump(cache_payload, fh)
+                stats = provider.get_cache_stats()
+                self.assertEqual(stats['device_cache_size'], 1)
+                self.assertEqual(stats['last_good_positions'], 1)
+                self.assertEqual(stats['last_good_breadcrumbs'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

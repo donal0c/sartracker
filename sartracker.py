@@ -384,10 +384,12 @@ class sartracker:
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
         self._current_refresh_task = None  # For backwards compatibility with Issue #4 cleanup
+        self._refresh_started_at = None  # Timestamp for refresh duration
 
         # Cached data for diagnostics (Issue #1 fix)
         self._cached_device_count = 0  # Last known device count
         self._last_refresh_time = None  # ISO timestamp of last successful refresh
+        self._last_refresh_duration_ms = None  # Duration of last refresh in ms
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -2190,6 +2192,8 @@ class sartracker:
         try:
             # Set refresh flag
             self._refresh_in_progress = True
+            from datetime import datetime
+            self._refresh_started_at = datetime.now()
 
             # Show loading state in UI
             if self.sar_panel:
@@ -2216,6 +2220,7 @@ class sartracker:
         except Exception as e:
             # Reset state on setup error
             self._refresh_in_progress = False
+            self._refresh_started_at = None
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
@@ -2290,6 +2295,11 @@ class sartracker:
                 from datetime import datetime
                 self._cached_device_count = len(devices) if devices else 0
                 self._last_refresh_time = datetime.now().isoformat()
+                if self._refresh_started_at:
+                    self._last_refresh_duration_ms = (datetime.now() - self._refresh_started_at).total_seconds() * 1000.0
+                else:
+                    self._last_refresh_duration_ms = None
+                self._refresh_started_at = None
             except Exception as cache_error:
                 print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
 
@@ -2328,7 +2338,8 @@ class sartracker:
             if self.provider_controller:
                 self.provider_controller.update_refresh_stats(
                     self._cached_device_count,
-                    self._last_refresh_time
+                    self._last_refresh_time,
+                    refresh_duration_ms=self._last_refresh_duration_ms
                 )
                 print(f"[SARTRACKER] Updated controller stats: {self._cached_device_count} devices")
 
@@ -2384,6 +2395,8 @@ class sartracker:
             # Reset refresh state
             self._refresh_in_progress = False
             self._current_refresh_task = None
+            self._refresh_started_at = None
+            self._last_refresh_duration_ms = None
 
             # Hide loading state
             if self.sar_panel:
@@ -4227,6 +4240,7 @@ class sartracker:
             'provider_type': None,
             'devices_count': 0,
             'last_refresh': None,
+            'last_refresh_duration_ms': self._last_refresh_duration_ms,
             'active_tasks_count': 0,  # Phase 0: Task manager health metric
             # NEW: Tool registry status (Issue #2 fix)
             'tool_registry_loaded': False,
@@ -4274,6 +4288,14 @@ class sartracker:
                 # ============================================================
                 status['devices_count'] = self._cached_device_count
                 status['last_refresh'] = self._last_refresh_time
+                status['last_refresh_duration_ms'] = self._last_refresh_duration_ms
+
+                # Provider-specific diagnostics
+                if self.provider_name == 'traccar_http' and hasattr(self.provider, 'get_cache_stats'):
+                    try:
+                        status['provider_cache_stats'] = self.provider.get_cache_stats()
+                    except Exception as cache_stats_err:
+                        print(f"[SARTRACKER] Warning: Error reading provider cache stats: {cache_stats_err}")
 
             # Read tool registry status (Issue #2 fix)
             status['tool_registry_loaded'] = self.tool_registry is not None
@@ -4312,6 +4334,7 @@ class sartracker:
                     status['provider_base_url'] = controller_status.get('provider_base_url')
                     status['provider_last_error'] = controller_status.get('last_error')
                     status['provider_status_message'] = controller_status.get('message')
+                    status['provider_refresh_duration_ms'] = controller_status.get('last_refresh_duration_ms', self._last_refresh_duration_ms)
                 except Exception as controller_error:
                     print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
             # ============================================================

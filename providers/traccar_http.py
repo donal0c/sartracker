@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import concurrent.futures
+import queue
 from pathlib import Path
 
 from .base import Provider, FeatureDict
@@ -73,7 +74,9 @@ class TraccarHttpProvider(Provider):
         token: Optional[str] = None,
         timeout_s: int = 10,
         cache_ttl: int = 300,
-        enable_last_good_cache: bool = True
+        enable_last_good_cache: bool = True,
+        breadcrumb_workers: int = 10,
+        enable_bulk_breadcrumbs: bool = False
     ):
         """
         Initialize Traccar HTTP provider.
@@ -87,6 +90,8 @@ class TraccarHttpProvider(Provider):
             timeout_s: HTTP request timeout in seconds (default: 10)
             cache_ttl: Device cache TTL in seconds (default: 300 = 5 minutes)
             enable_last_good_cache: Whether to enable last-good payload caching (default: True)
+            breadcrumb_workers: Max parallel workers for breadcrumb fetch (default: 10)
+            enable_bulk_breadcrumbs: Try bulk /api/positions?from=&to= for breadcrumbs before per-device (default: False)
 
         Raises:
             ValueError: If inputs invalid or auth credentials missing
@@ -124,6 +129,12 @@ class TraccarHttpProvider(Provider):
         if not isinstance(cache_ttl, int) or cache_ttl < 0:
             raise ValueError(f"cache_ttl must be non-negative integer, got: {cache_ttl}")
 
+        if not isinstance(breadcrumb_workers, int) or breadcrumb_workers <= 0:
+            raise ValueError(f"breadcrumb_workers must be positive integer, got: {breadcrumb_workers}")
+
+        if not isinstance(enable_bulk_breadcrumbs, bool):
+            raise ValueError(f"enable_bulk_breadcrumbs must be boolean, got: {enable_bulk_breadcrumbs}")
+
         # Store configuration
         # Traccar URLs copied from browsers may include '/#/' fragments; strip
         # the hash portion so API endpoints are formed correctly.
@@ -135,6 +146,8 @@ class TraccarHttpProvider(Provider):
         self.timeout_s = timeout_s
         self.cache_ttl = cache_ttl
         self.enable_last_good_cache = enable_last_good_cache
+        self.breadcrumb_workers = breadcrumb_workers
+        self.enable_bulk_breadcrumbs = enable_bulk_breadcrumbs
 
         # Initialize HttpClient
         self.http_client = HttpClient(
@@ -416,6 +429,7 @@ class TraccarHttpProvider(Provider):
         """
         print(f"[TRACCAR_HTTP] Fetching breadcrumbs (since={since_iso or 'last 3 hours'})")
 
+        session_pool = None
         try:
             # Create session if not provided
             if session is None:
@@ -442,8 +456,33 @@ class TraccarHttpProvider(Provider):
 
                 print(f"[TRACCAR_HTTP] Time window: {from_iso} to {to_iso}")
 
+                # Optional bulk fetch (single request) to reduce API load
+                if self.enable_bulk_breadcrumbs:
+                    try:
+                        bulk_params = {'from': from_iso, 'to': to_iso}
+                        bulk_data = self.http_client.get("/api/positions", session=session, params=bulk_params, expect_json=True)
+                        if isinstance(bulk_data, list):
+                            bulk_positions = []
+                            for pos in bulk_data:
+                                try:
+                                    feature = self._normalize_position(pos, device_map)
+                                    bulk_positions.append(feature)
+                                except Exception as e:
+                                    print(f"[TRACCAR_HTTP] Warning: Failed to normalize bulk breadcrumb: {e}")
+                            bulk_positions.sort(key=lambda x: (x['device_id'], x['ts']))
+                            print(f"[TRACCAR_HTTP] Bulk breadcrumbs fetched: {len(bulk_positions)} positions")
+                            return bulk_positions
+                        else:
+                            print(f"[TRACCAR_HTTP] Bulk breadcrumb response invalid (type={type(bulk_data).__name__}); falling back to per-device")
+                    except Exception as bulk_err:
+                        print(f"[TRACCAR_HTTP] Bulk breadcrumb fetch failed: {bulk_err}; falling back to per-device")
+
                 # Fetch breadcrumbs for each device in parallel
                 all_positions = []
+                session_pool = queue.Queue()
+                pool_size = max(1, min(self.breadcrumb_workers, len(device_map)))
+                for _ in range(pool_size):
+                    session_pool.put(self._create_session())
 
                 # Helper function for parallel execution
                 def fetch_device_breadcrumbs(device_id_str, device_name):
@@ -455,27 +494,24 @@ class TraccarHttpProvider(Provider):
                             'to': to_iso
                         }
 
-                        # Fetch positions for this device
-                        # Note: session is thread-safe for read operations, but requests.Session isn't strictly thread-safe
-                        # if used concurrently. However, HttpClient.get creates a new Request.
-                        # To be perfectly safe with requests.Session in threads, we should ideally use separate sessions
-                        # or rely on the fact that we are just doing GETs which are usually safe.
-                        # BUT: requests.Session object is NOT thread-safe.
-                        # We should create a lightweight session for each thread or use the main one with a lock.
-                        # Given the overhead, let's create a new session inside the thread or use a pool.
-                        # Actually, TraccarHttpProvider._create_session() creates a new session.
-                        # Let's create a local session for the worker.
-                        
-                        # Re-using the passed 'session' in threads is NOT safe.
-                        # We will use the provider's http_client to make a raw request, 
-                        # but we need auth. 
-                        
-                        # Better approach: Create a new session for each worker.
-                        worker_session = self._create_session()
+                        # Fetch positions for this device using pooled session
+                        try:
+                            worker_session = session_pool.get_nowait()
+                            from_pool = True
+                        except queue.Empty:
+                            worker_session = self._create_session()
+                            from_pool = False
+
                         try:
                             data = self.http_client.get("/api/positions", session=worker_session, params=params, expect_json=True)
                         finally:
-                            worker_session.close()
+                            if from_pool:
+                                session_pool.put(worker_session)
+                            else:
+                                try:
+                                    worker_session.close()
+                                except Exception:
+                                    pass
 
                         # Validate response type
                         if not isinstance(data, list):
@@ -498,7 +534,7 @@ class TraccarHttpProvider(Provider):
                         return []
 
                 # Execute in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
                     future_to_device = {
                         executor.submit(fetch_device_breadcrumbs, d_id, d_name): d_id 
                         for d_id, d_name in device_map.items()
@@ -517,6 +553,15 @@ class TraccarHttpProvider(Provider):
                 return all_positions
 
             finally:
+                # Close pooled sessions
+                if session_pool:
+                    while not session_pool.empty():
+                        pooled = session_pool.get_nowait()
+                        try:
+                            pooled.close()
+                        except Exception:
+                            pass
+
                 # Close session if we created it
                 if close_session:
                     try:
@@ -524,7 +569,12 @@ class TraccarHttpProvider(Provider):
                     except Exception as e:
                         print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
 
-        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
+        except (ProviderAuthError, ProviderNetworkError, ProviderDataError) as prov_err:
+            if self.enable_last_good_cache:
+                cached_breadcrumbs = self._load_last_good_breadcrumbs()
+                if cached_breadcrumbs:
+                    print(f"[TRACCAR_HTTP] {prov_err.__class__.__name__} fetching breadcrumbs; using cached breadcrumbs ({len(cached_breadcrumbs)} points)")
+                    return cached_breadcrumbs
             # Re-raise provider errors
             raise
         except Exception as e:
@@ -738,12 +788,13 @@ class TraccarHttpProvider(Provider):
             'last_update': last_update
         }
 
-    def _save_last_good_cache(self, features: List[FeatureDict]):
+    def _save_last_good_cache(self, features: List[FeatureDict], breadcrumbs: Optional[List[FeatureDict]] = None):
         """
         Save last-good positions to cache file for offline resilience.
 
         Args:
             features: List of feature dicts to cache
+            breadcrumbs: Optional list of breadcrumb feature dicts to cache
         """
         if not self.enable_last_good_cache:
             return
@@ -757,11 +808,14 @@ class TraccarHttpProvider(Provider):
                 'timestamp': format_iso(datetime.now(timezone.utc)),
                 'features': features
             }
+            if breadcrumbs is not None:
+                cache_data['breadcrumbs'] = breadcrumbs
 
             with open(_CACHE_FILE, 'w', encoding='utf-8') as f:
                 json.dump(cache_data, f, indent=2)
 
-            print(f"[TRACCAR_HTTP] Saved {len(features)} positions to last-good cache")
+            print(f"[TRACCAR_HTTP] Saved {len(features)} positions to last-good cache"
+                  + (f" and {len(breadcrumbs)} breadcrumbs" if breadcrumbs is not None else ""))
 
         except Exception as e:
             # Don't let cache save failures propagate - log and continue
@@ -777,55 +831,96 @@ class TraccarHttpProvider(Provider):
         Returns:
             List of feature dicts from cache, or None if cache unavailable or expired
         """
+        cache = self._read_last_good_cache(max_age_s=max_age_s)
+        if cache:
+            print(f"[TRACCAR_HTTP] Loaded {len(cache.get('features', []))} positions from cache (saved: {cache.get('timestamp')})")
+            return cache.get('features')
+        return None
+
+    def _load_last_good_breadcrumbs(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
+        """
+        Load last-good breadcrumbs from cache file (if saved).
+
+        Args:
+            max_age_s: Maximum age of cache in seconds
+
+        Returns:
+            List of breadcrumb feature dicts, or None if unavailable/expired.
+        """
+        cache = self._read_last_good_cache(max_age_s=max_age_s)
+        if cache and cache.get('breadcrumbs'):
+            print(f"[TRACCAR_HTTP] Loaded {len(cache.get('breadcrumbs', []))} breadcrumbs from cache (saved: {cache.get('timestamp')})")
+            return cache.get('breadcrumbs')
+        return None
+
+    def _read_last_good_cache(self, max_age_s: Optional[int] = 3600) -> Optional[Dict[str, Any]]:
+        """
+        Internal helper to read cache file and enforce age limits.
+        """
         if not self.enable_last_good_cache:
             return None
 
         try:
-            # Check if cache file exists
             if not os.path.exists(_CACHE_FILE):
                 print("[TRACCAR_HTTP] No last-good cache file found")
                 return None
 
-            # Read cache file
             with open(_CACHE_FILE, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
 
-            # Validate cache structure
-            if not isinstance(cache_data, dict) or 'features' not in cache_data:
+            if not isinstance(cache_data, dict) or 'features' not in cache_data or 'timestamp' not in cache_data:
                 print("[TRACCAR_HTTP] Invalid cache file structure")
                 return None
 
-            features = cache_data['features']
             timestamp_str = cache_data.get('timestamp')
+            cache_time = parse_iso(timestamp_str)
+            if cache_time.tzinfo is None:
+                cache_time = cache_time.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            age = (now - cache_time).total_seconds()
 
-            if not timestamp_str:
-                print("[TRACCAR_HTTP] Cache missing timestamp")
+            if max_age_s is not None and age > max_age_s:
+                print(f"[TRACCAR_HTTP] Cache expired (age={age:.1f}s > max={max_age_s}s), ignoring")
                 return None
 
-            # Enforce expiration
-            try:
-                cache_time = parse_iso(timestamp_str)
-                # Ensure aware comparison
-                if cache_time.tzinfo is None:
-                    cache_time = cache_time.replace(tzinfo=timezone.utc)
-                
-                now = datetime.now(timezone.utc)
-                age = (now - cache_time).total_seconds()
-
-                if age > max_age_s:
-                    print(f"[TRACCAR_HTTP] Cache expired (age={age:.1f}s > max={max_age_s}s), ignoring")
-                    return None
-            except Exception as e:
-                print(f"[TRACCAR_HTTP] Error verifying cache age: {e}")
-                return None
-
-            print(f"[TRACCAR_HTTP] Loaded {len(features)} positions from cache (saved: {timestamp_str})")
-            return features
-
+            cache_data['age_seconds'] = age
+            cache_data['timestamp'] = timestamp_str
+            return cache_data
         except Exception as e:
-            # Don't let cache load failures propagate - log and continue
-            print(f"[TRACCAR_HTTP] Warning: Failed to load last-good cache: {e}")
+            print(f"[TRACCAR_HTTP] Warning: Failed to read last-good cache: {e}")
             return None
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """
+        Return cache-related diagnostics for diagnostics panel/status APIs.
+        """
+        now = datetime.now(timezone.utc)
+        device_cache_age = None
+        if self._device_cache_timestamp:
+            device_cache_age = (now - self._device_cache_timestamp).total_seconds()
+
+        cache_info = self._read_last_good_cache(max_age_s=None)
+        last_good_age = None
+        last_good_ts = None
+        last_good_positions = None
+        last_good_breadcrumbs = None
+        if cache_info:
+            last_good_age = cache_info.get('age_seconds')
+            last_good_ts = cache_info.get('timestamp')
+            last_good_positions = len(cache_info.get('features', []) or [])
+            last_good_breadcrumbs = len(cache_info.get('breadcrumbs', []) or [])
+
+        return {
+            'cache_ttl_s': self.cache_ttl,
+            'device_cache_size': len(self._device_cache),
+            'device_cache_age_s': device_cache_age,
+            'last_good_cache_age_s': last_good_age,
+            'last_good_cache_ts': last_good_ts,
+            'last_good_positions': last_good_positions,
+            'last_good_breadcrumbs': last_good_breadcrumbs,
+            'breadcrumb_workers': self.breadcrumb_workers,
+            'bulk_breadcrumbs_enabled': self.enable_bulk_breadcrumbs
+        }
 
     def save_casualty(self, mission_id: int, name: str, lat: float, lon: float,
                      irish_grid_e: Optional[float] = None, irish_grid_n: Optional[float] = None,
@@ -1016,6 +1111,22 @@ def _create_traccar_http_provider(config: Dict) -> TraccarHttpProvider:
             recoverable=False
         )
 
+    breadcrumb_workers = config.get('breadcrumb_workers', 10)
+    if not isinstance(breadcrumb_workers, int) or breadcrumb_workers <= 0:
+        raise ProviderDataError(
+            f"Traccar HTTP provider 'breadcrumb_workers' must be positive integer, got: {breadcrumb_workers}",
+            provider_name='traccar_http',
+            recoverable=False
+        )
+
+    enable_bulk_breadcrumbs = config.get('enable_bulk_breadcrumbs', False)
+    if not isinstance(enable_bulk_breadcrumbs, bool):
+        raise ProviderDataError(
+            f"Traccar HTTP provider 'enable_bulk_breadcrumbs' must be boolean, got: {enable_bulk_breadcrumbs}",
+            provider_name='traccar_http',
+            recoverable=False
+        )
+
     # CREATE PROVIDER INSTANCE
     return TraccarHttpProvider(
         base_url=config['base_url'],
@@ -1025,7 +1136,9 @@ def _create_traccar_http_provider(config: Dict) -> TraccarHttpProvider:
         token=config.get('token'),
         timeout_s=int(timeout_s),
         cache_ttl=cache_ttl,
-        enable_last_good_cache=enable_last_good_cache
+        enable_last_good_cache=enable_last_good_cache,
+        breadcrumb_workers=breadcrumb_workers,
+        enable_bulk_breadcrumbs=enable_bulk_breadcrumbs
     )
 
 
@@ -1082,6 +1195,18 @@ registry.register(
                 'description': 'Enable last-good payload cache for offline resilience',
                 'required': False,
                 'default': True
+            },
+            'breadcrumb_workers': {
+                'type': 'integer',
+                'description': 'Parallel workers for breadcrumb fetch (default 10)',
+                'required': False,
+                'default': 10
+            },
+            'enable_bulk_breadcrumbs': {
+                'type': 'boolean',
+                'description': 'Attempt bulk /api/positions for breadcrumbs before per-device',
+                'required': False,
+                'default': False
             }
         },
         # Phase 4 capabilities

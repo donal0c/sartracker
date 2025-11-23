@@ -581,7 +581,9 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 breadcrumbs = self.provider.get_breadcrumbs(session=session)
             except (ProviderNetworkError, ProviderDataError) as e:
                 print(f"[TRACCAR_TASK] {e.__class__.__name__} fetching breadcrumbs: {e}")
-                breadcrumbs = []
+                breadcrumbs = self.provider._load_last_good_breadcrumbs() if getattr(self.provider, 'enable_last_good_cache', False) else []
+                if breadcrumbs:
+                    print(f"[TRACCAR_TASK] Using cached breadcrumbs ({len(breadcrumbs)} points)")
             except ProviderAuthError as e:
                 self.error_message = f"Failed to fetch breadcrumbs: {str(e)}"
                 return False
@@ -621,6 +623,13 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 'devices': devices,
                 'breadcrumb_processing': breadcrumb_processing
             }
+
+            # Persist last-good payload (positions + breadcrumbs) for offline resilience
+            try:
+                if getattr(self.provider, 'enable_last_good_cache', False):
+                    self.provider._save_last_good_cache(current, breadcrumbs)
+            except Exception as cache_err:
+                print(f"[TRACCAR_TASK] Warning: Failed to persist last-good cache: {cache_err}")
 
             # Update progress to 100%
             self.setProgress(100)
