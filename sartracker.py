@@ -21,7 +21,7 @@
  *                                                                         *
  ***************************************************************************/
 """
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Any
 import sys
 import os
 import re
@@ -62,7 +62,10 @@ from .utils.dialog_utils import BaseDialog
 from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
 from .config.keys import ConfigStore, SETTINGS_KEYS
 from .utils.secure_store import SecureStore
+from .utils.mission_storage import MissionStorageHelper, MissionPaths
 from .ui.mission_metadata_dialog import MissionMetadataDialog
+from .utils.provider_results import sanitize_provider_results
+from .utils.task_manager import TaskManager
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -373,6 +376,7 @@ class sartracker:
         self.bearing_tool = None
         self.polygon_tool = None
         self.tool_registry = None
+        self.mission_storage = None
         self.mission_controller = None  # Phase N3: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
@@ -394,6 +398,40 @@ class sartracker:
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
         self.itm = QgsCoordinateReferenceSystem("EPSG:29903")  # Irish Grid
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+    def _notify(self, level: str, title: str, message: str, duration: int = 3):
+        """Centralized notifier wrapper to simplify messaging and future redirection."""
+        bar = self.iface.messageBar() if self.iface else None
+        try:
+            if level == "info":
+                info(bar, title, message, duration=duration)
+            elif level == "warning":
+                warning(bar, title, message, duration=duration)
+            elif level == "error":
+                error(bar, title, message, duration=duration)
+            elif level == "success":
+                success(bar, title, message, duration=duration)
+        except Exception as e:
+            print(f"[SARTRACKER] Notify failed ({level}): {e}")
+
+    def _components_ready(self, *attrs) -> bool:
+        """Return True if all named attributes are truthy."""
+        return all(getattr(self, name, None) for name in attrs)
+
+    def _current_mission_paths(self) -> Optional[MissionPaths]:
+        """Build MissionPaths from current state if available."""
+        if not (self._mission_directory and self._mission_attachments_dir and self._mission_gpkg_path):
+            return None
+        return MissionPaths(
+            name=self._mission_folder_name or "",
+            mission_dir=self._mission_directory,
+            attachments_dir=self._mission_attachments_dir,
+            backup_dir=self._mission_backup_directory,
+            gpkg_path=self._mission_gpkg_path
+        )
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -548,7 +586,6 @@ class sartracker:
         self.first_start = True
 
         # Initialize task manager for background operations (Issue #6 fix)
-        from .utils.task_manager import TaskManager
         self.task_manager = TaskManager()
 
         # Connect to application aboutToQuit signal for safe shutdown
@@ -610,6 +647,33 @@ class sartracker:
         # Initialize layers controller
         self.layers_controller = LayersController(self.iface, layer_manager=self.layer_manager)
 
+        # Mission storage helper (filesystem + backups)
+        self.mission_storage = MissionStorageHelper(
+            layer_manager=self.layer_manager,
+            config_store=ConfigStore,
+            warn=lambda title, msg, duration=5: warning(self.iface.messageBar(), title, msg, duration=duration)
+        )
+
+        # ------------------------------------------------------------------ #
+        # Drawing tool initializer
+        # ------------------------------------------------------------------ #
+        # pylint: disable=attribute-defined-outside-init
+        def _init_drawing_tool(self, tool_attr, import_path, class_name, ctor, hooks):
+            try:
+                module = __import__(import_path, fromlist=[class_name])
+                cls = getattr(module, class_name)
+                tool = ctor(cls)
+                hooks(tool)
+                setattr(self, tool_attr, tool)
+            except Exception as e:
+                setattr(self, tool_attr, None)
+                warning(self.iface.messageBar(), "SAR Tracker",
+                        f"{class_name} failed to load: {e}", duration=5)
+                print(f"ERROR initializing {class_name}: {e}")
+
+        # Bind helper as instance method
+        self._init_drawing_tool = _init_drawing_tool.__get__(self, sartracker)
+
         # Marker interaction controller (delegates marker CRUD workflows)
         if MarkerController is not None and self.layers_controller:
             self.marker_controller = MarkerController(
@@ -630,57 +694,51 @@ class sartracker:
         self.measure_tool = MeasureTool(self.iface.mapCanvas())
         self.measure_tool.measurement_complete.connect(self._on_measurement_complete)
 
-        # Initialize Line Tool (with error handling for late-binding import)
-        try:
-            from .maptools import LineTool
-            self.line_tool = LineTool(self.iface.mapCanvas(), self.layers_controller)
-            self.line_tool.drawing_complete.connect(self._on_line_complete)
-            self.line_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
-            self.line_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Line drawing"))
-        except Exception as e:
-            self.line_tool = None
-            warning(self.iface.messageBar(), "SAR Tracker",
-                   f"Line Tool failed to load: {e}", duration=5)
-            print(f"ERROR initializing LineTool: {e}")
-
-        # Initialize Range Ring Tool (with error handling for late-binding import)
-        try:
-            from .maptools import RangeRingTool
-            self.range_ring_tool = RangeRingTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
-            self.range_ring_tool.drawing_complete.connect(self._on_range_rings_complete)
-            self.range_ring_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
-            self.range_ring_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Range ring"))
-        except Exception as e:
-            self.range_ring_tool = None
-            warning(self.iface.messageBar(), "SAR Tracker",
-                   f"Range Ring Tool failed to load: {e}", duration=5)
-            print(f"ERROR initializing RangeRingTool: {e}")
-
-        # Initialize Bearing Tool (with error handling for late-binding import)
-        try:
-            from .maptools import BearingTool
-            self.bearing_tool = BearingTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
-            self.bearing_tool.drawing_complete.connect(self._on_bearing_complete)
-            self.bearing_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
-            self.bearing_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Bearing line"))
-        except Exception as e:
-            self.bearing_tool = None
-            warning(self.iface.messageBar(), "SAR Tracker",
-                   f"Bearing Tool failed to load: {e}", duration=5)
-            print(f"ERROR initializing BearingTool: {e}")
-
-        # Initialize Polygon Tool (Search Areas) (with error handling for late-binding import)
-        try:
-            from .maptools import PolygonTool
-            self.polygon_tool = PolygonTool(self.iface.mapCanvas(), self.layers_controller, self.iface)
-            self.polygon_tool.drawing_complete.connect(self._on_polygon_complete)
-            self.polygon_tool.drawing_cancelled.connect(self._on_drawing_cancelled)
-            self.polygon_tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Polygon drawing"))
-        except Exception as e:
-            self.polygon_tool = None
-            warning(self.iface.messageBar(), "SAR Tracker",
-                   f"Polygon Tool failed to load: {e}", duration=5)
-            print(f"ERROR initializing PolygonTool: {e}")
+        # Initialize drawing tools with shared helper
+        self._init_drawing_tool(
+            tool_attr="line_tool",
+            import_path=".maptools",
+            class_name="LineTool",
+            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller),
+            hooks=lambda tool: (
+                tool.drawing_complete.connect(self._on_line_complete),
+                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
+                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Line drawing"))
+            )
+        )
+        self._init_drawing_tool(
+            tool_attr="range_ring_tool",
+            import_path=".maptools",
+            class_name="RangeRingTool",
+            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
+            hooks=lambda tool: (
+                tool.drawing_complete.connect(self._on_range_rings_complete),
+                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
+                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Range ring"))
+            )
+        )
+        self._init_drawing_tool(
+            tool_attr="bearing_tool",
+            import_path=".maptools",
+            class_name="BearingTool",
+            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
+            hooks=lambda tool: (
+                tool.drawing_complete.connect(self._on_bearing_complete),
+                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
+                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Bearing line"))
+            )
+        )
+        self._init_drawing_tool(
+            tool_attr="polygon_tool",
+            import_path=".maptools",
+            class_name="PolygonTool",
+            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
+            hooks=lambda tool: (
+                tool.drawing_complete.connect(self._on_polygon_complete),
+                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
+                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Polygon drawing"))
+            )
+        )
 
         # Initialize Tool Registry (with error handling for late-binding import)
         try:
@@ -1476,31 +1534,16 @@ class sartracker:
 
         # Race condition protection: prevent duplicate finalization
         if self._is_finalizing:
-            info(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                "Finalization already in progress, please wait.",
-                duration=3
-            )
+            self._notify("info", "Finalize Mission", "Finalization already in progress, please wait.", duration=3)
             return
 
         if not self._mission_gpkg_path or not self._mission_directory:
-            error(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                "No active mission store to finalize.",
-                duration=5
-            )
+            self._notify("error", "Finalize Mission", "No active mission store to finalize.", duration=5)
             return
 
         # Check if already finalized
         if self._check_mission_finalized():
-            info(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                "Mission is already finalized.",
-                duration=3
-            )
+            self._notify("info", "Finalize Mission", "Mission is already finalized.", duration=3)
             return
 
         self._is_finalizing = True
@@ -1511,38 +1554,20 @@ class sartracker:
                 if not project.write():
                     raise RuntimeError("Failed to save QGIS project before finalization")
             else:
-                error(
-                    self.iface.messageBar(),
-                    "Finalize Mission",
-                    "Please save the project before finalizing the mission.",
-                    duration=5
-                )
+                self._notify("error", "Finalize Mission", "Please save the project before finalizing the mission.", duration=5)
                 return
 
-            # Create archive
-            archive_path = self._create_mission_archive()
+            paths = self._current_mission_paths()
+            project_path = Path(project.fileName()) if project.fileName() else None
+            if not paths:
+                raise RuntimeError("Mission storage paths are not set")
 
-            # Mark as finalized in project custom variables
-            self._mark_mission_finalized()
-
-            # Update UI
-            if self.sar_panel:
-                self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=True)
-
-            success(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                f"Mission finalized successfully. Archive saved to:\n{archive_path}",
-                duration=10
-            )
+            # Run archive in background
+            self._start_archive_task(paths, project_path)
+            return
 
         except Exception as exc:
-            error(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                f"Failed to finalize mission: {exc}",
-                duration=10
-            )
+            self._notify("error", "Finalize Mission", f"Failed to finalize mission: {exc}", duration=10)
             print(f"[SARTRACKER] Error finalizing mission: {exc}")
             import traceback
             traceback.print_exc()
@@ -1552,7 +1577,7 @@ class sartracker:
     def _on_unlock_mission_requested(self):
         """Handle admin unlock request for finalized missions."""
         if not self.layer_manager or not self._check_mission_finalized():
-            info(self.iface.messageBar(), "Mission Unlock", "Mission is not finalized.", duration=4)
+            self._notify("info", "Mission Unlock", "Mission is not finalized.", duration=4)
             return
 
         admin_roster = ConfigStore.get_admin_list()
@@ -1569,16 +1594,16 @@ class sartracker:
             return
         admin_name = (admin_name or "").strip()
         if admin_roster and admin_name not in admin_roster:
-            warning(self.iface.messageBar(), "Mission Unlock", "Admin not in roster.", duration=5)
+            self._notify("warning", "Mission Unlock", "Admin not in roster.", duration=5)
             return
 
         try:
             self.layer_manager.set_mission_finalized(False, finalized_by=admin_name)
-            info(self.iface.messageBar(), "Mission Unlock", "Mission unlocked. Editing is re-enabled.", duration=5)
+            self._notify("info", "Mission Unlock", "Mission unlocked. Editing is re-enabled.", duration=5)
             if self.sar_panel:
                 self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=False)
         except Exception as exc:
-            error(self.iface.messageBar(), "Mission Unlock", f"Failed to unlock mission: {exc}", duration=6)
+            self._notify("error", "Mission Unlock", f"Failed to unlock mission: {exc}", duration=6)
 
     def _create_mission_archive(self) -> Path:
         """
@@ -1732,10 +1757,9 @@ class sartracker:
 
     def _mission_roots_from_settings(self):
         """Return primary and backup mission roots as Path objects."""
-        primary_root = Path(ConfigStore.get_mission_primary_root()).expanduser()
-        backup_root_str = ConfigStore.get_mission_backup_root()
-        backup_root = Path(backup_root_str).expanduser() if backup_root_str else None
-        return primary_root, backup_root
+        if not self.mission_storage:
+            return Path(ConfigStore.get_mission_primary_root()).expanduser(), None
+        return self.mission_storage.mission_roots()
 
     def _collect_mission_metadata(self, mode: str, allow_resume_time: bool, preselected: Optional[list] = None):
         """Prompt for coordinators (and optional resume time) and persist to project."""
@@ -1823,43 +1847,26 @@ class sartracker:
 
     def _prepare_new_mission_storage(self, mission_name: str):
         """Create mission storage directories + GeoPackage for a new mission."""
-        if not self.layer_manager:
+        if not self.layer_manager or not self.mission_storage:
             return
 
-        # Clear finalized flag for new mission
         try:
-            self.layer_manager.set_mission_finalized(False)
-        except Exception:
-            pass
-        # Reset mission metadata and clear cached coordinators/resume time
-        try:
-            self.layer_manager.set_mission_coordinators("")
-            self.layer_manager.set_resume_timestamp("")
-        except Exception:
-            pass
+            paths = self.mission_storage.prepare_new_mission(mission_name)
+        except Exception as exc:
+            error(self.iface.messageBar(), "Mission Storage", f"Failed to prepare mission storage: {exc}", duration=6)
+            return
+
+        self._mission_folder_name = paths.name
+        self._mission_directory = paths.mission_dir
+        self._mission_attachments_dir = paths.attachments_dir
+        self._mission_backup_directory = paths.backup_dir
+        self._mission_gpkg_path = paths.gpkg_path
+
         self._mission_coordinators_cache = ""
         self._metadata_collected = False
 
-        primary_root, backup_root = self._mission_roots_from_settings()
-        sanitized_name = self._sanitize_mission_name(mission_name)
-        mission_dir = primary_root / sanitized_name
-        attachments_dir = mission_dir / "attachments"
-        mission_dir.mkdir(parents=True, exist_ok=True)
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-
-        gpkg_path = mission_dir / f"{sanitized_name}.gpkg"
-
-        self._mission_folder_name = sanitized_name
-        self._mission_directory = mission_dir
-        self._mission_attachments_dir = attachments_dir
-        self._mission_backup_directory = self._ensure_backup_directory(create=True, folder_name=sanitized_name, backup_root=backup_root)
-        self._mission_gpkg_path = gpkg_path
-
-        self.layer_manager.set_mission_store(str(gpkg_path))
         if self.layers_controller:
             self.layers_controller.clear_layers()
-        self.layer_manager.ensure_structure(auto_migrate=False)
-        self._metadata_collected = False
         self._update_mission_storage_status(active=True)
 
         # CRITICAL: Refresh catalog cache (layers now backed by GeoPackage)
@@ -1873,7 +1880,7 @@ class sartracker:
 
     def _handle_mission_resume_storage(self, mission_name: str):
         """Restore mission storage metadata when resuming a paused mission."""
-        if not self.layer_manager:
+        if not self.layer_manager or not self.mission_storage:
             return
 
         store_path = self.layer_manager.get_mission_store()
@@ -1885,16 +1892,23 @@ class sartracker:
             self._prepare_new_mission_storage(mission_name)
             return
 
-        gpkg_path = Path(store_path)
-        sanitized_name = gpkg_path.parent.name
+        try:
+            paths = self.mission_storage.handle_resume(Path(store_path))
+        except Exception as exc:
+            warning(
+                self.iface.messageBar(),
+                "Mission Storage",
+                f"Mission store invalid, starting fresh: {exc}",
+                duration=5
+            )
+            self._prepare_new_mission_storage(mission_name)
+            return
 
-        self._mission_gpkg_path = gpkg_path
-        self._mission_directory = gpkg_path.parent
-        self._mission_folder_name = sanitized_name
-        attachments_dir = self._mission_directory / "attachments"
-        attachments_dir.mkdir(parents=True, exist_ok=True)
-        self._mission_attachments_dir = attachments_dir
-        self._mission_backup_directory = self._ensure_backup_directory(create=True)
+        self._mission_gpkg_path = paths.gpkg_path
+        self._mission_directory = paths.mission_dir
+        self._mission_folder_name = paths.name
+        self._mission_attachments_dir = paths.attachments_dir
+        self._mission_backup_directory = paths.backup_dir
         # Load coordinators from project and cache them
         try:
             existing_coords = self.layer_manager.get_mission_coordinators() if self.layer_manager else ""
@@ -1984,7 +1998,11 @@ class sartracker:
         else:
             attachments_dir.mkdir(parents=True, exist_ok=True)
             self._mission_attachments_dir = attachments_dir
-        self._mission_backup_directory = self._ensure_backup_directory(create=False)
+        self._mission_backup_directory = self.mission_storage.ensure_backup_directory(
+            folder_name=self._mission_folder_name,
+            backup_root=None,
+            create=False
+        ) if self.mission_storage else None
         try:
             existing_coords = self.layer_manager.get_mission_coordinators() if self.layer_manager else ""
             self._mission_coordinators_cache = existing_coords or ""
@@ -2013,136 +2031,75 @@ class sartracker:
 
     def _ensure_backup_directory(self, create: bool, folder_name: Optional[str] = None, backup_root: Optional[Path] = None):
         """Ensure backup directory exists when configured."""
-        backup_root = backup_root or (Path(ConfigStore.get_mission_backup_root()).expanduser()
-                                      if ConfigStore.get_mission_backup_root() else None)
-        folder = folder_name or self._mission_folder_name
-        if not backup_root or not folder:
+        if not self.mission_storage:
             return None
-
-        target = backup_root / folder
-        if create:
-            try:
-                target.mkdir(parents=True, exist_ok=True)
-                (target / "attachments").mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                warning(self.iface.messageBar(),
-                        "Mission Backup",
-                        f"Failed to prepare backup directory: {exc}",
-                        duration=5)
-                return None
-        return target
+        folder = folder_name or self._mission_folder_name
+        return self.mission_storage.ensure_backup_directory(folder, backup_root, create)
 
     def _ingest_attachment(self, attachment_path: Optional[str]) -> Optional[str]:
         """Copy user-selected attachments into the mission folder and return mission-relative path."""
-        if not attachment_path:
-            return None
-
-        attachments_dir = self._mission_attachments_dir
-        mission_dir = self._mission_directory
-
-        if not attachments_dir or not mission_dir:
+        if not self.mission_storage or not self._mission_directory or not self._mission_attachments_dir:
             warning(self.iface.messageBar(),
                     "Mission Storage",
                     "Mission storage is not initialized; attachment path kept as entered.",
                     duration=4)
             return attachment_path
 
-        raw_path = Path(attachment_path).expanduser()
-
-        # If user entered a mission-relative path (e.g. existing attachment), keep it
-        if not raw_path.is_absolute():
-            candidate = mission_dir / raw_path
-            if candidate.exists():
-                try:
-                    return str(candidate.relative_to(mission_dir))
-                except ValueError:
-                    return str(candidate)
-        else:
-            try:
-                mission_resolved = mission_dir.resolve()
-                raw_resolved = raw_path.resolve()
-                try:
-                    rel = raw_resolved.relative_to(mission_resolved)
-                    return str(rel)
-                except ValueError:
-                    pass
-            except Exception:
-                pass
-
-        if not raw_path.exists() or not raw_path.is_file():
-            warning(self.iface.messageBar(),
-                    "Attachments",
-                    "Attachment file not found; keeping original path reference.",
-                    duration=4)
+        paths = self._current_mission_paths()
+        if not paths:
             return attachment_path
+        return self.mission_storage.ingest_attachment(paths, attachment_path)
 
-        try:
-            attachments_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as exc:
-            warning(self.iface.messageBar(),
-                    "Attachments",
-                    f"Could not prepare attachments folder: {exc}",
-                    duration=4)
-            return attachment_path
-
-        destination = attachments_dir / raw_path.name
-        counter = 1
-        while destination.exists():
-            destination = attachments_dir / f"{raw_path.stem}_{counter}{raw_path.suffix}"
-            counter += 1
-
-        try:
-            shutil.copy2(raw_path, destination)
-        except Exception as exc:
-            warning(self.iface.messageBar(),
-                    "Attachments",
-                    f"Failed to copy attachment: {exc}",
-                    duration=5)
-            return attachment_path
-
-        try:
-            return str(destination.relative_to(mission_dir))
-        except ValueError:
-            return str(destination)
-
-    def _sync_mission_backup(self) -> bool:
+    def _sync_mission_backup(self, async_run: bool = False) -> bool:
         """Mirror GeoPackage (and attachments if present) to backup root."""
-        if not self.layer_manager:
+        if not self.mission_storage:
             return True
 
-        store_path = self.layer_manager.get_mission_store()
-        if not store_path:
+        paths = self._current_mission_paths()
+        if not paths:
             return True
 
-        gpkg_path = Path(store_path)
-        if not gpkg_path.exists():
-            return False
-
-        backup_dir = self._mission_backup_directory or self._ensure_backup_directory(create=True)
-        if not backup_dir:
-            return True  # Backup optional
-
-        try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(gpkg_path, backup_dir / gpkg_path.name)
-
-            attachments_src = self._mission_attachments_dir
-            if attachments_src and attachments_src.exists():
-                attachments_dst = backup_dir / "attachments"
-                attachments_dst.mkdir(parents=True, exist_ok=True)
-                for child in attachments_src.iterdir():
-                    target = attachments_dst / child.name
-                    if child.is_file():
-                        shutil.copy2(child, target)
-                    elif child.is_dir():
-                        shutil.copytree(child, target, dirs_exist_ok=True)
+        if async_run and self.task_manager:
+            self._start_backup_task(paths)
             return True
-        except Exception as exc:
-            warning(self.iface.messageBar(),
-                    "Mission Backup",
-                    f"Failed to sync mission backup: {exc}",
-                    duration=5)
-            return False
+
+        return self.mission_storage.sync_backup(paths)
+
+    def _start_backup_task(self, paths: MissionPaths):
+        """Run backup sync in background to avoid UI blocking."""
+        from qgis.core import QgsTask
+
+        class BackupTask(QgsTask):
+            def __init__(self, mission_paths: MissionPaths, storage: MissionStorageHelper):
+                super().__init__("Sync mission backup", QgsTask.CanCancel)
+                self.paths = mission_paths
+                self.storage = storage
+                self.error_message = None
+
+            def run(self) -> bool:
+                try:
+                    return bool(self.storage.sync_backup(self.paths))
+                except Exception as exc:
+                    self.error_message = str(exc)
+                    return False
+
+        task = BackupTask(paths, self.mission_storage)
+        self.task_manager.start_task(
+            task=task,
+            on_complete=lambda t: self._on_backup_complete(t),
+            on_error=lambda t: self._on_backup_error(t),
+            task_id="mission_backup"
+        )
+
+    def _on_backup_complete(self, task):
+        if getattr(task, "error_message", None):
+            self._notify("warning", "Mission Backup", f"Backup completed with warnings: {task.error_message}", duration=4)
+            return
+        self._notify("success", "Mission Backup", "Mission backup completed.", duration=2)
+
+    def _on_backup_error(self, task):
+        msg = getattr(task, "error_message", None) or "Backup task failed."
+        self._notify("warning", "Mission Backup", msg, duration=5)
 
     def _update_mission_storage_status(self, active: bool):
         """Update SAR Panel storage badge with current mission store info."""
@@ -2171,12 +2128,7 @@ class sartracker:
         Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
         """
         if not self.provider:
-            warning(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                "No data source loaded. Please load a data source first.",
-                duration=3
-            )
+            self._notify("warning", "SAR Tracker", "No data source loaded. Please load a data source first.", duration=3)
             return
 
         # Concurrent refresh protection (Issue #1)
@@ -2224,12 +2176,7 @@ class sartracker:
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
-            error(
-                self.iface.messageBar(),
-                "Refresh Error",
-                f"Failed to start refresh: {str(e)}",
-                duration=5
-            )
+            self._notify("error", "Refresh Error", f"Failed to start refresh: {str(e)}", duration=5)
 
     def _on_refresh_complete(self, task):
         """
@@ -2257,30 +2204,19 @@ class sartracker:
 
             # Check if task was cancelled
             if task.isCanceled():
-                info(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    "Refresh cancelled",
-                    duration=2
-                )
+                self._notify("info", "SAR Tracker", "Refresh cancelled", duration=2)
                 return
 
-            # Get results from background task
+            # Get and sanitize results from background task
             if not task.results:
-                warning(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    "Refresh completed but no data returned",
-                    duration=3
-                )
+                self._notify("warning", "SAR Tracker", "Refresh completed but no data returned", duration=3)
                 return
 
-            results = task.results
-            current = results.get('current', [])
-            breadcrumbs = results.get('breadcrumbs', [])
-            devices = results.get('devices', [])
-            breadcrumb_processing = results.get('breadcrumb_processing')
-            breadcrumb_processing = results.get('breadcrumb_processing')
+            sanitized, dropped = sanitize_provider_results(task.results)
+            current = sanitized.get('current', [])
+            breadcrumbs = sanitized.get('breadcrumbs', [])
+            devices = sanitized.get('devices', [])
+            breadcrumb_processing = sanitized.get('breadcrumb_processing')
 
             print(
                 "[SARTRACKER] Refresh payload -> "
@@ -2302,6 +2238,15 @@ class sartracker:
                 self._refresh_started_at = None
             except Exception as cache_error:
                 print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
+
+            # Surface validation drops (non-fatal)
+            dropped_total = sum(dropped.values()) if isinstance(dropped, dict) else 0
+            if dropped_total:
+                try:
+                    print(f"[SARTRACKER] Dropped invalid tracking records - current:{dropped.get('current', 0)} breadcrumbs:{dropped.get('breadcrumbs', 0)} devices:{dropped.get('devices', 0)}")
+                except Exception:
+                    pass
+                self._notify("warning", "SAR Tracker", f"Ignored {dropped_total} invalid tracking records (see log for details).", duration=4)
 
             # Update layers (main thread operation) with instrumentation
             try:
@@ -2349,19 +2294,9 @@ class sartracker:
                 f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
             )
             if current or breadcrumbs:
-                success(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
-                    duration=2
-                )
+                self._notify("success", "SAR Tracker", f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points", duration=2)
             else:
-                info(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    "Refresh completed but no tracking data was returned; layers cleared.",
-                    duration=3
-                )
+                self._notify("info", "SAR Tracker", "Refresh completed but no tracking data was returned; layers cleared.", duration=3)
 
         except Exception as e:
             # Reset state on processing error
@@ -2369,12 +2304,7 @@ class sartracker:
             if self.sar_panel:
                 self.sar_panel.set_loading_state(False)
 
-            error(
-                self.iface.messageBar(),
-                "Refresh Error",
-                f"Error processing refresh results: {str(e)}",
-                duration=5
-            )
+            self._notify("error", "Refresh Error", f"Error processing refresh results: {str(e)}", duration=5)
 
     def _on_refresh_error(self, task):
         """
@@ -2387,7 +2317,7 @@ class sartracker:
         or task terminated during unload. Check component existence.
         """
         # CRITICAL GUARD: Check if plugin components still exist
-        if not self.sar_panel:
+        if not self._components_ready("sar_panel"):
             print("[SARTRACKER] Refresh error after plugin unload, ignoring")
             return
 
@@ -2404,12 +2334,7 @@ class sartracker:
 
             # Show error message
             error_msg = task.error_message if task.error_message else "Unknown error during refresh"
-            error(
-                self.iface.messageBar(),
-                "Refresh Failed",
-                f"Error refreshing data: {error_msg}",
-                duration=5
-            )
+            self._notify("error", "Refresh Failed", f"Error refreshing data: {error_msg}", duration=5)
 
         except Exception as e:
             # DEFENSIVE: Catch ALL exceptions to prevent crashes in error handler
@@ -2915,7 +2840,7 @@ class sartracker:
                 )
                 return
 
-            # Get results from background task
+            # Get and sanitize results from background task
             if not task.results:
                 warning(
                     self.iface.messageBar(),
@@ -2925,10 +2850,11 @@ class sartracker:
                 )
                 return
 
-            results = task.results
-            current = results.get('current', [])
-            breadcrumbs = results.get('breadcrumbs', [])
-            devices = results.get('devices', [])
+            sanitized, dropped = sanitize_provider_results(task.results)
+            current = sanitized.get('current', [])
+            breadcrumbs = sanitized.get('breadcrumbs', [])
+            devices = sanitized.get('devices', [])
+            breadcrumb_processing = sanitized.get('breadcrumb_processing')
 
             # ============================================================
             # ISSUE #1 FIX: Update cached device count for diagnostics
@@ -2954,6 +2880,20 @@ class sartracker:
             # Update device list in panel
             if self.sar_panel:
                 self.sar_panel.update_devices(devices)
+
+            # Surface validation drops (non-fatal)
+            dropped_total = sum(dropped.values()) if isinstance(dropped, dict) else 0
+            if dropped_total:
+                try:
+                    print(f"[SARTRACKER] Dropped invalid CSV records - current:{dropped.get('current', 0)} breadcrumbs:{dropped.get('breadcrumbs', 0)} devices:{dropped.get('devices', 0)}")
+                except Exception:
+                    pass
+                warning(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    f"Ignored {dropped_total} invalid CSV tracking records (see log for details).",
+                    duration=4
+                )
 
             # Show result
             if not current and not breadcrumbs:
@@ -4084,7 +4024,7 @@ class sartracker:
                 if 'mission_backup_root' in changes and self._mission_folder_name:
                     self._mission_backup_directory = self._ensure_backup_directory(create=True)
                     if self._mission_backup_directory:
-                        self._sync_mission_backup()
+                        self._sync_mission_backup(async_run=True)
 
             # Settings already persisted to QSettings by SettingsPanel.
 

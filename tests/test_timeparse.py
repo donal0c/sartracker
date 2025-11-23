@@ -23,7 +23,7 @@ import unittest
 from datetime import datetime, timezone, timedelta
 
 # Import modules under test
-from utils.timeparse import (
+from sartracker.utils.timeparse import (
     parse_iso,
     format_iso,
     window,

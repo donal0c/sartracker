@@ -24,8 +24,8 @@ import requests
 from requests.auth import HTTPBasicAuth
 
 # Import modules under test
-from utils.http import HttpClient
-from utils.exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
+from sartracker.utils.http import HttpClient
+from sartracker.utils.exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
 
 
 class TestHttpClientInit(unittest.TestCase):

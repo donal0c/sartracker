@@ -51,14 +51,14 @@ except ImportError:
             return func
 
 
-from providers.csv import FileCSVProvider, _create_csv_provider
-from providers.registry import registry, ProviderMetadata
-from utils.exceptions import ProviderError, ProviderDataError
+from sartracker.providers.csv import FileCSVProvider, _create_csv_provider
+from sartracker.providers.registry import registry, ProviderMetadata
+from sartracker.utils.exceptions import ProviderError, ProviderDataError
 
 # Import traccar_http to trigger its self-registration (optional - needs requests)
 TRACCAR_HTTP_AVAILABLE = False
 try:
-    import providers.traccar_http  # noqa: F401
+    import sartracker.providers.traccar_http  # noqa: F401
     TRACCAR_HTTP_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: Traccar HTTP provider not available ({e}). Skipping HTTP tests.")
@@ -320,7 +320,7 @@ def test_registry_list_providers_includes_both():
 
 def test_provider_errors_inherit_from_base():
     """Test ProviderError subclasses inherit from ProviderError."""
-    from utils.exceptions import ProviderAuthError, ProviderNetworkError, ProviderDataError
+    from sartracker.utils.exceptions import ProviderAuthError, ProviderNetworkError, ProviderDataError
 
     assert issubclass(ProviderAuthError, ProviderError)
     assert issubclass(ProviderNetworkError, ProviderError)
