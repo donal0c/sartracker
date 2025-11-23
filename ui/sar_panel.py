@@ -15,16 +15,18 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings
 from qgis.PyQt.QtGui import QColor, QFont, QIcon
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea, AlignRight
 )
-from ..utils.notify import info, warning, error
+from ..utils.notify import info, warning, error, success
 from ..config.keys import ConfigStore, SETTINGS_KEYS
 from ..controllers.mission_controller import MissionState
 from .marker_log_widget import MarkerLogWidget
+from .layer_console_widget import LayerConsoleWidget
+from ..layers import LayerIds
 
 
 class SARPanel(QDockWidget):
@@ -62,13 +64,14 @@ class SARPanel(QDockWidget):
 
     # Phase N1: Provider signals removed - configuration moved to Settings Panel
 
-    def __init__(self, parent=None, mission_controller=None):
+    def __init__(self, parent=None, mission_controller=None, layers_controller=None):
         super().__init__("SAR Tracking", parent)
         
         self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
         
         # State
         self._mission_controller = mission_controller
+        self._layers_controller = layers_controller
         self._mission_state = MissionState.IDLE
         self.auto_refresh_enabled = False
         self.auto_refresh_interval_seconds = SETTINGS_KEYS.AUTO_REFRESH_INTERVAL_DEFAULT
@@ -80,9 +83,17 @@ class SARPanel(QDockWidget):
         self.hidden_panels = []  # Track which panels we hid
         self._pause_flash = False
         self._is_finalized = False
+        self._layer_console_connections: List[Tuple[Any, Any]] = []
+        self._marker_layer_to_type = {}
+        if self._layers_controller and hasattr(self._layers_controller, "MARKER_TYPE_TO_LAYER_ID"):
+            self._marker_layer_to_type = {
+                layer_id: marker_type
+                for marker_type, layer_id in self._layers_controller.MARKER_TYPE_TO_LAYER_ID.items()
+            }
 
         # Setup UI
         self._setup_ui()
+        self._configure_layer_console()
 
         if hasattr(self, "marker_log_widget"):
             self.marker_log_widget.edit_requested.connect(
@@ -275,6 +286,14 @@ class SARPanel(QDockWidget):
         mission_layout.addLayout(badge_layout)
         mission_group.setLayout(mission_layout)
         layout.addWidget(mission_group)
+
+        # Layer Console Section
+        layer_console_group = QGroupBox("Layer Console")
+        layer_console_layout = QVBoxLayout()
+        self.layer_console_widget = LayerConsoleWidget()
+        layer_console_layout.addWidget(self.layer_console_widget)
+        layer_console_group.setLayout(layer_console_layout)
+        layout.addWidget(layer_console_group)
 
         # Marker Log Section
         marker_group = QGroupBox("Marker Log")
@@ -756,6 +775,83 @@ class SARPanel(QDockWidget):
         self._set_button_state(self.pause_button, "flashOn", False)
         self._set_button_state(self.finish_button, "state", "idle")
 
+    def _configure_layer_console(self):
+        """Wire layer console widget to controllers and catalog."""
+        if not hasattr(self, "layer_console_widget") or not self.layer_console_widget:
+            return
+
+        # Widget signals
+        self.layer_console_widget.layer_visibility_toggled.connect(self._on_layer_visibility_toggled)
+        self.layer_console_widget.layer_delete_requested.connect(self._on_layer_delete_requested)
+        self.layer_console_widget.layer_zoom_requested.connect(self._on_layer_zoom_requested)
+        self.layer_console_widget.layer_rename_requested.connect(self._on_layer_rename_requested)
+        self.layer_console_widget.layer_duplicate_requested.connect(self._on_layer_duplicate_requested)
+        self.layer_console_widget.layer_export_requested.connect(self._on_layer_export_requested)
+        self.layer_console_widget.bulk_delete_requested.connect(self._on_bulk_delete_requested)
+        self.layer_console_widget.bulk_assign_team_requested.connect(self._on_bulk_assign_team_requested)
+        self.layer_console_widget.bulk_export_requested.connect(self._on_bulk_export_requested)
+        self.layer_console_widget.refresh_requested.connect(self._on_layer_console_refresh)
+
+        if self._layers_controller and getattr(self._layers_controller, "catalog", None):
+            self.layer_console_widget.set_catalog_fetcher(self._get_layer_console_data)
+            self._attach_catalog_signals()
+            self.layer_console_widget.refresh(full=True)
+
+    def _attach_catalog_signals(self):
+        """Attach catalog change signals for live refresh."""
+        catalog = getattr(self._layers_controller, "catalog", None)
+        if not catalog:
+            return
+        connections = [
+            (catalog.model_changed, self._on_catalog_model_changed),
+            (catalog.layer_updated, self._on_catalog_model_changed),
+            (catalog.feature_count_changed, self._on_catalog_feature_count_changed)
+        ]
+        for signal, handler in connections:
+            try:
+                signal.connect(handler)
+                self._layer_console_connections.append((signal, handler))
+            except Exception as exc:
+                print(f"[SARPanel] Warning: Failed to attach catalog signal: {exc}")
+
+    def _detach_catalog_signals(self):
+        """Disconnect catalog signal handlers."""
+        for signal, handler in list(self._layer_console_connections):
+            try:
+                # CRITICAL: Check if signal's parent object still exists
+                # Attempting to disconnect from a deleted object causes QGIS crash
+                parent = getattr(signal, '__self__', None)
+                if parent is None:
+                    continue  # Signal parent already deleted, skip
+
+                # Additional safety: Check if parent is a QObject and still valid
+                from qgis.PyQt.QtCore import QObject
+                if isinstance(parent, QObject):
+                    try:
+                        # Try to access a basic property - will fail if object deleted
+                        _ = parent.objectName()
+                    except (RuntimeError, AttributeError):
+                        # Object deleted, skip disconnect
+                        continue
+
+                signal.disconnect(handler)
+            except (TypeError, RuntimeError, AttributeError):
+                # Signal already disconnected, object deleted, or other Qt issue
+                pass
+        self._layer_console_connections = []
+
+    def _get_layer_console_data(self) -> Dict[str, Any]:
+        """Fetch catalog payload for console widget."""
+        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
+            return {"groups": []}
+        try:
+            return self._layers_controller.catalog.get_console_model(include_features=True, feature_limit=300)
+        except Exception as exc:
+            print(f"[SARPanel] Warning: Failed to build catalog payload: {exc}")
+            import traceback
+            traceback.print_exc()
+            return {"groups": []}
+
     def _apply_focus_mode_style(self):
         """Update focus mode button styling."""
         if not hasattr(self, 'focus_mode_button') or not self.focus_mode_button:
@@ -873,6 +969,237 @@ class SARPanel(QDockWidget):
 
         text = f"Auto Save {status}{(' ' + interval_text) if interval_text else ''} | Last: {last_text}"
         self._set_feature_badge(self.autosave_status_label, text, self.autosave_enabled, color)
+
+    # ------------------------------------------------------------------
+    # Layer Console handlers
+    # ------------------------------------------------------------------
+    def _on_catalog_model_changed(self, *_args):
+        self._refresh_layer_console(full=True)
+
+    def _on_catalog_feature_count_changed(self, *_args):
+        self._refresh_layer_console(full=False)
+
+    def _on_layer_console_refresh(self):
+        """Manual refresh from widget."""
+        if self._layers_controller and getattr(self._layers_controller, "catalog", None):
+            try:
+                self._layers_controller.catalog.rescan_layers()
+            except Exception as exc:
+                print(f"[SARPanel] Warning: Catalog rescan failed: {exc}")
+        self._refresh_layer_console(full=True)
+
+    def _on_layer_visibility_toggled(self, layer_id: str, visible: bool):
+        if not self._layers_controller:
+            return
+        try:
+            self._layers_controller.set_layer_visibility(layer_id, visible)
+        except Exception as exc:
+            self._notify(error, "Visibility Error", str(exc))
+
+    def _on_layer_delete_requested(self, layer_id: str, feature_id: object):
+        if not self._layers_controller:
+            return
+        try:
+            if layer_id in self._marker_layer_to_type:
+                marker_type = self._marker_layer_to_type[layer_id]
+                self._layers_controller.markers.delete_marker(marker_type, str(feature_id))
+            elif layer_id == LayerIds.SEARCH_AREAS:
+                self._layers_controller.drawings.delete_search_area(self._coerce_int(feature_id))
+            elif layer_id == LayerIds.RANGE_RINGS:
+                self._layers_controller.drawings.delete_range_ring(self._coerce_int(feature_id))
+            elif layer_id == LayerIds.BEARING_LINES:
+                self._layers_controller.drawings.delete_bearing_line(self._coerce_int(feature_id))
+            elif layer_id == LayerIds.LINES:
+                self._layers_controller.drawings.delete_line(self._coerce_int(feature_id))
+            elif layer_id == LayerIds.SEARCH_SECTORS:
+                self._layers_controller.drawings.delete_sector(self._coerce_int(feature_id))
+            elif layer_id == LayerIds.TEXT_LABELS:
+                self._layers_controller.drawings.delete_text_label(self._coerce_int(feature_id))
+            else:
+                # Fallback: attempt direct layer deletion with rollback protection
+                layer = self._layers_controller.layer_manager.get_layer(layer_id) if hasattr(self._layers_controller, "layer_manager") else None
+                if not layer or not layer.isValid():
+                    raise ValueError(f"Unsupported layer: {layer_id}")
+                if not layer.startEditing():
+                    raise RuntimeError("Unable to start edit session for deletion")
+                try:
+                    if not layer.deleteFeature(self._coerce_int(feature_id)):
+                        raise RuntimeError(f"Failed to delete feature {feature_id}")
+                    if not layer.commitChanges():
+                        raise RuntimeError(", ".join(layer.commitErrors()))
+                except Exception:
+                    if layer.isEditable():
+                        try:
+                            layer.rollBack()
+                        except RuntimeError:
+                            pass
+                    raise
+                finally:
+                    if layer.isEditable():
+                        try:
+                            layer.rollBack()
+                        except RuntimeError:
+                            pass
+
+            if getattr(self._layers_controller, "catalog", None):
+                try:
+                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
+                except Exception:
+                    pass
+
+            self._refresh_layer_console(layer_id, full=False)
+            self._notify(success, "Deleted", "Feature deleted successfully")
+        except Exception as exc:
+            self._notify(error, "Delete Error", str(exc))
+            print(f"[SARPanel] Delete failed for {layer_id}: {exc}")
+
+    def _on_layer_zoom_requested(self, layer_id: str, feature_id: object):
+        if not self._layers_controller:
+            return
+        # Markers use business_id strings; others use integer feature ids
+        if layer_id in self._marker_layer_to_type:
+            marker_type = self._marker_layer_to_type[layer_id]
+            try:
+                feature = self._layers_controller.markers.get_marker_feature(marker_type, str(feature_id))
+            except Exception:
+                self._notify(warning, "Zoom", "Marker unavailable")
+                return
+        else:
+            layer = self._layers_controller.layer_manager.get_layer(layer_id) if hasattr(self._layers_controller, "layer_manager") else None
+            if not layer or not layer.isValid():
+                self._notify(warning, "Zoom", f"Layer unavailable: {layer_id}")
+                return
+
+            try:
+                fid = self._coerce_int(feature_id)
+            except Exception:
+                self._notify(warning, "Zoom", "Invalid feature id")
+                return
+
+            feature = layer.getFeature(fid)
+
+        if not feature or not feature.isValid() or not feature.hasGeometry():
+            self._notify(warning, "Zoom", "Feature geometry unavailable")
+            return
+
+        geom = feature.geometry()
+        if not geom or geom.isEmpty():
+            self._notify(warning, "Zoom", "Feature has no geometry")
+            return
+
+        canvas = self._layers_controller.iface.mapCanvas() if hasattr(self._layers_controller, "iface") else None
+        if canvas:
+            canvas.setExtent(geom.boundingBox())
+            canvas.refresh()
+
+    def _on_layer_rename_requested(self, layer_id: str, feature_id: object, new_name: str):
+        if not self._layers_controller or not new_name:
+            return
+        try:
+            if layer_id in self._marker_layer_to_type:
+                marker_type = self._marker_layer_to_type[layer_id]
+                self._layers_controller.markers.update_marker(marker_type, str(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.SEARCH_AREAS:
+                self._layers_controller.drawings.update_search_area(self._coerce_int(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.RANGE_RINGS:
+                self._layers_controller.drawings.update_range_ring(self._coerce_int(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.BEARING_LINES:
+                self._layers_controller.drawings.update_bearing_line(self._coerce_int(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.LINES:
+                self._layers_controller.drawings.update_line(self._coerce_int(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.SEARCH_SECTORS:
+                self._layers_controller.drawings.update_sector(self._coerce_int(feature_id), {"name": new_name})
+            elif layer_id == LayerIds.TEXT_LABELS:
+                self._layers_controller.drawings.update_text_label(self._coerce_int(feature_id), {"name": new_name})
+            else:
+                raise ValueError(f"Rename not supported for layer {layer_id}")
+
+            if getattr(self._layers_controller, "catalog", None):
+                try:
+                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
+                except Exception:
+                    pass
+
+            self._refresh_layer_console(layer_id, full=False)
+            self._notify(success, "Renamed", "Feature renamed")
+        except Exception as exc:
+            self._notify(error, "Rename Error", str(exc))
+            print(f"[SARPanel] Rename failed for {layer_id}: {exc}")
+
+    def _on_bulk_delete_requested(self, layer_id: str, feature_ids: List[object]):
+        if not self._layers_controller or not feature_ids:
+            return
+        try:
+            deleted = 0
+            if layer_id in self._marker_layer_to_type:
+                marker_type = self._marker_layer_to_type[layer_id]
+                for fid in feature_ids:
+                    if self._layers_controller.markers.delete_marker(marker_type, str(fid)):
+                        deleted += 1
+            else:
+                ids = [self._coerce_int(fid) for fid in feature_ids]
+                deleted = self._layers_controller.bulk_delete_features(
+                    layer_id=layer_id,
+                    feature_ids=ids,
+                    confirmed=True,
+                    updated_by="Layer Console"
+                )
+            if getattr(self._layers_controller, "catalog", None):
+                try:
+                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
+                except Exception:
+                    pass
+            self._refresh_layer_console(layer_id, full=False)
+            self._notify(success, "Bulk Delete", f"Deleted {deleted} feature(s)")
+        except Exception as exc:
+            self._notify(error, "Bulk Delete Error", str(exc))
+            print(f"[SARPanel] Bulk delete failed for {layer_id}: {exc}")
+
+    def _on_bulk_assign_team_requested(self, layer_id: str, feature_ids: List[object], team: str):
+        self._notify(warning, "Assign Team", "Team assignment is not yet implemented for this layer")
+        print(f"[SARPanel] Assign team requested for {layer_id} ({len(feature_ids)} features) to {team}")
+
+    def _on_bulk_export_requested(self, layer_id: str, feature_ids: List[object]):
+        self._notify(warning, "Export", "Export from Layer Console not implemented yet")
+        print(f"[SARPanel] Export requested for {layer_id} ({len(feature_ids)} features)")
+
+    def _on_layer_duplicate_requested(self, layer_id: str, feature_id: object):
+        self._notify(warning, "Duplicate", "Duplicate not implemented for this layer")
+        print(f"[SARPanel] Duplicate requested for {layer_id} feature {feature_id}")
+
+    def _on_layer_export_requested(self, layer_id: str, feature_id: object):
+        self._notify(warning, "Export", "Export not implemented for this layer")
+        print(f"[SARPanel] Export requested for {layer_id} feature {feature_id}")
+
+    def _refresh_layer_console(self, layer_id: Optional[str] = None, full: bool = False):
+        if hasattr(self, "layer_console_widget") and self.layer_console_widget:
+            try:
+                self.layer_console_widget.refresh(full=full)
+            except Exception as exc:
+                print(f"[SARPanel] Layer console refresh failed: {exc}")
+
+    def _coerce_int(self, value: object) -> int:
+        if value is None:
+            raise ValueError("Feature id is required")
+        if isinstance(value, bool):
+            raise ValueError("Invalid feature id")
+        return int(str(int(value)))
+
+    def _message_bar(self):
+        if self._layers_controller and hasattr(self._layers_controller, "iface") and self._layers_controller.iface:
+            try:
+                return self._layers_controller.iface.messageBar()
+            except Exception:
+                return None
+        return None
+
+    def _notify(self, fn: Callable, title: str, message: str):
+        """Push message if message bar available, else log to stdout."""
+        bar = self._message_bar()
+        if bar:
+            fn(bar, title, message)
+        else:
+            print(f"[{title}] {message}")
     
     def _on_auto_refresh(self):
         """Handle auto-refresh timer."""
@@ -1356,6 +1683,33 @@ class SARPanel(QDockWidget):
         Qt5/Qt6 Compatible: Uses standard QTimer methods (isActive, stop).
         """
         try:
+            # CRITICAL: Disconnect layer console signals BEFORE cleanup to prevent segfault
+            if hasattr(self, 'layer_console_widget') and self.layer_console_widget:
+                try:
+                    # Disconnect all signals from SARPanel to layer console widget
+                    self.layer_console_widget.layer_visibility_toggled.disconnect()
+                    self.layer_console_widget.layer_delete_requested.disconnect()
+                    self.layer_console_widget.layer_zoom_requested.disconnect()
+                    self.layer_console_widget.layer_rename_requested.disconnect()
+                    self.layer_console_widget.layer_duplicate_requested.disconnect()
+                    self.layer_console_widget.layer_export_requested.disconnect()
+                    self.layer_console_widget.bulk_delete_requested.disconnect()
+                    self.layer_console_widget.bulk_assign_team_requested.disconnect()
+                    self.layer_console_widget.bulk_export_requested.disconnect()
+                    self.layer_console_widget.refresh_requested.disconnect()
+                except (TypeError, RuntimeError, AttributeError):
+                    # Signal already disconnected or widget destroyed
+                    pass
+
+            if hasattr(self, '_detach_catalog_signals'):
+                self._detach_catalog_signals()
+
+            if hasattr(self, 'layer_console_widget') and self.layer_console_widget:
+                try:
+                    self.layer_console_widget.cleanup()
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Error cleaning up layer console: {exc}")
+
             # CRITICAL: Restore hidden panels FIRST (Issue #3 fix)
             # If Focus Mode is active when plugin unloads, we must restore
             # all hidden dock widgets to return QGIS to its prior state

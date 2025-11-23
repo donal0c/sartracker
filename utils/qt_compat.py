@@ -60,6 +60,10 @@ Key (11 constants):
 Orientation (2 constants):
     Horizontal, Vertical
 
+ItemFlag (6 constants):
+    ItemIsEnabled, ItemIsSelectable, ItemIsUserCheckable,
+    ItemIsEditable, ItemIsDragEnabled, ItemIsDropEnabled
+
 WindowType (4 constants):
     WindowType_Widget, WindowType_Window, WindowType_Dialog, WindowType_Popup
 
@@ -261,6 +265,25 @@ if QT_VERSION == 6:
 else:  # Qt5
     Horizontal = Qt.Horizontal
     Vertical = Qt.Vertical
+
+
+# =============================================================================
+# ItemFlag enums (common flags for item views)
+# =============================================================================
+if QT_VERSION == 6:
+    ItemIsEnabled = Qt.ItemFlag.ItemIsEnabled
+    ItemIsSelectable = Qt.ItemFlag.ItemIsSelectable
+    ItemIsUserCheckable = Qt.ItemFlag.ItemIsUserCheckable
+    ItemIsEditable = Qt.ItemFlag.ItemIsEditable
+    ItemIsDragEnabled = Qt.ItemFlag.ItemIsDragEnabled
+    ItemIsDropEnabled = Qt.ItemFlag.ItemIsDropEnabled
+else:  # Qt5
+    ItemIsEnabled = Qt.ItemIsEnabled
+    ItemIsSelectable = Qt.ItemIsSelectable
+    ItemIsUserCheckable = Qt.ItemIsUserCheckable
+    ItemIsEditable = Qt.ItemIsEditable
+    ItemIsDragEnabled = Qt.ItemIsDragEnabled
+    ItemIsDropEnabled = Qt.ItemIsDropEnabled
 
 
 # =============================================================================
@@ -508,6 +531,13 @@ __all__ = [
     # Orientation
     'Horizontal',
     'Vertical',
+    # ItemFlag
+    'ItemIsEnabled',
+    'ItemIsSelectable',
+    'ItemIsUserCheckable',
+    'ItemIsEditable',
+    'ItemIsDragEnabled',
+    'ItemIsDropEnabled',
     # WindowType
     'WindowType_Widget',
     'WindowType_Window',

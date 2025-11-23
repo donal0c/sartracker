@@ -730,7 +730,11 @@ class sartracker:
             print("[SARTRACKER] MissionController import failed, mission UI limited")
 
         # Initialize SAR Panel
-        self.sar_panel = SARPanel(self.iface.mainWindow(), mission_controller=self.mission_controller)
+        self.sar_panel = SARPanel(
+            self.iface.mainWindow(),
+            mission_controller=self.mission_controller,
+            layers_controller=self.layers_controller
+        )
         self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
         self.sar_panel.hide()  # Hidden by default
         if self.layers_controller and self.sar_panel:

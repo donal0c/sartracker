@@ -111,6 +111,11 @@ class SETTINGS_KEYS:
     # UI STATE (Phase N1)
     # ========================================================================
     SETTINGS_MIGRATION_NOTICE_SHOWN = "SARTracker/UI/settings_migration_notice_shown"
+    LAYER_CONSOLE_EXPANDED_GROUPS = "SARTracker/LayerConsole/expanded_groups"
+    LAYER_CONSOLE_COLUMN_WIDTHS = "SARTracker/LayerConsole/column_widths"
+    LAYER_CONSOLE_FILTER_STATE = "SARTracker/LayerConsole/filter_state"
+    LAYER_CONSOLE_SELECTED_LAYER = "SARTracker/LayerConsole/selected_layer"
+    LAYER_CONSOLE_SELECTED_FEATURE = "SARTracker/LayerConsole/selected_feature"
 
     # ========================================================================
     # FEATURE FLAGS

@@ -391,6 +391,39 @@ class LayerCatalogService(QObject):
                     if type_val is not None:
                         type_field = str(type_val)
 
+                # Business identifier (if present)
+                business_id = None
+                business_idx = feature.fieldNameIndex('id')
+                if business_idx >= 0:
+                    business_val = feature.attribute('id')
+                    if business_val is not None and str(business_val) != '':
+                        business_id = str(business_val)
+
+                # Created / updated timestamps (lightweight string capture)
+                created_at_val = None
+                created_idx = feature.fieldNameIndex('created_at')
+                if created_idx >= 0:
+                    created_raw = feature.attribute('created_at')
+                    if created_raw not in (None, ''):
+                        created_at_val = str(created_raw)
+
+                updated_at_val = None
+                updated_idx = feature.fieldNameIndex('updated_at')
+                if updated_idx >= 0:
+                    updated_raw = feature.attribute('updated_at')
+                    if updated_raw not in (None, ''):
+                        updated_at_val = str(updated_raw)
+
+                # Display order (optional)
+                display_order_val = 0
+                order_idx = feature.fieldNameIndex('display_order')
+                if order_idx >= 0:
+                    order_raw = feature.attribute('display_order')
+                    try:
+                        display_order_val = max(0, int(order_raw))
+                    except (TypeError, ValueError):
+                        display_order_val = 0
+
                 # Extract geometry safely
                 geometry_wkt = ''
                 if feature.hasGeometry():
@@ -401,11 +434,31 @@ class LayerCatalogService(QObject):
                     except Exception as e:
                         print(f"[LayerCatalogService] Warning: Could not extract geometry for feature {feature.id()}: {e}")
 
+                # Build attributes payload for UI consumers
+                attributes: Dict[str, Any] = {
+                    'feature_id': feature.id()
+                }
+                if business_id is not None:
+                    attributes['business_id'] = business_id
+                if type_field:
+                    attributes['type'] = type_field
+                attributes['display_order'] = display_order_val
+                if created_at_val:
+                    attributes['created_at'] = created_at_val
+                if updated_at_val:
+                    attributes['updated_at'] = updated_at_val
+
+                summary_id = business_id if business_id is not None else str(feature.id())
+
                 summary = FeatureSummary(
-                    id=str(feature.id()),
-                    name=name,
-                    type=type_field,
-                    geometry_wkt=geometry_wkt
+                    id=str(summary_id),
+                    name=name or str(summary_id),
+                    type=type_field or layer_id,
+                    geometry_wkt=geometry_wkt,
+                    created_at=created_at_val,
+                    updated_at=updated_at_val,
+                    display_order=display_order_val,
+                    attributes=attributes
                 )
                 summaries.append(summary)
         except Exception as e:
@@ -414,6 +467,115 @@ class LayerCatalogService(QObject):
             traceback.print_exc()
 
         return summaries
+
+    def get_console_model(
+        self,
+        include_features: bool = True,
+        feature_limit: int = 500
+    ) -> Dict[str, Any]:
+        """
+        Build hierarchical payload for LayerConsoleWidget.
+
+        Args:
+            include_features: Include feature summaries for each layer
+            feature_limit: Maximum features to return per layer (None = no limit)
+
+        Returns:
+            Dictionary with group/layer/feature structure
+        """
+        if feature_limit is not None:
+            if not isinstance(feature_limit, int) or feature_limit <= 0:
+                raise ValueError("feature_limit must be a positive integer or None")
+
+        if self._cleanup_in_progress:
+            return {"groups": []}
+
+        # Sort groups by defined order, skip root container
+        try:
+            groups_sorted = sorted(self._groups.values(), key=lambda g: g.order)
+        except Exception:
+            groups_sorted = list(self._groups.values())
+
+        groups_payload: List[Dict[str, Any]] = []
+
+        for group_info in groups_sorted:
+            if group_info.id == GroupNames.ROOT:
+                continue  # Skip root container
+
+            # Only include top-level groups for now (Phase 3 scope)
+            if group_info.parent_id not in (None, GroupNames.ROOT):
+                continue
+
+            # Collect layer payloads
+            layers_payload: List[Dict[str, Any]] = []
+            child_layers = [
+                self._layers[layer_id]
+                for layer_id in group_info.children
+                if layer_id in self._layers
+            ]
+            try:
+                child_layers.sort(key=lambda li: li.order)
+            except Exception:
+                pass
+
+            for layer_info in child_layers:
+                layer_entry: Dict[str, Any] = {
+                    "layer_id": layer_info.id,
+                    "name": layer_info.canonical_name,
+                    "display_name": layer_info.display_name,
+                    "feature_count": layer_info.feature_count,
+                    "geometry_type": layer_info.geometry_type,
+                    "is_visible": layer_info.visible,
+                    "is_favorite": layer_info.favorite,
+                    "provider": layer_info.provider,
+                    "last_updated": layer_info.last_updated.isoformat() if layer_info.last_updated else None
+                }
+
+                # Feature summaries (optional for performance)
+                features_payload: List[Dict[str, Any]] = []
+                if include_features:
+                    try:
+                        summaries = self.list_features(layer_info.id, limit=feature_limit)
+                        for summary in summaries:
+                            created_val = summary.created_at
+                            if isinstance(created_val, datetime):
+                                created_val = created_val.isoformat()
+
+                            updated_val = summary.updated_at
+                            if isinstance(updated_val, datetime):
+                                updated_val = updated_val.isoformat()
+
+                            features_payload.append({
+                                "id": summary.id,
+                                "name": summary.name,
+                                "feature_id": summary.attributes.get("feature_id", summary.id),
+                                "business_id": summary.attributes.get("business_id"),
+                                "created_at": created_val,
+                                "updated_at": updated_val,
+                                "display_order": summary.display_order,
+                                "type": summary.type,
+                                "attributes": summary.attributes
+                            })
+                    except Exception as exc:
+                        print(f"[LayerCatalogService] Warning: Failed to build feature list for {layer_info.id}: {exc}")
+                        import traceback
+                        traceback.print_exc()
+
+                layer_entry["features"] = features_payload
+                layers_payload.append(layer_entry)
+
+            if not layers_payload:
+                continue
+
+            groups_payload.append({
+                "id": group_info.id,
+                "name": group_info.alias or group_info.name,
+                "expanded": group_info.expanded,
+                "visible": group_info.visible,
+                "layers": layers_payload
+            })
+
+        return {"groups": groups_payload}
 
     # ========================================================================
     # PUBLIC API - Write Operations (Metadata Only)
@@ -1106,14 +1268,41 @@ class LayerCatalogService(QObject):
         if connections:
             self._layer_signal_connections[layer_id] = connections
 
+    def _safe_disconnect(self, signal_obj, handler=None, label: str = "") -> None:
+        """
+        Safely disconnect a Qt signal, skipping if the parent QObject is gone.
+
+        Prevents the PyQt crash seen when calling disconnect() on a bound signal
+        whose C++ parent has already been destroyed (common during QGIS shutdown).
+        """
+        if not signal_obj:
+            return
+
+        parent = getattr(signal_obj, "__self__", None)
+        if parent is None:
+            return
+
+        if isinstance(parent, QObject):
+            try:
+                # Accessing objectName triggers RuntimeError if QObject is deleted
+                _ = parent.objectName()
+            except (RuntimeError, AttributeError):
+                return
+
+        try:
+            if handler:
+                signal_obj.disconnect(handler)
+            else:
+                signal_obj.disconnect()
+        except (TypeError, RuntimeError, AttributeError):
+            if label:
+                print(f"[LayerCatalogService] Warning: Could not disconnect {label}")
+
     def _disconnect_layer_signals(self, layer_id: str) -> None:
         """Disconnect per-layer signal handlers for a specific layer."""
         connections = self._layer_signal_connections.pop(layer_id, [])
         for signal, handler in connections:
-            try:
-                signal.disconnect(handler)
-            except (TypeError, RuntimeError):
-                pass
+            self._safe_disconnect(signal, handler, label=f"layer {layer_id}")
 
     def _disconnect_all_layer_signals(self) -> None:
         """Disconnect all layer-level signals (called on cache rebuild/cleanup)."""
@@ -1213,11 +1402,7 @@ class LayerCatalogService(QObject):
         # CRITICAL FIX: Disconnect signals FIRST (prevent new events)
         if hasattr(self, '_signal_connections'):
             for signal_obj, signal_name, handler in self._signal_connections:
-                try:
-                    signal_obj.disconnect(handler)
-                    print(f"[LayerCatalogService] Disconnected {signal_name}")
-                except (TypeError, RuntimeError) as e:
-                    print(f"[LayerCatalogService] Warning: Could not disconnect {signal_name}: {e}")
+                self._safe_disconnect(signal_obj, handler, label=signal_name)
 
         # Clear tracking
         self._signal_connections = []
@@ -1225,10 +1410,7 @@ class LayerCatalogService(QObject):
 
         # Disconnect timer signal (if connected)
         if self._refresh_timer:
-            try:
-                self._refresh_timer.timeout.disconnect(self._execute_refresh)
-            except (TypeError, RuntimeError):
-                pass
+            self._safe_disconnect(self._refresh_timer.timeout, self._execute_refresh, label="refresh_timer.timeout")
 
         # THEN stop and delete timer (safe - no handlers can start it)
         if self._refresh_timer:
