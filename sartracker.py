@@ -729,7 +729,11 @@ class sartracker:
         self._is_finalizing: bool = False  # Race condition protection
 
         # Initialize layers controller
-        self.layers_controller = LayersController(self.iface, layer_manager=self.layer_manager)
+        self.layers_controller = LayersController(
+            self.iface,
+            layer_manager=self.layer_manager,
+            task_manager=self.task_manager
+        )
 
         # Mission storage helper (filesystem + backups)
         self.mission_storage = MissionStorageHelper(

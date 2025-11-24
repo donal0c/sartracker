@@ -8,26 +8,40 @@ Handles device position updates from tracking sources (e.g., Traccar).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
+import logging
+from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 from datetime import timedelta
 import os
+import shutil
 import tempfile
-from collections import defaultdict
 
 from qgis.core import (
     QgsVectorLayer, QgsFeature, QgsGeometry, QgsField,
     QgsPointXY, QgsCategorizedSymbolRenderer, QgsRendererCategory,
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
-    QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext
+    QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext,
+    QgsTask
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QVariant
 
 from .base_manager import BaseLayerManager
+from .tracking_segments import (
+    build_segments_from_positions,
+    parse_iso_timestamp,
+    sanitize_breadcrumb_positions,
+    sanitize_current_positions,
+    validate_processed_segments,
+)
 from ...layers import LayerIds
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
+from ...utils.notify import warning as notify_warning
+
+
+logger = logging.getLogger(__name__)
 
 
 class TrackingLayerManager(BaseLayerManager):
@@ -50,10 +64,14 @@ class TrackingLayerManager(BaseLayerManager):
     BREADCRUMB_STYLE_MANAGED_PROP = "sartracker:breadcrumbs_style_managed"
     BREADCRUMB_STYLE_INITIALIZED_PROP = "sartracker:breadcrumbs_style_initialized"
 
-    def __init__(self, iface, shared_device_colors=None, layer_manager=None):
+    ASYNC_SEGMENT_THRESHOLD = 1500  # Minimum breadcrumb points before offloading
+
+    def __init__(self, iface, shared_device_colors=None, layer_manager=None, task_manager=None):
         """Initialize tracking layer manager."""
         super().__init__(iface, shared_device_colors, layer_manager)
+        self.task_manager = task_manager
         self.first_load = True  # Track if this is first data load for auto-zoom
+        self._breadcrumb_task_id: Optional[str] = None
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -63,11 +81,248 @@ class TrackingLayerManager(BaseLayerManager):
         """Reset manager state (called after clearing layers)."""
         super().reset_state()
         self.first_load = True  # Reset auto-zoom flag
+        self._cancel_breadcrumb_task()
+
+    def cleanup(self):
+        """Ensure background tasks are cancelled before teardown."""
+        self._cancel_breadcrumb_task()
+        super().cleanup()
 
     def _log_tracking_event(self, layer: QgsVectorLayer, layer_type: str, action: str, **extra):
         """Emit diagnostics for tracking layers when enabled."""
         payload = extra if extra else None
         self._log_layer_snapshot(layer, f"{layer_type}::{action}", payload)
+
+    def _notify_warning(self, title: str, message: str, duration: int = 6):
+        """Display a non-blocking warning if iface/messageBar are available."""
+        if not getattr(self, "iface", None):
+            return
+        try:
+            bar = self.iface.messageBar() if hasattr(self.iface, "messageBar") else None
+            if bar:
+                notify_warning(bar, title, message, duration=duration)
+        except Exception:
+            logger.debug("Failed to display warning '%s': %s", title, message)
+
+    def _report_validation_warning(self, data_label: str, total: int, skipped: int, last_error: Optional[str]):
+        """Aggregate validation skips into user-facing + logged warnings."""
+        if skipped <= 0:
+            return
+
+        msg = f"Skipped {skipped} invalid {data_label.lower()} record{'s' if skipped != 1 else ''}"
+        if total:
+            msg += f" out of {total}"
+        if last_error:
+            snippet = last_error if len(last_error) <= 140 else f"{last_error[:137]}..."
+            msg += f"; example: {snippet}"
+
+        logger.warning("%s", msg)
+        self._notify_warning(f"{data_label} Data", msg)
+
+    @contextmanager
+    def _layer_transaction(self, layer: QgsVectorLayer, layer_name: str, operation: str):
+        """Context manager ensuring safe start/commit/rollback semantics."""
+        if not layer or not layer.isValid():
+            raise LayerError(f"{layer_name} layer is unavailable or invalid.", layer_name=layer_name)
+        if layer.isEditable():
+            raise LayerLockError(layer_name)
+        if not layer.startEditing():
+            raise LayerTransactionError(layer_name, "start editing", details=operation)
+
+        try:
+            yield layer
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                details = "; ".join(errors) if errors else operation
+                raise LayerTransactionError(layer_name, "commit changes", details=details)
+        except LayerError:
+            layer.rollBack()
+            raise
+        except Exception as exc:
+            layer.rollBack()
+            raise LayerTransactionError(layer_name, operation, details=str(exc)) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def _clear_layer_features(self, layer: QgsVectorLayer, layer_name: str):
+        """Efficiently clear all features, falling back when truncate unsupported."""
+        if layer.featureCount() == 0:
+            return
+
+        try:
+            layer.dataProvider().truncate()
+        except (AttributeError, NotImplementedError, RuntimeError) as exc:
+            logger.debug("Truncate not available for %s: %s", layer_name, exc)
+            if not layer.deleteFeatures(layer.allFeatureIds()):
+                raise RuntimeError(f"Failed to clear features from {layer_name}")
+
+    def _cancel_breadcrumb_task(self):
+        """Cancel any inflight breadcrumb segmentation task."""
+        task_id = getattr(self, "_breadcrumb_task_id", None)
+        task_manager = getattr(self, "task_manager", None)
+        if task_manager and task_id:
+            try:
+                task_manager.cancel_task(task_id)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.debug("Breadcrumb task cancel failed: %s", exc)
+        self._breadcrumb_task_id = None
+
+    def _maybe_schedule_breadcrumb_task(
+        self,
+        positions: Optional[List[Dict]],
+        gap_minutes: float,
+        total_inputs: int,
+        processed_segments: Optional[Dict[str, Any]]
+    ) -> bool:
+        """
+        Decide whether to offload breadcrumb processing to a background task.
+        """
+        if processed_segments:
+            return False
+        if not getattr(self, "task_manager", None):
+            return False
+        if not isinstance(positions, list):
+            return False
+        if len(positions) < self.ASYNC_SEGMENT_THRESHOLD:
+            return False
+        return self._start_breadcrumb_task(positions, gap_minutes, total_inputs)
+
+    def _start_breadcrumb_task(self, positions: List[Dict], gap_minutes: float, total_inputs: int) -> bool:
+        """Create and queue a QgsTask that sanitizes and segments breadcrumbs."""
+        task_manager = getattr(self, "task_manager", None)
+        if not task_manager:
+            return False
+
+        create_task = getattr(QgsTask, "fromFunction", None)
+        if not create_task:
+            return False
+
+        try:
+            positions_snapshot = [dict(pos) for pos in positions]
+        except Exception:
+            positions_snapshot = list(positions)
+
+        def _worker(task, payload=positions_snapshot, gap=float(gap_minutes)):
+            try:
+                if hasattr(task, "isCanceled") and task.isCanceled():
+                    return False
+                sanitized_positions = sanitize_breadcrumb_positions(payload)
+                if hasattr(task, "isCanceled") and task.isCanceled():
+                    return False
+                segments = build_segments_from_positions(sanitized_positions.valid, gap)
+                task.setProperty("sartracker:segments", segments)
+                task.setProperty("sartracker:invalid_count", sanitized_positions.invalid_count)
+                task.setProperty("sartracker:last_error", sanitized_positions.last_error or "")
+                return True
+            except Exception as exc:
+                task.setProperty("sartracker:error", str(exc))
+                raise
+
+        task = create_task("Process breadcrumb payload", _worker)
+        task.setProperty("sartracker:payload", positions_snapshot)
+        task.setProperty("sartracker:total_inputs", total_inputs)
+        task.setProperty("sartracker:gap_minutes", gap_minutes)
+
+        self._cancel_breadcrumb_task()
+        task_id = f"tracking:breadcrumbs:{id(task)}"
+        self._breadcrumb_task_id = task_manager.start_task(
+            task,
+            on_complete=self._on_breadcrumb_task_complete,
+            on_error=self._on_breadcrumb_task_error,
+            task_id=task_id
+        )
+        logger.info(
+            "[TrackingManager] Offloading breadcrumb segmentation (%s points) to background task %s",
+            total_inputs,
+            task_id
+        )
+        return True
+
+    def _on_breadcrumb_task_complete(self, task: QgsTask):
+        """Handle successful breadcrumb task completion."""
+        self._breadcrumb_task_id = None
+        try:
+            segments = task.property("sartracker:segments") or []
+            total_inputs = task.property("sartracker:total_inputs") or len(segments)
+            invalid_count = task.property("sartracker:invalid_count") or 0
+            last_error = task.property("sartracker:last_error") or None
+            layer = self._get_or_create_breadcrumbs_layer()
+            self._apply_breadcrumb_results(
+                layer,
+                segments,
+                total_inputs,
+                invalid_count,
+                last_error
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("Breadcrumb task completion failed: %s", exc)
+
+    def _on_breadcrumb_task_error(self, task: QgsTask):
+        """Handle failed breadcrumb background processing by falling back to sync."""
+        self._breadcrumb_task_id = None
+        message = task.property("sartracker:error") if hasattr(task, "property") else None
+        logger.error("Breadcrumb processing task failed: %s", message or "Unknown error")
+        payload = task.property("sartracker:payload") if hasattr(task, "property") else None
+        gap_minutes = task.property("sartracker:gap_minutes") if hasattr(task, "property") else None
+
+        if isinstance(payload, list):
+            try:
+                sanitized_positions = sanitize_breadcrumb_positions(payload)
+                segments = build_segments_from_positions(
+                    sanitized_positions.valid,
+                    float(gap_minutes or 5.0)
+                )
+                layer = self._get_or_create_breadcrumbs_layer()
+                self._apply_breadcrumb_results(
+                    layer,
+                    segments,
+                    len(payload),
+                    sanitized_positions.invalid_count,
+                    sanitized_positions.last_error
+                )
+                return
+            except Exception as exc:
+                logger.error("Breadcrumb fallback processing also failed: %s", exc)
+
+        self._notify_warning(
+            "Breadcrumbs",
+            "Breadcrumb processing failed; latest breadcrumb layer may be stale."
+        )
+
+    def _apply_breadcrumb_results(
+        self,
+        layer: QgsVectorLayer,
+        segments: List[Dict[str, Any]],
+        total_inputs: int,
+        invalid_count: int,
+        last_error: Optional[str]
+    ):
+        """Common render/apply routine for both sync and async breadcrumb updates."""
+        self._report_validation_warning(
+            "Breadcrumbs",
+            total_inputs,
+            invalid_count,
+            last_error
+        )
+
+        self._replace_breadcrumb_layer_features(layer, segments or [])
+
+        try:
+            self._apply_breadcrumbs_style(layer)
+        except Exception as exc:
+            logger.warning("Failed to apply breadcrumb styling: %s", exc)
+
+        layer.triggerRepaint()
+        self._log_tracking_event(
+            layer,
+            "BREADCRUMBS",
+            "update",
+            segments=len(segments or [])
+        )
 
     # =========================================================================
     # Current Positions Layer
@@ -106,73 +361,24 @@ class TrackingLayerManager(BaseLayerManager):
         if not isinstance(positions, list):
             raise ValueError("positions must be a list")
 
-        # Validate each position dict
-        for i, pos in enumerate(positions):
-            if not isinstance(pos, dict):
-                raise ValueError(f"Position {i} must be a dictionary")
-
-            # Validate required fields
-            required_fields = ['device_id', 'name', 'ts', 'lat', 'lon']
-            missing_fields = [field for field in required_fields if field not in pos]
-            if missing_fields:
-                raise ValueError(f"Position {i} missing required fields: {missing_fields}")
-
-            # Validate coordinates
-            try:
-                lat = float(pos['lat'])
-                lon = float(pos['lon'])
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"Position {i} has invalid lat/lon: {e}")
-
-            if not (-90 <= lat <= 90):
-                raise ValueError(f"Position {i} has invalid latitude: {lat} (must be -90 to 90)")
-
-            if not (-180 <= lon <= 180):
-                raise ValueError(f"Position {i} has invalid longitude: {lon} (must be -180 to 180)")
-
-            # Validate device_id and name are non-empty strings
-            if not pos['device_id'] or not isinstance(pos['device_id'], str):
-                raise ValueError(f"Position {i} has invalid device_id (must be non-empty string)")
-
-            if not pos['name'] or not isinstance(pos['name'], str):
-                raise ValueError(f"Position {i} has invalid name (must be non-empty string)")
+        sanitized = sanitize_current_positions(positions)
+        valid_positions = sanitized.valid
+        self._report_validation_warning(
+            "Current Positions",
+            len(positions),
+            sanitized.invalid_count,
+            sanitized.last_error
+        )
 
         # Get or create layer
         layer = self._get_or_create_current_layer()
 
-        # Check if layer is already being edited (Issue #3 safety check)
-        if layer.isEditable():
-            raise LayerLockError(self.CURRENT_LAYER_NAME)
+        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "update current positions") as edit_layer:
+            self._clear_layer_features(edit_layer, self.CURRENT_LAYER_NAME)
 
-        # Layer update with proper transaction handling (Issue #3 fix)
-        # This ensures the layer is NEVER left in edit mode, even in edge cases
-        try:
-            # Start editing
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.CURRENT_LAYER_NAME}")
-
-            # Clear existing features efficiently
-            # Use dataProvider().truncate() for better performance with many features
-            # This is faster than iterating through all features to delete them
-            if layer.featureCount() > 0:
-                try:
-                    # Truncate is faster for clearing all features
-                    layer.dataProvider().truncate()
-                except (AttributeError, NotImplementedError, RuntimeError) as e:
-                    # Fallback to deleteFeatures if truncate not supported
-                    # Use allFeatureIds() to avoid loading feature objects into memory
-                    print(f"Truncate not available for {self.CURRENT_LAYER_NAME}, using deleteFeatures: {e}")
-                    if not layer.deleteFeatures(layer.allFeatureIds()):
-                        raise RuntimeError(f"Failed to clear features from {self.CURRENT_LAYER_NAME}")
-
-            # Add new features
-            for pos in positions:
-                feature = QgsFeature(layer.fields())
-                feature.setGeometry(
-                    QgsGeometry.fromPointXY(
-                        QgsPointXY(pos['lon'], pos['lat'])
-                    )
-                )
+            for pos in valid_positions:
+                feature = QgsFeature(edit_layer.fields())
+                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
                 feature.setAttributes([
                     pos['device_id'],
                     pos['name'],
@@ -181,45 +387,17 @@ class TrackingLayerManager(BaseLayerManager):
                     pos.get('speed'),
                     pos.get('battery')
                 ])
-                if not layer.addFeature(feature):
+                if not edit_layer.addFeature(feature):
                     raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
-
-            # Commit changes and check for errors
-            if not layer.commitChanges():
-                # Get commit errors for better error message
-                errors = layer.commitErrors()
-                raise RuntimeError(
-                    f"Failed to commit changes to {self.CURRENT_LAYER_NAME}: "
-                    f"{'; '.join(errors) if errors else 'Unknown error'}"
-                )
-
-        except Exception as e:
-            # Rollback on any error to prevent edit mode lockup (Issue #3)
-            layer.rollBack()
-
-            # Raise typed exception for error handler (Issue #3)
-            raise LayerTransactionError(
-                self.CURRENT_LAYER_NAME,
-                "commit changes",
-                details=str(e)
-            ) from e
-
-        finally:
-            # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
-            # This handles edge cases where commitChanges() succeeded but we raised exception anyway
-            if layer.isEditable():
-                layer.rollBack()
 
         # Apply styling (outside transaction - failures here don't affect data)
         try:
             self._apply_current_positions_style(layer)
         except Exception as e:
-            # Log styling errors but don't fail the update (Issue #3)
-            # Non-critical: styling failure doesn't affect core functionality
-            print(f"Warning: Failed to apply styling to {self.CURRENT_LAYER_NAME}: {str(e)}")
+            logger.warning("Failed to apply styling to %s: %s", self.CURRENT_LAYER_NAME, e)
 
         # Zoom to extent ONLY on first load
-        if self.first_load and positions:
+        if self.first_load and valid_positions:
             self.iface.mapCanvas().setExtent(layer.extent())
             self.iface.mapCanvas().refresh()
             self.first_load = False
@@ -231,7 +409,7 @@ class TrackingLayerManager(BaseLayerManager):
             layer,
             "CURRENT",
             "update",
-            payload_items=len(positions)
+            payload_items=len(valid_positions)
         )
 
     def _apply_current_positions_style(self, layer: QgsVectorLayer):
@@ -367,7 +545,7 @@ class TrackingLayerManager(BaseLayerManager):
             raise LayerLockError(layer.name())
 
         if not layer.startEditing():
-            print(f"[TrackingManager] Warning: Could not start editing {layer.name()} to add timestamp field")
+            logger.warning("Could not start editing %s to add timestamp field", layer.name())
             return
 
         try:
@@ -378,7 +556,7 @@ class TrackingLayerManager(BaseLayerManager):
                 raise RuntimeError(f"Commit failed: {', '.join(errors)}")
         except Exception as exc:
             layer.rollBack()
-            print(f"[TrackingManager] Warning: Could not update breadcrumbs schema: {exc}")
+            logger.warning("Could not update breadcrumbs schema: %s", exc)
         finally:
             if layer.isEditable():
                 try:
@@ -414,216 +592,27 @@ class TrackingLayerManager(BaseLayerManager):
         gap_minutes = float(time_gap_minutes)
         layer = self._get_or_create_breadcrumbs_layer()
 
-        if layer.isEditable():
-            raise LayerLockError(self.BREADCRUMBS_LAYER_NAME)
+        total_inputs = len(positions) if isinstance(positions, list) else 0
+        segments = validate_processed_segments(processed_segments, gap_minutes)
+        invalid_count = 0
+        last_error = None
 
-        segments = self._validate_processed_segments(processed_segments, gap_minutes)
         if segments is None:
-            sanitized_positions = self._sanitize_breadcrumb_positions(positions)
-            segments = self._build_segments_from_positions(sanitized_positions, gap_minutes)
+            if self._maybe_schedule_breadcrumb_task(positions, gap_minutes, total_inputs, processed_segments):
+                return
 
-        self._replace_breadcrumb_layer_features(layer, segments or [])
+            sanitized_positions = sanitize_breadcrumb_positions(positions)
+            invalid_count = sanitized_positions.invalid_count
+            last_error = sanitized_positions.last_error
+            segments = build_segments_from_positions(sanitized_positions.valid, gap_minutes)
 
-        try:
-            self._apply_breadcrumbs_style(layer)
-        except Exception as e:
-            print(f"Warning: Failed to apply styling to {self.BREADCRUMBS_LAYER_NAME}: {str(e)}")
-
-        layer.triggerRepaint()
-        self._log_tracking_event(
+        self._apply_breadcrumb_results(
             layer,
-            "BREADCRUMBS",
-            "update",
-            segments=len(segments or [])
+            segments or [],
+            total_inputs,
+            invalid_count,
+            last_error
         )
-
-    def _sanitize_breadcrumb_positions(self, positions: List[Dict]) -> List[Dict[str, Any]]:
-        """Validate and normalize raw breadcrumb payloads."""
-        if positions is None:
-            return []
-
-        if not isinstance(positions, list):
-            raise ValueError("positions must be a list")
-
-        sanitized = []
-        for i, pos in enumerate(positions):
-            if not isinstance(pos, dict):
-                raise ValueError(f"Position {i} must be a dictionary")
-
-            required_fields = ['device_id', 'name', 'ts', 'lat', 'lon']
-            missing_fields = [field for field in required_fields if field not in pos]
-            if missing_fields:
-                raise ValueError(f"Position {i} missing required fields: {missing_fields}")
-
-            try:
-                lat = float(pos['lat'])
-                lon = float(pos['lon'])
-            except (TypeError, ValueError) as e:
-                raise ValueError(f"Position {i} has invalid lat/lon: {e}")
-
-            if not (-90 <= lat <= 90):
-                raise ValueError(f"Position {i} has invalid latitude: {lat} (must be -90 to 90)")
-
-            if not (-180 <= lon <= 180):
-                raise ValueError(f"Position {i} has invalid longitude: {lon} (must be -180 to 180)")
-
-            device_id = pos['device_id']
-            name = pos['name']
-
-            if not device_id or not isinstance(device_id, str):
-                raise ValueError(f"Position {i} has invalid device_id (must be non-empty string)")
-
-            if not name or not isinstance(name, str):
-                raise ValueError(f"Position {i} has invalid name (must be non-empty string)")
-
-            ts = pos['ts']
-            if not isinstance(ts, str):
-                raise ValueError(f"Position {i} has invalid timestamp (must be string)")
-
-            sanitized.append({
-                'device_id': device_id,
-                'name': name,
-                'ts': ts,
-                'lat': lat,
-                'lon': lon
-            })
-
-        return sanitized
-
-    def _build_segments_from_positions(self, positions: List[Dict[str, Any]], time_gap_minutes: float) -> List[Dict[str, Any]]:
-        """Reproduce legacy segmentation logic for fallback scenarios."""
-        device_positions = defaultdict(list)
-        for pos in positions:
-            device_positions[pos['device_id']].append(pos)
-
-        segments = []
-
-        for device_id, device_pts in device_positions.items():
-            device_pts.sort(key=lambda p: p['ts'])
-            if not device_pts:
-                continue
-
-            current_segment = [device_pts[0]]
-
-            for idx in range(1, len(device_pts)):
-                pos = device_pts[idx]
-                prev_pos = device_pts[idx - 1]
-
-                try:
-                    prev_time = self._parse_iso_timestamp(prev_pos['ts'])
-                    curr_time = self._parse_iso_timestamp(pos['ts'])
-                    gap_minutes = (curr_time - prev_time).total_seconds() / 60.0
-                except Exception as e:
-                    print(f"Warning: Could not parse timestamp for device {device_id}: {e}. Treating as continuous segment.")
-                    gap_minutes = 0
-
-                if gap_minutes > time_gap_minutes:
-                    if len(current_segment) > 1:
-                        segments.append(self._segment_from_points(device_id, current_segment[0]['name'], current_segment))
-                    current_segment = [pos]
-                else:
-                    current_segment.append(pos)
-
-            if len(current_segment) > 1:
-                segments.append(self._segment_from_points(device_id, current_segment[0]['name'], current_segment))
-
-        return segments
-
-    def _segment_from_points(self, device_id: str, device_name: str, points: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Convert a list of sanitized points into a standardized segment payload."""
-        return {
-            'device_id': device_id,
-            'name': device_name,
-            'points': [
-                {
-                    'lon': point['lon'],
-                    'lat': point['lat'],
-                    'ts': point.get('ts')
-                }
-                for point in points
-            ]
-        }
-
-    def _validate_processed_segments(
-        self,
-        processed_payload: Optional[Dict[str, Any]],
-        requested_gap_minutes: float
-    ) -> Optional[List[Dict[str, Any]]]:
-        """
-        Validate provider-supplied pre-processed segments.
-
-        Returns:
-            List of safe segment payloads, an empty list (meaning no features),
-            or None if payload is unusable and we must fallback to raw data.
-        """
-        if not processed_payload:
-            return None
-
-        if isinstance(processed_payload, dict):
-            segments = processed_payload.get('segments')
-            payload_gap = processed_payload.get('time_gap_minutes', requested_gap_minutes)
-        else:
-            segments = processed_payload
-            payload_gap = requested_gap_minutes
-
-        try:
-            gap_value = float(payload_gap)
-        except (TypeError, ValueError):
-            gap_value = requested_gap_minutes
-
-        if gap_value <= 0 or abs(gap_value - requested_gap_minutes) > 0.001:
-            return None
-
-        if segments is None or not isinstance(segments, list):
-            return None
-
-        validated = []
-        for segment in segments:
-            if not isinstance(segment, dict):
-                continue
-
-            device_id = segment.get('device_id')
-            name = segment.get('name') or device_id
-            points = segment.get('points')
-
-            if not device_id or not isinstance(device_id, str):
-                continue
-            if not name or not isinstance(name, str):
-                name = device_id
-            if not isinstance(points, list) or len(points) < 2:
-                continue
-
-            processed_points = []
-            valid_segment = True
-            for point in points:
-                if not isinstance(point, dict):
-                    valid_segment = False
-                    break
-                try:
-                    lat = float(point.get('lat'))
-                    lon = float(point.get('lon'))
-                except (TypeError, ValueError):
-                    valid_segment = False
-                    break
-
-                if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-                    valid_segment = False
-                    break
-
-                processed_points.append({
-                    'lat': lat,
-                    'lon': lon,
-                    'ts': point.get('ts')
-                })
-
-            if valid_segment and len(processed_points) >= 2:
-                validated.append({
-                    'device_id': device_id,
-                    'name': name,
-                    'points': processed_points
-                })
-
-        return validated if validated else []
 
     def _replace_breadcrumb_layer_features(self, layer: QgsVectorLayer, segments: List[Dict[str, Any]]):
         """
@@ -631,17 +620,8 @@ class TrackingLayerManager(BaseLayerManager):
         """
         segments = segments or []
 
-        try:
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.BREADCRUMBS_LAYER_NAME}")
-
-            if layer.featureCount() > 0:
-                try:
-                    layer.dataProvider().truncate()
-                except (AttributeError, NotImplementedError, RuntimeError) as e:
-                    print(f"Truncate not available for {self.BREADCRUMBS_LAYER_NAME}, using deleteFeatures: {e}")
-                    if not layer.deleteFeatures(layer.allFeatureIds()):
-                        raise RuntimeError(f"Failed to clear features from {self.BREADCRUMBS_LAYER_NAME}")
+        with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "update breadcrumbs") as edit_layer:
+            self._clear_layer_features(edit_layer, self.BREADCRUMBS_LAYER_NAME)
 
             for segment in segments:
                 qgs_points = []
@@ -663,7 +643,7 @@ class TrackingLayerManager(BaseLayerManager):
                     continue
 
                 geom = QgsGeometry.fromPolylineXY(qgs_points)
-                feature = QgsFeature(layer.fields())
+                feature = QgsFeature(edit_layer.fields())
                 feature.setGeometry(geom)
                 device_id = segment.get('device_id', '')
                 device_name = segment.get('name') or device_id
@@ -680,42 +660,12 @@ class TrackingLayerManager(BaseLayerManager):
                     'timestamp': ts_value
                 }
                 for field_name, value in attr_map.items():
-                    idx = layer.fields().indexFromName(field_name)
+                    idx = edit_layer.fields().indexFromName(field_name)
                     if idx != -1:
                         feature.setAttribute(idx, value)
-                if not layer.addFeature(feature):
+
+                if not edit_layer.addFeature(feature):
                     raise RuntimeError(f"Failed to add breadcrumb segment for device {device_id}")
-
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(
-                    f"Failed to commit changes to {self.BREADCRUMBS_LAYER_NAME}: "
-                    f"{'; '.join(errors) if errors else 'Unknown error'}"
-                )
-
-        except Exception as e:
-            layer.rollBack()
-            raise LayerTransactionError(
-                self.BREADCRUMBS_LAYER_NAME,
-                "commit changes",
-                details=str(e)
-            ) from e
-
-        finally:
-            if layer.isEditable():
-                layer.rollBack()
-
-    @staticmethod
-    def _parse_iso_timestamp(timestamp: str) -> datetime:
-        """Parse ISO timestamp handling 'Z' suffix."""
-        if not isinstance(timestamp, str):
-            raise ValueError("Timestamp must be a string")
-
-        ts = timestamp.strip()
-        if ts.endswith('Z'):
-            ts = ts[:-1] + '+00:00'
-
-        return datetime.fromisoformat(ts)
 
     def _apply_breadcrumbs_style(self, layer: QgsVectorLayer):
         """
@@ -777,7 +727,7 @@ class TrackingLayerManager(BaseLayerManager):
                 # User switched renderer manually - stop auto styling so their custom
                 # symbology persists across refreshes.
                 layer.setCustomProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, False)
-                print("[SARTRACKER] Breadcrumb renderer manually overridden; auto styling disabled.")
+                logger.info("Breadcrumb renderer manually overridden; auto styling disabled.")
                 return
 
             # FIRST LOAD / RESET: Create new renderer
@@ -836,36 +786,17 @@ class TrackingLayerManager(BaseLayerManager):
         if not feature_ids_to_delete:
             return 0
 
-        # Delete features
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=self.CURRENT_LAYER_NAME,
-                operation="start editing",
-                details="delete device positions"
-            )
-
-        try:
-            if not layer.deleteFeatures(feature_ids_to_delete):
+        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "delete device positions") as edit_layer:
+            if not edit_layer.deleteFeatures(feature_ids_to_delete):
                 raise RuntimeError("Failed to delete features")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
-
-            layer.triggerRepaint()
-            print(f"[TrackingManager] Deleted {len(feature_ids_to_delete)} positions for {len(device_ids)} devices")
-            return len(feature_ids_to_delete)
-
-        except Exception as e:
-            layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=self.CURRENT_LAYER_NAME,
-                operation="delete device positions",
-                details=str(e)
-            ) from e
-        finally:
-            if layer.isEditable():
-                layer.rollBack()
+        layer.triggerRepaint()
+        logger.info(
+            "[TrackingManager] Deleted %s positions for %s devices",
+            len(feature_ids_to_delete),
+            len(device_ids)
+        )
+        return len(feature_ids_to_delete)
 
     def delete_device_breadcrumbs(
         self,
@@ -899,35 +830,17 @@ class TrackingLayerManager(BaseLayerManager):
         if not feature_ids_to_delete:
             return 0
 
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=self.BREADCRUMBS_LAYER_NAME,
-                operation="start editing",
-                details="delete device breadcrumbs"
-            )
-
-        try:
-            if not layer.deleteFeatures(feature_ids_to_delete):
+        with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "delete device breadcrumbs") as edit_layer:
+            if not edit_layer.deleteFeatures(feature_ids_to_delete):
                 raise RuntimeError("Failed to delete breadcrumbs")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
-
-            layer.triggerRepaint()
-            print(f"[TrackingManager] Deleted {len(feature_ids_to_delete)} breadcrumb segments for {len(device_ids)} devices")
-            return len(feature_ids_to_delete)
-
-        except Exception as e:
-            layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=self.BREADCRUMBS_LAYER_NAME,
-                operation="delete device breadcrumbs",
-                details=str(e)
-            ) from e
-        finally:
-            if layer.isEditable():
-                layer.rollBack()
+        layer.triggerRepaint()
+        logger.info(
+            "[TrackingManager] Deleted %s breadcrumb segments for %s devices",
+            len(feature_ids_to_delete),
+            len(device_ids)
+        )
+        return len(feature_ids_to_delete)
 
     def prune_old_breadcrumbs(
         self,
@@ -955,7 +868,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         ts_idx = layer.fields().indexFromName("timestamp")
         if ts_idx == -1:
-            print(f"[TrackingManager] WARNING: Breadcrumbs layer missing timestamp field; cannot prune")
+            logger.warning("Breadcrumbs layer missing timestamp field; cannot prune")
             return 0
 
         threshold = datetime.utcnow() - timedelta(hours=float(older_than_hours))
@@ -965,7 +878,7 @@ class TrackingLayerManager(BaseLayerManager):
             if not ts_val:
                 continue
             try:
-                ts = self._parse_iso_timestamp(str(ts_val))
+                ts = parse_iso_timestamp(str(ts_val))
             except Exception:
                 continue
             if ts < threshold:
@@ -974,41 +887,17 @@ class TrackingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
-        if layer.isEditable():
-            raise LayerLockError(layer.name())
-
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=self.BREADCRUMBS_LAYER_NAME,
-                operation="start editing",
-                details="prune breadcrumbs"
-            )
-
-        try:
-            if not layer.deleteFeatures(feature_ids):
+        with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "prune breadcrumbs") as edit_layer:
+            if not edit_layer.deleteFeatures(feature_ids):
                 raise RuntimeError("Failed to delete old breadcrumbs")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
-
-            layer.triggerRepaint()
-            print(f"[TrackingManager] Pruned {len(feature_ids)} breadcrumb segments older than {older_than_hours}h")
-            return len(feature_ids)
-
-        except Exception as exc:
-            layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=self.BREADCRUMBS_LAYER_NAME,
-                operation="prune breadcrumbs",
-                details=str(exc)
-            ) from exc
-        finally:
-            if layer.isEditable():
-                try:
-                    layer.rollBack()
-                except RuntimeError:
-                    pass
+        layer.triggerRepaint()
+        logger.info(
+            "[TrackingManager] Pruned %s breadcrumb segments older than %sh",
+            len(feature_ids),
+            older_than_hours
+        )
+        return len(feature_ids)
 
     def export_device_track(
         self,
@@ -1058,16 +947,20 @@ class TrackingLayerManager(BaseLayerManager):
         temp_dir = tempfile.mkdtemp(prefix="sartracker_export_")
         path = os.path.join(temp_dir, f"{device_id}_track.geojson")
 
-        options = QgsVectorFileWriter.SaveVectorOptions()
-        options.driverName = "GeoJSON"
-        result, error_message = QgsVectorFileWriter.writeAsVectorFormatV2(
-            export_layer,
-            path,
-            QgsCoordinateTransformContext(),
-            options
-        )
-        if result != QgsVectorFileWriter.NoError:
-            raise RuntimeError(f"Export failed: {error_message}")
+        try:
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "GeoJSON"
+            result, error_message = QgsVectorFileWriter.writeAsVectorFormatV2(
+                export_layer,
+                path,
+                QgsCoordinateTransformContext(),
+                options
+            )
+            if result != QgsVectorFileWriter.NoError:
+                raise RuntimeError(f"Export failed: {error_message}")
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
 
-        print(f"[TrackingManager] Exported track for {device_id} to {path}")
+        logger.info("[TrackingManager] Exported track for %s to %s", device_id, path)
         return path

@@ -64,7 +64,7 @@ class LayersController:
         "casualty": LayerIds.MARKERS_CASUALTIES
     }
 
-    def __init__(self, iface, layer_manager: Optional[SchemaLayerManager] = None):
+    def __init__(self, iface, layer_manager: Optional[SchemaLayerManager] = None, task_manager=None):
         """
         Initialize layers controller.
 
@@ -86,11 +86,17 @@ class LayersController:
 
         # Shared LayerManager (GeoPackage-aware)
         self.layer_manager = layer_manager or SchemaLayerManager(iface)
+        self.task_manager = task_manager
 
         # Initialize specialized managers with shared color registry
         # Managers must be initialized in this order (no dependencies between them currently)
         try:
-            self.tracking = TrackingLayerManager(iface, self._shared_device_colors, self.layer_manager)
+            self.tracking = TrackingLayerManager(
+                iface,
+                self._shared_device_colors,
+                self.layer_manager,
+                task_manager=task_manager
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize TrackingLayerManager: {e}")
 
