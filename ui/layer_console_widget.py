@@ -49,72 +49,6 @@ POSITION_LAYER_IDS = {"sar_current_positions_active"}
 TRACK_LAYER_IDS = {"sar_breadcrumbs"}
 
 
-class FetchConsoleModelTask(QgsTask):
-    """
-    Background task for fetching layer console model.
-
-    Prevents UI freeze during feature enumeration (Issue #2.1).
-    Runs catalog.get_console_model() in background thread.
-    """
-
-    def __init__(self, catalog, include_features: bool, feature_limit: int,
-                 show_hidden: bool = True, filter_favorites_only: bool = False):
-        """
-        Initialize fetch task.
-
-        Args:
-            catalog: LayerCatalogService instance
-            include_features: Whether to include feature summaries
-            feature_limit: Maximum features per layer
-            show_hidden: Include hidden layers (default: True)
-            filter_favorites_only: Only include favorites (default: False)
-        """
-        super().__init__("Fetch Layer Console Model", QgsTask.CanCancel)
-        self.catalog = catalog
-        self.include_features = include_features
-        self.feature_limit = feature_limit
-        self.show_hidden = show_hidden
-        self.filter_favorites_only = filter_favorites_only
-        self.result = None
-        self.error_message = None
-
-    def run(self):
-        """
-        Run in background thread.
-
-        Returns:
-            True if successful, False on error
-        """
-        try:
-            # CRITICAL: This runs in a background thread
-            # Do NOT access any Qt widgets here
-            self.result = self.catalog.get_console_model(
-                include_features=self.include_features,
-                feature_limit=self.feature_limit,
-                show_hidden=self.show_hidden,
-                filter_favorites_only=self.filter_favorites_only
-            )
-            return True
-        except Exception as e:
-            self.error_message = str(e)
-            print(f"[FetchConsoleModelTask] Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def finished(self, success: bool):
-        """
-        Called on UI thread after run() completes.
-
-        Args:
-            success: True if run() returned True
-
-        Note:
-            This is just a stub - actual handling done via TaskManager callbacks
-        """
-        pass
-
-
 class LayerConsoleWidget(QWidget):
     """
     CalTopo-style layer console (presentation layer).
@@ -181,6 +115,7 @@ class LayerConsoleWidget(QWidget):
         self._empty_state_label: Optional[QLabel] = None
         self._suppress_item_changed: bool = False
         self._is_loading: bool = False  # Track loading state (Issue #2.1)
+        self._catalog_task_id: Optional[str] = None
 
         # CRITICAL FIX: Issue #2.1 - TaskManager for background operations
         self._task_manager = TaskManager()
@@ -430,8 +365,16 @@ class LayerConsoleWidget(QWidget):
             return
 
         # Cancel any existing refresh task
+        if self._catalog_task_id and self._catalog:
+            try:
+                self._catalog.cancel_task(self._catalog_task_id)
+            except Exception:
+                pass
+            finally:
+                self._catalog_task_id = None
+
         if self._task_manager:
-            self._task_manager.cancel_task("refresh")
+            self._task_manager.cancel_task("refresh_fetcher")
 
         # CRITICAL: Use background task for both catalog service and fetcher paths
         if self._catalog or self._catalog_fetcher:
@@ -443,15 +386,27 @@ class LayerConsoleWidget(QWidget):
             filter_favorites = (self.filter_combo.currentData() == "favorites") if self.filter_combo else False
 
             if self._catalog:
-                task = FetchConsoleModelTask(
-                    catalog=self._catalog,
-                    include_features=True,
-                    feature_limit=self._feature_limit,
-                    show_hidden=show_hidden,
-                    filter_favorites_only=filter_favorites
-                )
-                task_id = "refresh"
-                on_complete = lambda t: self._on_refresh_complete(t, full)
+                def _on_catalog_complete(payload: Dict[str, Any]):
+                    self._catalog_task_id = None
+                    self._on_refresh_complete(payload, full)
+
+                def _on_catalog_error(exc: Exception):
+                    self._catalog_task_id = None
+                    self._on_refresh_error(exc)
+
+                try:
+                    self._catalog_task_id = self._catalog.start_console_model_task(
+                        include_features=True,
+                        feature_limit=self._feature_limit,
+                        show_hidden=show_hidden,
+                        filter_favorites_only=filter_favorites,
+                        on_complete=_on_catalog_complete,
+                        on_error=_on_catalog_error,
+                        task_id="layer_console_refresh"
+                    )
+                except Exception as exc:
+                    _on_catalog_error(exc)
+                return
             else:
                 # Wrap synchronous fetcher in a QgsTask for background execution
                 class FetcherTask(QgsTask):
@@ -474,15 +429,13 @@ class LayerConsoleWidget(QWidget):
 
                 task = FetcherTask(self._catalog_fetcher)
                 task_id = "refresh_fetcher"
-                on_complete = lambda t: self._on_refresh_complete(t, full)
 
-            # Start task with callbacks
-            self._task_manager.start_task(
-                task=task,
-                on_complete=on_complete,
-                on_error=self._on_refresh_error,
-                task_id=task_id
-            )
+                self._task_manager.start_task(
+                    task=task,
+                    on_complete=lambda t: self._on_refresh_complete(t.result, full),
+                    on_error=lambda t: self._on_refresh_error(getattr(t, "error_message", "Refresh failed")),
+                    task_id=task_id
+                )
         else:
             # No catalog available - notify parent to attempt refresh
             self.refresh_requested.emit()
@@ -530,7 +483,7 @@ class LayerConsoleWidget(QWidget):
 
         # Status will be updated by _update_status_bar()
 
-    def _on_refresh_complete(self, task: FetchConsoleModelTask, full: bool):
+    def _on_refresh_complete(self, payload: Optional[Dict[str, Any]], full: bool):
         """
         Handle successful completion of background refresh.
 
@@ -550,13 +503,12 @@ class LayerConsoleWidget(QWidget):
             return
 
         try:
-            # Extract result from task
-            if task.result:
-                # ISSUE #4.8: Validate catalog data structure and types
-                self._catalog_data = self._validate_catalog_data(task.result)
-            else:
-                print("[LayerConsole] Warning: Task completed but no result data")
-                self._catalog_data = {"groups": []}
+            if not payload:
+                print("[LayerConsole] Warning: Refresh completed without data")
+                payload = {"groups": []}
+
+            # ISSUE #4.8: Validate catalog data structure and types
+            self._catalog_data = self._validate_catalog_data(payload)
 
             # Update tree on UI thread
             if full:
@@ -572,7 +524,7 @@ class LayerConsoleWidget(QWidget):
             # Always restore UI state
             self._hide_loading_state()
 
-    def _on_refresh_error(self, task: FetchConsoleModelTask):
+    def _on_refresh_error(self, error):
         """
         Handle refresh task error or cancellation.
 
@@ -589,16 +541,16 @@ class LayerConsoleWidget(QWidget):
             return
 
         try:
-            if task.error_message:
-                print(f"[LayerConsole] Refresh failed: {task.error_message}")
-                if hasattr(self, 'status_label') and self.status_label:
-                    self.status_label.setText(f"Refresh failed: {task.error_message}")
-                    self.status_label.setStyleSheet("color: red;")
-            else:
-                print("[LayerConsole] Refresh task cancelled or terminated")
-                if hasattr(self, 'status_label') and self.status_label:
-                    self.status_label.setText("Refresh cancelled")
-                    self.status_label.setStyleSheet("")
+            message = "Refresh cancelled"
+            if isinstance(error, Exception):
+                message = str(error)
+            elif isinstance(error, str):
+                message = error
+
+            print(f"[LayerConsole] Refresh failed: {message}")
+            if hasattr(self, 'status_label') and self.status_label:
+                self.status_label.setText(f"Refresh failed: {message}")
+                self.status_label.setStyleSheet("color: red;")
         finally:
             # Always restore UI state
             self._hide_loading_state()

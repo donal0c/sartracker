@@ -10,18 +10,24 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 Phase 1 Deliverable - Part of CalTopo Console Foundation
 """
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Set, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
 from qgis.core import (
     QgsProject, QgsVectorLayer, QgsLayerTreeGroup, QgsLayerTreeNode,
-    QgsFeatureRequest, QgsWkbTypes
+    QgsFeatureRequest, QgsWkbTypes, QgsTask
 )
 
 from ..layers import LayerManager, LayerIds, GroupNames, get_layer_by_id
 from ..layers.schema import get_expected_structure, LAYER_NAME_TO_ID
+from ..utils.notify import warning as notify_warning, error as notify_error
+from ..utils.task_manager import TaskManager
+
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -173,6 +179,265 @@ class FeatureSummary:
             raise ValueError(f"attributes must be a dict, got {type(self.attributes).__name__}")
 
 
+class _ConsoleModelTask(QgsTask):
+    """Background task for fetching console model safely."""
+
+    def __init__(
+        self,
+        catalog: "LayerCatalogService",
+        include_features: bool,
+        feature_limit: int,
+        show_hidden: bool,
+        filter_favorites_only: bool
+    ):
+        super().__init__("Fetch Layer Catalog Model", QgsTask.CanCancel)
+        self._catalog = catalog
+        self.include_features = include_features
+        self.feature_limit = feature_limit
+        self.show_hidden = show_hidden
+        self.filter_favorites_only = filter_favorites_only
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[Exception] = None
+
+    def run(self) -> bool:
+        try:
+            if getattr(self._catalog, "_cleanup_in_progress", False):
+                self.result = {"groups": []}
+                return True
+
+            self.result = self._catalog.get_console_model(
+                include_features=self.include_features,
+                feature_limit=self.feature_limit,
+                show_hidden=self.show_hidden,
+                filter_favorites_only=self.filter_favorites_only
+            )
+            return True
+        except Exception as exc:
+            self.error = exc
+            logger.exception("Console model task failed")
+            return False
+
+
+@dataclass
+class CatalogBuildResult:
+    """Container for cache build outputs."""
+    groups: Dict[str, LayerGroupInfo]
+    layers: Dict[str, LayerInfo]
+    layer_refs: Dict[str, QgsVectorLayer]
+
+
+class _CatalogCacheBuilder:
+    """Pure helper that constructs layer/group metadata."""
+
+    def __init__(
+        self,
+        layer_manager: LayerManager,
+        project: QgsProject,
+        logger_instance: logging.Logger = None,
+    ) -> None:
+        self.layer_manager = layer_manager
+        self.project = project
+        self.logger = logger_instance or logger
+        self._groups: Dict[str, LayerGroupInfo] = {}
+        self._layers: Dict[str, LayerInfo] = {}
+        self._layer_refs: Dict[str, QgsVectorLayer] = {}
+
+    def build(self) -> CatalogBuildResult:
+        """Run a full catalog build and return the cache dictionaries."""
+        self._groups = {
+            GroupNames.ROOT: LayerGroupInfo(
+                id=GroupNames.ROOT,
+                name=GroupNames.ROOT,
+                order=0,
+                visible=True,
+                expanded=True
+            )
+        }
+        self._layers = {}
+        self._layer_refs = {}
+
+        root_group = get_expected_structure()
+        self._process_group_definition(root_group, parent_id=None)
+
+        return CatalogBuildResult(
+            groups=self._groups,
+            layers=self._layers,
+            layer_refs=self._layer_refs
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers (mirrors previous LayerCatalogService methods)
+    # ------------------------------------------------------------------
+
+    def _process_group_definition(self, group_def, parent_id: Optional[str]) -> None:
+        group_id = self._ensure_group_entry(group_def, parent_id)
+
+        if group_def.layers:
+            for layer_def in sorted(group_def.layers, key=lambda ld: ld.position):
+                self._add_layer_from_definition(layer_def, group_id)
+
+        if group_def.subgroups:
+            for subgroup in sorted(group_def.subgroups, key=lambda gd: gd.position):
+                self._process_group_definition(subgroup, group_id)
+
+    def _ensure_group_entry(self, group_def, parent_id: Optional[str]) -> str:
+        if parent_id is None and group_def.name == GroupNames.ROOT:
+            return GroupNames.ROOT
+
+        group_id = self._generate_group_id(group_def, parent_id)
+
+        if group_id not in self._groups:
+            self._groups[group_id] = LayerGroupInfo(
+                id=group_id,
+                name=group_def.name,
+                order=group_def.position,
+                parent_id=parent_id,
+                alias=None,
+                visible=True,
+                expanded=True
+            )
+
+        if parent_id and parent_id in self._groups:
+            parent_info = self._groups[parent_id]
+            if group_id not in parent_info.subgroups:
+                parent_info.subgroups.append(group_id)
+
+        return group_id
+
+    def _generate_group_id(self, group_def, parent_id: Optional[str]) -> str:
+        if not parent_id:
+            return group_def.name
+        return f"{parent_id}/{group_def.name}"
+
+    def _add_layer_from_definition(self, layer_def, group_id: str) -> None:
+        layer_id = layer_def.layer_id
+        layer = self.layer_manager.get_layer(layer_id)
+
+        if not layer or not layer.isValid():
+            self.logger.warning("Layer %s not found or invalid in group %s; skipping", layer_id, group_id)
+            return
+
+        try:
+            layer_info = self._extract_layer_info(layer_id, layer, layer_def, group_id)
+        except RuntimeError:
+            return
+
+        self._layers[layer_id] = layer_info
+        self._layer_refs[layer_id] = layer
+
+        group_info = self._groups.get(group_id)
+        if group_info and layer_id not in group_info.children:
+            group_info.children.append(layer_id)
+
+    def _extract_layer_info(self, layer_id: str, layer: QgsVectorLayer, layer_def, group_id: str) -> LayerInfo:
+        return build_layer_info(
+            layer_manager=self.layer_manager,
+            project=self.project,
+            layer_id=layer_id,
+            layer=layer,
+            layer_def=layer_def,
+            group_id=group_id,
+            logger_instance=self.logger
+        )
+
+
+def build_layer_info(
+    layer_manager: LayerManager,
+    project: QgsProject,
+    layer_id: str,
+    layer: QgsVectorLayer,
+    layer_def,
+    group_id: str,
+    logger_instance: logging.Logger,
+) -> LayerInfo:
+    """Shared helper to build LayerInfo objects from a live layer."""
+    logger_ref = logger_instance or logger
+
+    try:
+        metadata = layer_manager.get_layer_metadata(layer_id) or {}
+    except Exception as e:
+        logger_ref.warning("Failed to get metadata for %s: %s", layer_id, e, exc_info=True)
+        metadata = {}
+
+    try:
+        provider = layer.dataProvider().name() if layer.dataProvider() else "memory"
+    except Exception as e:
+        logger_ref.warning("Failed to get provider for %s: %s", layer_id, e, exc_info=True)
+        provider = "unknown"
+
+    try:
+        feature_count = layer.featureCount()
+    except Exception as e:
+        logger_ref.warning("Failed to get feature count for %s: %s", layer_id, e, exc_info=True)
+        feature_count = 0
+
+    try:
+        field_names = [field.name() for field in layer.fields()]
+    except Exception as e:
+        logger_ref.warning("Failed to get fields for %s: %s", layer_id, e, exc_info=True)
+        field_names = []
+
+    geom_type = ""
+    try:
+        geom_value = layer.geometryType()
+        point_geom = getattr(QgsWkbTypes, "PointGeometry", getattr(QgsWkbTypes, "Point", None))
+        line_geom = getattr(QgsWkbTypes, "LineGeometry", getattr(QgsWkbTypes, "Line", None))
+        poly_geom = getattr(QgsWkbTypes, "PolygonGeometry", getattr(QgsWkbTypes, "Polygon", None))
+        if point_geom is not None and geom_value == point_geom:
+            geom_type = "Point"
+        elif line_geom is not None and geom_value == line_geom:
+            geom_type = "LineString"
+        elif poly_geom is not None and geom_value == poly_geom:
+            geom_type = "Polygon"
+    except Exception as e:
+        logger_ref.warning("Failed to get geometry type for %s: %s", layer_id, e, exc_info=True)
+
+    visible = True
+    try:
+        layer_tree_root = project.layerTreeRoot()
+        if layer_tree_root:
+            layer_node = layer_tree_root.findLayer(layer.id())
+            if layer_node:
+                visible = layer_node.isVisible()
+    except Exception as e:
+        logger_ref.warning("Could not determine visibility for %s: %s", layer_id, e, exc_info=True)
+
+    last_updated = None
+    timestamp = metadata.get('updated_at')
+    if timestamp:
+        try:
+            last_updated = datetime.fromisoformat(timestamp)
+        except Exception:
+            pass
+
+    try:
+        data_source_uri = layer.source()
+    except Exception:
+        data_source_uri = ""
+
+    try:
+        return LayerInfo(
+            id=layer_id,
+            canonical_name=layer_def.name,
+            group_id=group_id,
+            qgis_layer_id=layer.id(),
+            alias=metadata.get('alias'),
+            order=metadata.get('display_order', layer_def.position),
+            visible=visible,
+            provider=provider,
+            feature_count=feature_count,
+            last_updated=last_updated,
+            favorite=metadata.get('favorite', False),
+            schema_fields=field_names,
+            layer_type=layer_id.split('_')[0] if '_' in layer_id else '',
+            geometry_type=geom_type,
+            editable=True,
+            data_source_uri=data_source_uri
+        )
+    except Exception as e:
+        logger_ref.exception("Failed to create LayerInfo for %s", layer_id)
+        raise RuntimeError(f"Failed to extract layer info for {layer_id}: {e}")
+
 # ============================================================================
 # CATALOG SERVICE
 # ============================================================================
@@ -205,7 +470,13 @@ class LayerCatalogService(QObject):
     group_updated = pyqtSignal(str)                  # group_id changed
     feature_count_changed = pyqtSignal(str, int)     # layer_id, new_count
 
-    def __init__(self, iface, layer_manager: LayerManager):
+    def __init__(
+        self,
+        iface,
+        layer_manager: LayerManager,
+        task_manager: Optional[TaskManager] = None,
+        project: Optional[QgsProject] = None
+    ):
         """
         Initialize catalog service.
 
@@ -221,7 +492,10 @@ class LayerCatalogService(QObject):
 
         self.iface = iface
         self.layer_manager = layer_manager
-        self.project = QgsProject.instance()
+        self.project = project or QgsProject.instance()
+        self._task_manager = task_manager or TaskManager()
+        self._owned_task_manager = task_manager is None
+        self._message_bar = self._resolve_message_bar()
 
         if not self.project:
             raise RuntimeError("QgsProject instance not available")
@@ -259,9 +533,122 @@ class LayerCatalogService(QObject):
                 'mission_store_changed',
                 self._on_mission_store_changed
             ))
-            print("[LayerCatalogService] Connected to mission store change signal")
+            logger.debug("LayerCatalogService connected to mission store change signal")
 
-        print("[LayerCatalogService] Initialized successfully")
+        logger.info("LayerCatalogService initialized successfully")
+
+    # ========================================================================
+    # Logging / Notification Utilities
+    # ========================================================================
+
+    def _resolve_message_bar(self):
+        """Return QGIS message bar if iface provides one."""
+        iface = getattr(self, 'iface', None)
+        if not iface or not hasattr(iface, 'messageBar'):
+            return None
+        try:
+            return iface.messageBar()
+        except Exception:
+            logger.debug("LayerCatalogService could not resolve message bar", exc_info=True)
+            return None
+
+    def _message_bar_safe(self):
+        """Lazy-fetch message bar, caching first successful lookup."""
+        if self._message_bar:
+            return self._message_bar
+        self._message_bar = self._resolve_message_bar()
+        return self._message_bar
+
+    def _notify_warning(self, title: str, message: str) -> None:
+        bar = self._message_bar_safe()
+        if not bar:
+            return
+        try:
+            notify_warning(bar, title, message, duration=7)
+        except Exception:
+            logger.debug("LayerCatalogService warning notification suppressed", exc_info=True)
+
+    def _notify_error(self, title: str, message: str) -> None:
+        bar = self._message_bar_safe()
+        if not bar:
+            return
+        try:
+            notify_error(bar, title, message, duration=10)
+        except Exception:
+            logger.debug("LayerCatalogService error notification suppressed", exc_info=True)
+
+    # ========================================================================
+    # Background Task Helpers
+    # ========================================================================
+
+    def start_console_model_task(
+        self,
+        include_features: bool = True,
+        feature_limit: int = 500,
+        show_hidden: bool = True,
+        filter_favorites_only: bool = False,
+        on_complete: Optional[Callable[[Dict[str, Any]], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None,
+        task_id: Optional[str] = None
+    ) -> str:
+        """Run get_console_model() in background via TaskManager."""
+        task_manager = getattr(self, "_task_manager", None)
+        if not task_manager:
+            raise RuntimeError("Task manager not available")
+
+        task = _ConsoleModelTask(
+            catalog=self,
+            include_features=include_features,
+            feature_limit=feature_limit,
+            show_hidden=show_hidden,
+            filter_favorites_only=filter_favorites_only
+        )
+
+        def _handle_complete(qgs_task: _ConsoleModelTask):
+            payload = qgs_task.result or {"groups": []}
+            if on_complete:
+                on_complete(payload)
+
+        def _handle_error(qgs_task: _ConsoleModelTask):
+            err = qgs_task.error or RuntimeError("Catalog fetch failed")
+            if on_error:
+                on_error(err)
+            else:
+                self._notify_error("Layer Catalog", str(err))
+
+        return task_manager.start_task(
+            task=task,
+            on_complete=_handle_complete,
+            on_error=_handle_error,
+            task_id=task_id or "catalog_fetch"
+        )
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a background catalog task."""
+        task_manager = getattr(self, "_task_manager", None)
+        if not task_manager:
+            return False
+        return task_manager.cancel_task(task_id)
+
+    def _load_layer_metadata(self, layer_id: str) -> Dict[str, Any]:
+        if not self.layer_manager:
+            raise RuntimeError("Layer manager not available")
+        try:
+            return self.layer_manager.get_layer_metadata(layer_id) or {}
+        except Exception as exc:
+            logger.exception("Failed to load metadata for %s", layer_id)
+            self._notify_error("Layer Metadata", f"Could not read metadata for {layer_id}: {exc}")
+            raise
+
+    def _persist_layer_metadata(self, layer_id: str, metadata: Dict[str, Any], action: str) -> None:
+        if not self.layer_manager:
+            raise RuntimeError("Layer manager not available")
+        try:
+            self.layer_manager.set_layer_metadata(layer_id, metadata)
+        except Exception as exc:
+            logger.exception("Failed to %s for %s", action, layer_id)
+            self._notify_error("Layer Metadata", f"Could not {action} for {layer_id}: {exc}")
+            raise RuntimeError(f"Failed to {action} for {layer_id}: {exc}")
 
     # ========================================================================
     # PUBLIC API - Read Operations
@@ -358,12 +745,12 @@ class LayerCatalogService(QObject):
 
         layer_info = self.get_layer(layer_id)
         if not layer_info:
-            print(f"[LayerCatalogService] Warning: Layer {layer_id} not in catalog")
+            logger.warning("Layer %s not in catalog during list_features", layer_id)
             return []
 
         layer = self.layer_manager.get_layer(layer_id)
         if not layer or not layer.isValid():
-            print(f"[LayerCatalogService] Warning: Layer {layer_id} not available or invalid")
+            logger.warning("Layer %s not available or invalid during list_features", layer_id)
             return []
 
         # Build feature request
@@ -432,7 +819,13 @@ class LayerCatalogService(QObject):
                         if geom and not geom.isNull():
                             geometry_wkt = geom.asWkt()
                     except Exception as e:
-                        print(f"[LayerCatalogService] Warning: Could not extract geometry for feature {feature.id()}: {e}")
+                        logger.warning(
+                            "Could not extract geometry for feature %s in layer %s: %s",
+                            feature.id(),
+                            layer_id,
+                            e,
+                            exc_info=True
+                        )
 
                 # Build attributes payload for UI consumers
                 attributes: Dict[str, Any] = {
@@ -462,9 +855,8 @@ class LayerCatalogService(QObject):
                 )
                 summaries.append(summary)
         except Exception as e:
-            print(f"[LayerCatalogService] Error enumerating features for {layer_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Error enumerating features for layer %s", layer_id)
+            self._notify_warning("Layer Data Unavailable", f"Could not list features for {layer_info.display_name}: {e}")
 
         try:
             summaries.sort(key=lambda s: (s.display_order if s.display_order is not None else 0, str(s.id)))
@@ -596,9 +988,11 @@ class LayerCatalogService(QObject):
                         except Exception:
                             pass
                     except Exception as exc:
-                        print(f"[LayerCatalogService] Warning: Failed to build feature list for {layer_info.id}: {exc}")
-                        import traceback
-                        traceback.print_exc()
+                        logger.exception("Failed to build feature list for %s", layer_info.id)
+                        self._notify_warning(
+                            "Feature List Failed",
+                            f"Could not load features for {layer_info.display_name}: {exc}"
+                        )
 
                 layer_entry["features"] = features_payload
                 layers_payload.append(layer_entry)
@@ -647,11 +1041,14 @@ class LayerCatalogService(QObject):
                 # ISSUE #4.4: Check for duplicate aliases
                 for lid, layer_info in self._layers.items():
                     if lid != layer_id and layer_info.alias == alias:
-                        print(f"[LayerCatalog] Warning: Alias '{alias}' already used by layer '{lid}'")
+                        logger.warning("Alias '%s' already used by layer '%s'", alias, lid)
                         # Don't raise error, just warn - allow duplicates but notify user
 
         # Get current metadata
-        metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
+        try:
+            metadata = self._load_layer_metadata(layer_id)
+        except Exception:
+            return
 
         # Update alias
         if alias is None:
@@ -660,10 +1057,7 @@ class LayerCatalogService(QObject):
             metadata['alias'] = alias
 
         # Write to storage
-        try:
-            self.layer_manager.set_layer_metadata(layer_id, metadata)
-        except Exception as e:
-            raise RuntimeError(f"Failed to set alias for {layer_id}: {e}")
+        self._persist_layer_metadata(layer_id, metadata, "set alias")
 
         # Update cache
         if layer_id in self._layers:
@@ -673,7 +1067,7 @@ class LayerCatalogService(QObject):
         self.alias_changed.emit(layer_id)
         self.layer_updated.emit(layer_id)
 
-        print(f"[LayerCatalogService] Set alias for {layer_id}: {alias}")
+        logger.info("Set alias for %s -> %s", layer_id, alias)
 
     def set_layer_order(self, layer_id: str, order: int) -> None:
         """
@@ -695,14 +1089,14 @@ class LayerCatalogService(QObject):
             raise ValueError("Order must be non-negative integer")
 
         # Get current metadata
-        metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
+        try:
+            metadata = self._load_layer_metadata(layer_id)
+        except Exception:
+            return
         metadata['display_order'] = order
 
         # Write to storage
-        try:
-            self.layer_manager.set_layer_metadata(layer_id, metadata)
-        except Exception as e:
-            raise RuntimeError(f"Failed to set order for {layer_id}: {e}")
+        self._persist_layer_metadata(layer_id, metadata, "set order")
 
         # Update cache
         if layer_id in self._layers:
@@ -711,7 +1105,7 @@ class LayerCatalogService(QObject):
         # Emit signal
         self.layer_updated.emit(layer_id)
 
-        print(f"[LayerCatalogService] Set order for {layer_id}: {order}")
+        logger.info("Set order for %s -> %s", layer_id, order)
 
     def set_layer_favorite(self, layer_id: str, is_favorite: bool) -> None:
         """
@@ -730,14 +1124,14 @@ class LayerCatalogService(QObject):
             raise ValueError(f"Unknown layer_id: {layer_id}")
 
         # Get current metadata
-        metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
+        try:
+            metadata = self._load_layer_metadata(layer_id)
+        except Exception:
+            return
         metadata['favorite'] = bool(is_favorite)
 
         # Write to storage
-        try:
-            self.layer_manager.set_layer_metadata(layer_id, metadata)
-        except Exception as e:
-            raise RuntimeError(f"Failed to set favorite for {layer_id}: {e}")
+        self._persist_layer_metadata(layer_id, metadata, "set favorite")
 
         # Update cache
         if layer_id in self._layers:
@@ -746,7 +1140,7 @@ class LayerCatalogService(QObject):
         # Emit signal
         self.layer_updated.emit(layer_id)
 
-        print(f"[LayerCatalogService] Set favorite for {layer_id}: {is_favorite}")
+        logger.info("Set favorite for %s -> %s", layer_id, is_favorite)
 
     # ========================================================================
     # CACHE MANAGEMENT
@@ -759,125 +1153,45 @@ class LayerCatalogService(QObject):
         This is called on init and on major structural changes.
         Queries LayerManager for all layers and populates cache.
         """
-        print("[LayerCatalogService] Building catalog cache...")
+        logger.info("Building layer catalog cache")
 
         # Ensure LayerManager structure exists
         try:
             self.layer_manager.ensure_structure()
         except Exception as e:
-            print(f"[LayerCatalogService] Warning: ensure_structure failed: {e}")
-
-        # Clear existing cache
-        self._groups.clear()
-        self._layers.clear()
+            logger.exception("LayerManager.ensure_structure failed")
+            self._notify_error("Layer Catalog", f"Layer structure incomplete: {e}")
 
         # Disconnect existing per-layer signal hooks before rebuilding cache
         self._disconnect_all_layer_signals()
 
-        # Build groups cache (root first)
-        self._groups[GroupNames.ROOT] = LayerGroupInfo(
-            id=GroupNames.ROOT,
-            name=GroupNames.ROOT,
-            order=0,
-            visible=True,
-            expanded=True
+        builder = _CatalogCacheBuilder(
+            layer_manager=self.layer_manager,
+            project=self.project,
+            logger_instance=logger
         )
 
-        # Build layers cache by walking schema definition
-        root_group = get_expected_structure()
-        self._process_group_definition(root_group, parent_id=None)
+        result = builder.build()
 
-        print(f"[LayerCatalogService] Cache built: {len(self._groups)} groups, {len(self._layers)} layers")
+        # Replace cache contents in-place so external references stay valid
+        self._groups.clear()
+        self._groups.update(result.groups)
+
+        self._layers.clear()
+        self._layers.update(result.layers)
+
+        # Rewire per-layer signals now that cache is rebuilt
+        for layer_id, layer in result.layer_refs.items():
+            self._wire_layer_signals(layer_id, layer)
+
+        logger.info(
+            "Layer catalog cache built (%s groups, %s layers)",
+            len(self._groups),
+            len(self._layers)
+        )
 
         # Emit full refresh signal
         self.model_changed.emit()
-
-    def _process_group_definition(self, group_def, parent_id: Optional[str]) -> None:
-        """
-        Create catalog entries for a group definition (and recurse into children).
-
-        Args:
-            group_def: GroupDefinition instance
-            parent_id: Parent group identifier (None = root)
-        """
-        group_id = self._ensure_group_entry(group_def, parent_id)
-
-        # Process layers attached to this group
-        if group_def.layers:
-            for layer_def in sorted(group_def.layers, key=lambda ld: ld.position):
-                self._add_layer_from_definition(layer_def, group_id)
-
-        # Recurse into subgroups
-        if group_def.subgroups:
-            for subgroup in sorted(group_def.subgroups, key=lambda gd: gd.position):
-                self._process_group_definition(subgroup, group_id)
-
-    def _ensure_group_entry(self, group_def, parent_id: Optional[str]) -> str:
-        """
-        Ensure LayerGroupInfo exists for the provided definition.
-
-        Args:
-            group_def: GroupDefinition instance
-            parent_id: Identifier of the parent group
-
-        Returns:
-            str: Group identifier used in the catalog
-        """
-        if parent_id is None and group_def.name == GroupNames.ROOT:
-            return GroupNames.ROOT
-
-        group_id = self._generate_group_id(group_def, parent_id)
-
-        if group_id not in self._groups:
-            self._groups[group_id] = LayerGroupInfo(
-                id=group_id,
-                name=group_def.name,
-                order=group_def.position,
-                parent_id=parent_id,
-                alias=None,
-                visible=True,
-                expanded=True
-            )
-
-        # Link group to parent
-        if parent_id and parent_id in self._groups:
-            parent_info = self._groups[parent_id]
-            if group_id not in parent_info.subgroups:
-                parent_info.subgroups.append(group_id)
-
-        return group_id
-
-    def _generate_group_id(self, group_def, parent_id: Optional[str]) -> str:
-        """
-        Generate a stable identifier for a group based on its hierarchy.
-        """
-        if not parent_id:
-            return group_def.name
-        return f"{parent_id}/{group_def.name}"
-
-    def _add_layer_from_definition(self, layer_def, group_id: str) -> None:
-        """
-        Create catalog entries for a layer definition if the layer exists.
-        """
-        layer_id = layer_def.layer_id
-        layer = self.layer_manager.get_layer(layer_id)
-
-        if not layer or not layer.isValid():
-            print(f"[LayerCatalogService] Layer {layer_id} not found in group {group_id}, skipping")
-            return
-
-        try:
-            layer_info = self._extract_layer_info(layer_id, layer, layer_def, group_id)
-        except RuntimeError:
-            return
-
-        self._layers[layer_id] = layer_info
-        self._wire_layer_signals(layer_id, layer)
-
-        # Track layer as child of the group
-        group_info = self._groups.get(group_id)
-        if group_info and layer_id not in group_info.children:
-            group_info.children.append(layer_id)
 
     def rescan_layers(self):
         """
@@ -886,115 +1200,8 @@ class LayerCatalogService(QObject):
         Use after structural changes (layer deletions, schema repairs).
         This is a public method that can be called by LayersController or other components.
         """
-        print("[LayerCatalogService] Rescanning all layers...")
+        logger.info("Rescanning all layers for catalog rebuild")
         self._build_cache()
-
-    def _extract_layer_info(self, layer_id: str, layer: QgsVectorLayer, layer_def, group_id: str) -> LayerInfo:
-        """
-        Extract LayerInfo from a QgsVectorLayer (with error handling).
-
-        Args:
-            layer_id: Layer identifier
-            layer: QGIS vector layer
-            layer_def: Schema definition
-
-        Returns:
-            LayerInfo object
-
-        Raises:
-            RuntimeError: If critical extraction fails
-        """
-        # Get stored metadata (safe - has error handling)
-        try:
-            metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Failed to get metadata for {layer_id}: {e}")
-            metadata = {}
-
-        # Determine provider (safe with fallback)
-        try:
-            provider = layer.dataProvider().name() if layer.dataProvider() else "memory"
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Failed to get provider for {layer_id}: {e}")
-            provider = "unknown"
-
-        # Get feature count (safe with fallback)
-        try:
-            feature_count = layer.featureCount()
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Failed to get feature count for {layer_id}: {e}")
-            feature_count = 0
-
-        # Extract field names (safe with fallback)
-        try:
-            field_names = [field.name() for field in layer.fields()]
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Failed to get fields for {layer_id}: {e}")
-            field_names = []
-
-        # Determine geometry type (safe with fallback)
-        geom_type = ""
-        try:
-            if layer.geometryType() == QgsWkbTypes.PointGeometry:
-                geom_type = "Point"
-            elif layer.geometryType() == QgsWkbTypes.LineGeometry:
-                geom_type = "LineString"
-            elif layer.geometryType() == QgsWkbTypes.PolygonGeometry:
-                geom_type = "Polygon"
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Failed to get geometry type for {layer_id}: {e}")
-
-        # Determine visibility (already had error handling)
-        visible = True
-        try:
-            layer_tree_root = self.project.layerTreeRoot()
-            if layer_tree_root:
-                layer_node = layer_tree_root.findLayer(layer.id())
-                if layer_node:
-                    visible = layer_node.isVisible()
-        except Exception as e:
-            print(f"[LayerCatalogService] Warning: Could not determine visibility for {layer_id}: {e}")
-
-        # Parse last_updated timestamp from metadata
-        last_updated = None
-        timestamp = metadata.get('updated_at')
-        if timestamp:
-            try:
-                last_updated = datetime.fromisoformat(timestamp)
-            except Exception:
-                pass
-
-        # Capture data source URI for diagnostics
-        try:
-            data_source_uri = layer.source()
-        except Exception:
-            data_source_uri = ""
-
-        # Build LayerInfo (wrap in try-catch for safety)
-        try:
-            return LayerInfo(
-                id=layer_id,
-                canonical_name=layer_def.name,
-                group_id=group_id,
-                qgis_layer_id=layer.id(),
-                alias=metadata.get('alias'),
-                order=metadata.get('display_order', layer_def.position),
-                visible=visible,
-                provider=provider,
-                feature_count=feature_count,
-                last_updated=last_updated,
-                favorite=metadata.get('favorite', False),
-                schema_fields=field_names,
-                layer_type=layer_id.split('_')[0] if '_' in layer_id else '',
-                geometry_type=geom_type,
-                editable=True,
-                data_source_uri=data_source_uri
-            )
-        except Exception as e:
-            print(f"[LayerCatalogService] ERROR: Failed to create LayerInfo for {layer_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            raise RuntimeError(f"Failed to extract layer info for {layer_id}: {e}")
 
     def refresh_layer(self, layer_id: str, full: bool = False) -> None:
         """
@@ -1013,42 +1220,48 @@ class LayerCatalogService(QObject):
 
         # DEFENSIVE GUARD - Check cleanup flag first
         if self._cleanup_in_progress:
-            print("[LayerCatalogService] refresh_layer called during cleanup, ignoring")
+            logger.debug("refresh_layer called during cleanup; ignoring request")
             return
 
         if not self.layer_manager or not self._layers:
-            print("[LayerCatalogService] refresh_layer called after cleanup, ignoring")
+            logger.debug("refresh_layer called after cleanup; ignoring request")
             return
 
         if layer_id not in self._layers:
-            print(f"[LayerCatalogService] Warning: Attempted refresh of unknown layer {layer_id}")
+            logger.warning("Attempted refresh of unknown layer %s", layer_id)
             return
 
         try:
             # Get layer from manager
             layer = self.layer_manager.get_layer(layer_id)
             if not layer or not layer.isValid():
-                print(f"[LayerCatalogService] Warning: Layer {layer_id} not valid, skipping refresh")
+                logger.warning("Layer %s not valid during refresh", layer_id)
                 return
 
             # Get layer definition from schema
             layer_def = get_layer_by_id(layer_id)
             if not layer_def:
-                print(f"[LayerCatalogService] Warning: No schema definition for {layer_id}")
+                logger.warning("No schema definition for %s", layer_id)
                 return
 
             if full:
                 # Full rebuild - extract all layer info
                 try:
                     group_id = self._layers[layer_id].group_id if layer_id in self._layers else GroupNames.ROOT
-                    layer_info = self._extract_layer_info(layer_id, layer, layer_def, group_id)
+                    layer_info = build_layer_info(
+                        layer_manager=self.layer_manager,
+                        project=self.project,
+                        layer_id=layer_id,
+                        layer=layer,
+                        layer_def=layer_def,
+                        group_id=group_id,
+                        logger_instance=logger
+                    )
                     self._layers[layer_id] = layer_info
                     self._wire_layer_signals(layer_id, layer)
-                    print(f"[LayerCatalogService] Full refresh completed for {layer_id}")
+                    logger.info("Full refresh completed for %s", layer_id)
                 except Exception as e:
-                    print(f"[LayerCatalogService] Error extracting layer info for {layer_id}: {e}")
-                    import traceback
-                    traceback.print_exc()
+                    logger.exception("Error extracting layer info for %s", layer_id)
                     return
             else:
                 # Quick update (feature count only)
@@ -1060,9 +1273,14 @@ class LayerCatalogService(QObject):
                         self._layers[layer_id].feature_count = new_count
                         if hasattr(self, 'feature_count_changed'):
                             self.feature_count_changed.emit(layer_id, new_count)
-                        print(f"[LayerCatalogService] Feature count updated for {layer_id}: {old_count} → {new_count}")
+                        logger.debug(
+                            "Feature count updated for %s: %s -> %s",
+                            layer_id,
+                            old_count,
+                            new_count
+                        )
                 except Exception as e:
-                    print(f"[LayerCatalogService] Error updating feature count for {layer_id}: {e}")
+                    logger.warning("Error updating feature count for %s: %s", layer_id, e, exc_info=True)
                     return
 
             # Emit signal (defensive - check attribute exists)
@@ -1070,9 +1288,7 @@ class LayerCatalogService(QObject):
                 self.layer_updated.emit(layer_id)
 
         except Exception as e:
-            print(f"[LayerCatalogService] Unexpected error in refresh_layer for {layer_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Unexpected error in refresh_layer for %s", layer_id)
 
     # ========================================================================
     # SIGNAL HANDLERS (Defensive)
@@ -1083,7 +1299,7 @@ class LayerCatalogService(QObject):
         project = QgsProject.instance()
 
         if not project:
-            print("[LayerCatalogService] Warning: No project instance, skipping signal wiring")
+            logger.warning("No QgsProject instance available; skipping signal wiring")
             return
 
         # Wire signals with exception handling
@@ -1092,13 +1308,13 @@ class LayerCatalogService(QObject):
             project.layersAdded.connect(self._on_layers_added)
             self._signal_connections.append((project.layersAdded, 'layersAdded', self._on_layers_added))
         except Exception as e:
-            print(f"[LayerCatalogService] Failed to connect layersAdded: {e}")
+            logger.warning("Failed to connect layersAdded: %s", e, exc_info=True)
 
         try:
             project.layersWillBeRemoved.connect(self._on_layers_removed)
             self._signal_connections.append((project.layersWillBeRemoved, 'layersWillBeRemoved', self._on_layers_removed))
         except Exception as e:
-            print(f"[LayerCatalogService] Failed to connect layersWillBeRemoved: {e}")
+            logger.warning("Failed to connect layersWillBeRemoved: %s", e, exc_info=True)
 
         try:
             layer_tree_root = project.layerTreeRoot()
@@ -1106,15 +1322,15 @@ class LayerCatalogService(QObject):
                 layer_tree_root.visibilityChanged.connect(self._on_visibility_changed)
                 self._signal_connections.append((layer_tree_root.visibilityChanged, 'visibilityChanged', self._on_visibility_changed))
         except Exception as e:
-            print(f"[LayerCatalogService] Failed to connect visibilityChanged: {e}")
+            logger.warning("Failed to connect visibilityChanged: %s", e, exc_info=True)
 
         try:
             project.projectSaved.connect(self._on_project_saved)
             self._signal_connections.append((project.projectSaved, 'projectSaved', self._on_project_saved))
         except Exception as e:
-            print(f"[LayerCatalogService] Failed to connect projectSaved: {e}")
+            logger.warning("Failed to connect projectSaved: %s", e, exc_info=True)
 
-        print(f"[LayerCatalogService] Wired {len(self._signal_connections)} signals")
+        logger.debug("Wired %s signals", len(self._signal_connections))
 
     def _on_layers_added(self, layers: List[QgsVectorLayer]):
         """Handle layersAdded signal."""
@@ -1124,7 +1340,7 @@ class LayerCatalogService(QObject):
 
         # DEFENSIVE GUARD
         if not self.layer_manager or not self._layers or not self.project:
-            print("[LayerCatalogService] Handler fired after cleanup, ignoring")
+            logger.debug("layersAdded handler fired after cleanup; ignoring")
             return
 
         if not hasattr(self, '_signal_connections'):
@@ -1148,9 +1364,7 @@ class LayerCatalogService(QObject):
             self._schedule_refresh(managed_layers)
 
         except Exception as e:
-            print(f"[LayerCatalogService] Error in _on_layers_added: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("layersAdded handler failed")
 
     def _on_layers_removed(self, layer_ids: List[str]):
         """Handle layersWillBeRemoved signal."""
@@ -1172,15 +1386,15 @@ class LayerCatalogService(QObject):
                         del self._layers[catalog_id]
                         self._disconnect_layer_signals(catalog_id)
                         removed_count += 1
-                        print(f"[LayerCatalogService] Removed {catalog_id} from cache")
+                        logger.info("Removed %s from catalog cache", catalog_id)
                         self.layer_updated.emit(catalog_id)
 
             if removed_count > 0:
-                print(f"[LayerCatalogService] Removed {removed_count} layer(s) from catalog")
-                print("[LayerCatalogService] Hint: If layers are recreated, call rescan_layers() to refresh cache")
+                logger.info("Removed %s managed layer(s) from catalog", removed_count)
+                logger.debug("If layers are recreated, call rescan_layers() to refresh cache")
 
         except Exception as e:
-            print(f"[LayerCatalogService] Error in _on_layers_removed: {e}")
+            logger.exception("layersWillBeRemoved handler failed")
 
     def _on_visibility_changed(self, node: QgsLayerTreeNode):
         """Handle visibilityChanged signal."""
@@ -1197,7 +1411,7 @@ class LayerCatalogService(QObject):
             # For now, just emit model_changed
             self.model_changed.emit()
         except Exception as e:
-            print(f"[LayerCatalogService] Error in _on_visibility_changed: {e}")
+            logger.warning("visibilityChanged handler failed: %s", e, exc_info=True)
 
     def _on_project_saved(self):
         """Handle projectSaved signal."""
@@ -1246,13 +1460,13 @@ class LayerCatalogService(QObject):
         if not layer_ids:
             return
 
-        print(f"[LayerCatalogService] Refreshing {len(layer_ids)} layer(s) after debounce")
+        logger.debug("Refreshing %s layer(s) after debounce", len(layer_ids))
 
         for layer_id in layer_ids:
             try:
                 self.refresh_layer(layer_id, full=False)
             except Exception as e:
-                print(f"[LayerCatalogService] Error refreshing {layer_id}: {e}")
+                logger.warning("Error refreshing %s during debounced update: %s", layer_id, e, exc_info=True)
 
     # --------------------------------------------------------------------
     # Layer-level signal wiring (keeps catalog in sync with edits)
@@ -1312,7 +1526,13 @@ class LayerCatalogService(QObject):
                 signal.connect(handler)
                 connections.append((signal, handler))
             except Exception as exc:
-                print(f"[LayerCatalogService] Warning: Could not connect {signal_name} for {layer_id}: {exc}")
+                logger.warning(
+                    "Could not connect %s for %s: %s",
+                    signal_name,
+                    layer_id,
+                    exc,
+                    exc_info=True
+                )
 
         if connections:
             self._layer_signal_connections[layer_id] = connections
@@ -1343,9 +1563,9 @@ class LayerCatalogService(QObject):
                 signal_obj.disconnect(handler)
             else:
                 signal_obj.disconnect()
-        except (TypeError, RuntimeError, AttributeError):
+        except (TypeError, RuntimeError, AttributeError) as exc:
             if label:
-                print(f"[LayerCatalogService] Warning: Could not disconnect {label}")
+                logger.debug("Could not disconnect %s: %s", label, exc)
 
     def _disconnect_layer_signals(self, layer_id: str) -> None:
         """Disconnect per-layer signal handlers for a specific layer."""
@@ -1368,11 +1588,12 @@ class LayerCatalogService(QObject):
             return
 
         try:
-            print(f"[LayerCatalogService] Mission store changed to: {new_path}")
+            logger.info("Mission store changed to %s", new_path)
             # Force full cache rebuild (layer providers changed: memory ↔ ogr)
             self._build_cache()
         except Exception as e:
-            print(f"[LayerCatalogService] Error in _on_mission_store_changed: {e}")
+            logger.exception("Error handling mission store change")
+            self._notify_error("Mission Store", f"Could not reload mission data: {e}")
 
     # ========================================================================
     # DIAGNOSTICS (Phase 5 Prep)
@@ -1409,7 +1630,7 @@ class LayerCatalogService(QObject):
             "total_features": sum(info.feature_count for info in self._layers.values()),
             "warnings": warnings,
             "mission_store_path": mission_store_path,
-            "last_refresh": datetime.utcnow().isoformat()
+            "last_refresh": datetime.now(timezone.utc).isoformat()
         }
 
     def dump_catalog(self, path: str) -> None:
@@ -1428,10 +1649,13 @@ class LayerCatalogService(QObject):
             "snapshot": self.get_catalog_snapshot()
         }
 
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2, default=str)
-
-        print(f"[LayerCatalogService] Dumped catalog to {path}")
+        try:
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            logger.info("Dumped catalog snapshot to %s", path)
+        except OSError as exc:
+            logger.exception("Failed to dump catalog to %s", path)
+            self._notify_warning("Catalog Dump Failed", f"Could not write catalog file: {exc}")
 
     # ========================================================================
     # LIFECYCLE
@@ -1446,7 +1670,7 @@ class LayerCatalogService(QObject):
         """
         # CRITICAL FIX: Set cleanup flag FIRST (before any other operations)
         self._cleanup_in_progress = True
-        print("[LayerCatalogService] Starting cleanup...")
+        logger.info("LayerCatalogService cleanup started")
 
         # CRITICAL FIX: Stop timer IMMEDIATELY after setting cleanup flag
         # This prevents race condition where timer fires between flag set and signal disconnect
@@ -1454,7 +1678,7 @@ class LayerCatalogService(QObject):
             try:
                 if self._refresh_timer.isActive():
                     self._refresh_timer.stop()  # Stop BEFORE disconnect
-                print("[LayerCatalogService] Stopped refresh timer")
+                logger.debug("Stopped refresh timer")
             except (RuntimeError, TypeError):
                 pass
 
@@ -1485,9 +1709,19 @@ class LayerCatalogService(QObject):
         self._layers.clear()
         self._pending_refresh_layers.clear()
 
+        task_manager = getattr(self, "_task_manager", None)
+        if task_manager:
+            try:
+                task_manager.cancel_all()
+            except Exception:
+                pass
+            if getattr(self, "_owned_task_manager", False):
+                self._task_manager = None
+
         # Null out references
         self.layer_manager = None
         self.iface = None
         self.project = None
 
-        print("[LayerCatalogService] Cleanup complete")
+        self._message_bar = None
+        logger.info("LayerCatalogService cleanup complete")

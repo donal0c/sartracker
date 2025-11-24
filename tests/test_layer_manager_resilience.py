@@ -19,6 +19,8 @@ def _install_qgis_stubs():
     qgis_mod = types.ModuleType("qgis")
     pyqt_mod = types.ModuleType("qgis.PyQt")
     qtcore_mod = types.ModuleType("qgis.PyQt.QtCore")
+    qtgui_mod = types.ModuleType("qgis.PyQt.QtGui")
+    qtwidgets_mod = types.ModuleType("qgis.PyQt.QtWidgets")
     core_mod = types.ModuleType("qgis.core")
 
     class DummySignal:
@@ -56,6 +58,66 @@ def _install_qgis_stubs():
     qtcore_mod.QVariant = QVariant
     qtcore_mod.QObject = QObject
     qtcore_mod.pyqtSignal = pyqtSignal
+
+    class QTimer(QObject):
+        def __init__(self, *_args, **_kwargs):
+            super().__init__()
+            self._active = False
+            self.timeout = pyqtSignal()
+
+        def setSingleShot(self, _flag):
+            return None
+
+        def start(self, _interval):
+            self._active = True
+
+        def stop(self):
+            self._active = False
+
+        def isActive(self):
+            return self._active
+
+        def deleteLater(self):
+            self._active = False
+
+    qtcore_mod.QTimer = QTimer
+
+    class QSettings:
+        def __init__(self, *_args, **_kwargs):
+            self._store = {}
+
+        def value(self, key, default=None):
+            return self._store.get(key, default)
+
+        def setValue(self, key, value):
+            self._store[key] = value
+
+        def remove(self, key):
+            self._store.pop(key, None)
+
+    qtcore_mod.QSettings = QSettings
+
+    class QColor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    class QFont:
+        Bold = 75
+
+        def __init__(self, *_args, **_kwargs):
+            self._size = kwargs.get("pointSize", 10)
+
+        def setPointSize(self, size):
+            self._size = size
+
+    qtgui_mod.QColor = QColor
+    qtgui_mod.QFont = QFont
+
+    class QDialog:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+    qtwidgets_mod.QDialog = QDialog
 
     class QgsProject:
         _instance = None
@@ -132,6 +194,110 @@ def _install_qgis_stubs():
     class QgsLayerTreeLayer:
         pass
 
+    class QgsLayerTreeNode:
+        def __init__(self):
+            self._visible = True
+
+        def isVisible(self):
+            return self._visible
+
+        def setItemVisibilityChecked(self, flag):
+            self._visible = bool(flag)
+
+    class QgsPointXY:
+        def __init__(self, x=0, y=0):
+            self.x = x
+            self.y = y
+
+    class QgsRendererCategory:
+        def __init__(self, value, symbol, label):
+            self.value = value
+            self.symbol = symbol
+            self.label = label
+
+    class QgsCategorizedSymbolRenderer:
+        def __init__(self, field, categories=None):
+            self.field = field
+            self.categories = categories or []
+
+    class QgsFeatureRequest:
+        def __init__(self):
+            self._limit = None
+
+        def setLimit(self, limit):
+            self._limit = limit
+
+    class QgsVectorLayerSimpleLabeling:
+        def __init__(self, *_args, **_kwargs):
+            self.settings = _args[0] if _args else None
+
+    class QgsSimpleMarkerSymbolLayer:
+        def __init__(self, *_args, **_kwargs):
+            self._props = {}
+
+        def setColor(self, *_args, **_kwargs):
+            return None
+
+        def setSize(self, *_args, **_kwargs):
+            return None
+
+    class QgsPalLayerSettings:
+        def __init__(self):
+            self.enabled = False
+
+    class QgsTextFormat:
+        def __init__(self):
+            self.buffer = QgsTextBufferSettings()
+
+    class QgsTextBufferSettings:
+        def __init__(self):
+            self.enabled = False
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+    class QgsFeature:
+        def __init__(self, fid=0):
+            self._id = fid
+            self._attributes = {}
+            self._geometry = None
+
+        def id(self):
+            return self._id
+
+        def setAttributes(self, attrs):
+            self._attributes = attrs
+
+        def attributes(self):
+            return self._attributes
+
+        def attribute(self, key):
+            return self._attributes.get(key)
+
+        def setGeometry(self, geom):
+            self._geometry = geom
+
+        def geometry(self):
+            return self._geometry
+
+    class QgsGeometry:
+        def __init__(self, wkt=""):
+            self._wkt = wkt
+
+        @classmethod
+        def fromPointXY(cls, point):
+            return cls(f"POINT({point.x} {point.y})")
+
+        @classmethod
+        def fromWkt(cls, wkt):
+            return cls(wkt)
+
+        def asWkt(self):
+            return self._wkt
+
+        def isNull(self):
+            return not bool(self._wkt)
+
     class QgsCoordinateReferenceSystem:
         def __init__(self, *_args, **_kwargs):
             self._valid = True
@@ -141,6 +307,10 @@ def _install_qgis_stubs():
 
     class QgsCoordinateTransformContext:
         pass
+
+    class QgsDistanceArea:
+        def measureLine(self, *_args, **_kwargs):
+            return 0.0
 
     class _GeomTypes:
         Point = 1
@@ -164,6 +334,8 @@ def _install_qgis_stubs():
             return None
 
     class QgsTask:
+        CanCancel = 1
+
         def __init__(self, *_args, **_kwargs):
             self.taskCompleted = DummySignal()
             self.taskTerminated = DummySignal()
@@ -242,13 +414,28 @@ def _install_qgis_stubs():
         def uri(self):
             return ""
 
+    NULL = object()
+
     core_mod.QgsProject = QgsProject
     core_mod.QgsVectorLayer = QgsVectorLayer
     core_mod.QgsField = QgsField
     core_mod.QgsLayerTreeGroup = QgsLayerTreeGroup
     core_mod.QgsLayerTreeLayer = QgsLayerTreeLayer
+    core_mod.QgsLayerTreeNode = QgsLayerTreeNode
+    core_mod.QgsPointXY = QgsPointXY
+    core_mod.QgsRendererCategory = QgsRendererCategory
+    core_mod.QgsCategorizedSymbolRenderer = QgsCategorizedSymbolRenderer
+    core_mod.QgsFeatureRequest = QgsFeatureRequest
+    core_mod.QgsVectorLayerSimpleLabeling = QgsVectorLayerSimpleLabeling
+    core_mod.QgsSimpleMarkerSymbolLayer = QgsSimpleMarkerSymbolLayer
+    core_mod.QgsPalLayerSettings = QgsPalLayerSettings
+    core_mod.QgsTextFormat = QgsTextFormat
+    core_mod.QgsTextBufferSettings = QgsTextBufferSettings
+    core_mod.QgsFeature = QgsFeature
+    core_mod.QgsGeometry = QgsGeometry
     core_mod.QgsCoordinateReferenceSystem = QgsCoordinateReferenceSystem
     core_mod.QgsCoordinateTransformContext = QgsCoordinateTransformContext
+    core_mod.QgsDistanceArea = QgsDistanceArea
     core_mod.QgsMarkerSymbol = QgsMarkerSymbol
     core_mod.QgsLineSymbol = QgsLineSymbol
     core_mod.QgsFillSymbol = QgsFillSymbol
@@ -258,16 +445,21 @@ def _install_qgis_stubs():
     core_mod.QgsVectorLayerExporter = QgsVectorLayerExporter
     core_mod.QgsVectorFileWriter = QgsVectorFileWriter
     core_mod.QgsDataSourceUri = QgsDataSourceUri
+    core_mod.NULL = NULL
     core_mod.QgsApplication = types.SimpleNamespace(taskManager=lambda: DummyTaskManager())
     core_mod.QgsProject.instance = classmethod(lambda cls: _project_instance())
 
     sys.modules["qgis"] = qgis_mod
     sys.modules["qgis.PyQt"] = pyqt_mod
     sys.modules["qgis.PyQt.QtCore"] = qtcore_mod
+    sys.modules["qgis.PyQt.QtGui"] = qtgui_mod
+    sys.modules["qgis.PyQt.QtWidgets"] = qtwidgets_mod
     sys.modules["qgis.core"] = core_mod
     qgis_mod.PyQt = pyqt_mod
     qgis_mod.core = core_mod
     pyqt_mod.QtCore = qtcore_mod
+    pyqt_mod.QtGui = qtgui_mod
+    pyqt_mod.QtWidgets = qtwidgets_mod
 
 
 def _install_notify_stub():
@@ -639,3 +831,20 @@ def test_set_mission_finalized_uses_helper(monkeypatch):
     mgr.set_mission_finalized(False)
     assert set_vars[manager.LayerManager.MISSION_FINALIZED_VAR] == ""
     assert locks[-1] is False
+    class QgsRendererCategory:
+        def __init__(self, value, symbol, label):
+            self.value = value
+            self.symbol = symbol
+            self.label = label
+
+    class QgsCategorizedSymbolRenderer:
+        def __init__(self, field, categories=None):
+            self.field = field
+            self.categories = categories or []
+
+    class QgsFeatureRequest:
+        def __init__(self):
+            self._limit = None
+
+        def setLimit(self, limit):
+            self._limit = limit
