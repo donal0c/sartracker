@@ -12,7 +12,7 @@ Qt5/Qt6 Compatible: no Qt imports; safe for background threads (AI_CODE_REFERENC
 
 Classification: CRITICAL - LIFE SAFETY SYSTEM
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -20,6 +20,9 @@ import sys
 import concurrent.futures
 import queue
 from pathlib import Path
+import logging
+from threading import RLock
+import contextlib
 
 from .base import Provider, FeatureDict
 from ..utils.http import HttpClient
@@ -28,6 +31,8 @@ from ..utils.exceptions import (
     ProviderError, ProviderAuthError, ProviderNetworkError, ProviderDataError,
     validate_coordinate_pair
 )
+
+logger = logging.getLogger(__name__)
 
 # Cache file location (OS-specific)
 def _default_cache_dir() -> str:
@@ -159,8 +164,23 @@ class TraccarHttpProvider(Provider):
         # Device cache: {device_id: device_name, ...}
         self._device_cache: Dict[str, str] = {}
         self._device_cache_timestamp: Optional[datetime] = None
+        self._device_cache_stale: bool = False
+        self._device_cache_warning: Optional[str] = None
+        self._cache_lock: RLock = RLock()
+        self._last_breadcrumb_failures: List[str] = []
+        self._last_connection_status: Dict[str, Any] = {
+            'success': None,
+            'message': None,
+            'timestamp': None
+        }
 
-        print(f"[TRACCAR_HTTP] Initialized: {base_url} (auth={auth_type}, timeout={timeout_s}s, cache_ttl={cache_ttl}s)")
+        logger.info(
+            "Traccar HTTP initialized: base_url=%s auth=%s timeout=%ss cache_ttl=%ss",
+            base_url,
+            auth_type,
+            timeout_s,
+            cache_ttl
+        )
 
     def _create_session(self):
         """
@@ -207,11 +227,18 @@ class TraccarHttpProvider(Provider):
         if not force and self._device_cache_timestamp:
             age = (now - self._device_cache_timestamp).total_seconds()
             if age < self.cache_ttl:
-                print(f"[TRACCAR_HTTP] Using cached devices (age={age:.1f}s, ttl={self.cache_ttl}s)")
+                logger.debug(
+                    "Using cached devices (age=%.1fs ttl=%ss)",
+                    age,
+                    self.cache_ttl
+                )
                 return self._device_cache
 
         # Cache miss or expired - fetch from API
-        print(f"[TRACCAR_HTTP] Fetching devices from /api/devices (cache {'forced' if force else 'expired'})")
+        logger.info(
+            "Fetching devices from /api/devices (cache %s)",
+            "forced" if force else "expired"
+        )
 
         try:
             # Create session if not provided
@@ -236,7 +263,7 @@ class TraccarHttpProvider(Provider):
                 device_map = self._build_device_map(data)
                 self._set_device_cache(device_map, timestamp=now)
 
-                print(f"[TRACCAR_HTTP] Device cache updated: {len(device_map)} devices")
+                logger.info("Device cache updated: %s devices", len(device_map))
                 return device_map
 
             finally:
@@ -245,15 +272,37 @@ class TraccarHttpProvider(Provider):
                     try:
                         session.close()
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
+                        logger.warning("Error closing session after /api/devices fetch: %s", e)
 
-        except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
-            # Re-raise provider errors
+        except ProviderAuthError:
+            # Auth failures must always bubble up
             raise
-        except Exception as e:
-            # Wrap unexpected errors
+        except (ProviderNetworkError, ProviderDataError) as exc:
+            if self._device_cache:
+                self._device_cache_stale = True
+                self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+                logger.warning(
+                    "Device fetch failed (%s): %s; using stale cache with %s entries",
+                    exc.__class__.__name__,
+                    exc,
+                    len(self._device_cache)
+                )
+                return self._device_cache
+            raise
+        except Exception as exc:
+            if self._device_cache:
+                self._device_cache_stale = True
+                self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+                logger.warning(
+                    "Unexpected device fetch error (%s): %s; using stale cache with %s entries",
+                    exc.__class__.__name__,
+                    exc,
+                    len(self._device_cache)
+                )
+                return self._device_cache
+            # Wrap unexpected errors when no cache available
             raise ProviderDataError(
-                f"Unexpected error loading devices: {str(e)}",
+                f"Unexpected error loading devices: {str(exc)}",
                 provider_name='traccar_http',
                 recoverable=False
             )
@@ -270,6 +319,33 @@ class TraccarHttpProvider(Provider):
         if timestamp is None:
             timestamp = datetime.now(timezone.utc)
         self._device_cache_timestamp = timestamp
+        self._device_cache_stale = False
+        self._device_cache_warning = None
+
+    def _annotate_origin(self, records: Optional[List[Dict[str, Any]]], origin: str) -> List[Dict[str, Any]]:
+        """
+        Attach a data_origin flag so downstream layers know live vs cached data.
+
+        Args:
+            records: List of feature/device dicts.
+            origin: String flag such as 'live' or 'cache'.
+
+        Returns:
+            New list with data_origin applied (invalid entries skipped).
+        """
+        if not records:
+            return []
+
+        annotated: List[Dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            if record.get('data_origin') == origin:
+                annotated.append(record)
+            else:
+                annotated.append({**record, 'data_origin': origin})
+        return annotated
 
     def _build_device_map(self, raw_devices: List[Dict[str, Any]]) -> Dict[str, str]:
         """
@@ -280,12 +356,12 @@ class TraccarHttpProvider(Provider):
         device_map: Dict[str, str] = {}
         for device in raw_devices or []:
             if not isinstance(device, dict):
-                print(f"[TRACCAR_HTTP] Warning: Skipping invalid device: {device}")
+                logger.warning("Skipping invalid device entry: %s", device)
                 continue
 
             device_id = device.get('id')
             if device_id is None:
-                print(f"[TRACCAR_HTTP] Warning: Device missing 'id': {device}")
+                logger.warning("Device payload missing 'id': %s", device)
                 continue
 
             device_id_str = str(device_id)
@@ -328,7 +404,7 @@ class TraccarHttpProvider(Provider):
         Thread-Safety:
             Safe when each task creates its own session.
         """
-        print("[TRACCAR_HTTP] Fetching current positions from /api/positions")
+        logger.info("Fetching current positions from /api/positions")
 
         try:
             # Create session if not provided
@@ -362,19 +438,25 @@ class TraccarHttpProvider(Provider):
                     except Exception as e:
                         # Log error but continue with other positions (graceful degradation)
                         device_id = pos.get('deviceId', 'unknown')
-                        print(f"[TRACCAR_HTTP] Warning: Failed to normalize position for device {device_id}: {e}")
+                        logger.warning(
+                            "Failed to normalize position for device %s: %s",
+                            device_id,
+                            e
+                        )
                         continue
 
                 # Sort by timestamp (most recent first)
                 features.sort(key=lambda x: x['ts'], reverse=True)
 
-                print(f"[TRACCAR_HTTP] Fetched {len(features)} current positions")
+                logger.info("Fetched %s current positions", len(features))
+
+                annotated_features = self._annotate_origin(features, origin='live')
 
                 # Save to last-good cache
-                if self.enable_last_good_cache and features:
-                    self._save_last_good_cache(features)
+                if self.enable_last_good_cache and annotated_features:
+                    self._save_last_good_cache(annotated_features)
 
-                return features
+                return annotated_features
 
             finally:
                 # Close session if we created it
@@ -382,18 +464,25 @@ class TraccarHttpProvider(Provider):
                     try:
                         session.close()
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
+                        logger.warning("Error closing session after /api/positions fetch: %s", e)
 
         except ProviderAuthError:
             # Auth errors must be surfaced to the operator immediately
             raise
         except (ProviderNetworkError, ProviderDataError) as e:
             if self.enable_last_good_cache:
-                print(f"[TRACCAR_HTTP] {e.__class__.__name__} - loading last-good cache: {e}")
+                logger.warning(
+                    "%s fetching current positions, loading last-good cache: %s",
+                    e.__class__.__name__,
+                    e
+                )
                 cached = self._load_last_good_cache()
                 if cached:
-                    print(f"[TRACCAR_HTTP] Loaded {len(cached)} positions from last-good cache")
-                    return cached
+                    logger.warning(
+                        "Serving %s cached positions from last-good cache",
+                        len(cached)
+                    )
+                    return self._annotate_origin(cached, origin='cache')
 
             raise
         except Exception as e:
@@ -404,7 +493,14 @@ class TraccarHttpProvider(Provider):
                 recoverable=False
             )
 
-    def get_breadcrumbs(self, since_iso: Optional[str] = None, mission_id: Optional[int] = None, session=None) -> List[FeatureDict]:
+    def get_breadcrumbs(
+        self,
+        since_iso: Optional[str] = None,
+        mission_id: Optional[int] = None,
+        session=None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        progress_callback: Optional[Callable[[float], None]] = None
+    ) -> List[FeatureDict]:
         """
         Get breadcrumb trail for all devices.
 
@@ -415,6 +511,8 @@ class TraccarHttpProvider(Provider):
             since_iso: Optional ISO8601 timestamp to filter from (default: last 3 hours)
             mission_id: Optional mission ID (ignored by HTTP provider)
             session: Optional requests.Session for thread-safe execution
+            cancel_check: Optional callable returning True to request cancellation
+            progress_callback: Optional callable receiving progress (0.0-1.0)
 
         Returns:
             List of position features sorted by (device_id, timestamp)
@@ -427,9 +525,28 @@ class TraccarHttpProvider(Provider):
         Thread-Safety:
             Safe when each task creates its own session.
         """
-        print(f"[TRACCAR_HTTP] Fetching breadcrumbs (since={since_iso or 'last 3 hours'})")
+        logger.info("Fetching breadcrumbs (since=%s)", since_iso or "last 3 hours")
+        self._last_breadcrumb_failures = []
+
+        def _should_cancel() -> bool:
+            return bool(cancel_check and cancel_check())
+
+        def _report_progress(completed: int, total: int):
+            if not progress_callback:
+                return
+            total = max(total, 1)
+            fraction = max(0.0, min(1.0, completed / total))
+            try:
+                progress_callback(fraction)
+            except Exception as progress_err:
+                logger.debug("Breadcrumb progress callback failed: %s", progress_err)
+
+        if _should_cancel():
+            logger.info("Breadcrumb fetch canceled before start")
+            return []
 
         session_pool = None
+        executor = None
         try:
             # Create session if not provided
             if session is None:
@@ -441,6 +558,11 @@ class TraccarHttpProvider(Provider):
             try:
                 # Load device cache first
                 device_map = self._load_devices(force=False, session=session)
+                device_count = len(device_map)
+
+                if _should_cancel():
+                    logger.info("Breadcrumb fetch canceled before time window setup")
+                    return []
 
                 # Determine time range using timeparse utilities
                 if since_iso:
@@ -454,13 +576,18 @@ class TraccarHttpProvider(Provider):
                 # Current time
                 to_iso = format_iso(datetime.now(timezone.utc))
 
-                print(f"[TRACCAR_HTTP] Time window: {from_iso} to {to_iso}")
+                logger.debug("Breadcrumb time window: %s -> %s", from_iso, to_iso)
 
                 # Optional bulk fetch (single request) to reduce API load
                 if self.enable_bulk_breadcrumbs:
                     try:
                         bulk_params = {'from': from_iso, 'to': to_iso}
-                        bulk_data = self.http_client.get("/api/positions", session=session, params=bulk_params, expect_json=True)
+                        bulk_data = self.http_client.get(
+                            "/api/positions",
+                            session=session,
+                            params=bulk_params,
+                            expect_json=True
+                        )
                         if isinstance(bulk_data, list):
                             bulk_positions = []
                             for pos in bulk_data:
@@ -468,25 +595,46 @@ class TraccarHttpProvider(Provider):
                                     feature = self._normalize_position(pos, device_map)
                                     bulk_positions.append(feature)
                                 except Exception as e:
-                                    print(f"[TRACCAR_HTTP] Warning: Failed to normalize bulk breadcrumb: {e}")
+                                    logger.warning("Failed to normalize bulk breadcrumb record: %s", e)
                             bulk_positions.sort(key=lambda x: (x['device_id'], x['ts']))
-                            print(f"[TRACCAR_HTTP] Bulk breadcrumbs fetched: {len(bulk_positions)} positions")
-                            return bulk_positions
+                            logger.info("Bulk breadcrumbs fetched: %s positions", len(bulk_positions))
+                            annotated_bulk = self._annotate_origin(bulk_positions, origin='live')
+                            _report_progress(1, 1)
+                            return annotated_bulk
                         else:
-                            print(f"[TRACCAR_HTTP] Bulk breadcrumb response invalid (type={type(bulk_data).__name__}); falling back to per-device")
+                            logger.warning(
+                                "Bulk breadcrumb response invalid (type=%s); falling back to per-device",
+                                type(bulk_data).__name__
+                            )
                     except Exception as bulk_err:
-                        print(f"[TRACCAR_HTTP] Bulk breadcrumb fetch failed: {bulk_err}; falling back to per-device")
+                        logger.warning(
+                            "Bulk breadcrumb fetch failed: %s; falling back to per-device",
+                            bulk_err
+                        )
 
                 # Fetch breadcrumbs for each device in parallel
                 all_positions = []
                 session_pool = queue.Queue()
-                pool_size = max(1, min(self.breadcrumb_workers, len(device_map)))
+                total_devices = max(device_count, 1)
+
+                if device_count == 0:
+                    _report_progress(1, 1)
+                    return []
+
+                pool_size = max(1, min(self.breadcrumb_workers, device_count))
                 for _ in range(pool_size):
                     session_pool.put(self._create_session())
+
+                cancel_requested = False
+                processed_devices = 0
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=pool_size)
 
                 # Helper function for parallel execution
                 def fetch_device_breadcrumbs(device_id_str, device_name):
                     try:
+                        if _should_cancel():
+                            return []
+
                         # Query parameters
                         params = {
                             'deviceId': device_id_str,
@@ -503,7 +651,17 @@ class TraccarHttpProvider(Provider):
                             from_pool = False
 
                         try:
-                            data = self.http_client.get("/api/positions", session=worker_session, params=params, expect_json=True)
+                            data = self.http_client.get(
+                                "/api/positions",
+                                session=worker_session,
+                                params=params,
+                                expect_json=True
+                            )
+                        except Exception as http_err:
+                            message = f"{device_name}: HTTP error {http_err}"
+                            self._last_breadcrumb_failures.append(message)
+                            logger.warning("Failed HTTP breadcrumb fetch for %s: %s", device_name, http_err)
+                            return []
                         finally:
                             if from_pool:
                                 session_pool.put(worker_session)
@@ -515,7 +673,15 @@ class TraccarHttpProvider(Provider):
 
                         # Validate response type
                         if not isinstance(data, list):
-                            print(f"[TRACCAR_HTTP] Warning: Invalid response for device {device_id_str}: expected list, got {type(data).__name__}")
+                            message = (
+                                f"{device_name}: invalid response type {type(data).__name__}"
+                            )
+                            self._last_breadcrumb_failures.append(message)
+                            logger.warning(
+                                "Invalid breadcrumb response for device %s: expected list, got %s",
+                                device_id_str,
+                                type(data).__name__
+                            )
                             return []
 
                         # Normalize each position
@@ -525,32 +691,77 @@ class TraccarHttpProvider(Provider):
                                 feature = self._normalize_position(pos, device_map)
                                 device_positions.append(feature)
                             except Exception as e:
-                                # print(f"[TRACCAR_HTTP] Warning: Failed to normalize breadcrumb position for device {device_id_str}: {e}")
+                                self._last_breadcrumb_failures.append(
+                                    f"{device_name}: invalid position payload ({e})"
+                                )
                                 continue
                         return device_positions
 
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Failed to fetch breadcrumbs for device {device_name}: {e}")
+                        message = f"{device_name}: unexpected error {e}"
+                        self._last_breadcrumb_failures.append(message)
+                        logger.warning(
+                            "Failed to fetch breadcrumbs for device %s: %s",
+                            device_name,
+                            e
+                        )
                         return []
 
                 # Execute in parallel
-                with concurrent.futures.ThreadPoolExecutor(max_workers=pool_size) as executor:
-                    future_to_device = {
-                        executor.submit(fetch_device_breadcrumbs, d_id, d_name): d_id 
-                        for d_id, d_name in device_map.items()
-                    }
-                    
+                future_to_device = {
+                    executor.submit(fetch_device_breadcrumbs, d_id, d_name): (d_id, d_name)
+                    for d_id, d_name in device_map.items()
+                }
+
+                try:
                     for future in concurrent.futures.as_completed(future_to_device):
-                        results = future.result()
+                        device_id_str, device_name = future_to_device[future]
+                        try:
+                            results = future.result()
+                        except Exception as worker_exc:
+                            message = f"{device_name}: worker error {worker_exc}"
+                            self._last_breadcrumb_failures.append(message)
+                            logger.warning(
+                                "Breadcrumb worker failed for device %s: %s",
+                                device_name,
+                                worker_exc
+                            )
+                            results = []
+
                         if results:
                             all_positions.extend(results)
+
+                        processed_devices += 1
+                        _report_progress(processed_devices, total_devices)
+
+                        if _should_cancel():
+                            cancel_requested = True
+                            break
+                finally:
+                    executor.shutdown(wait=not cancel_requested, cancel_futures=cancel_requested)
 
                 # Sort by (device_id, timestamp)
                 all_positions.sort(key=lambda x: (x['device_id'], x['ts']))
 
-                print(f"[TRACCAR_HTTP] Fetched {len(all_positions)} breadcrumb positions for {len(device_map)} devices")
+                logger.info(
+                    "Fetched %s breadcrumb positions for %s devices",
+                    len(all_positions),
+                    len(device_map)
+                )
 
-                return all_positions
+                if cancel_requested:
+                    logger.info(
+                        "Breadcrumb fetch canceled after %s/%s devices; returning partial data",
+                        processed_devices,
+                        device_count
+                    )
+                    _report_progress(processed_devices, total_devices)
+                    return self._annotate_origin(all_positions, origin='live')
+
+                _report_progress(total_devices, total_devices)
+                annotated_positions = self._annotate_origin(all_positions, origin='live')
+
+                return annotated_positions
 
             finally:
                 # Close pooled sessions
@@ -567,14 +778,19 @@ class TraccarHttpProvider(Provider):
                     try:
                         session.close()
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
+                        logger.warning("Error closing session after breadcrumbs fetch: %s", e)
 
         except (ProviderAuthError, ProviderNetworkError, ProviderDataError) as prov_err:
             if self.enable_last_good_cache:
                 cached_breadcrumbs = self._load_last_good_breadcrumbs()
                 if cached_breadcrumbs:
-                    print(f"[TRACCAR_HTTP] {prov_err.__class__.__name__} fetching breadcrumbs; using cached breadcrumbs ({len(cached_breadcrumbs)} points)")
-                    return cached_breadcrumbs
+                    logger.warning(
+                        "%s fetching breadcrumbs; using cached breadcrumbs (%s points)",
+                        prov_err.__class__.__name__,
+                        len(cached_breadcrumbs)
+                    )
+                    _report_progress(1, 1)
+                    return self._annotate_origin(cached_breadcrumbs, origin='cache')
             # Re-raise provider errors
             raise
         except Exception as e:
@@ -609,7 +825,7 @@ class TraccarHttpProvider(Provider):
         Thread-Safety:
             Safe when each task creates its own session.
         """
-        print("[TRACCAR_HTTP] Fetching devices from /api/devices")
+        logger.info("Fetching devices from /api/devices")
 
         try:
             # Create session if not provided
@@ -634,7 +850,7 @@ class TraccarHttpProvider(Provider):
                 # Update device cache so subsequent calls during this refresh don't re-fetch
                 device_map = self._build_device_map(data)
                 self._set_device_cache(device_map)
-                print(f"[TRACCAR_HTTP] Device cache updated via get_devices: {len(device_map)} devices")
+                logger.info("Device cache updated via get_devices: %s devices", len(device_map))
 
                 # Normalize each device
                 devices = []
@@ -645,10 +861,14 @@ class TraccarHttpProvider(Provider):
                     except Exception as e:
                         # Log error but continue with other devices
                         device_id = raw_device.get('id', 'unknown')
-                        print(f"[TRACCAR_HTTP] Warning: Failed to normalize device {device_id}: {e}")
+                        logger.warning(
+                            "Failed to normalize device %s: %s",
+                            device_id,
+                            e
+                        )
                         continue
 
-                print(f"[TRACCAR_HTTP] Fetched {len(devices)} devices")
+                logger.info("Fetched %s devices", len(devices))
                 return devices
 
             finally:
@@ -657,7 +877,7 @@ class TraccarHttpProvider(Provider):
                     try:
                         session.close()
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Error closing session: {e}")
+                        logger.warning("Error closing session after /api/devices in get_devices: %s", e)
 
         except (ProviderAuthError, ProviderNetworkError, ProviderDataError):
             # Re-raise provider errors
@@ -800,10 +1020,6 @@ class TraccarHttpProvider(Provider):
             return
 
         try:
-            # Ensure cache directory exists
-            os.makedirs(_CACHE_DIR, exist_ok=True)
-
-            # Write cache file
             cache_data = {
                 'timestamp': format_iso(datetime.now(timezone.utc)),
                 'features': features
@@ -811,15 +1027,49 @@ class TraccarHttpProvider(Provider):
             if breadcrumbs is not None:
                 cache_data['breadcrumbs'] = breadcrumbs
 
-            with open(_CACHE_FILE, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=2)
+            tmp_file = f"{_CACHE_FILE}.tmp"
+            with self._cache_lock:
+                os.makedirs(_CACHE_DIR, exist_ok=True)
+                try:
+                    with open(tmp_file, 'w', encoding='utf-8') as f:
+                        json.dump(cache_data, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp_file, _CACHE_FILE)
+                finally:
+                    with contextlib.suppress(FileNotFoundError):
+                        os.remove(tmp_file)
 
-            print(f"[TRACCAR_HTTP] Saved {len(features)} positions to last-good cache"
-                  + (f" and {len(breadcrumbs)} breadcrumbs" if breadcrumbs is not None else ""))
+            if breadcrumbs is not None:
+                logger.info(
+                    "Saved %s positions and %s breadcrumbs to last-good cache",
+                    len(features),
+                    len(breadcrumbs)
+                )
+            else:
+                logger.info(
+                    "Saved %s positions to last-good cache",
+                    len(features)
+                )
 
         except Exception as e:
             # Don't let cache save failures propagate - log and continue
-            print(f"[TRACCAR_HTTP] Warning: Failed to save last-good cache: {e}")
+            logger.warning("Failed to save last-good cache: %s", e)
+
+    def _purge_cache_file(self, reason: str):
+        """
+        Remove corrupt cache file to allow clean recreation.
+
+        Args:
+            reason: Human-readable reason for purge.
+        """
+        with self._cache_lock:
+            try:
+                if os.path.exists(_CACHE_FILE):
+                    os.remove(_CACHE_FILE)
+                    logger.warning("Removed corrupt last-good cache (%s)", reason)
+            except Exception as exc:
+                logger.warning("Failed to remove corrupt cache after %s: %s", reason, exc)
 
     def _load_last_good_cache(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
         """
@@ -833,7 +1083,11 @@ class TraccarHttpProvider(Provider):
         """
         cache = self._read_last_good_cache(max_age_s=max_age_s)
         if cache:
-            print(f"[TRACCAR_HTTP] Loaded {len(cache.get('features', []))} positions from cache (saved: {cache.get('timestamp')})")
+            logger.info(
+                "Loaded %s positions from cache (saved: %s)",
+                len(cache.get('features', [])),
+                cache.get('timestamp')
+            )
             return cache.get('features')
         return None
 
@@ -849,7 +1103,11 @@ class TraccarHttpProvider(Provider):
         """
         cache = self._read_last_good_cache(max_age_s=max_age_s)
         if cache and cache.get('breadcrumbs'):
-            print(f"[TRACCAR_HTTP] Loaded {len(cache.get('breadcrumbs', []))} breadcrumbs from cache (saved: {cache.get('timestamp')})")
+            logger.info(
+                "Loaded %s breadcrumbs from cache (saved: %s)",
+                len(cache.get('breadcrumbs', [])),
+                cache.get('timestamp')
+            )
             return cache.get('breadcrumbs')
         return None
 
@@ -860,35 +1118,51 @@ class TraccarHttpProvider(Provider):
         if not self.enable_last_good_cache:
             return None
 
-        try:
+        with self._cache_lock:
             if not os.path.exists(_CACHE_FILE):
-                print("[TRACCAR_HTTP] No last-good cache file found")
+                logger.debug("No last-good cache file found at %s", _CACHE_FILE)
                 return None
 
-            with open(_CACHE_FILE, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
+            try:
+                with open(_CACHE_FILE, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+            except json.JSONDecodeError as exc:
+                logger.warning("JSON decode error reading last-good cache: %s", exc)
+                self._purge_cache_file(f"JSON decode error: {exc}")
+                return None
+            except Exception as exc:
+                logger.warning("Failed to read last-good cache: %s", exc)
+                return None
 
             if not isinstance(cache_data, dict) or 'features' not in cache_data or 'timestamp' not in cache_data:
-                print("[TRACCAR_HTTP] Invalid cache file structure")
+                logger.warning("Invalid cache file structure at %s", _CACHE_FILE)
+                self._purge_cache_file("Invalid cache structure")
                 return None
 
             timestamp_str = cache_data.get('timestamp')
-            cache_time = parse_iso(timestamp_str)
+            try:
+                cache_time = parse_iso(timestamp_str)
+            except Exception as exc:
+                logger.warning("Invalid cache timestamp '%s': %s", timestamp_str, exc)
+                self._purge_cache_file("Invalid timestamp format")
+                return None
+
             if cache_time.tzinfo is None:
                 cache_time = cache_time.replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             age = (now - cache_time).total_seconds()
 
             if max_age_s is not None and age > max_age_s:
-                print(f"[TRACCAR_HTTP] Cache expired (age={age:.1f}s > max={max_age_s}s), ignoring")
+                logger.info(
+                    "Cache expired (age=%.1fs > max=%ss), ignoring",
+                    age,
+                    max_age_s
+                )
                 return None
 
             cache_data['age_seconds'] = age
             cache_data['timestamp'] = timestamp_str
             return cache_data
-        except Exception as e:
-            print(f"[TRACCAR_HTTP] Warning: Failed to read last-good cache: {e}")
-            return None
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """
@@ -914,12 +1188,15 @@ class TraccarHttpProvider(Provider):
             'cache_ttl_s': self.cache_ttl,
             'device_cache_size': len(self._device_cache),
             'device_cache_age_s': device_cache_age,
+            'device_cache_stale': self._device_cache_stale,
+            'device_cache_warning': self._device_cache_warning,
             'last_good_cache_age_s': last_good_age,
             'last_good_cache_ts': last_good_ts,
             'last_good_positions': last_good_positions,
             'last_good_breadcrumbs': last_good_breadcrumbs,
             'breadcrumb_workers': self.breadcrumb_workers,
-            'bulk_breadcrumbs_enabled': self.enable_bulk_breadcrumbs
+            'bulk_breadcrumbs_enabled': self.enable_bulk_breadcrumbs,
+            'breadcrumb_failures': list(self._last_breadcrumb_failures)
         }
 
     def save_casualty(self, mission_id: int, name: str, lat: float, lon: float,
@@ -931,7 +1208,11 @@ class TraccarHttpProvider(Provider):
         Raises:
             NotImplementedError
         """
-        raise NotImplementedError("Traccar HTTP provider does not support saving casualties")
+        raise ProviderDataError(
+            "Traccar HTTP provider does not support saving casualties",
+            provider_name='traccar_http',
+            recoverable=False
+        )
 
     def save_poi(self, mission_id: int, name: str, lat: float, lon: float,
                 poi_type: str = "", irish_grid_e: Optional[float] = None,
@@ -943,7 +1224,11 @@ class TraccarHttpProvider(Provider):
         Raises:
             NotImplementedError
         """
-        raise NotImplementedError("Traccar HTTP provider does not support saving POIs")
+        raise ProviderDataError(
+            "Traccar HTTP provider does not support saving POIs",
+            provider_name='traccar_http',
+            recoverable=False
+        )
 
     def test_connection(self, session=None) -> bool:
         """
@@ -975,10 +1260,22 @@ class TraccarHttpProvider(Provider):
 
                 # Validate response is a list
                 if not isinstance(data, list):
-                    print(f"[TRACCAR_HTTP] Connection test failed: invalid response type")
+                    message = "Connection test failed: invalid response type"
+                    logger.warning(message)
+                    self._last_connection_status = {
+                        'success': False,
+                        'message': message,
+                        'timestamp': format_iso(datetime.now(timezone.utc))
+                    }
                     return False
 
-                print(f"[TRACCAR_HTTP] Connection test successful ({len(data)} devices)")
+                success_message = f"Connection test successful ({len(data)} devices)"
+                logger.info(success_message)
+                self._last_connection_status = {
+                    'success': True,
+                    'message': success_message,
+                    'timestamp': format_iso(datetime.now(timezone.utc))
+                }
                 return True
 
             finally:
@@ -987,12 +1284,23 @@ class TraccarHttpProvider(Provider):
                     try:
                         session.close()
                     except Exception as e:
-                        print(f"[TRACCAR_HTTP] Warning: Error closing session in test_connection: {e}")
+                        logger.warning("Error closing session in test_connection: %s", e)
 
         except Exception as e:
             # Catch all exceptions and return False (per contract)
-            print(f"[TRACCAR_HTTP] Connection test failed: {e}")
+            logger.error("Connection test failed: %s", e)
+            self._last_connection_status = {
+                'success': False,
+                'message': str(e),
+                'timestamp': format_iso(datetime.now(timezone.utc))
+            }
             return False
+
+    def get_connection_status(self) -> Dict[str, Any]:
+        """
+        Return last connection test status for diagnostics panels.
+        """
+        return dict(self._last_connection_status)
 
     def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
         """

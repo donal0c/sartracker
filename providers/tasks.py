@@ -172,6 +172,18 @@ class ConnectionTestTask(QgsTask):
             if self.isCanceled():
                 return False
 
+            def _update_error_from_status():
+                status_getter = getattr(self.provider, "get_connection_status", None)
+                if callable(status_getter):
+                    try:
+                        status = status_getter()
+                    except Exception:
+                        return
+                    if status:
+                        message = status.get('message')
+                        if message:
+                            self.error_message = message
+
             # For HTTP providers, pass a thread-local session (Issue #1 fix)
             # For other providers (CSV), test_connection() doesn't need session
             if hasattr(self.provider, '_create_session'):
@@ -179,6 +191,8 @@ class ConnectionTestTask(QgsTask):
                 session = self.provider._create_session()
                 try:
                     self.success = self.provider.test_connection(session=session)
+                    if not self.success:
+                        _update_error_from_status()
                 finally:
                     # CRITICAL: Close session to release connections
                     try:
@@ -188,6 +202,8 @@ class ConnectionTestTask(QgsTask):
             else:
                 # CSV or other provider without session support
                 self.success = self.provider.test_connection()
+                if not self.success:
+                    _update_error_from_status()
 
             return self.success
 
@@ -577,19 +593,36 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
             # Fetch breadcrumbs with session (always attempt, even when using cached positions)
             breadcrumb_processing = None
+            def _breadcrumb_progress(fraction: float):
+                try:
+                    fraction_val = max(0.0, min(1.0, float(fraction)))
+                except Exception:
+                    fraction_val = 0.0
+                start = 66.0
+                end = 95.0
+                self.setProgress(start + (end - start) * fraction_val)
+
             try:
-                breadcrumbs = self.provider.get_breadcrumbs(session=session)
+                breadcrumbs = self.provider.get_breadcrumbs(
+                    session=session,
+                    cancel_check=self.isCanceled,
+                    progress_callback=_breadcrumb_progress
+                )
             except (ProviderNetworkError, ProviderDataError) as e:
                 print(f"[TRACCAR_TASK] {e.__class__.__name__} fetching breadcrumbs: {e}")
                 breadcrumbs = self.provider._load_last_good_breadcrumbs() if getattr(self.provider, 'enable_last_good_cache', False) else []
                 if breadcrumbs:
                     print(f"[TRACCAR_TASK] Using cached breadcrumbs ({len(breadcrumbs)} points)")
+                _breadcrumb_progress(1.0)
             except ProviderAuthError as e:
                 self.error_message = f"Failed to fetch breadcrumbs: {str(e)}"
                 return False
             except Exception as e:
                 print(f"[TRACCAR_TASK] Error fetching breadcrumbs: {e}")
                 breadcrumbs = []
+                _breadcrumb_progress(1.0)
+            else:
+                _breadcrumb_progress(1.0)
 
             # Check for cancellation
             if self.isCanceled():
