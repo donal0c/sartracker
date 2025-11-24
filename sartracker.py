@@ -27,6 +27,7 @@ import sys
 import os
 import re
 import shutil
+import math
 from pathlib import Path
 from datetime import datetime
 
@@ -425,6 +426,41 @@ class sartracker:
         except Exception as e:
             print(f"[SARTRACKER] Notify failed ({level}): {e}")
 
+    def _log_exception(self, context: str, exc: Exception):
+        """Log an exception with context and traceback for diagnostics."""
+        try:
+            tb = traceback.format_exc()
+        except Exception:
+            tb = None
+        print(f"[SARTRACKER][{context}] {exc}")
+        if tb:
+            print(tb)
+
+    def _is_number(self, value) -> bool:
+        """Return True if value can be interpreted as a finite float (excludes bool)."""
+        if value is None or isinstance(value, bool):
+            return False
+        try:
+            return math.isfinite(float(value))
+        except Exception:
+            return False
+
+    def _valid_latlon(self, lat, lon) -> bool:
+        """Basic latitude/longitude validation."""
+        if not self._is_number(lat) or not self._is_number(lon):
+            return False
+        lat_f = float(lat)
+        lon_f = float(lon)
+        return -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0
+
+    def _clear_loading_state(self):
+        """Safely clear SAR panel loading indicator."""
+        try:
+            if self.sar_panel:
+                self.sar_panel.set_loading_state(False)
+        except Exception as exc:
+            self._log_exception("_clear_loading_state", exc)
+
     def _components_ready(self, *attrs) -> bool:
         """Return True if all named attributes are truthy."""
         return all(getattr(self, name, None) for name in attrs)
@@ -440,6 +476,46 @@ class sartracker:
             backup_dir=self._mission_backup_directory,
             gpkg_path=self._mission_gpkg_path
         )
+
+    def _setup_status_bar_coords(self) -> bool:
+        """Initialize coordinate label, timer, and map canvas listener."""
+        try:
+            self.coords_label = QLabel()
+            self.coords_label.setMinimumWidth(550)
+            self.coords_label.setMaximumWidth(550)  # Fixed width prevents jitter
+
+            # Use monospace font for stable width
+            font = QFont("Courier New", 10)
+            if not font.exactMatch():
+                font = QFont("Monospace", 10)
+            self.coords_label.setFont(font)
+
+            self.coords_label.setStyleSheet("QLabel { padding: 2px 8px; background-color: #f0f0f0; }")
+            self.iface.statusBarIface().addPermanentWidget(self.coords_label)
+
+            # Set up timer to throttle coordinate updates (50ms = 20 updates/sec max)
+            # Phase 0 fix: Add parent for proper Qt lifecycle (AI_CODE_REFERENCE.md Pattern 7)
+            self.coords_update_timer = QTimer(self.iface.mainWindow())
+            self.coords_update_timer.timeout.connect(self._update_coords_display)
+            self.coords_update_timer.start(50)
+
+            # Connect to map canvas mouse movement (stores point, actual update happens on timer)
+            # Store connection reference for proper cleanup in unload() (Issue #4)
+            self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
+            self._map_canvas_connected = True
+            return True
+        except Exception as exc:
+            self._log_exception("_setup_status_bar_coords", exc)
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Coordinate status display failed to initialize.",
+                duration=5
+            )
+            self._map_canvas_connected = False
+            self.coords_update_timer = None
+            self.coords_label = None
+            return False
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -963,29 +1039,7 @@ class sartracker:
             print("[SARTRACKER] Drawing tool buttons disabled due to registry initialization failure")
 
         # Add coordinate display to status bar
-        self.coords_label = QLabel()
-        self.coords_label.setMinimumWidth(550)
-        self.coords_label.setMaximumWidth(550)  # Fixed width prevents jitter
-
-        # Use monospace font for stable width
-        font = QFont("Courier New", 10)
-        if not font.exactMatch():
-            font = QFont("Monospace", 10)
-        self.coords_label.setFont(font)
-
-        self.coords_label.setStyleSheet("QLabel { padding: 2px 8px; background-color: #f0f0f0; }")
-        self.iface.statusBarIface().addPermanentWidget(self.coords_label)
-
-        # Set up timer to throttle coordinate updates (50ms = 20 updates/sec max)
-        # Phase 0 fix: Add parent for proper Qt lifecycle (AI_CODE_REFERENCE.md Pattern 7)
-        self.coords_update_timer = QTimer(self.iface.mainWindow())
-        self.coords_update_timer.timeout.connect(self._update_coords_display)
-        self.coords_update_timer.start(50)
-
-        # Connect to map canvas mouse movement (stores point, actual update happens on timer)
-        # Store connection reference for proper cleanup in unload() (Issue #4)
-        self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
-        self._map_canvas_connected = True
+        self._setup_status_bar_coords()
 
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
@@ -1877,6 +1931,7 @@ class sartracker:
         try:
             paths = self.mission_storage.prepare_new_mission(mission_name)
         except Exception as exc:
+            self._log_exception("_prepare_new_mission_storage", exc)
             error(self.iface.messageBar(), "Mission Storage", f"Failed to prepare mission storage: {exc}", duration=6)
             return
 
@@ -1919,6 +1974,7 @@ class sartracker:
         try:
             paths = self.mission_storage.handle_resume(Path(store_path))
         except Exception as exc:
+            self._log_exception("_handle_mission_resume_storage", exc)
             warning(
                 self.iface.messageBar(),
                 "Mission Storage",
@@ -2017,16 +2073,38 @@ class sartracker:
         self._mission_directory = gpkg_path.parent
         self._mission_folder_name = self._mission_directory.name
         attachments_dir = self._mission_directory / "attachments"
-        if attachments_dir.exists():
-            self._mission_attachments_dir = attachments_dir
-        else:
-            attachments_dir.mkdir(parents=True, exist_ok=True)
-            self._mission_attachments_dir = attachments_dir
-        self._mission_backup_directory = self.mission_storage.ensure_backup_directory(
-            folder_name=self._mission_folder_name,
-            backup_root=None,
-            create=False
-        ) if self.mission_storage else None
+        try:
+            if attachments_dir.exists():
+                self._mission_attachments_dir = attachments_dir
+            else:
+                attachments_dir.mkdir(parents=True, exist_ok=True)
+                self._mission_attachments_dir = attachments_dir
+        except Exception as exc:
+            self._mission_attachments_dir = None
+            self._log_exception("_load_existing_mission_storage_state.attachments", exc)
+            warning(
+                self.iface.messageBar(),
+                "Mission Storage",
+                "Attachments folder could not be prepared. Attachments will stay at original paths.",
+                duration=6
+            )
+
+        self._mission_backup_directory = None
+        if self.mission_storage:
+            try:
+                self._mission_backup_directory = self.mission_storage.ensure_backup_directory(
+                    folder_name=self._mission_folder_name,
+                    backup_root=None,
+                    create=False
+                )
+            except Exception as exc:
+                self._log_exception("_load_existing_mission_storage_state.backup", exc)
+                warning(
+                    self.iface.messageBar(),
+                    "Mission Storage",
+                    "Backup directory unavailable. Backups are disabled until path is fixed.",
+                    duration=6
+                )
         try:
             existing_coords = self.layer_manager.get_mission_coordinators() if self.layer_manager else ""
             self._mission_coordinators_cache = existing_coords or ""
@@ -2072,7 +2150,15 @@ class sartracker:
         paths = self._current_mission_paths()
         if not paths:
             return attachment_path
-        return self.mission_storage.ingest_attachment(paths, attachment_path)
+        try:
+            return self.mission_storage.ingest_attachment(paths, attachment_path)
+        except Exception as exc:
+            self._log_exception("_ingest_attachment", exc)
+            warning(self.iface.messageBar(),
+                    "Mission Storage",
+                    f"Attachment could not be copied to mission store. Using original path. ({exc})",
+                    duration=6)
+            return attachment_path
 
     def _sync_mission_backup(self, async_run: bool = False) -> bool:
         """Mirror GeoPackage (and attachments if present) to backup root."""
@@ -2087,7 +2173,17 @@ class sartracker:
             self._start_backup_task(paths)
             return True
 
-        return self.mission_storage.sync_backup(paths)
+        try:
+            return self.mission_storage.sync_backup(paths)
+        except Exception as exc:
+            self._log_exception("_sync_mission_backup", exc)
+            warning(
+                self.iface.messageBar(),
+                "Mission Backup",
+                f"Backup failed: {exc}",
+                duration=6
+            )
+            return False
 
     def _start_backup_task(self, paths: MissionPaths):
         """Run backup sync in background to avoid UI blocking."""
@@ -2197,8 +2293,9 @@ class sartracker:
             # Reset state on setup error
             self._refresh_in_progress = False
             self._refresh_started_at = None
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
+
+            self._log_exception("_on_refresh_data", e)
 
             self._notify("error", "Refresh Error", f"Failed to start refresh: {str(e)}", duration=5)
 
@@ -2223,8 +2320,7 @@ class sartracker:
             self._current_refresh_task = None
 
             # Hide loading state (check again before accessing)
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             # Check if task was cancelled
             if task.isCanceled():
@@ -2325,8 +2421,9 @@ class sartracker:
         except Exception as e:
             # Reset state on processing error
             self._refresh_in_progress = False
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
+
+            self._log_exception("_on_refresh_complete", e)
 
             self._notify("error", "Refresh Error", f"Error processing refresh results: {str(e)}", duration=5)
 
@@ -2353,8 +2450,7 @@ class sartracker:
             self._last_refresh_duration_ms = None
 
             # Hide loading state
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             # Show error message
             error_msg = task.error_message if task.error_message else "Unknown error during refresh"
@@ -2362,17 +2458,14 @@ class sartracker:
 
         except Exception as e:
             # DEFENSIVE: Catch ALL exceptions to prevent crashes in error handler
-            print(f"[SARTRACKER] Exception in _on_refresh_error: {e}")
-            import traceback
-            traceback.print_exc()
+            self._log_exception("_on_refresh_error", e)
 
             # Reset state (safe even if components are None)
             self._refresh_in_progress = False
 
             # Try to update UI, but don't crash if components are gone
             try:
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
             except:
                 pass
 
@@ -2488,8 +2581,7 @@ class sartracker:
         except Exception as e:
             # Reset state on error during provider creation
             self._refresh_in_progress = False
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             error(
                 self.iface.messageBar(),
@@ -2546,8 +2638,7 @@ class sartracker:
             if self._pending_provider is None:
                 print("[SARTRACKER] Warning: Connection test completed but no pending provider")
                 self._refresh_in_progress = False
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
                 return
 
             # Check if connection test succeeded
@@ -2559,8 +2650,7 @@ class sartracker:
                 print(f"[SARTRACKER] Rolling back to previous provider: {self.provider_name}")
 
                 self._refresh_in_progress = False
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
 
                 # Show user-friendly error
                 provider_display = self._pending_provider_name
@@ -2656,8 +2746,7 @@ class sartracker:
             # Verify provider still exists (defensive check for life-safety)
             if not self.provider:
                 self._refresh_in_progress = False
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
                 error(
                     self.iface.messageBar(),
                     "Internal Error",
@@ -2670,8 +2759,7 @@ class sartracker:
             # Verify task manager still exists (defensive check)
             if not self.task_manager:
                 self._refresh_in_progress = False
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
                 error(
                     self.iface.messageBar(),
                     "Internal Error",
@@ -2699,14 +2787,11 @@ class sartracker:
 
         except Exception as e:
             # DEFENSIVE: Catch all exceptions to prevent error handler crashes
-            print(f"[SARTRACKER] Exception in _on_connection_test_complete: {e}")
-            import traceback
-            traceback.print_exc()
+            self._log_exception("_on_connection_test_complete", e)
 
             # Reset state
             self._refresh_in_progress = False
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             # Clean up shadow state (preserve current provider on error)
             self._pending_provider = None
@@ -2753,8 +2838,7 @@ class sartracker:
             if self._pending_provider is None:
                 print("[SARTRACKER] Warning: Connection test error but no pending provider")
                 self._refresh_in_progress = False
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
                 return
 
             # ================================================================
@@ -2767,8 +2851,7 @@ class sartracker:
             self._refresh_in_progress = False
 
             # Hide loading state
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             # Get error message
             error_msg = (
@@ -2802,9 +2885,7 @@ class sartracker:
 
         except Exception as e:
             # Last resort error handling
-            print(f"[SARTRACKER] Error in connection test error handler: {e}")
-            import traceback
-            traceback.print_exc()
+            self._log_exception("_on_connection_test_error", e)
 
             # Best effort: clean up shadow state
             self._pending_provider = None
@@ -2814,8 +2895,7 @@ class sartracker:
             self._refresh_in_progress = False
 
             try:
-                if self.sar_panel:
-                    self.sar_panel.set_loading_state(False)
+                self._clear_loading_state()
             except:
                 pass
 
@@ -2851,8 +2931,7 @@ class sartracker:
             self._current_refresh_task = None
 
             # Hide loading state (check again before accessing)
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
 
             # Check if task was cancelled
             if task.isCanceled():
@@ -2938,8 +3017,9 @@ class sartracker:
         except Exception as e:
             # Reset state on processing error
             self._refresh_in_progress = False
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(False)
+            self._clear_loading_state()
+
+            self._log_exception("_on_load_complete", e)
 
             error(
                 self.iface.messageBar(),
@@ -3097,6 +3177,15 @@ class sartracker:
             easting: Irish Grid Easting (ITM)
             northing: Irish Grid Northing (ITM)
         """
+        if not self._valid_latlon(lat, lon):
+            warning(
+                self.iface.messageBar(),
+                "Markers",
+                "Invalid coordinates from map click; marker not added.",
+                duration=4
+            )
+            return
+
         if self.marker_controller:
             self.marker_controller.handle_new_marker(
                 self.current_marker_type or "ipp_lkp",
@@ -3184,6 +3273,12 @@ class sartracker:
 
     def _on_marker_zoom_requested(self, lat: float, lon: float):
         """Zoom map canvas to marker coordinates."""
+        if not self._valid_latlon(lat, lon):
+            warning(self.iface.messageBar(),
+                    "Markers",
+                    "Marker coordinates are invalid; cannot zoom.",
+                    duration=4)
+            return
         try:
             dest_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
             source_crs = QgsCoordinateReferenceSystem(4326)
@@ -3604,30 +3699,49 @@ class sartracker:
         if not self.layers_controller:
             return
 
+        # Basic validation
+        if not self._is_number(distance_m) or not self._is_number(bearing):
+            warning(
+                self.iface.messageBar(),
+                "Measurement Overlays",
+                "Invalid measurement values; overlay not saved.",
+                duration=4
+            )
+            return
+
         from datetime import datetime as dt
 
-        canvas = self.iface.mapCanvas()
-        canvas_crs = canvas.mapSettings().destinationCrs()
-        transform = QgsCoordinateTransform(canvas_crs, self.wgs84, QgsProject.instance())
+        try:
+            canvas = self.iface.mapCanvas()
+            canvas_crs = canvas.mapSettings().destinationCrs()
+            transform = QgsCoordinateTransform(canvas_crs, self.wgs84, QgsProject.instance())
 
-        points_wgs84 = [
-            transform.transform(point1),
-            transform.transform(point2)
-        ]
+            points_wgs84 = [
+                transform.transform(point1),
+                transform.transform(point2)
+            ]
 
-        if distance_m < 1000:
-            distance_str = f"{distance_m:.1f} m"
-        else:
-            distance_str = f"{distance_m / 1000.0:.2f} km"
+            if distance_m < 1000:
+                distance_str = f"{distance_m:.1f} m"
+            else:
+                distance_str = f"{distance_m / 1000.0:.2f} km"
 
-        name = f"Measurement {dt.now().strftime('%H:%M:%S')}"
-        description = f"{distance_str} | {bearing:.1f}°"
+            name = f"Measurement {dt.now().strftime('%H:%M:%S')}"
+            description = f"{distance_str} | {bearing:.1f}°"
 
-        self.layers_controller.add_measurement_overlay(
-            name=name,
-            points_wgs84=points_wgs84,
-            description=description
-        )
+            self.layers_controller.add_measurement_overlay(
+                name=name,
+                points_wgs84=points_wgs84,
+                description=description
+            )
+        except Exception as exc:
+            self._log_exception("_persist_measurement_overlay", exc)
+            warning(
+                self.iface.messageBar(),
+                "Measurement Overlays",
+                "Could not save measurement overlay.",
+                duration=4
+            )
 
     def _update_measurement_overlay_indicator(self):
         """Update SARPanel measurement badge with current overlay count."""
@@ -3684,7 +3798,7 @@ class sartracker:
                 if save_success:
                     persistence_issues = self.layer_manager.validate_persistence(quiet=True) if self.layer_manager else {}
                     persistence_ok = not persistence_issues
-                    backup_ok = self._sync_mission_backup()
+                    backup_ok = self._sync_mission_backup(async_run=True)
                     if not persistence_ok:
                         warning(
                             self.iface.messageBar(),
@@ -3731,7 +3845,7 @@ class sartracker:
                     if save_success:
                         persistence_issues = self.layer_manager.validate_persistence(quiet=True) if self.layer_manager else {}
                         persistence_ok = not persistence_issues
-                        backup_ok = self._sync_mission_backup()
+                        backup_ok = self._sync_mission_backup(async_run=True)
                         overall_success = persistence_ok and backup_ok
                         if not persistence_ok:
                             warning(
@@ -3762,7 +3876,9 @@ class sartracker:
                     pass
 
         except Exception as e:
-            self.sar_panel.update_autosave_status(False)
+            if self.sar_panel:
+                self.sar_panel.update_autosave_status(False)
+            self._log_exception("_on_autosave_requested", e)
             QMessageBox.critical(
                 self.iface.mainWindow(),
                 "Auto-Save Error",
@@ -4169,7 +4285,7 @@ class sartracker:
 
     # ============================================================================
 
-    def get_plugin_status(self) -> dict:
+    def get_plugin_status(self, debug_hook=None) -> dict:
         """
         Get current plugin status for diagnostics.
 
@@ -4307,5 +4423,11 @@ class sartracker:
             # Defensive: Don't let diagnostics query crash plugin
             # See AI_CODE_REFERENCE.md – Pattern 9 (Defensive Guards)
             print(f"[SARTRACKER] Warning: Error reading plugin status: {e}")
+
+        if debug_hook:
+            try:
+                debug_hook(status)
+            except Exception as exc:
+                self._log_exception("get_plugin_status.debug_hook", exc)
 
         return status
