@@ -433,38 +433,59 @@ class LayerConsoleWidget(QWidget):
         if self._task_manager:
             self._task_manager.cancel_task("refresh")
 
-        # CRITICAL: Use background task if catalog service available
-        if self._catalog:
+        # CRITICAL: Use background task for both catalog service and fetcher paths
+        if self._catalog or self._catalog_fetcher:
             # Show loading state
             self._show_loading_state()
 
-            # Create background task
             # PERFORMANCE FIX: Issue #3.4 - Pass filters to avoid fetching hidden layers
             show_hidden = self.show_hidden_checkbox.isChecked() if self.show_hidden_checkbox else True
             filter_favorites = (self.filter_combo.currentData() == "favorites") if self.filter_combo else False
 
-            task = FetchConsoleModelTask(
-                catalog=self._catalog,
-                include_features=True,
-                feature_limit=self._feature_limit,
-                show_hidden=show_hidden,
-                filter_favorites_only=filter_favorites
-            )
+            if self._catalog:
+                task = FetchConsoleModelTask(
+                    catalog=self._catalog,
+                    include_features=True,
+                    feature_limit=self._feature_limit,
+                    show_hidden=show_hidden,
+                    filter_favorites_only=filter_favorites
+                )
+                task_id = "refresh"
+                on_complete = lambda t: self._on_refresh_complete(t, full)
+            else:
+                # Wrap synchronous fetcher in a QgsTask for background execution
+                class FetcherTask(QgsTask):
+                    def __init__(self, fetcher: Callable[[], Dict[str, Any]]):
+                        super().__init__("Fetch Layer Console Model (fetcher)", QgsTask.CanCancel)
+                        self.fetcher = fetcher
+                        self.result = None
+                        self.error_message = None
+
+                    def run(self):
+                        try:
+                            self.result = self.fetcher() or {"groups": []}
+                            return True
+                        except Exception as exc:
+                            self.error_message = str(exc)
+                            print(f"[FetcherTask] Error: {exc}")
+                            import traceback
+                            traceback.print_exc()
+                            return False
+
+                task = FetcherTask(self._catalog_fetcher)
+                task_id = "refresh_fetcher"
+                on_complete = lambda t: self._on_refresh_complete(t, full)
 
             # Start task with callbacks
             self._task_manager.start_task(
                 task=task,
-                on_complete=lambda t: self._on_refresh_complete(t, full),
+                on_complete=on_complete,
                 on_error=self._on_refresh_error,
-                task_id="refresh"
+                task_id=task_id
             )
         else:
-            # Fallback to synchronous fetch (for backward compatibility)
-            self._catalog_data = self._fetch_catalog_model()
-            if full:
-                self._rebuild_tree()
-            else:
-                self._update_tree_incremental()
+            # No catalog available - notify parent to attempt refresh
+            self.refresh_requested.emit()
 
     def _show_loading_state(self):
         """
@@ -572,10 +593,12 @@ class LayerConsoleWidget(QWidget):
                 print(f"[LayerConsole] Refresh failed: {task.error_message}")
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText(f"Refresh failed: {task.error_message}")
+                    self.status_label.setStyleSheet("color: red;")
             else:
                 print("[LayerConsole] Refresh task cancelled or terminated")
                 if hasattr(self, 'status_label') and self.status_label:
                     self.status_label.setText("Refresh cancelled")
+                    self.status_label.setStyleSheet("")
         finally:
             # Always restore UI state
             self._hide_loading_state()
@@ -590,34 +613,26 @@ class LayerConsoleWidget(QWidget):
         if self._cleanup_in_progress:
             return {"groups": []}
 
-        if self._catalog:
-            try:
+        # In async refactor, this method should only be used by background tasks or legacy callers.
+        try:
+            if self._catalog:
                 return self._catalog.get_console_model(
                     include_features=True,
                     feature_limit=self._feature_limit
                 ) or {"groups": []}
-            except Exception as exc:
-                print(f"[LayerConsole] Error fetching catalog via service: {exc}")
-                # CRITICAL FIX: Issue #2.7 - Show error to user
-                if hasattr(self, 'status_label') and self.status_label:
-                    self.status_label.setText(f"Error loading catalog: {exc}")
-                    self.status_label.setStyleSheet("color: red;")
-                return {"groups": []}
 
-        if self._catalog_fetcher:
-            try:
+            if self._catalog_fetcher:
                 return self._catalog_fetcher() or {"groups": []}
-            except Exception as exc:
-                print(f"[LayerConsole] Error fetching catalog via fetcher: {exc}")
-                # CRITICAL FIX: Issue #2.7 - Show error to user
-                if hasattr(self, 'status_label') and self.status_label:
-                    self.status_label.setText(f"Error loading catalog: {exc}")
-                    self.status_label.setStyleSheet("color: red;")
-                return {"groups": []}
 
-        # No catalog available - notify parent to attempt refresh
-        self.refresh_requested.emit()
-        return {"groups": []}
+            # No catalog available - notify parent to attempt refresh
+            self.refresh_requested.emit()
+            return {"groups": []}
+        except Exception as exc:
+            print(f"[LayerConsole] Error fetching catalog: {exc}")
+            if hasattr(self, 'status_label') and self.status_label:
+                self.status_label.setText(f"Error loading catalog: {exc}")
+                self.status_label.setStyleSheet("color: red;")
+            return {"groups": []}
 
     def _validate_catalog_data(self, data: Any) -> Dict[str, Any]:
         """ISSUE #4.8: Validate and sanitize catalog data structure.
@@ -648,7 +663,39 @@ class LayerConsoleWidget(QWidget):
             if not isinstance(group, dict):
                 print(f"[LayerConsole] Security: group[{i}] is not dict, skipping")
                 continue
-            validated_groups.append(group)
+            layers = group.get("layers", [])
+            if not isinstance(layers, list):
+                print(f"[LayerConsole] Security: group[{i}].layers is not list, skipping group")
+                continue
+
+            validated_layers: List[Dict[str, Any]] = []
+            for j, layer in enumerate(layers):
+                if not isinstance(layer, dict):
+                    print(f"[LayerConsole] Security: group[{i}].layers[{j}] is not dict, skipping")
+                    continue
+
+                features = layer.get("features", [])
+                if not isinstance(features, list):
+                    print(f"[LayerConsole] Security: group[{i}].layers[{j}].features is not list, coercing to empty")
+                    features = []
+
+                # Clamp features to feature_limit to avoid UI overload / DoS
+                max_features = max(1, int(self._feature_limit or 0)) if isinstance(self._feature_limit, int) else 300
+                validated_features: List[Dict[str, Any]] = []
+                for k, feature in enumerate(features[:max_features]):
+                    if not isinstance(feature, dict):
+                        print(f"[LayerConsole] Security: group[{i}].layers[{j}].features[{k}] is not dict, skipping")
+                        continue
+                    validated_features.append(feature)
+
+                layer_copy = dict(layer)
+                layer_copy["features"] = validated_features
+                validated_layers.append(layer_copy)
+
+            if validated_layers:
+                group_copy = dict(group)
+                group_copy["layers"] = validated_layers
+                validated_groups.append(group_copy)
 
         return {"groups": validated_groups}
 
@@ -887,10 +934,14 @@ class LayerConsoleWidget(QWidget):
 
     # ------------------------------------------------------------------ Item creation
     def _create_group_item(self, group_data: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
-        group_id = group_data.get("id")
-        group_name = group_data.get("name", "Group")
-        layers = group_data.get("layers", []) or []
-        if not layers:
+        try:
+            group_id = group_data.get("id")
+            group_name = group_data.get("name", "Group")
+            layers = group_data.get("layers", []) or []
+            if not isinstance(layers, list) or not layers:
+                return None
+        except Exception as exc:
+            print(f"[LayerConsole] Warning: failed to read group data: {exc}")
             return None
 
         total_features = sum(layer.get("feature_count", 0) for layer in layers)
@@ -920,10 +971,14 @@ class LayerConsoleWidget(QWidget):
         return item
 
     def _create_layer_item(self, layer_data: Dict[str, Any]) -> Optional[QTreeWidgetItem]:
-        layer_id = layer_data.get("layer_id")
-        if not layer_id:
+        try:
+            layer_id = layer_data.get("layer_id")
+            if not layer_id:
+                return None
+            layer_name = layer_data.get("display_name") or layer_data.get("name", "Layer")
+        except Exception as exc:
+            print(f"[LayerConsole] Warning: failed to read layer data: {exc}")
             return None
-        layer_name = layer_data.get("display_name") or layer_data.get("name", "Layer")
 
         # CRITICAL FIX: Issue #2.6 - Use display_feature_count for filtered views
         # Shows filtered count during search, total count otherwise
@@ -961,6 +1016,9 @@ class LayerConsoleWidget(QWidget):
         })
 
         features = layer_data.get("features", []) or []
+        if not isinstance(features, list):
+            print(f"[LayerConsole] Warning: features for layer {layer_id} is not list, skipping features")
+            features = []
         for feature_data in features:
             feature_item = self._create_feature_item(feature_data, layer_id)
             if feature_item:
@@ -980,6 +1038,10 @@ class LayerConsoleWidget(QWidget):
         return item
 
     def _create_feature_item(self, feature_data: Dict[str, Any], layer_id: str) -> Optional[QTreeWidgetItem]:
+        if not isinstance(feature_data, dict):
+            print(f"[LayerConsole] Warning: feature data for layer {layer_id} is not dict, skipping")
+            return None
+
         feature_name = feature_data.get("name") or feature_data.get("id")
         feature_id = feature_data.get("feature_id", feature_data.get("id"))
         business_id = feature_data.get("business_id")
@@ -2159,86 +2221,43 @@ class LayerConsoleWidget(QWidget):
         search_text = self.search_input.text().strip().lower() if self.search_input else ""
         show_hidden = self.show_hidden_checkbox.isChecked() if self.show_hidden_checkbox else True
 
-        filtered_groups: List[Dict[str, Any]] = []
-        total_items = 0
-        shown_items = 0
-        self._search_active = bool(search_text)
-
-        for group in groups or []:
-            layers = group.get("layers", []) or []
-            new_layers: List[Dict[str, Any]] = []
-
-            for layer in layers:
-                features = layer.get("features", []) or []
-                feature_count = max(layer.get("feature_count", 0), len(features))
-
-                # ISSUE #4.2: Check type filter first, then show-hidden
-                # This makes more sense: "Show me markers (including hidden ones)"
-                if not self._layer_matches_type_filter(layer, filter_value):
-                    continue
-
-                # Show-hidden filter only applies when no specific type filter is active
-                # When filtering by type, user wants to see all of that type
-                if filter_value in (None, "favorites"):
-                    # Only apply show-hidden when showing "All Types" or "Favorites"
-                    if not show_hidden and not layer.get("is_visible", True):
-                        continue
-
-                layer_name = layer.get("display_name") or layer.get("name", "")
-                layer_matches_search = self._matches_search(layer_name, search_text)
-
-                filtered_features = features
-                if search_text:
-                    # ISSUE #4.1: Don't override filtered features when layer name matches
-                    # Keep filtered features even if layer name matches search
-                    filtered_features = [
-                        f for f in features
-                        if self._matches_search(f.get("name") or f.get("id", ""), search_text)
-                        or self._matches_search(str(f.get("business_id", "")), search_text)
-                        or self._matches_search(str(f.get("type", "")), search_text)
-                    ]
-
-                if search_text and not layer_matches_search and not filtered_features:
-                    continue
-
-                layer_copy = dict(layer)
-                layer_copy["features"] = filtered_features
-
-                # CRITICAL FIX: Issue #2.6 - Show filtered count during search
-                # Coordinator needs to see which layers have matching features
-                if search_text and not layer_matches_search:
-                    # Searching and layer name doesn't match - show filtered count
-                    layer_copy["display_feature_count"] = len(filtered_features)
-                else:
-                    # Not searching OR layer name matches - show total count
-                    layer_copy["display_feature_count"] = layer_copy.get("feature_count", 0)
-
-                new_layers.append(layer_copy)
-                displayed_features = len(filtered_features) if self._search_active else len(features)
-                shown_items += 1 + displayed_features
-                total_items += 1 + feature_count
-
-            if new_layers:
-                new_group = dict(group)
-                new_group["layers"] = new_layers
-                filtered_groups.append(new_group)
+        filtered_groups, shown_items, total_items, search_active = self._shape_filtered_groups(
+            groups=groups,
+            filter_value=filter_value,
+            search_text=search_text,
+            show_hidden=show_hidden,
+            feature_limit=self._feature_limit
+        )
 
         self._status_total_items = total_items
         self._status_shown_items = shown_items
+        self._search_active = search_active
         return filtered_groups
 
     def _matches_search(self, text: str, needle: str) -> bool:
         """Case-insensitive substring search with None safety."""
+        return self._matches_search_static(text, needle)
+
+    def _layer_matches_type_filter(self, layer: Dict[str, Any], filter_value: Optional[str]) -> bool:
+        """Determine if a layer matches the selected type filter."""
+        return self._layer_matches_type_filter_static(layer, filter_value)
+
+    @staticmethod
+    def _matches_search_static(text: str, needle: str) -> bool:
+        """Case-insensitive substring search with None safety (pure helper)."""
         if not needle:
             return True
         if text is None:
             return False
         return needle in str(text).lower()
 
-    def _layer_matches_type_filter(self, layer: Dict[str, Any], filter_value: Optional[str]) -> bool:
-        """Determine if a layer matches the selected type filter."""
+    @staticmethod
+    def _layer_matches_type_filter_static(layer: Dict[str, Any], filter_value: Optional[str]) -> bool:
+        """Determine if a layer matches the selected type filter (pure helper)."""
         if not filter_value:
             return True
+        if not isinstance(layer, dict):
+            return False
         layer_id = layer.get("layer_id")
         if not layer_id:
             return False
@@ -2261,6 +2280,88 @@ class LayerConsoleWidget(QWidget):
         if filter_value == "breadcrumbs":
             return layer_id in TRACK_LAYER_IDS
         return True
+
+    @staticmethod
+    def _shape_filtered_groups(groups: List[Dict[str, Any]], filter_value: Optional[str],
+                               search_text: str, show_hidden: bool,
+                               feature_limit: Optional[int]) -> Tuple[List[Dict[str, Any]], int, int, bool]:
+        """
+        Pure helper: apply filter/search/show-hidden rules and return shaped groups.
+
+        Returns:
+            (filtered_groups, shown_items, total_items, search_active)
+        """
+        filtered_groups: List[Dict[str, Any]] = []
+        total_items = 0
+        shown_items = 0
+        search_active = bool(search_text)
+        search_text = search_text or ""
+        max_features = max(1, int(feature_limit or 0)) if isinstance(feature_limit, int) else 300
+
+        for group in groups or []:
+            if not isinstance(group, dict):
+                print("[LayerConsole] Warning: skipping non-dict group in filtered view")
+                continue
+
+            layers = group.get("layers", []) or []
+            if not isinstance(layers, list):
+                print("[LayerConsole] Warning: skipping group with non-list layers in filtered view")
+                continue
+            new_layers: List[Dict[str, Any]] = []
+
+            for layer in layers:
+                if not isinstance(layer, dict):
+                    print("[LayerConsole] Warning: skipping non-dict layer in filtered view")
+                    continue
+                features = layer.get("features", []) or []
+                if not isinstance(features, list):
+                    print("[LayerConsole] Warning: features payload is not list, coercing to empty")
+                    features = []
+                if max_features and len(features) > max_features:
+                    features = features[:max_features]
+                feature_count = max(layer.get("feature_count", 0), len(features))
+
+                if not LayerConsoleWidget._layer_matches_type_filter_static(layer, filter_value):
+                    continue
+
+                if filter_value in (None, "favorites"):
+                    if not show_hidden and not layer.get("is_visible", True):
+                        continue
+
+                layer_name = layer.get("display_name") or layer.get("name", "")
+                layer_matches_search = LayerConsoleWidget._matches_search_static(layer_name, search_text)
+
+                filtered_features = features
+                if search_text:
+                    filtered_features = [
+                        f for f in features
+                        if LayerConsoleWidget._matches_search_static(f.get("name") or f.get("id", ""), search_text)
+                        or LayerConsoleWidget._matches_search_static(str(f.get("business_id", "")), search_text)
+                        or LayerConsoleWidget._matches_search_static(str(f.get("type", "")), search_text)
+                    ]
+
+                if search_text and not layer_matches_search and not filtered_features:
+                    continue
+
+                layer_copy = dict(layer)
+                layer_copy["features"] = filtered_features
+
+                if search_text and not layer_matches_search:
+                    layer_copy["display_feature_count"] = len(filtered_features)
+                else:
+                    layer_copy["display_feature_count"] = layer_copy.get("feature_count", 0)
+
+                new_layers.append(layer_copy)
+                displayed_features = len(filtered_features) if search_active else len(features)
+                shown_items += 1 + displayed_features
+                total_items += 1 + feature_count
+
+            if new_layers:
+                new_group = dict(group)
+                new_group["layers"] = new_layers
+                filtered_groups.append(new_group)
+
+        return filtered_groups, shown_items, total_items, search_active
 
     def _has_group_structure_changed(self, group_item: QTreeWidgetItem, group_data: Dict[str, Any]) -> bool:
         """Detect add/remove layer or feature changes requiring rebuild."""

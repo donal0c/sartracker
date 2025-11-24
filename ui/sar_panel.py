@@ -86,6 +86,8 @@ class SARPanel(QDockWidget):
         self.hidden_panels = []  # Track which panels we hid
         self._pause_flash = False
         self._is_finalized = False
+        self._is_active = True
+        self._audit_warning_logged = False
         self._layer_console_connections: List[Tuple[Any, Any]] = []
         self._mission_controller_connections: List[Tuple[Any, Callable]] = []
         self._marker_layer_to_type = {}
@@ -163,26 +165,32 @@ class SARPanel(QDockWidget):
         self.attachment_open_requested.emit(path)
 
     def _current_user_name(self) -> str:
-        """Get the current user name for audit logging.
+        """Get the current user name for audit logging with fallbacks."""
+        try:
+            stored_name = QSettings().value("sartracker/coordinator_name")
+            if stored_name:
+                return str(stored_name)
+        except Exception as settings_error:
+            print(f"[SARPanel] Warning: Failed to read coordinator name: {settings_error}")
 
-        Returns:
-            User name from QGIS or system, or "Unknown" if unavailable
-        """
         try:
             from qgis.core import QgsApplication
             user = QgsApplication.userFullName()
             if user:
                 return user
-        except Exception:
-            pass
+        except Exception as qgis_error:
+            print(f"[SARPanel] Warning: Failed to read QGIS user name: {qgis_error}")
 
         try:
             user = getpass.getuser()
             if user:
                 return user
-        except Exception:
-            pass
+        except Exception as os_error:
+            print(f"[SARPanel] Warning: Failed to read system user name: {os_error}")
 
+        if not getattr(self, "_user_name_warning_logged", False):
+            print("[SARPanel] Warning: Could not determine user name; using 'Unknown'")
+            self._user_name_warning_logged = True
         return "Unknown"
 
     def _get_audit_log_path(self) -> Optional[str]:
@@ -225,6 +233,9 @@ class SARPanel(QDockWidget):
         audit_path = self._get_audit_log_path()
         if not audit_path:
             print(f"[SARPanel] Warning: Audit logging disabled (no path available)")
+            if not self._audit_warning_logged:
+                self._notify(warning, "Audit Logging", "Audit log unavailable; actions will not be recorded.")
+                self._audit_warning_logged = True
             return
 
         try:
@@ -242,8 +253,12 @@ class SARPanel(QDockWidget):
                 f.write(json.dumps(entry) + "\n")
 
             print(f"[SARPanel] Audit: {operation} on {layer_id} by {entry['user']} (count={count})")
+            self._audit_warning_logged = False
         except Exception as e:
             print(f"[SARPanel] ERROR: Failed to write audit log: {e}")
+            if not self._audit_warning_logged:
+                self._notify(error, "Audit Logging", f"Failed to write audit log: {e}")
+                self._audit_warning_logged = True
 
     def _standard_icon(self, *enum_names: str) -> QIcon:
         """
@@ -801,6 +816,8 @@ class SARPanel(QDockWidget):
 
     def _toggle_pause_flash(self):
         """Flash pause button while mission paused."""
+        if not self._is_active:
+            return
         self._pause_flash = not self._pause_flash
         self._set_button_state(self.pause_button, "flashOn", self._pause_flash)
 
@@ -1040,6 +1057,9 @@ class SARPanel(QDockWidget):
 
     def _apply_auto_refresh_timer(self):
         """Start/stop the auto-refresh timer based on current config."""
+        if not self._is_active:
+            self.refresh_timer.stop()
+            return
         if self.auto_refresh_enabled:
             self.refresh_timer.start(self.auto_refresh_interval_seconds * 1000)
         else:
@@ -1067,6 +1087,9 @@ class SARPanel(QDockWidget):
 
     def _apply_autosave_timer(self):
         """Start/stop the auto-save timer based on current config."""
+        if not self._is_active:
+            self.autosave_timer.stop()
+            return
         if self.autosave_enabled:
             self.autosave_timer.start(self.autosave_interval_minutes * 60 * 1000)
         else:
@@ -1427,6 +1450,8 @@ class SARPanel(QDockWidget):
     
     def _on_auto_refresh(self):
         """Handle auto-refresh timer."""
+        if not self._is_active:
+            return
         # Only refresh if mission is not paused (or controller unavailable)
         if not self._mission_controller:
             self.refresh_requested.emit()
@@ -1468,25 +1493,44 @@ class SARPanel(QDockWidget):
             devices: List of device dicts from provider
         """
         self.devices_list.clear()
-        
-        for device in devices:
-            device_id = device.get('device_id', 'Unknown')
-            status = device.get('status', 'unknown')
-            last_update = device.get('last_update', 'Never')
-            
-            # Format display text
-            text = f"{device_id}"
-            if status == 'online':
-                text = f"🟢 {text}"
-            elif status == 'offline':
-                text = f"🔴 {text}"
-            else:
-                text = f"⚪ {text}"
-            
-            text += f"\n  Last: {last_update}"
-            
-            item = QListWidgetItem(text)
-            self.devices_list.addItem(item)
+        try:
+            if devices is None:
+                return
+            if not isinstance(devices, list):
+                raise ValueError("Device payload must be a list")
+
+            invalid = 0
+            for device in devices:
+                if not isinstance(device, dict):
+                    invalid += 1
+                    continue
+
+                device_id = device.get('device_id') or device.get('id') or 'Unknown'
+                status = device.get('status', 'unknown')
+                last_update = device.get('last_update', 'Never')
+                
+                # Format display text
+                text = f"{device_id}"
+                if status == 'online':
+                    text = f"🟢 {text}"
+                elif status == 'offline':
+                    text = f"🔴 {text}"
+                else:
+                    text = f"⚪ {text}"
+                
+                text += f"\n  Last: {last_update}"
+                
+                item = QListWidgetItem(text)
+                self.devices_list.addItem(item)
+
+            if invalid and not getattr(self, "_devices_warning_logged", False):
+                self._notify(warning, "Devices", f"Ignored {invalid} malformed device entries")
+                self._devices_warning_logged = True
+        except Exception as exc:
+            self.devices_list.clear()
+            if not getattr(self, "_devices_warning_logged", False):
+                self._notify(warning, "Devices", f"Could not display devices: {exc}")
+                self._devices_warning_logged = True
     
     def set_data_source(self, source_info: str):
         """
@@ -1660,6 +1704,8 @@ class SARPanel(QDockWidget):
 
     def _on_autosave(self):
         """Handle auto-save timer - request project save."""
+        if not self._is_active:
+            return
         if self.autosave_enabled:
             self.autosave_requested.emit()
 
@@ -1701,69 +1747,83 @@ class SARPanel(QDockWidget):
 
         Qt5/Qt6 Compatible: Uses QLabel.setText().
         """
-        provider = status_dict.get('provider', 'None')
-        state = status_dict.get('state', 'unknown')
-        message = status_dict.get('message', '')
-        devices_count = status_dict.get('devices_count', 0)
-        last_refresh = status_dict.get('last_refresh', 'Never')
-        poll_active = status_dict.get('poll_active', False)
-        poll_interval = status_dict.get('poll_interval')
-        last_error = status_dict.get('last_error')
+        try:
+            if not isinstance(status_dict, dict):
+                raise ValueError("Status payload must be a dict")
 
-        # Format last refresh time
-        if last_refresh and last_refresh != 'Never':
-            try:
-                # Extract time component from ISO timestamp
-                last_refresh = last_refresh.split('T')[1][:8] if 'T' in last_refresh else last_refresh
-            except:
-                pass
+            provider = status_dict.get('provider', 'None')
+            state = status_dict.get('state', 'unknown')
+            message = status_dict.get('message', '')
+            devices_count = status_dict.get('devices_count', 0)
+            last_refresh = status_dict.get('last_refresh', 'Never')
+            poll_active = status_dict.get('poll_active', False)
+            poll_interval = status_dict.get('poll_interval')
+            last_error = status_dict.get('last_error')
 
-        # Format status text
-        status_parts = [f"Provider: {provider}"]
-        status_parts.append(f"Devices: {devices_count}")
-        if last_refresh != 'Never':
-            status_parts.append(f"Last Refresh: {last_refresh}")
-        if poll_active:
-            if poll_interval:
-                status_parts.append(f"🔄 Polling ({poll_interval}s)")
+            # Format last refresh time
+            if last_refresh and last_refresh != 'Never':
+                try:
+                    # Extract time component from ISO timestamp
+                    last_refresh = last_refresh.split('T')[1][:8] if 'T' in last_refresh else last_refresh
+                except Exception:
+                    pass
+
+            # Format status text
+            status_parts = [f"Provider: {provider}"]
+            status_parts.append(f"Devices: {devices_count}")
+            if last_refresh != 'Never':
+                status_parts.append(f"Last Refresh: {last_refresh}")
+            if poll_active:
+                if poll_interval:
+                    status_parts.append(f"🔄 Polling ({poll_interval}s)")
+                else:
+                    status_parts.append("🔄 Polling")
+
+            # Add state indicator
+            if state == 'ok':
+                status_parts.append("✓ Connected")
+            elif state == 'error':
+                status_parts.append("✗ Error")
+            elif state == 'testing':
+                status_parts.append("⏳ Testing...")
+            elif state == 'connecting':
+                status_parts.append("⏳ Connecting...")
+
+            if last_error and state == 'error':
+                status_parts.append(f"Last Error: {last_error}")
+            elif message:
+                status_parts.append(message)
+
+            status_text = " | ".join(status_parts)
+            self.provider_status_label.setText(status_text)
+
+            # Update label background color based on state
+            if state == 'ok':
+                bg_color = "#d4edda"  # Light green
+            elif state == 'error':
+                bg_color = "#f8d7da"  # Light red
+            elif state in ('testing', 'connecting'):
+                bg_color = "#fff3cd"  # Light yellow
             else:
-                status_parts.append("🔄 Polling")
+                bg_color = "#f0f0f0"  # Light gray
 
-        # Add state indicator
-        if state == 'ok':
-            status_parts.append("✓ Connected")
-        elif state == 'error':
-            status_parts.append("✗ Error")
-        elif state == 'testing':
-            status_parts.append("⏳ Testing...")
-        elif state == 'connecting':
-            status_parts.append("⏳ Connecting...")
-
-        if last_error and state == 'error':
-            status_parts.append(f"Last Error: {last_error}")
-
-        status_text = " | ".join(status_parts)
-        self.provider_status_label.setText(status_text)
-
-        # Update label background color based on state
-        if state == 'ok':
-            bg_color = "#d4edda"  # Light green
-        elif state == 'error':
-            bg_color = "#f8d7da"  # Light red
-        elif state in ('testing', 'connecting'):
-            bg_color = "#fff3cd"  # Light yellow
-        else:
-            bg_color = "#f0f0f0"  # Light gray
-
-        self.provider_status_label.setStyleSheet(
-            f"QLabel {{ "
-            f"  padding: 4px; "
-            f"  background-color: {bg_color}; "
-            f"  border: 1px solid #ccc; "
-            f"  border-radius: 3px; "
-            f"  font-size: 10px; "
-            f"}}"
-        )
+            self.provider_status_label.setStyleSheet(
+                f"QLabel {{ "
+                f"  padding: 4px; "
+                f"  background-color: {bg_color}; "
+                f"  border: 1px solid #ccc; "
+                f"  border-radius: 3px; "
+                f"  font-size: 10px; "
+                f"}}"
+            )
+        except Exception as exc:
+            self.provider_status_label.setText("Provider: unavailable | State: unknown")
+            self.provider_status_label.setStyleSheet(
+                "QLabel { padding: 4px; background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 3px; font-size: 10px; }"
+            )
+            if not getattr(self, "_provider_warning_logged", False):
+                self._notify(warning, "Provider Status", f"Could not render provider status: {exc}")
+                self._provider_warning_logged = True
 
     def _toggle_focus_mode(self):
         """
@@ -1915,6 +1975,7 @@ class SARPanel(QDockWidget):
         Qt5/Qt6 Compatible: Uses standard QTimer methods (isActive, stop).
         """
         try:
+            self._is_active = False
             # CRITICAL: Disconnect tracked layer console signals to prevent segfault
             # Use targeted disconnection - only disconnect our handlers, not all handlers
             for signal, handler in list(self._layer_console_connections):
@@ -2023,10 +2084,3 @@ class SARPanel(QDockWidget):
         super().closeEvent(event)
 
         print("[SARTRACKER] SARPanel: closeEvent handled, timers stopped")
-
-    def _current_user_name(self) -> str:
-        """Retrieve coordinator name for audit trail."""
-        try:
-            return QSettings().value("sartracker/coordinator_name", "Unknown") or "Unknown"
-        except Exception:
-            return "Unknown"

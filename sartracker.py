@@ -22,6 +22,7 @@
  ***************************************************************************/
 """
 from typing import Optional, Dict, List, Any
+from importlib import import_module
 import sys
 import os
 import re
@@ -39,6 +40,13 @@ if os.path.exists(vendor_path):
         print(f"[SAR Tracker] Injected vendor path: {vendor_path}")
 else:
     print(f"[SAR Tracker] Warning: Vendor path not found: {vendor_path}")
+
+# Ensure plugin parent is available for package imports (defensive)
+plugin_root = os.path.dirname(__file__)
+plugin_parent = os.path.dirname(plugin_root)
+if plugin_parent and plugin_parent not in sys.path:
+    sys.path.insert(0, plugin_parent)
+    print(f"[SAR Tracker] Added plugin parent to sys.path: {plugin_parent}")
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
@@ -660,7 +668,22 @@ class sartracker:
         # pylint: disable=attribute-defined-outside-init
         def _init_drawing_tool(self, tool_attr, import_path, class_name, ctor, hooks):
             try:
-                module = __import__(import_path, fromlist=[class_name])
+                package_name = __package__ or (__name__.rpartition('.')[0] or __name__)
+                if not package_name or package_name == "__main__":
+                    package_name = Path(__file__).resolve().parent.name
+
+                # First attempt: relative import using package context (preferred)
+                try:
+                    module = import_module(import_path, package=package_name)
+                    resolved_name = f"{package_name}{import_path}"
+                except ModuleNotFoundError as import_error:
+                    # Fallback: build absolute module path manually
+                    if import_path.startswith('.'):
+                        resolved_name = f"{package_name}{import_path}"
+                    else:
+                        resolved_name = import_path
+                    module = import_module(resolved_name)
+
                 cls = getattr(module, class_name)
                 tool = ctor(cls)
                 hooks(tool)
@@ -669,7 +692,8 @@ class sartracker:
                 setattr(self, tool_attr, None)
                 warning(self.iface.messageBar(), "SAR Tracker",
                         f"{class_name} failed to load: {e}", duration=5)
-                print(f"ERROR initializing {class_name}: {e}")
+                print(f"ERROR initializing {class_name} from {resolved_name if 'resolved_name' in locals() else import_path}: {e}")
+                traceback.print_exc()
 
         # Bind helper as instance method
         self._init_drawing_tool = _init_drawing_tool.__get__(self, sartracker)

@@ -142,6 +142,7 @@ class LayerManager(QObject):
     MISSION_FINALIZED_AT_VAR = "sartracker:finalized_at"
     MISSION_COORDINATORS_VAR = "sartracker:mission_coordinators"
     MISSION_RESUME_TIME_VAR = "sartracker:mission_resume_time"
+    _metadata_migration_in_progress = False
 
     def __init__(self, iface):
         """
@@ -161,9 +162,18 @@ class LayerManager(QObject):
         self._mission_store_path: Optional[str] = self._load_mission_store_path()
         self._layer_provider_uris: Dict[str, str] = {}
         self._metadata_lock = RLock()  # Thread-safety for metadata operations
+        self._metadata_migration_in_progress = False
 
         # Connect to project signals for cache management
         self._connect_signals()
+
+    def _log(self, level: str, message: str):
+        """Consistent logging helper for LayerManager."""
+        try:
+            print(f"[LayerManager][{level}] {message}")
+        except Exception:
+            # Avoid raising if stdout unavailable
+            pass
 
     def _connect_signals(self):
         """Connect to project signals to manage cache lifecycle."""
@@ -172,7 +182,12 @@ class LayerManager(QObject):
                 self.project.layersWillBeRemoved.connect(self._on_layers_removed)
                 self._signals_connected = True
             except Exception as e:
-                print(f"[LayerManager] Warning: Could not connect signals: {e}")
+                msg = f"Could not connect project signals: {e}"
+                self._log("WARN", msg)
+                try:
+                    warning(self.iface.messageBar(), "Layer Manager", msg)
+                except Exception:
+                    pass
 
     def _load_mission_store_path(self) -> Optional[str]:
         """Read mission store path from project custom variables."""
@@ -196,12 +211,28 @@ class LayerManager(QObject):
 
         normalized = str(Path(path).expanduser())
         target_dir = Path(normalized).parent
-        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            msg = f"Failed to prepare mission store directory '{target_dir}': {exc}"
+            self._log("WARN", msg)
+            try:
+                error(self.iface.messageBar(), "Mission Store", msg)
+            except Exception:
+                # Best-effort notify; avoid raising further
+                pass
+            return
 
         try:
             self._set_project_variable(self.MISSION_STORE_VAR, normalized)
         except RuntimeError as exc:
-            print(f"[LayerManager] Warning: {exc}")
+            msg = f"{exc}"
+            self._log("WARN", msg)
+            try:
+                error(self.iface.messageBar(), "Mission Store", msg)
+            except Exception:
+                pass
+            return
 
         old_path = self._mission_store_path
         self._mission_store_path = normalized
@@ -237,22 +268,26 @@ class LayerManager(QObject):
             finalized_by: Operator/admin name.
             finalized_at: ISO timestamp (optional, defaults to now when setting).
         """
-        project = QgsProject.instance()
         try:
-            if finalized:
-                timestamp = finalized_at or datetime.now(timezone.utc).isoformat()
-                self._set_project_variable(self.MISSION_FINALIZED_VAR, "true")
-                self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, finalized_by or "")
-                self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, timestamp)
-                self._set_layers_read_only(True)
-            else:
-                self._set_project_variable(self.MISSION_FINALIZED_VAR, "")
-                self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, "")
-                self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, "")
-                self._set_layers_read_only(False)
-            project.write()
+            self._persist_finalized_state(finalized, finalized_by, finalized_at)
         except Exception as exc:
             print(f"[LayerManager] Warning: Failed to persist finalized flag: {exc}")
+
+    def _persist_finalized_state(self, finalized: bool, finalized_by: str, finalized_at: Optional[str]):
+        """Internal helper to persist finalized/read-only state safely."""
+        project = QgsProject.instance()
+        if finalized:
+            timestamp = finalized_at or datetime.now(timezone.utc).isoformat()
+            self._set_project_variable(self.MISSION_FINALIZED_VAR, "true")
+            self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, finalized_by or "")
+            self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, timestamp)
+            self._set_layers_read_only(True)
+        else:
+            self._set_project_variable(self.MISSION_FINALIZED_VAR, "")
+            self._set_project_variable(self.MISSION_FINALIZED_BY_VAR, "")
+            self._set_project_variable(self.MISSION_FINALIZED_AT_VAR, "")
+            self._set_layers_read_only(False)
+        project.write()
 
     def is_mission_finalized(self) -> bool:
         """Return True if project is marked finalized."""
@@ -277,7 +312,7 @@ class LayerManager(QObject):
                 if isinstance(layer, QgsVectorLayer):
                     layer.setReadOnly(read_only)
         except Exception as exc:
-            print(f"[LayerManager] Warning: Failed to set layer read-only={read_only}: {exc}")
+            self._log("WARN", f"Failed to set layer read-only={read_only}: {exc}")
 
     def set_mission_coordinators(self, coordinators: str):
         """Persist coordinator roster for the current mission (comma-delimited)."""
@@ -309,6 +344,14 @@ class LayerManager(QObject):
 
     def _mission_store_enabled(self) -> bool:
         return bool(self._mission_store_path)
+
+    def _notify_metadata_warning(self, message: str):
+        """Best-effort helper to warn users about metadata issues."""
+        try:
+            warning(self.iface.messageBar(), "Catalog Metadata", message)
+        except Exception:
+            # Avoid raising if iface/messageBar is unavailable (e.g., tests)
+            pass
 
     def _set_project_variable(self, key: str, value: Optional[str]):
         """
@@ -642,11 +685,11 @@ class LayerManager(QObject):
         try:
             results = run_migration(self)
             if results.get('migrated'):
-                print(f"[LayerManager] Ran migrations on: {results['migrated']}")
+                self._log("INFO", f"Ran migrations on: {results['migrated']}")
             if results.get('failed'):
-                print(f"[LayerManager] WARNING: Migrations failed for: {results['failed']}")
+                self._log("WARN", f"Migrations failed for: {results['failed']}")
         except Exception as exc:
-            print(f"[LayerManager] WARNING: Migration run failed: {exc}")
+            self._log("WARN", f"Migration run failed: {exc}")
 
     def ensure_vector_layer(
         self,
@@ -718,7 +761,15 @@ class LayerManager(QObject):
     def _create_vector_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
         """Create a layer backed by memory or the mission store."""
         if self._mission_store_enabled():
-            return self._ensure_persistent_layer(layer_def)
+            try:
+                return self._ensure_persistent_layer(layer_def)
+            except Exception as exc:
+                msg = f"Persistent layer failed for {layer_def.layer_id}: {exc}"
+                self._log("WARN", msg)
+                try:
+                    warning(self.iface.messageBar(), "Mission Store", f"{msg}; using memory instead.")
+                except Exception:
+                    pass
         return self._create_memory_layer(layer_def)
 
     def _create_memory_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
@@ -1020,6 +1071,105 @@ class LayerManager(QObject):
             traceback.print_exc()
             return False
 
+    def ensure_structure_async(
+        self,
+        task_manager,
+        auto_migrate: bool = True,
+        on_complete: Optional[Callable[[bool], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None
+    ):
+        """
+        Run ensure_structure with optional TaskManager to avoid blocking the UI.
+
+        Falls back to synchronous execution if tasks are unavailable.
+        """
+        return self._run_task_or_sync(
+            description="Ensure SAR Tracker layer structure",
+            func=lambda: self.ensure_structure(auto_migrate=auto_migrate),
+            task_manager=task_manager,
+            on_complete=on_complete,
+            on_error=on_error
+        )
+
+    def repair_structure_async(
+        self,
+        task_manager,
+        on_complete: Optional[Callable[[bool], None]] = None,
+        on_error: Optional[Callable[[Exception], None]] = None
+    ):
+        """
+        Run repair_structure with optional TaskManager to avoid blocking the UI.
+
+        Falls back to synchronous execution if tasks are unavailable.
+        """
+        return self._run_task_or_sync(
+            description="Repair SAR Tracker layer structure",
+            func=self.repair_structure,
+            task_manager=task_manager,
+            on_complete=on_complete,
+            on_error=on_error
+        )
+
+    def _run_task_or_sync(
+        self,
+        description: str,
+        func: Callable[[], bool],
+        task_manager,
+        on_complete: Optional[Callable[[bool], None]],
+        on_error: Optional[Callable[[Exception], None]]
+    ):
+        """
+        Helper to run a function via TaskManager if available, otherwise sync.
+        """
+        if task_manager is None:
+            try:
+                result = func()
+                if on_complete:
+                    on_complete(result)
+                return result
+            except Exception as exc:
+                if on_error:
+                    on_error(exc)
+                    return False
+                raise
+
+        try:
+            from qgis.core import QgsTask
+        except Exception:
+            print("[LayerManager] Warning: QgsTask not available; running synchronously")
+            return self._run_task_or_sync(description, func, None, on_complete, on_error)
+
+        create_task = getattr(QgsTask, "fromFunction", None)
+        if not create_task:
+            print("[LayerManager] Warning: QgsTask.fromFunction missing; running synchronously")
+            return self._run_task_or_sync(description, func, None, on_complete, on_error)
+
+        def _runner(_task):
+            try:
+                return func()
+            except Exception as exc:
+                _task.setProperty("sartracker:error", exc)
+                return False
+
+        def _finished(_task, result):
+            if result:
+                if on_complete:
+                    on_complete(result)
+            else:
+                exc = getattr(_task, "property", lambda _k: None)("sartracker:error") if hasattr(_task, "property") else None
+                if on_error:
+                    on_error(exc or RuntimeError(f"{description} failed"))
+                else:
+                    self._log("WARN", f"{description} failed: {exc}")
+
+        try:
+            task = create_task(description, _runner, on_finished=_finished)
+            task_manager.start_task(task)
+            return True
+        except Exception as exc:
+            self._log("WARN", f"Failed to start task '{description}': {exc}")
+            return self._run_task_or_sync(description, func, None, on_complete, on_error)
+
     def migrate_memory_layer_to_store(self, layer: QgsVectorLayer, layer_def: LayerDefinition) -> QgsVectorLayer:
         """
         Export an existing memory layer into the mission store.
@@ -1092,9 +1242,9 @@ class LayerManager(QObject):
         if not layer:
             raise RuntimeError(f"Layer not found for category: {category}")
 
-        # Add feature to layer
-        layer.startEditing()
         try:
+            # Add feature to layer
+            layer.startEditing()
             if not layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to layer: {layer.name()}")
 
@@ -1103,7 +1253,14 @@ class LayerManager(QObject):
                 raise RuntimeError(f"Failed to commit changes: {errors}")
 
         except Exception as e:
-            layer.rollBack()
+            try:
+                error(self.iface.messageBar(), "Add Feature Failed", str(e))
+            except Exception:
+                pass
+            try:
+                layer.rollBack()
+            except Exception:
+                pass
             raise
 
         finally:
@@ -1127,21 +1284,31 @@ class LayerManager(QObject):
             issues["mission_store"] = "not_configured"
             return issues
 
+        missing_layers: List[str] = []
+        memory_layers: List[str] = []
+
         for layer_def in self._collect_layer_definitions():
             layer = self.get_layer(layer_def.layer_id)
             if not layer:
                 issues[layer_def.layer_id] = "missing"
+                missing_layers.append(layer_def.layer_id)
                 continue
 
             provider = (layer.providerType() or "").lower()
             if provider == "memory":
                 issues[layer_def.layer_id] = "memory"
+                memory_layers.append(layer_def.layer_id)
 
         if issues:
             if not quiet:
+                details = []
+                if missing_layers:
+                    details.append(f"missing: {', '.join(missing_layers)}")
+                if memory_layers:
+                    details.append(f"in memory: {', '.join(memory_layers)}")
                 warning(self.iface.messageBar(),
                         "Persistence Diagnostics",
-                        f"{len(issues)} layer(s) still use memory providers.")
+                        f"{len(issues)} layer(s) need attention ({'; '.join(details)})")
         else:
             if not quiet:
                 info(self.iface.messageBar(),
@@ -1154,7 +1321,7 @@ class LayerManager(QObject):
         """Clear all cached layer and group references."""
         self._layer_cache.clear()
         self._group_cache.clear()
-        print("[LayerManager] Cleared layer cache")
+        self._log("INFO", "Cleared layer cache")
 
     # ------------------------------------------------------------------
     # Catalog Metadata Management (Phase 1 - CalTopo Console)
@@ -1185,6 +1352,7 @@ class LayerManager(QObject):
         with self._metadata_lock:
             layer_metadata = None
             project_metadata = None
+            parse_warning_emitted = False
 
             # Read from layer tree node custom property (new source of truth)
             node = self._get_layer_tree_node(layer_id)
@@ -1196,6 +1364,9 @@ class LayerManager(QObject):
                         layer_metadata = self._migrate_datetime_timezone(layer_metadata, layer_id)
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[LayerManager] Failed to parse layer tree metadata for {layer_id}: {e}")
+                        if not parse_warning_emitted:
+                            self._notify_metadata_warning(f"Layer metadata for {layer_id} is corrupt; using project fallback.")
+                            parse_warning_emitted = True
 
             # Read from layer custom property (legacy storage for backward compatibility)
             layer = self.get_layer(layer_id)
@@ -1214,6 +1385,9 @@ class LayerManager(QObject):
                                 print(f"[LayerManager] Warning: Could not migrate metadata to layer tree: {migrate_exc}")
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[LayerManager] Failed to parse layer metadata for {layer_id}: {e}")
+                        if not parse_warning_emitted:
+                            self._notify_metadata_warning(f"Layer metadata for {layer_id} is corrupt; using project fallback.")
+                            parse_warning_emitted = True
 
             # Read from project variable (fallback storage)
             project = QgsProject.instance()
@@ -1227,6 +1401,9 @@ class LayerManager(QObject):
                         project_metadata = self._migrate_datetime_timezone(project_metadata, layer_id)
                     except (json.JSONDecodeError, TypeError) as e:
                         print(f"[LayerManager] Failed to parse project metadata for {layer_id}: {e}")
+                        if not parse_warning_emitted:
+                            self._notify_metadata_warning(f"Project metadata for {layer_id} is corrupt.")
+                            parse_warning_emitted = True
 
             # CRITICAL FIX: Check for sync drift and repair
             if layer_metadata and project_metadata:
@@ -1501,6 +1678,9 @@ class LayerManager(QObject):
         Returns:
             Metadata with timezone-aware datetimes
         """
+        if self._metadata_migration_in_progress:
+            return metadata
+
         if 'updated_at' in metadata:
             try:
                 # Parse existing datetime
@@ -1517,10 +1697,14 @@ class LayerManager(QObject):
 
                         # Write back to storage to persist migration
                         try:
+                            self._metadata_migration_in_progress = True
                             self.set_layer_metadata(layer_id, metadata)
                             print(f"[LayerManager] Migrated timestamp persisted for {layer_id}")
                         except Exception as e:
                             print(f"[LayerManager] Warning: Could not persist migrated timestamp: {e}")
+                            self._notify_metadata_warning(f"Could not persist migrated timestamp for {layer_id}: {e}")
+                        finally:
+                            self._metadata_migration_in_progress = False
             except (ValueError, TypeError, AttributeError) as e:
                 print(f"[LayerManager] Warning: Could not migrate datetime for {layer_id}: {e}")
 
