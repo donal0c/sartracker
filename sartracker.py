@@ -333,6 +333,7 @@ class sartracker:
 
         # Phase 1 Refactor: Initialize lifecycle manager for coordinated startup/teardown
         self.lifecycle = PluginLifecycleManager(iface, log_prefix="[SARTRACKER]")
+        self._app_is_quitting = False
 
         # Create centralized error handler (Issue #3)
         self.error_handler = ErrorHandler(self.iface.messageBar())
@@ -1198,6 +1199,13 @@ class sartracker:
         Handle application exit signal.
         Cancels all tasks immediately to prevent race conditions during QGIS shutdown.
         """
+        self._app_is_quitting = True
+        if self.layer_manager:
+            try:
+                self.layer_manager.set_application_closing(True)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
+
         try:
             if self.task_manager and self.task_manager.get_active_count() > 0:
                 print("[SARTRACKER] Application about to quit - forcing task cancellation")
@@ -1208,6 +1216,12 @@ class sartracker:
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
+            if self.layer_manager:
+                try:
+                    self.layer_manager.set_application_closing(True)
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Could not set layer manager shutdown flag: {exc}")
+
             # ============================================================
             # Phase 1 Refactor: Use lifecycle manager for coordinated cleanup
             # Lifecycle cleanup handles:

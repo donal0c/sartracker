@@ -14,7 +14,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Any
 from threading import RLock
-from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal
+from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal, QCoreApplication, QEvent
 from qgis.core import (
     QgsProject,
     QgsVectorLayer,
@@ -159,10 +159,31 @@ class LayerManager(QObject):
         self._layer_cache: Dict[str, QgsVectorLayer] = {}
         self._group_cache: Dict[str, QgsLayerTreeGroup] = {}
         self._signals_connected = False
+        self._project_cleared_connected = False
+        self._application_closing = False
+        self._about_to_quit_connected = False
+        self._event_filter_installed = False
+        self._main_window = iface.mainWindow() if iface else None
         self._mission_store_path: Optional[str] = self._load_mission_store_path()
         self._layer_provider_uris: Dict[str, str] = {}
         self._metadata_lock = RLock()  # Thread-safety for metadata operations
         self._metadata_migration_in_progress = False
+
+        # Track QGIS shutdown so we can skip rebuilds during app exit
+        app = QCoreApplication.instance()
+        if app:
+            try:
+                app.aboutToQuit.connect(self._handle_app_about_to_quit)
+                self._about_to_quit_connected = True
+            except Exception as exc:
+                self._log("WARN", f"Could not track application shutdown: {exc}")
+
+        if self._main_window:
+            try:
+                self._main_window.installEventFilter(self)
+                self._event_filter_installed = True
+            except Exception as exc:
+                self._log("WARN", f"Could not install main window event filter: {exc}")
 
         # Connect to project signals for cache management
         self._connect_signals()
@@ -180,12 +201,6 @@ class LayerManager(QObject):
         if not self._signals_connected:
             try:
                 self.project.layersWillBeRemoved.connect(self._on_layers_removed)
-                # Detect full project clears (e.g., user discards project)
-                try:
-                    self.project.cleared.connect(self._on_project_cleared)
-                except Exception:
-                    # cleared not available in some QGIS versions
-                    pass
                 self._signals_connected = True
             except Exception as e:
                 msg = f"Could not connect project signals: {e}"
@@ -194,6 +209,14 @@ class LayerManager(QObject):
                     warning(self.iface.messageBar(), "Layer Manager", msg)
                 except Exception:
                     pass
+
+            # Detect full project clears (e.g., user discards project)
+            try:
+                self.project.cleared.connect(self._on_project_cleared)
+                self._project_cleared_connected = True
+            except Exception:
+                # cleared not available in some QGIS versions
+                self._project_cleared_connected = False
 
     def _load_mission_store_path(self) -> Optional[str]:
         """Read mission store path from project custom variables."""
@@ -399,6 +422,38 @@ class LayerManager(QObject):
             except Exception as e:
                 print(f"[LayerManager] Warning: Could not disconnect signals: {e}")
 
+        if self._project_cleared_connected:
+            try:
+                self.project.cleared.disconnect(self._on_project_cleared)
+            except Exception as exc:
+                self._log("WARN", f"Could not disconnect project cleared signal: {exc}")
+            finally:
+                self._project_cleared_connected = False
+
+        if self._about_to_quit_connected:
+            app = QCoreApplication.instance()
+            if app:
+                try:
+                    app.aboutToQuit.disconnect(self._handle_app_about_to_quit)
+                except Exception as exc:
+                    self._log("WARN", f"Could not disconnect shutdown handler: {exc}")
+            self._about_to_quit_connected = False
+
+        if self._event_filter_installed and self._main_window:
+            try:
+                self._main_window.removeEventFilter(self)
+            except Exception as exc:
+                self._log("WARN", f"Could not remove event filter: {exc}")
+            self._event_filter_installed = False
+
+    def set_application_closing(self, closing: bool = True):
+        """Allow external callers to mark that QGIS shutdown has started."""
+        self._application_closing = closing
+
+    def _handle_app_about_to_quit(self):
+        """Qt aboutToQuit handler to prevent late-stage rebuilds."""
+        self._application_closing = True
+
     def _on_layers_removed(self, layer_ids: List[str]):
         """
         Handle layer removal by clearing cache entries.
@@ -420,11 +475,25 @@ class LayerManager(QObject):
         Prevents SAR layers from remaining absent in the QGIS Layers panel
         after the user declines to save and QGIS resets the project.
         """
+        if self._application_closing:
+            self._log("INFO", "Project cleared during application shutdown; skipping rebuild")
+            return
+
         try:
             print("[LayerManager] Project cleared detected; rebuilding SAR layer structure")
             self.ensure_structure(auto_migrate=False)
         except Exception as exc:
             self._log("WARN", f"Failed to rebuild structure after project clear: {exc}")
+
+    def eventFilter(self, obj, event):
+        """Watch the QGIS main window for close events to detect shutdown earlier."""
+        if obj == self._main_window and event is not None:
+            try:
+                if event.type() == QEvent.Close:
+                    self._application_closing = True
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
 
     def ensure_structure(self, auto_migrate: bool = True) -> bool:
         """
