@@ -75,6 +75,7 @@ from .utils.mission_storage import MissionStorageHelper, MissionPaths
 from .ui.mission_metadata_dialog import MissionMetadataDialog
 from .utils.provider_results import sanitize_provider_results
 from .utils.task_manager import TaskManager
+from .services.lifecycle_manager import PluginLifecycleManager, validate_init_preconditions
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -330,6 +331,9 @@ class sartracker:
         # Save reference to the QGIS interface
         self.iface = iface
 
+        # Phase 1 Refactor: Initialize lifecycle manager for coordinated startup/teardown
+        self.lifecycle = PluginLifecycleManager(iface, log_prefix="[SARTRACKER]")
+
         # Create centralized error handler (Issue #3)
         self.error_handler = ErrorHandler(self.iface.messageBar())
 
@@ -462,7 +466,12 @@ class sartracker:
             self._log_exception("_clear_loading_state", exc)
 
     def _components_ready(self, *attrs) -> bool:
-        """Return True if all named attributes are truthy."""
+        """Return True if all named attributes are truthy.
+
+        Note: This checks actual instance attributes, NOT the lifecycle registry.
+        The registry tracks components for cleanup, but components may exist
+        before being registered or may not be registered at all.
+        """
         return all(getattr(self, name, None) for name in attrs)
 
     def _current_mission_paths(self) -> Optional[MissionPaths]:
@@ -672,9 +681,17 @@ class sartracker:
         # Initialize task manager for background operations (Issue #6 fix)
         self.task_manager = TaskManager()
 
+        # Phase 1 Refactor: Register task manager with lifecycle for coordinated cleanup
+        self.lifecycle.register_component(
+            'task_manager',
+            self.task_manager,
+            cleanup_fn=self.task_manager.cancel_all
+        )
+
         # Connect to application aboutToQuit signal for safe shutdown
         # This prevents race conditions where tasks outlive the plugin during QGIS exit
         QCoreApplication.instance().aboutToQuit.connect(self._on_app_about_to_quit)
+        self.lifecycle.track_signal(QCoreApplication.instance().aboutToQuit, self._on_app_about_to_quit)
 
         # Connection test tracking (Issue #2 fix)
         self._current_connection_task = None
@@ -734,6 +751,9 @@ class sartracker:
             layer_manager=self.layer_manager,
             task_manager=self.task_manager
         )
+
+        # Note: layer_manager and layers_controller cleanup is handled in unload()
+        # directly to avoid lifecycle registration side effects
 
         # Mission storage helper (filesystem + backups)
         self.mission_storage = MissionStorageHelper(
@@ -901,6 +921,8 @@ class sartracker:
         )
         self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
         self.sar_panel.hide()  # Hidden by default
+
+        # Note: SAR panel cleanup is handled in unload() directly
         if self.layers_controller and self.sar_panel:
             try:
                 self.sar_panel.configure_marker_log(self.layers_controller.list_markers)
@@ -1048,6 +1070,10 @@ class sartracker:
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
 
+        # Phase 1 Refactor: Mark initialization complete for lifecycle tracking
+        self.lifecycle.mark_init_complete()
+        print(f"[SARTRACKER] Plugin initialization complete. {len(self.lifecycle.registry._components)} components registered.")
+
     def _handle_import_failure(self, errors):
         """
         Handle import failures with clear user guidance.
@@ -1182,7 +1208,26 @@ class sartracker:
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
-            # Disconnect application aboutToQuit signal
+            # ============================================================
+            # Phase 1 Refactor: Use lifecycle manager for coordinated cleanup
+            # Lifecycle cleanup handles:
+            # - Signal disconnection (in reverse order of connection)
+            # - Component cleanup (in reverse dependency order)
+            # ============================================================
+            if hasattr(self, 'lifecycle') and self.lifecycle:
+                print("[SARTRACKER] Starting lifecycle cleanup...")
+                lifecycle_errors = self.lifecycle.cleanup()
+                if lifecycle_errors:
+                    for comp_name, err in lifecycle_errors.items():
+                        print(f"[SARTRACKER] Warning: Lifecycle cleanup error for {comp_name}: {err}")
+                print("[SARTRACKER] Lifecycle cleanup complete")
+
+            # ============================================================
+            # Legacy cleanup below (kept for safety during gradual migration)
+            # TODO: Remove once lifecycle manager handles all components
+            # ============================================================
+
+            # Disconnect application aboutToQuit signal (may already be disconnected by lifecycle)
             try:
                 QCoreApplication.instance().aboutToQuit.disconnect(self._on_app_about_to_quit)
             except Exception:
@@ -1948,8 +1993,8 @@ class sartracker:
         self._mission_coordinators_cache = ""
         self._metadata_collected = False
 
-        if self.layers_controller:
-            self.layers_controller.clear_layers()
+        self._rebuild_layers_for_new_store()
+
         self._update_mission_storage_status(active=True)
 
         # CRITICAL: Refresh catalog cache (layers now backed by GeoPackage)
@@ -1960,6 +2005,9 @@ class sartracker:
                 print("[SARTRACKER] Catalog refreshed successfully")
             except Exception as e:
                 print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
+
+        # Ensure SAR layers are visible in QGIS layer tree after rebuild
+        self._recover_missing_layers()
 
     def _handle_mission_resume_storage(self, mission_name: str):
         """Restore mission storage metadata when resuming a paused mission."""
@@ -2048,28 +2096,36 @@ class sartracker:
                 should_resume = False
 
             if not should_resume:
-                # User chose "Start Fresh" - clear mission store
-                self.layer_manager.clear_mission_store()
+                # User chose "Start Fresh" - immediately create/attach a new empty mission store
+                mission_name = self._prompt_new_mission_name()
+                if not mission_name:
+                    info(
+                        self.iface.messageBar(),
+                        "SAR Tracker",
+                        "Start Fresh cancelled; continuing with existing mission store.",
+                        duration=4
+                    )
+                    return
+
+                self._prepare_new_mission_storage(mission_name)
                 try:
-                    self.layer_manager.set_mission_finalized(False)
-                    self.layer_manager.set_mission_coordinators("")
-                    self.layer_manager.set_resume_timestamp("")
-                except Exception:
-                    pass
-                self._mission_coordinators_cache = ""
-                self._metadata_collected = False
-                self._mission_gpkg_path = None
-                self._mission_directory = None
-                self._mission_folder_name = None
-                self._mission_backup_directory = None
-                self._mission_attachments_dir = None
-                self._update_mission_storage_status(active=False)
+                    if self.mission_controller:
+                        self.mission_controller.clear_saved_state()
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Failed to clear saved mission state: {exc}")
+                # Reflect idle state in UI badges if mission controller not active yet
+                is_active = self.mission_controller.is_active() if self.mission_controller else False
+                self._update_mission_storage_status(active=is_active)
                 info(
                     self.iface.messageBar(),
                     "SAR Tracker",
-                    "Mission store cleared. Ready for new mission.",
-                    duration=3
+                    f"New mission storage created for '{mission_name}'.",
+                    duration=4
                 )
+                # Show finalize button if idle and layers exist (consistent with resume path)
+                if self.sar_panel and not is_active:
+                    is_finalized = self._check_mission_finalized()
+                    self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
                 return
 
         # User chose resume or no prompt needed - continue loading
@@ -2134,6 +2190,92 @@ class sartracker:
         if self.sar_panel and not is_active:
             is_finalized = self._check_mission_finalized()
             self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
+        # Ensure SAR layers remain visible if QGIS cleared them after prompt
+        self._recover_missing_layers()
+
+    def _prompt_new_mission_name(self) -> Optional[str]:
+        """Prompt user for a new mission name when starting fresh on load."""
+        from qgis.PyQt.QtWidgets import QInputDialog
+        default_name = f"Mission {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+
+        name, ok = QInputDialog.getText(
+            self.iface.mainWindow(),
+            "Start New Mission",
+            "Enter a name for the new mission:",
+            text=default_name
+        )
+        if not ok:
+            return None
+
+        sanitized = self._sanitize_mission_name(name)
+        if not sanitized:
+            sanitized = self._sanitize_mission_name(default_name)
+        return sanitized
+
+    def _rebuild_layers_for_new_store(self):
+        """
+        Force a clean rebuild of managed layers against the current mission store.
+
+        Removes any existing SAR layers from the project and then re-runs
+        LayerManager.ensure_structure so the Layers panel is immediately
+        repopulated with empty layers pointing at the new GeoPackage.
+        """
+        if not self.layer_manager:
+            return
+
+        project = QgsProject.instance()
+
+        # Remove existing SAR layers to avoid stale provider URIs
+        try:
+            to_remove = []
+            for layer in project.mapLayers().values():
+                try:
+                    layer_id_prop = layer.customProperty('sartracker:layer_id')
+                except Exception:
+                    layer_id_prop = None
+                if layer_id_prop:
+                    to_remove.append(layer.id())
+            if to_remove:
+                project.removeMapLayers(to_remove)
+        except Exception as exc:
+            self._log_exception("_rebuild_layers_for_new_store.remove_layers", exc)
+
+        # Ensure structure (idempotent) to recreate groups/layers against new store
+        try:
+            self.layer_manager.ensure_structure(auto_migrate=False)
+        except Exception as exc:
+            self._log_exception("_rebuild_layers_for_new_store.ensure_structure", exc)
+
+        # Force catalog rebuild if present
+        if self.layers_controller and self.layers_controller.catalog:
+                try:
+                    self.layers_controller.catalog._build_cache()
+                except Exception as exc:
+                    self._log_exception("_rebuild_layers_for_new_store.catalog", exc)
+
+    def _recover_missing_layers(self):
+        """
+        Ensure SAR layers are present in the QGIS layer tree.
+
+        If the root SAR group is missing (e.g., after a QGIS save/discard prompt
+        clears the project layers), rebuild the structure so layers stay visible.
+        """
+        try:
+            root = QgsProject.instance().layerTreeRoot()
+            sar_group = root.findGroup(GroupNames.ROOT) if root else None
+            if sar_group:
+                return
+            # Group missing – re-ensure structure
+            if self.layer_manager:
+                print("[SARTRACKER] SAR layer group missing; rebuilding structure")
+                self.layer_manager.ensure_structure(auto_migrate=False)
+                if self.layers_controller and self.layers_controller.catalog:
+                    try:
+                        self.layers_controller.catalog._build_cache()
+                    except Exception as exc:
+                        self._log_exception("_recover_missing_layers.catalog", exc)
+        except Exception as exc:
+            self._log_exception("_recover_missing_layers", exc)
 
     def _ensure_backup_directory(self, create: bool, folder_name: Optional[str] = None, backup_root: Optional[Path] = None):
         """Ensure backup directory exists when configured."""

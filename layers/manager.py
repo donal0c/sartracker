@@ -180,6 +180,12 @@ class LayerManager(QObject):
         if not self._signals_connected:
             try:
                 self.project.layersWillBeRemoved.connect(self._on_layers_removed)
+                # Detect full project clears (e.g., user discards project)
+                try:
+                    self.project.cleared.connect(self._on_project_cleared)
+                except Exception:
+                    # cleared not available in some QGIS versions
+                    pass
                 self._signals_connected = True
             except Exception as e:
                 msg = f"Could not connect project signals: {e}"
@@ -407,6 +413,19 @@ class LayerManager(QObject):
                 del self._layer_cache[key]
                 print(f"[LayerManager] Removed {key} from cache")
 
+    def _on_project_cleared(self):
+        """
+        Rebuild SAR Tracker layer structure after project is cleared.
+
+        Prevents SAR layers from remaining absent in the QGIS Layers panel
+        after the user declines to save and QGIS resets the project.
+        """
+        try:
+            print("[LayerManager] Project cleared detected; rebuilding SAR layer structure")
+            self.ensure_structure(auto_migrate=False)
+        except Exception as exc:
+            self._log("WARN", f"Failed to rebuild structure after project clear: {exc}")
+
     def ensure_structure(self, auto_migrate: bool = True) -> bool:
         """
         Ensure the complete SAR Tracker layer structure exists.
@@ -553,6 +572,9 @@ class LayerManager(QObject):
         """
         Verify that the layer structure matches the schema.
 
+        If the root group exists but individual layers are missing,
+        this method will recreate them (idempotent operation).
+
         Returns:
             True if structure is valid, False otherwise
         """
@@ -566,7 +588,12 @@ class LayerManager(QObject):
                        "Root group missing - use 'Repair Layers' in Settings")
                 return False
 
-            # Structure exists - could add more detailed verification here
+            # CRITICAL FIX: Ensure all layers exist even when schema version matches
+            # _create_group_recursive is idempotent - it only creates missing layers
+            structure = get_expected_structure()
+            self._create_group_recursive(structure)
+            print("[LayerManager] Verified and ensured layer structure is complete")
+
             return True
 
         except Exception as e:
