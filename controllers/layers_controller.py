@@ -14,7 +14,8 @@ actual layer management to specialized manager classes:
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
+import logging
 from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 
 from .layer_managers.tracking_manager import TrackingLayerManager
@@ -23,7 +24,11 @@ from .layer_managers.drawing_manager import DrawingLayerManager
 from .layer_catalog import LayerCatalogService
 from ..layers.helicopter_manager import HelicopterLayerManager
 from ..layers import LayerManager as SchemaLayerManager, GroupNames, LayerIds
-from ..utils.exceptions import LayerTransactionError
+from ..utils.exceptions import LayerTransactionError, LayerLockError
+from ..utils.notify import error as notify_error, warning as notify_warning
+
+
+logger = logging.getLogger(__name__)
 
 
 class LayersController:
@@ -57,6 +62,7 @@ class LayersController:
 
     # Layer group name (shared across all managers)
     LAYER_GROUP_NAME = GroupNames.ROOT
+    CATALOG_RETRY_LIMIT = 2
     MARKER_TYPE_TO_LAYER_ID = {
         "ipp_lkp": LayerIds.MARKERS_IPP_LKP,
         "clue": LayerIds.MARKERS_CLUES,
@@ -119,18 +125,157 @@ class LayersController:
         # NON-FATAL: Catalog is optional, core SAR functionality works without it
         try:
             self.catalog = LayerCatalogService(iface, self.layer_manager)
-            print("[LayersController] Catalog service initialized successfully")
+            logger.info("Layer catalog service initialized successfully")
         except Exception as e:
             self.catalog = None
-            print(f"[LayersController] WARNING: Failed to initialize catalog service: {e}")
-            print("[LayersController] Plugin will continue without catalog (core functionality unaffected)")
-            import traceback
-            traceback.print_exc()
+            logger.warning("Failed to initialize catalog service: %s", e)
+            logger.warning("Plugin will continue without catalog (core functionality unaffected)")
+            logger.exception("Layer catalog initialization error")
 
     def _assert_not_read_only(self, operation: str):
         """Raise if mission is finalized/read-only."""
         if self.layer_manager and self.layer_manager.is_read_only():
             raise LayerTransactionError("mission data", operation, details="Mission is finalized (read-only)")
+
+    def _execute_manager_call(self, operation: str, func: Callable, *args, **kwargs):
+        """
+        Execute a manager call with consistent exception logging.
+
+        Args:
+            operation: Human-friendly operation description
+            func: Callable to execute
+        """
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            logger.exception("LayersController %s failed: %s", operation, exc)
+            self._notify_error("Layer Operation Failed", f"{operation} failed: {exc}")
+            raise
+
+    def _apply_layer_edit(self, layer, operation: str, edit_fn: Callable):
+        """
+        Apply edits to a QGIS layer within a safe transaction.
+
+        Args:
+            layer: Target QgsVectorLayer
+            operation: Human-friendly description for error context
+            edit_fn: Callable that performs edits when passed the layer
+        """
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details=operation
+            )
+
+        try:
+            result = edit_fn(layer)
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                raise RuntimeError(
+                    f"Commit failed: {', '.join(errors) if errors else 'Unknown error'}"
+                )
+
+            return result
+
+        except Exception as exc:
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation=operation,
+                details=str(exc)
+            ) from exc
+
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def _run_task_or_sync(self, description: str, func: Callable[[], Any], task_id: Optional[str] = None):
+        """
+        Run a callable via TaskManager if available, otherwise synchronously.
+
+        Args:
+            description: Human-readable task description
+            func: Callable to execute
+            task_id: Optional task identifier for TaskManager tracking
+        """
+        task_manager = getattr(self, "task_manager", None)
+
+        if not task_manager:
+            return func()
+
+        try:
+            from qgis.core import QgsTask
+        except Exception as exc:
+            logger.warning("QgsTask unavailable for %s; running synchronously: %s", description, exc)
+            return func()
+
+        create_task = getattr(QgsTask, "fromFunction", None)
+        if not create_task:
+            logger.warning("QgsTask.fromFunction unavailable for %s; running synchronously", description)
+            return func()
+
+        def _runner(task):
+            try:
+                func()
+                return True
+            except Exception as exc:
+                try:
+                    task.setProperty("sartracker:error", str(exc))
+                except Exception:
+                    pass
+                raise
+
+        def _on_complete(task):
+            logger.info("%s completed", description)
+
+        def _on_error(task):
+            error_details = None
+            try:
+                error_details = task.property("sartracker:error")
+            except Exception:
+                error_details = None
+            message = error_details or "Unknown error"
+            logger.error("%s failed: %s", description, message)
+            self._notify_error("Background Task Failed", f"{description} failed: {message}")
+
+        try:
+            task = create_task(description, _runner)
+        except Exception as exc:
+            logger.warning("Failed to create task '%s': %s. Running synchronously.", description, exc)
+            return func()
+
+        assigned_id = task_id or f"layers_controller::{description.replace(' ', '_').lower()}"
+        task_manager.start_task(task, on_complete=_on_complete, on_error=_on_error, task_id=assigned_id)
+        return assigned_id
+
+    def _notify(self, notify_func: Callable, title: str, message: str, duration: int = 6):
+        """Send a message-bar notification via utils.notify helpers."""
+        if not self.iface:
+            logger.warning("Notification dropped (iface unavailable): %s - %s", title, message)
+            return
+
+        bar_getter = getattr(self.iface, "messageBar", None)
+        bar = bar_getter() if callable(bar_getter) else None
+        if not bar:
+            logger.warning("Notification dropped (message bar unavailable): %s - %s", title, message)
+            return
+
+        try:
+            notify_func(bar, title, message, duration=duration)
+        except Exception as exc:
+            logger.warning("Failed to deliver notification '%s': %s", title, exc)
+
+    def _notify_error(self, title: str, message: str, duration: int = 6):
+        """Convenience wrapper for error notifications."""
+        self._notify(notify_error, title, message, duration=duration)
+
+    def _notify_warning(self, title: str, message: str, duration: int = 6):
+        """Convenience wrapper for warning notifications."""
+        self._notify(notify_warning, title, message, duration=duration)
 
     # =========================================================================
     # Tracking Methods (delegate to tracking manager)
@@ -148,7 +293,11 @@ class LayersController:
             RuntimeError: If layer operations fail (from manager)
         """
         self._assert_not_read_only("update current positions")
-        return self.tracking.update_current_positions(positions)
+        return self._execute_manager_call(
+            "update current positions",
+            self.tracking.update_current_positions,
+            positions
+        )
 
     def update_breadcrumbs(
         self,
@@ -169,7 +318,9 @@ class LayersController:
             RuntimeError: If layer operations fail (from manager)
         """
         self._assert_not_read_only("update breadcrumbs")
-        return self.tracking.update_breadcrumbs(
+        return self._execute_manager_call(
+            "update breadcrumbs",
+            self.tracking.update_breadcrumbs,
             positions,
             time_gap_minutes,
             processed_segments=processed_segments
@@ -179,18 +330,70 @@ class LayersController:
     # Catalog Methods
     # =========================================================================
 
-    def rescan_catalog(self):
+    def rescan_catalog(self, use_background: bool = True):
         """Force catalog to rescan all layers (HIGH-5)."""
-        if self.catalog:
-            self.catalog.rescan_layers()
+        if not self.catalog:
+            return
+
+        if use_background:
+            self._run_task_or_sync(
+                "Layer Catalog Rescan",
+                lambda: self._call_catalog_operation("rescan layers", self.catalog.rescan_layers),
+                task_id="layers_controller::catalog_rescan"
+            )
+        else:
+            self._call_catalog_operation("rescan layers", self.catalog.rescan_layers)
 
     def _refresh_catalog_for_layer(self, layer_id: str):
         """Helper to refresh catalog feature count (HIGH-6)."""
         if self.catalog:
+            self._call_catalog_operation(
+                f"refresh layer {layer_id}",
+                self.catalog.refresh_layer,
+                layer_id,
+                full=False
+            )
+
+    def _call_catalog_operation(self, operation: str, func: Callable, *args, **kwargs) -> bool:
+        """Execute catalog operations with retries."""
+        attempts = self.CATALOG_RETRY_LIMIT
+        if attempts < 1:
+            attempts = 1
+
+        last_exc = None
+        for attempt in range(1, attempts + 1):
             try:
-                self.catalog.refresh_layer(layer_id, full=False)
-            except Exception as e:
-                print(f"[LayersController] Warning: Catalog refresh failed for {layer_id}: {e}")
+                func(*args, **kwargs)
+                if attempt > 1:
+                    logger.info(
+                        "Catalog operation %s succeeded on attempt %s/%s",
+                        operation,
+                        attempt,
+                        attempts
+                    )
+                return True
+            except Exception as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    logger.warning(
+                        "Catalog operation %s failed (attempt %s/%s): %s",
+                        operation,
+                        attempt,
+                        attempts,
+                        exc
+                    )
+                else:
+                    logger.exception(
+                        "Catalog operation %s failed after %s attempts: %s",
+                        operation,
+                        attempts,
+                        exc
+                    )
+                    self._notify_warning(
+                        "Catalog Update",
+                        f"{operation} failed after {attempts} attempts: {exc}"
+                    )
+        return False
 
     # =========================================================================
     # Marker Methods (delegate to marker manager)
@@ -221,7 +424,9 @@ class LayersController:
             str: UUID of added marker
         """
         self._assert_not_read_only("add marker")
-        marker_id = self.markers.add_ipp_lkp(
+        marker_id = self._execute_manager_call(
+            "add IPP/LKP marker",
+            self.markers.add_ipp_lkp,
             name, lat, lon, subject_category, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
@@ -258,7 +463,9 @@ class LayersController:
             str: UUID of added clue
         """
         self._assert_not_read_only("add marker")
-        clue_id = self.markers.add_clue(
+        clue_id = self._execute_manager_call(
+            "add clue marker",
+            self.markers.add_clue,
             name, lat, lon, clue_type, confidence, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
@@ -295,7 +502,9 @@ class LayersController:
             str: UUID of added hazard
         """
         self._assert_not_read_only("add marker")
-        hazard_id = self.markers.add_hazard(
+        hazard_id = self._execute_manager_call(
+            "add hazard marker",
+            self.markers.add_hazard,
             name, lat, lon, hazard_type, severity, description,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
@@ -338,7 +547,9 @@ class LayersController:
             str: UUID of added casualty
         """
         self._assert_not_read_only("add marker")
-        casualty_id = self.markers.add_casualty(
+        casualty_id = self._execute_manager_call(
+            "add casualty marker",
+            self.markers.add_casualty,
             name, lat, lon, condition, treatment, evacuation_priority,
             description, found_by, irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
@@ -355,7 +566,7 @@ class LayersController:
         Returns:
             List of dicts with marker metadata
         """
-        return self.markers.list_markers()
+        return self._execute_manager_call("list markers", self.markers.list_markers)
 
     def get_marker_feature(self, marker_type: str, marker_id: str):
         """
@@ -365,7 +576,12 @@ class LayersController:
             marker_type: 'ipp_lkp', 'clue', 'hazard', or 'casualty'
             marker_id: UUID string stored in 'id' attribute
         """
-        return self.markers.get_marker_feature(marker_type, marker_id)
+        return self._execute_manager_call(
+            "get marker feature",
+            self.markers.get_marker_feature,
+            marker_type,
+            marker_id
+        )
 
     def update_marker(self, marker_type: str, marker_id: str, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
         """
@@ -378,7 +594,14 @@ class LayersController:
             updated_by: Optional operator name for audit trail
         """
         self._assert_not_read_only("update marker")
-        updated = self.markers.update_marker(marker_type, marker_id, updates, updated_by=updated_by)
+        updated = self._execute_manager_call(
+            "update marker",
+            self.markers.update_marker,
+            marker_type,
+            marker_id,
+            updates,
+            updated_by=updated_by
+        )
         layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
         if updated and layer_id:
             self._refresh_catalog_for_layer(layer_id)
@@ -393,7 +616,12 @@ class LayersController:
             marker_id: UUID string
         """
         self._assert_not_read_only("delete marker")
-        deleted = self.markers.delete_marker(marker_type, marker_id)
+        deleted = self._execute_manager_call(
+            "delete marker",
+            self.markers.delete_marker,
+            marker_type,
+            marker_id
+        )
         layer_id = self.MARKER_TYPE_TO_LAYER_ID.get(marker_type)
         if deleted and layer_id:
             self._refresh_catalog_for_layer(layer_id)
@@ -423,7 +651,9 @@ class LayersController:
             int: Feature ID of added line
         """
         self._assert_not_read_only("add drawing")
-        line_id = self.drawings.add_line(
+        line_id = self._execute_manager_call(
+            "add line",
+            self.drawings.add_line,
             name,
             points_wgs84,
             description,
@@ -451,12 +681,14 @@ class LayersController:
             int: Feature ID
         """
         self._assert_not_read_only("add measurement")
-        overlay_id = self.drawings.add_measurement_overlay(
-            name=name,
-            points_wgs84=points_wgs84,
-            description=description,
-            color=color,
-            width=width
+        overlay_id = self._execute_manager_call(
+            "add measurement overlay",
+            self.drawings.add_measurement_overlay,
+            name,
+            points_wgs84,
+            description,
+            color,
+            width
         )
         self._refresh_catalog_for_layer(LayerIds.LINES)
         return overlay_id
@@ -469,14 +701,20 @@ class LayersController:
             int: Number of overlays deleted
         """
         self._assert_not_read_only("clear measurement overlays")
-        removed = self.drawings.clear_measurement_overlays()
+        removed = self._execute_manager_call(
+            "clear measurement overlays",
+            self.drawings.clear_measurement_overlays
+        )
         if removed:
             self._refresh_catalog_for_layer(LayerIds.LINES)
         return removed
 
     def count_measurement_overlays(self) -> int:
         """Return number of active measurement overlays."""
-        return self.drawings.count_measurement_overlays()
+        return self._execute_manager_call(
+            "count measurement overlays",
+            self.drawings.count_measurement_overlays
+        )
 
     def add_search_area(self, name: str, polygon_wgs84: List[QgsPointXY],
                         team: str = "Unassigned", status: str = "Planned",
@@ -502,7 +740,9 @@ class LayersController:
             int: Feature ID of added search area
         """
         self._assert_not_read_only("add search area")
-        area_id = self.drawings.add_search_area(
+        area_id = self._execute_manager_call(
+            "add search area",
+            self.drawings.add_search_area,
             name, polygon_wgs84, team, status, priority, POA,
             terrain, search_method, color, notes
         )
@@ -530,7 +770,9 @@ class LayersController:
             int: Feature ID of added ring
         """
         self._assert_not_read_only("add range ring")
-        ring_id = self.drawings.add_range_ring(
+        ring_id = self._execute_manager_call(
+            "add range ring",
+            self.drawings.add_range_ring,
             name, center_wgs84, radius_m, label, color,
             lpb_category, percentile
         )
@@ -557,7 +799,9 @@ class LayersController:
             int: Feature ID of added bearing line
         """
         self._assert_not_read_only("add bearing line")
-        bearing_id = self.drawings.add_bearing_line(
+        bearing_id = self._execute_manager_call(
+            "add bearing line",
+            self.drawings.add_bearing_line,
             name, origin_wgs84, bearing, distance_m, label, color
         )
         self._refresh_catalog_for_layer(LayerIds.BEARING_LINES)
@@ -582,7 +826,9 @@ class LayersController:
             int: Feature ID of added sector
         """
         self._assert_not_read_only("add sector")
-        sector_id = self.drawings.add_sector(
+        sector_id = self._execute_manager_call(
+            "add sector",
+            self.drawings.add_sector,
             name, center_wgs84, start_bearing, end_bearing, radius_m,
             priority, color
         )
@@ -606,7 +852,9 @@ class LayersController:
             int: Feature ID of added label
         """
         self._assert_not_read_only("add text label")
-        label_id = self.drawings.add_text_label(
+        label_id = self._execute_manager_call(
+            "add text label",
+            self.drawings.add_text_label,
             text, location_wgs84, font_size, color, rotation
         )
         self._refresh_catalog_for_layer(LayerIds.TEXT_LABELS)
@@ -624,7 +872,10 @@ class LayersController:
             QgsLayerTreeGroup: The SAR Tracking group
         """
         # Delegate to tracking manager (any manager can handle this)
-        return self.tracking.get_or_create_layer_group()
+        return self._execute_manager_call(
+            "get or create layer group",
+            self.tracking.get_or_create_layer_group
+        )
 
     def clear_layers(self):
         """
@@ -674,7 +925,6 @@ class LayersController:
             ValueError: If not confirmed for large deletion
             LayerTransactionError: If deletion fails
         """
-        from ..utils.exceptions import LayerTransactionError
         self._assert_not_read_only("bulk delete")
 
         # Validate
@@ -727,49 +977,21 @@ class LayersController:
         if not layer or not layer.isValid():
             raise RuntimeError(f"Layer {layer_id} not available")
 
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="start editing",
-                details="Bulk delete operation"
-            )
-
-        deleted = 0
-        try:
+        def _delete_features_transaction(target_layer):
+            deleted_count = 0
             for feature_id in feature_ids:
-                if layer.deleteFeature(feature_id):
-                    deleted += 1
+                if target_layer.deleteFeature(feature_id):
+                    deleted_count += 1
+            return deleted_count
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+        deleted = self._apply_layer_edit(
+            layer,
+            "bulk delete features",
+            _delete_features_transaction
+        )
 
-            print(f"[LayersController] Bulk deleted {deleted}/{len(feature_ids)} features from {layer_id}")
-
-        except Exception as e:
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="bulk delete features",
-                details=str(e)
-            ) from e
-        finally:
-            # CRITICAL: Ensure layer NEVER left in edit mode (even if exception during rollback)
-            if layer and layer.isValid() and layer.isEditable():
-                try:
-                    layer.rollBack()
-                except RuntimeError:
-                    pass  # Layer already rolled back or deleted
-
-            # Move catalog refresh outside transaction scope to ensure it happens
-            # even if there are issues during commit
-            try:
-                self._refresh_catalog_for_layer(layer_id)
-            except Exception as refresh_error:
-                # Log but don't fail the operation if catalog refresh fails
-                print(f"[LayersController] Warning: Catalog refresh failed for {layer_id}: {refresh_error}")
-
+        logger.info("Bulk deleted %s/%s features from %s", deleted, len(feature_ids), layer_id)
+        self._refresh_catalog_for_layer(layer_id)
         return deleted
 
     # =========================================================================
@@ -817,9 +1039,11 @@ class LayersController:
         new_status = section_to_status[target_section]
 
         # Update status field using DrawingLayerManager
-        success = self.drawings.update_search_area(
-            feature_id=feature_id,
-            updates={'status': new_status},
+        success = self._execute_manager_call(
+            "update search area status",
+            self.drawings.update_search_area,
+            feature_id,
+            {'status': new_status},
             updated_by=updated_by
         )
 
@@ -850,8 +1074,6 @@ class LayersController:
             LayerTransactionError: If update fails
         """
         self._assert_not_read_only("reorder features")
-        from ..utils.exceptions import LayerTransactionError, LayerLockError
-
         # Validate
         if not feature_ids_in_order:
             raise ValueError("feature_ids_in_order cannot be empty")
@@ -861,63 +1083,45 @@ class LayersController:
             raise RuntimeError(f"Layer {layer_id} not available")
 
         # Check display_order field exists
-        if layer.fields().indexFromName('display_order') == -1:
+        field_index = layer.fields().indexFromName('display_order')
+        if field_index == -1:
             raise ValueError(f"Layer {layer_id} does not have display_order field")
 
         if layer.isEditable():
             raise LayerLockError(layer.name())
 
-        # Start transaction
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="start editing",
-                details="Reorder features"
-            )
-
-        try:
-            # Set display_order = index for each feature
-            field_index = layer.fields().indexFromName('display_order')
+        def _reorder_transaction(target_layer):
             updated_count = 0
-
             for order, feature_id in enumerate(feature_ids_in_order):
-                # Verify feature exists
-                feature = layer.getFeature(feature_id)
+                feature = target_layer.getFeature(feature_id)
                 if not feature.isValid():
-                    print(f"[LayersController] Warning: Feature {feature_id} not found, skipping")
+                    logger.warning(
+                        "Feature %s not found while reordering layer %s; skipping",
+                        feature_id,
+                        layer_id
+                    )
                     continue
 
-                # Update display_order
-                success = layer.changeAttributeValue(feature_id, field_index, order)
+                success = target_layer.changeAttributeValue(feature_id, field_index, order)
                 if success:
                     updated_count += 1
                 else:
-                    print(f"[LayersController] Warning: Failed to update display_order for {feature_id}")
+                    logger.warning(
+                        "Failed to update display_order for feature %s in layer %s",
+                        feature_id,
+                        layer_id
+                    )
+            return updated_count
 
-            # Commit changes
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Commit failed: {', '.join(errors)}")
+        updated_count = self._apply_layer_edit(
+            layer,
+            "reorder features",
+            _reorder_transaction
+        )
 
-            # Refresh catalog
-            self._refresh_catalog_for_layer(layer_id)
-
-            print(f"[LayersController] Reordered {updated_count} features in {layer_id}")
-            return True
-
-        except Exception as e:
-            layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="reorder features",
-                details=str(e)
-            ) from e
-        finally:
-            if layer and layer.isValid() and layer.isEditable():
-                try:
-                    layer.rollBack()
-                except RuntimeError:
-                    pass
+        self._refresh_catalog_for_layer(layer_id)
+        logger.info("Reordered %s features in %s", updated_count, layer_id)
+        return True
 
     # =========================================================================
     # Phase 2 - Visibility and Layer Management Helpers
@@ -994,21 +1198,21 @@ class LayersController:
         CRITICAL: This is called from sartracker.py unload().
         Must clean up catalog first (it depends on other managers).
         """
-        print("[LayersController] Starting cleanup...")
+        logger.info("LayersController cleanup started")
 
         # Clean up catalog FIRST (it depends on other managers)
         if hasattr(self, 'catalog') and self.catalog:
             try:
                 self.catalog.cleanup()
             except Exception as e:
-                print(f"[LayersController] Catalog cleanup error: {e}")
+                logger.exception("Catalog cleanup error: %s", e)
             self.catalog = None
 
         # MEMORY LEAK FIX: Clear shared device color cache (unbounded growth issue)
         # This dict accumulates entries for every device ever seen, but never removes them
         # Over 8-hour operations, this can grow to hundreds of orphaned entries
         if hasattr(self, '_shared_device_colors') and self._shared_device_colors:
-            print(f"[LayersController] Clearing device color cache ({len(self._shared_device_colors)} entries)")
+            logger.info("Clearing device color cache (%s entries)", len(self._shared_device_colors))
             self._shared_device_colors.clear()
 
         # LIFECYCLE FIX: Explicitly clear manager references for clean garbage collection
@@ -1023,6 +1227,6 @@ class LayersController:
             if hasattr(self, 'helicopters') and self.helicopters:
                 self.helicopters = None
         except Exception as e:
-            print(f"[LayersController] Manager cleanup error: {e}")
+            logger.exception("Manager cleanup error: %s", e)
 
-        print("[LayersController] Cleanup complete")
+        logger.info("LayersController cleanup complete")
