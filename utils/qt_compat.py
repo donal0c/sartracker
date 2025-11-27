@@ -80,6 +80,14 @@ WindowFlags (7 constants):
 WindowModality (3 constants):
     NonModal, WindowModal, ApplicationModal
 
+ToolButtonStyle (5 constants):
+    ToolButtonIconOnly, ToolButtonTextOnly, ToolButtonTextBesideIcon,
+    ToolButtonTextUnderIcon, ToolButtonFollowStyle
+
+QMessageBox StandardButton (6 constants):
+    MessageBoxOk, MessageBoxCancel, MessageBoxYes, MessageBoxNo,
+    MessageBoxApply, MessageBoxClose
+
 Dialog (2 constants):
     DialogAccepted, DialogRejected
 
@@ -87,7 +95,7 @@ Functions (2 functions):
     dialog_exec(dialog) - Execute dialog in Qt5/Qt6 compatible way
     push_message(bar, title, msg, level, duration) - Push message to QGIS message bar
 
-Total: 78 exported symbols for Qt5/Qt6 compatibility
+Total: 89 exported symbols for Qt5/Qt6 compatibility
 """
 
 from qgis.PyQt.QtCore import Qt
@@ -359,6 +367,72 @@ else:  # Qt5
 
 
 # =============================================================================
+# ToolButtonStyle enums
+# =============================================================================
+if QT_VERSION == 6:
+    from qgis.PyQt.QtCore import Qt as QtCore
+    try:
+        ToolButtonIconOnly = QtCore.ToolButtonStyle.ToolButtonIconOnly
+        ToolButtonTextOnly = QtCore.ToolButtonStyle.ToolButtonTextOnly
+        ToolButtonTextBesideIcon = QtCore.ToolButtonStyle.ToolButtonTextBesideIcon
+        ToolButtonTextUnderIcon = QtCore.ToolButtonStyle.ToolButtonTextUnderIcon
+        ToolButtonFollowStyle = QtCore.ToolButtonStyle.ToolButtonFollowStyle
+    except AttributeError:
+        # Fallback if ToolButtonStyle not in expected location
+        ToolButtonIconOnly = Qt.ToolButtonIconOnly
+        ToolButtonTextOnly = Qt.ToolButtonTextOnly
+        ToolButtonTextBesideIcon = Qt.ToolButtonTextBesideIcon
+        ToolButtonTextUnderIcon = Qt.ToolButtonTextUnderIcon
+        ToolButtonFollowStyle = Qt.ToolButtonFollowStyle
+else:  # Qt5
+    ToolButtonIconOnly = Qt.ToolButtonIconOnly
+    ToolButtonTextOnly = Qt.ToolButtonTextOnly
+    ToolButtonTextBesideIcon = Qt.ToolButtonTextBesideIcon
+    ToolButtonTextUnderIcon = Qt.ToolButtonTextUnderIcon
+    ToolButtonFollowStyle = Qt.ToolButtonFollowStyle
+
+
+# =============================================================================
+# QMessageBox StandardButton enums
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QMessageBox
+    if QT_VERSION == 6:
+        # Qt6: Enums in StandardButton namespace
+        try:
+            MessageBoxOk = QMessageBox.StandardButton.Ok
+            MessageBoxCancel = QMessageBox.StandardButton.Cancel
+            MessageBoxYes = QMessageBox.StandardButton.Yes
+            MessageBoxNo = QMessageBox.StandardButton.No
+            MessageBoxApply = QMessageBox.StandardButton.Apply
+            MessageBoxClose = QMessageBox.StandardButton.Close
+        except AttributeError:
+            # Fallback if StandardButton not scoped
+            MessageBoxOk = QMessageBox.Ok
+            MessageBoxCancel = QMessageBox.Cancel
+            MessageBoxYes = QMessageBox.Yes
+            MessageBoxNo = QMessageBox.No
+            MessageBoxApply = QMessageBox.Apply
+            MessageBoxClose = QMessageBox.Close
+    else:
+        # Qt5: Direct access
+        MessageBoxOk = QMessageBox.Ok
+        MessageBoxCancel = QMessageBox.Cancel
+        MessageBoxYes = QMessageBox.Yes
+        MessageBoxNo = QMessageBox.No
+        MessageBoxApply = QMessageBox.Apply
+        MessageBoxClose = QMessageBox.Close
+except (AttributeError, ImportError):
+    # Fallback values if QMessageBox unavailable
+    MessageBoxOk = 0x00000400
+    MessageBoxCancel = 0x00400000
+    MessageBoxYes = 0x00004000
+    MessageBoxNo = 0x00010000
+    MessageBoxApply = 0x02000000
+    MessageBoxClose = 0x00200000
+
+
+# =============================================================================
 # QDialog result codes
 # =============================================================================
 try:
@@ -566,6 +640,19 @@ __all__ = [
     'NonModal',
     'WindowModal',
     'ApplicationModal',
+    # ToolButtonStyle
+    'ToolButtonIconOnly',
+    'ToolButtonTextOnly',
+    'ToolButtonTextBesideIcon',
+    'ToolButtonTextUnderIcon',
+    'ToolButtonFollowStyle',
+    # QMessageBox StandardButton
+    'MessageBoxOk',
+    'MessageBoxCancel',
+    'MessageBoxYes',
+    'MessageBoxNo',
+    'MessageBoxApply',
+    'MessageBoxClose',
     # EventLoop
     'AllEvents',
     'ExcludeUserInputEvents',

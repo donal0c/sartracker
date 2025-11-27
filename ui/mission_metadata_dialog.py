@@ -18,9 +18,10 @@ from qgis.PyQt.QtWidgets import (
     QDialogButtonBox,
     QDateTimeEdit
 )
-from qgis.PyQt.QtCore import Qt, QDateTime
+from qgis.PyQt.QtCore import QDateTime
 
 from ..utils.dialog_utils import BaseDialog
+from ..utils.qt_compat import Checked, Unchecked, ItemIsUserCheckable
 
 
 class MissionMetadataDialog(BaseDialog):
@@ -65,15 +66,15 @@ class MissionMetadataDialog(BaseDialog):
         self.roster_list = QListWidget()
         for name in self._coordinators:
             item = QListWidgetItem(name)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if name in self._preselected else Qt.Unchecked)
+            item.setFlags(item.flags() | ItemIsUserCheckable)
+            item.setCheckState(Checked if name in self._preselected else Unchecked)
             self.roster_list.addItem(item)
         # If nothing preselected, default all to checked so operators don't have to tick each entry
         if self.roster_list.count() > 0:
-            has_checked = any(self.roster_list.item(i).checkState() == Qt.Checked for i in range(self.roster_list.count()))
+            has_checked = any(self.roster_list.item(i).checkState() == Checked for i in range(self.roster_list.count()))
             if not has_checked:
                 for i in range(self.roster_list.count()):
-                    self.roster_list.item(i).setCheckState(Qt.Checked)
+                    self.roster_list.item(i).setCheckState(Checked)
         layout.addWidget(self.roster_list)
 
         add_layout = QHBoxLayout()
@@ -109,15 +110,15 @@ class MissionMetadataDialog(BaseDialog):
         self.new_coordinator_input.clear()
 
         item = QListWidgetItem(name)
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(Qt.Checked)
+        item.setFlags(item.flags() | ItemIsUserCheckable)
+        item.setCheckState(Checked)
         self.roster_list.addItem(item)
 
     def selected_coordinators(self) -> List[str]:
         names: List[str] = []
         for i in range(self.roster_list.count()):
             item = self.roster_list.item(i)
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Checked:
                 text = item.text().strip()
                 if text:
                     names.append(text)

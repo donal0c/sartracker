@@ -461,6 +461,11 @@ class LayerManager(QObject):
         Args:
             layer_ids: List of layer IDs being removed
         """
+        # CRITICAL: Skip during QGIS shutdown to prevent access violation crashes
+        # During app exit, cached layer objects may have deleted C++ objects
+        if self._application_closing:
+            return
+
         for layer_id in layer_ids:
             # Remove from cache if present
             cache_keys_to_remove = [k for k, v in self._layer_cache.items() if v.id() == layer_id]

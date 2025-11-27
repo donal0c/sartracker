@@ -22,7 +22,9 @@ import getpass
 
 # Import Qt5/Qt6 compatible constants and functions
 from ..utils.qt_compat import (
-    LeftDockWidgetArea, RightDockWidgetArea, AlignRight
+    LeftDockWidgetArea, RightDockWidgetArea, AlignRight,
+    ToolButtonTextBesideIcon, PointingHandCursor,
+    MessageBoxYes, MessageBoxNo
 )
 from ..utils.notify import info, warning, error, success
 from ..config.keys import ConfigStore, SETTINGS_KEYS
@@ -289,9 +291,9 @@ class SARPanel(QDockWidget):
         focus_layout = QHBoxLayout()
         self.focus_mode_button = QToolButton()
         self.focus_mode_button.setText("Enter Focus Mode")
-        self.focus_mode_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.focus_mode_button.setToolButtonStyle(ToolButtonTextBesideIcon)
         self.focus_mode_button.setAutoRaise(False)
-        self.focus_mode_button.setCursor(Qt.PointingHandCursor)
+        self.focus_mode_button.setCursor(PointingHandCursor)
         self.focus_mode_button.setIcon(
             self._standard_icon("SP_TitleBarMaxButton", "SP_TitleBarNormalButton", "SP_DialogYesButton")
         )
@@ -699,11 +701,11 @@ class SARPanel(QDockWidget):
             "• Reset UI for the next mission\n\n"
             "Mission data remains saved in the GeoPackage.\n"
             "Use 'Finalize Mission' later to archive and lock the data.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            MessageBoxYes | MessageBoxNo,
+            MessageBoxNo
         )
 
-        if confirm != QMessageBox.Yes:
+        if confirm != MessageBoxYes:
             return
 
         try:
@@ -731,11 +733,11 @@ class SARPanel(QDockWidget):
             "After finalization, the mission data cannot be edited without\n"
             "admin override.\n\n"
             "Continue with finalization?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            MessageBoxYes | MessageBoxNo,
+            MessageBoxNo
         )
 
-        if confirm != QMessageBox.Yes:
+        if confirm != MessageBoxYes:
             return
 
         # Emit signal to sartracker.py to handle archiving

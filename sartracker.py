@@ -63,7 +63,7 @@ import os.path
 import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted
+from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
@@ -619,6 +619,8 @@ class sartracker:
 
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
+        print("[SARTRACKER] initGui() starting... (v0.3.1-debug)")
+        print(f"[SARTRACKER] Plugin dir: {self.plugin_dir}")
 
         # Version check
         from qgis.core import Qgis
@@ -644,22 +646,34 @@ class sartracker:
         self.iface.addPluginToMenu(self.menu, separator)
 
         # Add Settings menu item (Phase N1)
-        self.settings_action = QAction("Settings...", self.iface.mainWindow())
-        self.settings_action.triggered.connect(self._show_settings)
-        self.iface.addPluginToMenu(self.menu, self.settings_action)
-        self.actions.append(self.settings_action)
+        try:
+            self.settings_action = QAction("Settings...", self.iface.mainWindow())
+            self.settings_action.triggered.connect(self._show_settings)
+            self.iface.addPluginToMenu(self.menu, self.settings_action)
+            self.actions.append(self.settings_action)
+            print("[SARTRACKER] Added Settings menu item")
+        except Exception as e:
+            print(f"[SARTRACKER] ERROR adding Settings menu: {e}")
 
         # Add Diagnostics menu item
-        self.diagnostics_action = QAction("Diagnostics", self.iface.mainWindow())
-        self.diagnostics_action.triggered.connect(self._show_diagnostics)
-        self.iface.addPluginToMenu(self.menu, self.diagnostics_action)
-        self.actions.append(self.diagnostics_action)
+        try:
+            self.diagnostics_action = QAction("Diagnostics", self.iface.mainWindow())
+            self.diagnostics_action.triggered.connect(self._show_diagnostics)
+            self.iface.addPluginToMenu(self.menu, self.diagnostics_action)
+            self.actions.append(self.diagnostics_action)
+            print("[SARTRACKER] Added Diagnostics menu item")
+        except Exception as e:
+            print(f"[SARTRACKER] ERROR adding Diagnostics menu: {e}")
 
         # Add Smoke Test menu item
-        self.smoketest_action = QAction("Run Smoke Test", self.iface.mainWindow())
-        self.smoketest_action.triggered.connect(self._run_smoke_test)
-        self.iface.addPluginToMenu(self.menu, self.smoketest_action)
-        self.actions.append(self.smoketest_action)
+        try:
+            self.smoketest_action = QAction("Run Smoke Test", self.iface.mainWindow())
+            self.smoketest_action.triggered.connect(self._run_smoke_test)
+            self.iface.addPluginToMenu(self.menu, self.smoketest_action)
+            self.actions.append(self.smoketest_action)
+            print("[SARTRACKER] Added Smoke Test menu item")
+        except Exception as e:
+            print(f"[SARTRACKER] ERROR adding Smoke Test menu: {e}")
 
         # ============================================================================
         # FAIL-FAST CHECK: Abort initialization if critical imports failed
@@ -1074,6 +1088,7 @@ class sartracker:
         # Phase 1 Refactor: Mark initialization complete for lifecycle tracking
         self.lifecycle.mark_init_complete()
         print(f"[SARTRACKER] Plugin initialization complete. {len(self.lifecycle.registry._components)} components registered.")
+        print(f"[SARTRACKER] Menu items in self.actions: {len(self.actions)}")
 
     def _handle_import_failure(self, errors):
         """
@@ -3411,10 +3426,10 @@ class sartracker:
             self.iface.mainWindow(),
             "Delete Marker",
             "Are you sure you want to delete this marker?\nThis action cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            MessageBoxYes | MessageBoxNo,
+            MessageBoxNo
         )
-        if confirm != QMessageBox.Yes:
+        if confirm != MessageBoxYes:
             return
 
         try:

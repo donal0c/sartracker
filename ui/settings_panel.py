@@ -24,7 +24,8 @@ import os
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
-    Checked, PasswordEchoMode
+    Checked, PasswordEchoMode,
+    MessageBoxYes, MessageBoxNo
 )
 from ..utils.notify import info, warning, error, success
 
@@ -955,11 +956,11 @@ class SettingsPanel(QDockWidget):
             "Reset Settings",
             "Are you sure you want to reset all settings to default values?\n\n"
             "This will NOT affect provider credentials.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            MessageBoxYes | MessageBoxNo,
+            MessageBoxNo
         )
 
-        if reply != QMessageBox.Yes:
+        if reply != MessageBoxYes:
             return
 
         try:

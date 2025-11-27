@@ -16,7 +16,7 @@ from qgis.PyQt.QtGui import QDesktopServices
 from ..ui.marker_dialog import MarkerDialog
 from ..ui.marker_log_widget import MarkerLogWidget
 from ..utils.notify import success, warning, error
-from ..utils.qt_compat import dialog_exec, DialogAccepted
+from ..utils.qt_compat import dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo
 from ..utils.exceptions import LayerTransactionError
 
 
@@ -103,10 +103,10 @@ class MarkerController:
             self.iface.mainWindow(),
             "Delete Marker",
             "Are you sure you want to delete this marker?\nThis action cannot be undone.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            MessageBoxYes | MessageBoxNo,
+            MessageBoxNo
         )
-        if confirm != QMessageBox.Yes:
+        if confirm != MessageBoxYes:
             return
 
         try:
