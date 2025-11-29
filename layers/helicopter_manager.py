@@ -266,7 +266,8 @@ def update_helicopter_position(
 
     try:
         # Clear existing features (replace with new position)
-        layer.startEditing()
+        if not layer.startEditing():
+            raise RuntimeError(f"Failed to start editing helicopter layer - layer may be locked or read-only")
 
         try:
             # Remove all existing features
@@ -331,7 +332,8 @@ def clear_helicopter_layer(layer: QgsVectorLayer) -> bool:
         True if successful, False otherwise
     """
     try:
-        layer.startEditing()
+        if not layer.startEditing():
+            raise RuntimeError(f"Failed to start editing helicopter layer - layer may be locked or read-only")
         try:
             layer.dataProvider().truncate()
             if not layer.commitChanges():

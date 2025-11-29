@@ -331,7 +331,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.LINES_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "LINES", {})
         except Exception as e:
@@ -508,8 +510,8 @@ class DrawingLayerManager(BaseLayerManager):
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
                     continue
-            if not layer.changeAttributeValue(feature_id, field_index, value):
-                raise RuntimeError(f"Failed to update {field_name}")
+                if not layer.changeAttributeValue(feature_id, field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
 
             self._safe_commit(layer, "update", "LINES", {"feature_id": feature_id})
 
@@ -778,7 +780,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.SEARCH_AREAS_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "SEARCH_AREAS", {})
         except Exception as e:
@@ -932,7 +936,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.RANGE_RINGS_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "RANGE_RINGS", {})
         except Exception as e:
@@ -1091,7 +1097,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.BEARING_LINES_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "BEARING_LINES", {})
         except Exception as e:
@@ -1260,7 +1268,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.SECTORS_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "SECTORS", {})
         except Exception as e:
@@ -1369,6 +1379,53 @@ class DrawingLayerManager(BaseLayerManager):
                 if not (-180.0 <= lon <= 180.0):
                     raise ValueError("center_lon must be between -180 and 180")
 
+            # Check if geometric parameters changed - if so, regenerate geometry
+            geometric_params = {'center_lat', 'center_lon', 'start_bearing', 'end_bearing', 'radius_m'}
+            if geometric_params & updates.keys():
+                # Get current values for any parameters not being updated
+                current_center_lat = feature.attribute('center_lat')
+                current_center_lon = feature.attribute('center_lon')
+                current_start_bearing = feature.attribute('start_bearing')
+                current_end_bearing = feature.attribute('end_bearing')
+                current_radius_m = feature.attribute('radius_m')
+
+                # Use updated values if provided, otherwise keep current
+                new_center_lat = updates.get('center_lat', current_center_lat)
+                new_center_lon = updates.get('center_lon', current_center_lon)
+                new_start_bearing = updates.get('start_bearing', current_start_bearing)
+                new_end_bearing = updates.get('end_bearing', current_end_bearing)
+                new_radius_m = updates.get('radius_m', current_radius_m)
+
+                # Regenerate sector geometry
+                points_deg = geodesic_sector_points(
+                    float(new_center_lon),
+                    float(new_center_lat),
+                    float(new_start_bearing),
+                    float(new_end_bearing),
+                    float(new_radius_m),
+                    num_segments=36
+                )
+                points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
+                new_geometry = QgsGeometry.fromPolygonXY([points])
+
+                # Recalculate area
+                distance_calc = QgsDistanceArea()
+                distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+                distance_calc.setEllipsoid('WGS84')
+                area_sqm = distance_calc.measureArea(new_geometry)
+                area_sqkm = area_sqm / 1000000.0
+
+                # Update geometry
+                if not layer.changeGeometry(feature_id, new_geometry):
+                    raise RuntimeError("Failed to update sector geometry")
+
+                # Update area attribute
+                area_field_index = layer.fields().indexFromName('area_sqkm')
+                if area_field_index != -1:
+                    if not layer.changeAttributeValue(feature_id, area_field_index, area_sqkm):
+                        raise RuntimeError("Failed to update area_sqkm")
+
+            # Update all requested attributes
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
                 if field_index == -1:
@@ -1594,7 +1651,9 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer.startEditing()
         try:
-            layer.addFeature(feature)
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to {self.TEXT_LABELS_LAYER_NAME} layer")
             self._set_display_order(layer, feature.id())
             self._safe_commit(layer, "add", "TEXT_LABELS", {})
         except Exception as e:

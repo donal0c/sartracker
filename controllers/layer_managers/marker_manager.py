@@ -296,7 +296,8 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add to layer with error handling
         try:
-            layer.startEditing()
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.IPP_LKP_LAYER_NAME} layer - layer may be locked or read-only")
 
             if not layer.addFeature(feature):
                 layer.rollBack()
@@ -412,7 +413,8 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add to layer with error handling
         try:
-            layer.startEditing()
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.CLUES_LAYER_NAME} layer - layer may be locked or read-only")
 
             if not layer.addFeature(feature):
                 layer.rollBack()
@@ -528,7 +530,8 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add to layer with error handling
         try:
-            layer.startEditing()
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.HAZARDS_LAYER_NAME} layer - layer may be locked or read-only")
 
             if not layer.addFeature(feature):
                 layer.rollBack()
@@ -661,7 +664,8 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Add to layer with proper transaction handling (Issue #3 pattern)
         try:
-            layer.startEditing()
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {self.CASUALTIES_LAYER_NAME} layer - layer may be locked or read-only")
 
             if not layer.addFeature(feature):
                 layer.rollBack()
@@ -752,21 +756,27 @@ class MarkerLayerManager(BaseLayerManager):
         if not feature:
             raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
 
-        layer.startEditing()
+        if not layer.startEditing():
+            raise RuntimeError(f"Failed to start editing {layer.name()} layer - layer may be locked or read-only")
         try:
-            if updates:
-                self._apply_feature_attributes(layer, feature, updates)
+            # Build complete attribute update dictionary
             audit_attrs = self._build_audit_attributes(
                 include_created=False,
                 updated_by=updated_by or updates.get("updated_by"),
                 coordinator_ids=updates.get("coordinator_ids"),
                 attachment_path=updates.get("attachment_path")
             )
-            self._apply_feature_attributes(layer, feature, audit_attrs)
+            all_updates = {**(updates or {}), **audit_attrs}
 
-            if not layer.updateFeature(feature):
-                layer.rollBack()
-                raise RuntimeError(f"Failed to update marker '{marker_id}'")
+            # Use changeAttributeValue() for reliable updates (avoid feature copy issues)
+            fields = layer.fields()
+            for field_name, value in all_updates.items():
+                field_index = fields.indexOf(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    layer.rollBack()
+                    raise RuntimeError(f"Failed to update marker '{marker_id}' field '{field_name}'")
 
             if not layer.commitChanges():
                 errors = layer.commitErrors()
@@ -794,7 +804,8 @@ class MarkerLayerManager(BaseLayerManager):
         if not feature:
             raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
 
-        layer.startEditing()
+        if not layer.startEditing():
+            raise RuntimeError(f"Failed to start editing {layer.name()} layer - layer may be locked or read-only")
         try:
             if not layer.deleteFeature(feature.id()):
                 layer.rollBack()
