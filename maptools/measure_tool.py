@@ -5,6 +5,8 @@ Measure Tool
 Custom QGIS map tool for measuring distance and bearing between two points.
 """
 
+import logging
+
 from qgis.core import (
     QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsGeometry, QgsDistanceArea, QgsUnitTypes, QgsWkbTypes
@@ -18,6 +20,10 @@ import math
 from ..utils.qt_compat import CrossCursor
 # Import shared geodesic utilities
 from ..utils.drawing_math import geodesic_bearing
+# Import notification utilities
+from ..utils.notify import warning as notify_warning
+
+logger = logging.getLogger(__name__)
 
 
 class MeasureTool(QgsMapTool):
@@ -115,15 +121,22 @@ class MeasureTool(QgsMapTool):
         canvas_crs = self.canvas.mapSettings().destinationCrs()
 
         # Transform points to WGS84 for accurate distance calculation
-        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        transform = QgsCoordinateTransform(
-            canvas_crs,
-            wgs84,
-            QgsProject.instance()
-        )
+        # MEASURE-TRANSFORM fix: Add error handling for coordinate transforms
+        try:
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            transform = QgsCoordinateTransform(
+                canvas_crs,
+                wgs84,
+                QgsProject.instance()
+            )
 
-        point1_wgs84 = transform.transform(self.first_point)
-        point2_wgs84 = transform.transform(self.second_point)
+            point1_wgs84 = transform.transform(self.first_point)
+            point2_wgs84 = transform.transform(self.second_point)
+        except Exception as e:
+            error_msg = f"Failed to transform coordinates for measurement: {e}"
+            logger.error(error_msg)
+            notify_warning("Coordinate transform failed", error_msg)
+            raise RuntimeError(error_msg)
 
         # Calculate distance using ellipsoidal calculation
         distance_m = self.distance_calc.measureLine(point1_wgs84, point2_wgs84)

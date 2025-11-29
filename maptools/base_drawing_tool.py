@@ -9,6 +9,8 @@ preview management, and tool lifecycle.
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
+import logging
+
 from qgis.core import (
     QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsDistanceArea
@@ -19,6 +21,8 @@ from qgis.PyQt.QtGui import QCursor
 
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import CrossCursor, Key_Escape
+
+logger = logging.getLogger(__name__)
 
 
 class BaseDrawingTool(QgsMapTool):
@@ -87,7 +91,10 @@ class BaseDrawingTool(QgsMapTool):
             point: QgsPointXY in canvas CRS
 
         Returns:
-            QgsPointXY in WGS84, or original point if transformation fails
+            QgsPointXY in WGS84
+
+        Raises:
+            RuntimeError: If coordinate transformation fails
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
@@ -101,8 +108,12 @@ class BaseDrawingTool(QgsMapTool):
             )
             return transform.transform(point)
         except Exception as e:
-            print(f"Error transforming to WGS84: {e}")
-            return point  # Return original point as fallback
+            # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
+            error_msg = f"Failed to transform coordinates from {canvas_crs.authid() if canvas_crs else 'Unknown'} to WGS84: {e}"
+            logger.error(error_msg)
+            error = RuntimeError(error_msg)
+            self.drawing_error.emit(error)
+            raise error
 
     def transform_to_itm(self, point):
         """
@@ -112,7 +123,10 @@ class BaseDrawingTool(QgsMapTool):
             point: QgsPointXY in canvas CRS
 
         Returns:
-            QgsPointXY in ITM, or original point if transformation fails
+            QgsPointXY in ITM
+
+        Raises:
+            RuntimeError: If coordinate transformation fails
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
@@ -126,8 +140,12 @@ class BaseDrawingTool(QgsMapTool):
             )
             return transform.transform(point)
         except Exception as e:
-            print(f"Error transforming to ITM: {e}")
-            return point  # Return original point as fallback
+            # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
+            error_msg = f"Failed to transform coordinates from {canvas_crs.authid() if canvas_crs else 'Unknown'} to ITM: {e}"
+            logger.error(error_msg)
+            error = RuntimeError(error_msg)
+            self.drawing_error.emit(error)
+            raise error
 
     def transform_from_wgs84(self, point):
         """
@@ -137,7 +155,10 @@ class BaseDrawingTool(QgsMapTool):
             point: QgsPointXY in WGS84
 
         Returns:
-            QgsPointXY in canvas CRS, or original point if transformation fails
+            QgsPointXY in canvas CRS
+
+        Raises:
+            RuntimeError: If coordinate transformation fails
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
@@ -151,8 +172,12 @@ class BaseDrawingTool(QgsMapTool):
             )
             return transform.transform(point)
         except Exception as e:
-            print(f"Error transforming from WGS84: {e}")
-            return point  # Return original point as fallback
+            # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
+            error_msg = f"Failed to transform coordinates from WGS84 to {canvas_crs.authid() if canvas_crs else 'Unknown'}: {e}"
+            logger.error(error_msg)
+            error = RuntimeError(error_msg)
+            self.drawing_error.emit(error)
+            raise error
 
     def calculate_distance(self, point1_wgs84, point2_wgs84):
         """

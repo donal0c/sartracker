@@ -72,6 +72,8 @@ class TrackingLayerManager(BaseLayerManager):
         self.task_manager = task_manager
         self.first_load = True  # Track if this is first data load for auto-zoom
         self._breadcrumb_task_id: Optional[str] = None
+        # BUG-BC-001 fix: Track mission generation to prevent stale async data
+        self._mission_generation = 0
         # BUG-060 fix: Track temp directories for cleanup
         self._temp_export_dirs: List[str] = []
         self._cleanup_old_temp_dirs()
@@ -85,6 +87,8 @@ class TrackingLayerManager(BaseLayerManager):
         super().reset_state()
         self.first_load = True  # Reset auto-zoom flag
         self._cancel_breadcrumb_task()
+        # BUG-BC-001 fix: Increment generation to invalidate in-flight async tasks
+        self._mission_generation += 1
 
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
@@ -231,6 +235,8 @@ class TrackingLayerManager(BaseLayerManager):
         task.setProperty("sartracker:payload", positions_snapshot)
         task.setProperty("sartracker:total_inputs", total_inputs)
         task.setProperty("sartracker:gap_minutes", gap_minutes)
+        # BUG-BC-001 fix: Store mission generation to detect stale data
+        task.setProperty("sartracker:mission_generation", self._mission_generation)
 
         self._cancel_breadcrumb_task()
         task_id = f"tracking:breadcrumbs:{id(task)}"
@@ -261,6 +267,16 @@ class TrackingLayerManager(BaseLayerManager):
             return
 
         try:
+            # BUG-BC-001 fix: Validate mission generation to prevent stale data
+            task_generation = task.property("sartracker:mission_generation")
+            if task_generation is not None and task_generation != self._mission_generation:
+                logger.info(
+                    "Breadcrumb task complete but mission generation changed (%s -> %s) - discarding stale data",
+                    task_generation,
+                    self._mission_generation
+                )
+                return
+
             segments = task.property("sartracker:segments") or []
             total_inputs = task.property("sartracker:total_inputs") or len(segments)
             invalid_count = task.property("sartracker:invalid_count") or 0
@@ -293,6 +309,17 @@ class TrackingLayerManager(BaseLayerManager):
 
         message = task.property("sartracker:error") if hasattr(task, "property") else None
         logger.error("Breadcrumb processing task failed: %s", message or "Unknown error")
+
+        # BUG-BC-001 fix: Validate mission generation to prevent stale data
+        task_generation = task.property("sartracker:mission_generation") if hasattr(task, "property") else None
+        if task_generation is not None and task_generation != self._mission_generation:
+            logger.info(
+                "Breadcrumb task error but mission generation changed (%s -> %s) - discarding stale data",
+                task_generation,
+                self._mission_generation
+            )
+            return
+
         payload = task.property("sartracker:payload") if hasattr(task, "property") else None
         gap_minutes = task.property("sartracker:gap_minutes") if hasattr(task, "property") else None
 

@@ -183,15 +183,15 @@ class MissionController(QObject):
         self._clear_saved_state()
         self._update_resume_state("idle")
 
-        # Reset timers for UI (emit zeroed values after finish event)
+        # MISSION-DOUBLE-EMIT fix: Reset all state BEFORE emitting IDLE
+        # This ensures both emissions have consistent data
         self._mission_start_ts = None
         self._pause_started_at = None
         self._paused_total_seconds = 0.0
         self._last_emitted = MissionTiming(0.0, 0.0)
-        self.mission_timing_updated.emit(0.0, 0.0)
-
-        # Transition back to idle so UI re-enables start button
         self._state = MissionState.IDLE
+
+        # Single emission of IDLE state with zeroed timing (timing update handled by state change)
         self._emit_state_changed()
         return True
 
@@ -254,15 +254,24 @@ class MissionController(QObject):
         if pause_started_str:
             try:
                 pause_started_at = datetime.fromisoformat(pause_started_str)
-            except (TypeError, ValueError):
-                pause_started_at = None
+            except (TypeError, ValueError) as exc:
+                # MISSION-RESTORE fix: Raise error instead of defaulting to now()
+                # Defaulting to current time would corrupt pause timing calculations
+                raise ValueError(
+                    f"Mission was in PAUSED state but pause_started timestamp is invalid: {exc}"
+                ) from exc
 
         self._reset_internal_state()
         self._mission_name = mission_name
         self._mission_start_ts = start_ts
         self._paused_total_seconds = max(0.0, paused_seconds)
-        self._pause_started_at = pause_started_at or _utcnow()
-        self._state = MissionState.PAUSED
+        # MISSION-RESTORE fix: Only restore as PAUSED if we have valid pause_started
+        if pause_started_at:
+            self._pause_started_at = pause_started_at
+            self._state = MissionState.PAUSED
+        else:
+            self._pause_started_at = None
+            self._state = MissionState.ACTIVE
         self._timer.start()
 
         self._emit_state_changed()

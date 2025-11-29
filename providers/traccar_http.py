@@ -224,15 +224,17 @@ class TraccarHttpProvider(Provider):
         # Check cache validity
         now = datetime.now(timezone.utc)
 
-        if not force and self._device_cache_timestamp:
-            age = (now - self._device_cache_timestamp).total_seconds()
-            if age < self.cache_ttl:
-                logger.debug(
-                    "Using cached devices (age=%.1fs ttl=%ss)",
-                    age,
-                    self.cache_ttl
-                )
-                return self._device_cache
+        # BUG-PF-002 fix: Protect device cache access with lock
+        with self._cache_lock:
+            if not force and self._device_cache_timestamp:
+                age = (now - self._device_cache_timestamp).total_seconds()
+                if age < self.cache_ttl:
+                    logger.debug(
+                        "Using cached devices (age=%.1fs ttl=%ss)",
+                        age,
+                        self.cache_ttl
+                    )
+                    return self._device_cache.copy()  # Return copy to avoid external modification
 
         # Cache miss or expired - fetch from API
         logger.info(
@@ -278,28 +280,44 @@ class TraccarHttpProvider(Provider):
             # Auth failures must always bubble up
             raise
         except (ProviderNetworkError, ProviderDataError) as exc:
-            if self._device_cache:
-                self._device_cache_stale = True
-                self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+            # BUG-PF-002 fix: Protect cache access with lock
+            with self._cache_lock:
+                if self._device_cache:
+                    self._device_cache_stale = True
+                    self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+                    cache_size = len(self._device_cache)
+                    cache_copy = self._device_cache.copy()
+                else:
+                    cache_copy = None
+
+            if cache_copy:
                 logger.warning(
                     "Device fetch failed (%s): %s; using stale cache with %s entries",
                     exc.__class__.__name__,
                     exc,
-                    len(self._device_cache)
+                    cache_size
                 )
-                return self._device_cache
+                return cache_copy
             raise
         except Exception as exc:
-            if self._device_cache:
-                self._device_cache_stale = True
-                self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+            # BUG-PF-002 fix: Protect cache access with lock
+            with self._cache_lock:
+                if self._device_cache:
+                    self._device_cache_stale = True
+                    self._device_cache_warning = f"{exc.__class__.__name__}: {exc}"
+                    cache_size = len(self._device_cache)
+                    cache_copy = self._device_cache.copy()
+                else:
+                    cache_copy = None
+
+            if cache_copy:
                 logger.warning(
                     "Unexpected device fetch error (%s): %s; using stale cache with %s entries",
                     exc.__class__.__name__,
                     exc,
-                    len(self._device_cache)
+                    cache_size
                 )
-                return self._device_cache
+                return cache_copy
             # Wrap unexpected errors when no cache available
             raise ProviderDataError(
                 f"Unexpected error loading devices: {str(exc)}",
@@ -315,12 +333,14 @@ class TraccarHttpProvider(Provider):
             device_map: Mapping of device IDs to names.
             timestamp: Optional datetime to record as cache timestamp.
         """
-        self._device_cache = device_map or {}
-        if timestamp is None:
-            timestamp = datetime.now(timezone.utc)
-        self._device_cache_timestamp = timestamp
-        self._device_cache_stale = False
-        self._device_cache_warning = None
+        # BUG-PF-002 fix: Protect device cache updates with lock
+        with self._cache_lock:
+            self._device_cache = device_map or {}
+            if timestamp is None:
+                timestamp = datetime.now(timezone.utc)
+            self._device_cache_timestamp = timestamp
+            self._device_cache_stale = False
+            self._device_cache_warning = None
 
     def _annotate_origin(self, records: Optional[List[Dict[str, Any]]], origin: str) -> List[Dict[str, Any]]:
         """
@@ -476,13 +496,35 @@ class TraccarHttpProvider(Provider):
                     e.__class__.__name__,
                     e
                 )
-                cached = self._load_last_good_cache()
-                if cached:
-                    logger.warning(
-                        "Serving %s cached positions from last-good cache",
-                        len(cached)
-                    )
-                    return self._annotate_origin(cached, origin='cache')
+                cache_result = self._load_last_good_cache_with_metadata()
+                if cache_result:
+                    cached, cache_timestamp = cache_result
+                    # BUG-C3 fix: Calculate and log cache age to make stale data visible
+                    now = datetime.now(timezone.utc)
+                    age_seconds = (now - cache_timestamp).total_seconds()
+                    age_minutes = age_seconds / 60
+                    age_hours = age_minutes / 60
+
+                    # Log at ERROR level so it's highly visible
+                    if age_hours >= 1:
+                        logger.error(
+                            "⚠️  SERVING STALE CACHED DATA: %s positions from cache (%.1f hours old) - Network unavailable",
+                            len(cached),
+                            age_hours
+                        )
+                    else:
+                        logger.error(
+                            "⚠️  SERVING STALE CACHED DATA: %s positions from cache (%.0f minutes old) - Network unavailable",
+                            len(cached),
+                            age_minutes
+                        )
+
+                    # Annotate with both origin and cache age for UI to use
+                    annotated = self._annotate_origin(cached, origin='cache')
+                    for record in annotated:
+                        record['cache_age_seconds'] = age_seconds
+                        record['cache_timestamp'] = format_iso(cache_timestamp)
+                    return annotated
 
             raise
         except Exception as e:
@@ -526,7 +568,9 @@ class TraccarHttpProvider(Provider):
             Safe when each task creates its own session.
         """
         logger.info("Fetching breadcrumbs (since=%s)", since_iso or "last 3 hours")
-        self._last_breadcrumb_failures = []
+        # BUG-PF-001 fix: Protect list access with lock
+        with self._cache_lock:
+            self._last_breadcrumb_failures = []
 
         def _should_cancel() -> bool:
             return bool(cancel_check and cancel_check())
@@ -659,7 +703,9 @@ class TraccarHttpProvider(Provider):
                             )
                         except Exception as http_err:
                             message = f"{device_name}: HTTP error {http_err}"
-                            self._last_breadcrumb_failures.append(message)
+                            # BUG-PF-001 fix: Protect list access with lock
+                            with self._cache_lock:
+                                self._last_breadcrumb_failures.append(message)
                             logger.warning("Failed HTTP breadcrumb fetch for %s: %s", device_name, http_err)
                             return []
                         finally:
@@ -676,7 +722,9 @@ class TraccarHttpProvider(Provider):
                             message = (
                                 f"{device_name}: invalid response type {type(data).__name__}"
                             )
-                            self._last_breadcrumb_failures.append(message)
+                            # BUG-PF-001 fix: Protect list access with lock
+                            with self._cache_lock:
+                                self._last_breadcrumb_failures.append(message)
                             logger.warning(
                                 "Invalid breadcrumb response for device %s: expected list, got %s",
                                 device_id_str,
@@ -691,15 +739,19 @@ class TraccarHttpProvider(Provider):
                                 feature = self._normalize_position(pos, device_map)
                                 device_positions.append(feature)
                             except Exception as e:
-                                self._last_breadcrumb_failures.append(
-                                    f"{device_name}: invalid position payload ({e})"
-                                )
+                                # BUG-PF-001 fix: Protect list access with lock
+                                with self._cache_lock:
+                                    self._last_breadcrumb_failures.append(
+                                        f"{device_name}: invalid position payload ({e})"
+                                    )
                                 continue
                         return device_positions
 
                     except Exception as e:
                         message = f"{device_name}: unexpected error {e}"
-                        self._last_breadcrumb_failures.append(message)
+                        # BUG-PF-001 fix: Protect list access with lock
+                        with self._cache_lock:
+                            self._last_breadcrumb_failures.append(message)
                         logger.warning(
                             "Failed to fetch breadcrumbs for device %s: %s",
                             device_name,
@@ -720,7 +772,9 @@ class TraccarHttpProvider(Provider):
                             results = future.result()
                         except Exception as worker_exc:
                             message = f"{device_name}: worker error {worker_exc}"
-                            self._last_breadcrumb_failures.append(message)
+                            # BUG-PF-001 fix: Protect list access with lock
+                            with self._cache_lock:
+                                self._last_breadcrumb_failures.append(message)
                             logger.warning(
                                 "Breadcrumb worker failed for device %s: %s",
                                 device_name,
@@ -1036,6 +1090,17 @@ class TraccarHttpProvider(Provider):
                         f.flush()
                         os.fsync(f.fileno())
                     os.replace(tmp_file, _CACHE_FILE)
+                    # BUG-C1 fix: Fsync parent directory to ensure directory entry is persisted
+                    try:
+                        dir_fd = os.open(_CACHE_DIR, os.O_RDONLY)
+                        try:
+                            os.fsync(dir_fd)
+                        finally:
+                            os.close(dir_fd)
+                    except (OSError, AttributeError):
+                        # OSError: Can't open directory (some filesystems)
+                        # AttributeError: O_RDONLY not available on Windows
+                        pass
                 finally:
                     with contextlib.suppress(FileNotFoundError):
                         os.remove(tmp_file)
@@ -1089,6 +1154,28 @@ class TraccarHttpProvider(Provider):
                 cache.get('timestamp')
             )
             return cache.get('features')
+        return None
+
+    def _load_last_good_cache_with_metadata(self, max_age_s: int = 3600):
+        """
+        Load last-good positions from cache file with timestamp metadata.
+
+        Args:
+            max_age_s: Maximum age of cache in seconds (default: 3600 = 1 hour)
+
+        Returns:
+            Tuple of (features list, cache datetime), or None if cache unavailable or expired
+        """
+        cache = self._read_last_good_cache(max_age_s=max_age_s)
+        if cache:
+            features = cache.get('features')
+            timestamp_str = cache.get('timestamp')
+            try:
+                cache_timestamp = parse_iso(timestamp_str)
+                return (features, cache_timestamp)
+            except Exception as e:
+                logger.warning("Failed to parse cache timestamp: %s", e)
+                return None
         return None
 
     def _load_last_good_breadcrumbs(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
@@ -1169,9 +1256,6 @@ class TraccarHttpProvider(Provider):
         Return cache-related diagnostics for diagnostics panel/status APIs.
         """
         now = datetime.now(timezone.utc)
-        device_cache_age = None
-        if self._device_cache_timestamp:
-            device_cache_age = (now - self._device_cache_timestamp).total_seconds()
 
         cache_info = self._read_last_good_cache(max_age_s=None)
         last_good_age = None
@@ -1184,19 +1268,29 @@ class TraccarHttpProvider(Provider):
             last_good_positions = len(cache_info.get('features', []) or [])
             last_good_breadcrumbs = len(cache_info.get('breadcrumbs', []) or [])
 
+        # BUG-PF-001 & BUG-PF-002 fix: Protect all cache access with lock
+        with self._cache_lock:
+            device_cache_size = len(self._device_cache)
+            device_cache_age = None
+            if self._device_cache_timestamp:
+                device_cache_age = (now - self._device_cache_timestamp).total_seconds()
+            device_cache_stale = self._device_cache_stale
+            device_cache_warning = self._device_cache_warning
+            breadcrumb_failures_copy = list(self._last_breadcrumb_failures)
+
         return {
             'cache_ttl_s': self.cache_ttl,
-            'device_cache_size': len(self._device_cache),
+            'device_cache_size': device_cache_size,
             'device_cache_age_s': device_cache_age,
-            'device_cache_stale': self._device_cache_stale,
-            'device_cache_warning': self._device_cache_warning,
+            'device_cache_stale': device_cache_stale,
+            'device_cache_warning': device_cache_warning,
             'last_good_cache_age_s': last_good_age,
             'last_good_cache_ts': last_good_ts,
             'last_good_positions': last_good_positions,
             'last_good_breadcrumbs': last_good_breadcrumbs,
             'breadcrumb_workers': self.breadcrumb_workers,
             'bulk_breadcrumbs_enabled': self.enable_bulk_breadcrumbs,
-            'breadcrumb_failures': list(self._last_breadcrumb_failures)
+            'breadcrumb_failures': breadcrumb_failures_copy
         }
 
     def save_casualty(self, mission_id: int, name: str, lat: float, lon: float,

@@ -8,6 +8,8 @@ Used for witness sightings, radio direction finding, and line-of-sight analysis.
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
+import logging
+
 from qgis.core import QgsPointXY, QgsGeometry, QgsWkbTypes
 from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtGui import QColor
@@ -23,6 +25,8 @@ from ..utils.dialog_utils import BaseDialog
 from ..utils.exceptions import DrawingError
 
 from .base_drawing_tool import BaseDrawingTool
+
+logger = logging.getLogger(__name__)
 
 
 class BearingLineDialog(BaseDialog):
@@ -377,9 +381,8 @@ class BearingTool(BaseDrawingTool):
                 self.drawing_cancelled.emit()
 
         except Exception as e:
-            print(f"Error showing bearing dialog: {e}")
-            import traceback
-            traceback.print_exc()
+            # BEARING-TRANSFORM fix: Use proper logging instead of print
+            logger.error("Error showing bearing dialog: %s", e, exc_info=True)
             self.origin_point = None
             if self.canvas:
                 self.canvas.unsetMapTool(self)
@@ -421,9 +424,8 @@ class BearingTool(BaseDrawingTool):
             })
 
         except Exception as e:
-            print(f"Error creating bearing line: {e}")
-            import traceback
-            traceback.print_exc()
+            # BEARING-TRANSFORM fix: Use proper logging instead of print
+            logger.error("Error creating bearing line: %s", e, exc_info=True)
             # Emit error signal for error handler (Issue #3)
             self.drawing_error.emit(
                 DrawingError(f"Failed to create bearing line: {str(e)}", tool_name="Bearing")

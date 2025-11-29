@@ -937,14 +937,11 @@ class LayerManager(QObject):
         if not self._mission_store_path:
             raise RuntimeError("Mission store path is not configured")
 
-        try:
-            ds = QgsDataSourceUri()
-            ds.setDatabase(self._mission_store_path)
-            ds.setDataSource("", layer_def.layer_id, None)
-            uri = ds.uri()
-        except Exception:
-            # Fallback to legacy formatting if QgsDataSourceUri fails for any reason
-            uri = f"{self._mission_store_path}|layername={layer_def.layer_id}"
+        # OGR provider expects the canonical "<path>|layername=<table>" syntax for GeoPackage layers.
+        # Using QgsDataSourceUri yields a PostGIS-style connection string that the ogr provider
+        # does not understand, which in turn produces invalid layers and forces a fallback to memory.
+        path = Path(self._mission_store_path).as_posix()
+        uri = f"{path}|layername={layer_def.layer_id}"
 
         self._layer_provider_uris[layer_def.layer_id] = uri
         return uri

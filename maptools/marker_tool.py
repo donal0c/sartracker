@@ -5,6 +5,8 @@ Marker Map Tool
 Custom QGIS map tool for adding POI and Casualty markers by clicking on map.
 """
 
+import logging
+
 from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsMapTool
 from qgis.PyQt.QtCore import pyqtSignal
@@ -12,6 +14,10 @@ from qgis.PyQt.QtGui import QCursor
 
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import CrossCursor
+# Import notification utilities
+from ..utils.notify import warning as notify_warning
+
+logger = logging.getLogger(__name__)
 
 
 class MarkerMapTool(QgsMapTool):
@@ -46,22 +52,29 @@ class MarkerMapTool(QgsMapTool):
         
         # Get canvas CRS
         canvas_crs = self.canvas.mapSettings().destinationCrs()
-        
-        # Transform to WGS84
-        transform_to_wgs84 = QgsCoordinateTransform(
-            canvas_crs,
-            self.wgs84,
-            QgsProject.instance()
-        )
-        wgs84_point = transform_to_wgs84.transform(point)
-        
-        # Transform to Irish Grid (ITM)
-        transform_to_itm = QgsCoordinateTransform(
-            canvas_crs,
-            self.itm,
-            QgsProject.instance()
-        )
-        itm_point = transform_to_itm.transform(point)
+
+        # MARKER-TRANSFORM fix: Add error handling for coordinate transforms
+        try:
+            # Transform to WGS84
+            transform_to_wgs84 = QgsCoordinateTransform(
+                canvas_crs,
+                self.wgs84,
+                QgsProject.instance()
+            )
+            wgs84_point = transform_to_wgs84.transform(point)
+
+            # Transform to Irish Grid (ITM)
+            transform_to_itm = QgsCoordinateTransform(
+                canvas_crs,
+                self.itm,
+                QgsProject.instance()
+            )
+            itm_point = transform_to_itm.transform(point)
+        except Exception as e:
+            error_msg = f"Failed to transform marker coordinates: {e}"
+            logger.error(error_msg)
+            notify_warning("Coordinate transform failed", error_msg)
+            return  # Don't emit signal with bad coordinates
         
         # Emit signal with coordinates
         self.marker_clicked.emit(

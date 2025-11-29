@@ -842,9 +842,8 @@ class MarkerLayerManager(BaseLayerManager):
                 "update marker",
                 details=str(exc)
             ) from exc
-        finally:
-            if layer.isEditable():
-                layer.rollBack()
+        # No finally block needed - commitChanges() exits edit mode on success,
+        # and rollBack is handled in the except block on failure
 
         layer.triggerRepaint()
         self._log_marker_event(layer, self._marker_log_label(marker_type), "update", marker_id=marker_id)
@@ -875,9 +874,8 @@ class MarkerLayerManager(BaseLayerManager):
                 "delete marker",
                 details=str(exc)
             ) from exc
-        finally:
-            if layer.isEditable():
-                layer.rollBack()
+        # No finally block needed - commitChanges() exits edit mode on success,
+        # and rollBack is handled in the except block on failure
 
         layer.triggerRepaint()
         self._log_marker_event(layer, self._marker_log_label(marker_type), "delete", marker_id=marker_id)
