@@ -245,12 +245,25 @@ class TrackingLayerManager(BaseLayerManager):
     def _on_breadcrumb_task_complete(self, task: QgsTask):
         """Handle successful breadcrumb task completion."""
         self._breadcrumb_task_id = None
+
+        # SAFETY: Guard against plugin unload during async task (CLAUDE.md Pattern 4)
+        # Task may complete after cleanup() was called
+        if not getattr(self, 'iface', None):
+            logger.debug("Breadcrumb task complete but iface gone - plugin unloading")
+            return
+        if not getattr(self, '_layer_manager', None):
+            logger.debug("Breadcrumb task complete but layer_manager gone - plugin unloading")
+            return
+
         try:
             segments = task.property("sartracker:segments") or []
             total_inputs = task.property("sartracker:total_inputs") or len(segments)
             invalid_count = task.property("sartracker:invalid_count") or 0
             last_error = task.property("sartracker:last_error") or None
             layer = self._get_or_create_breadcrumbs_layer()
+            if not layer or not layer.isValid():
+                logger.warning("Breadcrumb task complete but layer unavailable")
+                return
             self._apply_breadcrumb_results(
                 layer,
                 segments,
@@ -264,6 +277,15 @@ class TrackingLayerManager(BaseLayerManager):
     def _on_breadcrumb_task_error(self, task: QgsTask):
         """Handle failed breadcrumb background processing by falling back to sync."""
         self._breadcrumb_task_id = None
+
+        # SAFETY: Guard against plugin unload during async task (CLAUDE.md Pattern 4)
+        if not getattr(self, 'iface', None):
+            logger.debug("Breadcrumb task error but iface gone - plugin unloading")
+            return
+        if not getattr(self, '_layer_manager', None):
+            logger.debug("Breadcrumb task error but layer_manager gone - plugin unloading")
+            return
+
         message = task.property("sartracker:error") if hasattr(task, "property") else None
         logger.error("Breadcrumb processing task failed: %s", message or "Unknown error")
         payload = task.property("sartracker:payload") if hasattr(task, "property") else None
@@ -277,6 +299,9 @@ class TrackingLayerManager(BaseLayerManager):
                     float(gap_minutes or 5.0)
                 )
                 layer = self._get_or_create_breadcrumbs_layer()
+                if not layer or not layer.isValid():
+                    logger.warning("Breadcrumb fallback: layer unavailable")
+                    return
                 self._apply_breadcrumb_results(
                     layer,
                     segments,
@@ -426,7 +451,9 @@ class TrackingLayerManager(BaseLayerManager):
             device_ids = layer.uniqueValues(
                 layer.fields().indexOf('device_id')
             )
-        except Exception:
+        except Exception as exc:
+            # CRITICAL FIX (BUG-024): Log renderer setup failures instead of silent return
+            logger.warning("Failed to get device IDs for styling: %s", exc)
             return
 
         # Check if we already have a categorized renderer
@@ -682,8 +709,9 @@ class TrackingLayerManager(BaseLayerManager):
         # Get unique device IDs from data
         try:
             device_ids = layer.uniqueValues(layer.fields().indexOf('device_id'))
-        except Exception:
-            # Layer might not be valid yet
+        except Exception as exc:
+            # CRITICAL FIX (BUG-024): Log breadcrumb styling failures
+            logger.warning("Failed to get device IDs for breadcrumb styling: %s", exc)
             return
 
         # Check if we already have a categorized renderer

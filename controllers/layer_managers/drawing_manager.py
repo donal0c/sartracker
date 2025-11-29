@@ -411,9 +411,16 @@ class DrawingLayerManager(BaseLayerManager):
         if layer.isEditable():
             raise LayerLockError(layer.name())
 
-        layer.startEditing()
+        # CRITICAL FIX (BUG-027): Check startEditing and deleteFeatures return values
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                self.LINES_LAYER_NAME,
+                "start editing for delete",
+                details="Layer may be locked or read-only"
+            )
         try:
-            layer.deleteFeatures(ids_to_delete)
+            if not layer.deleteFeatures(ids_to_delete):
+                raise RuntimeError("deleteFeatures returned False - features may not have been deleted")
             self._safe_commit(layer, "clear_overlays", "LINES", {"deleted": len(ids_to_delete)})
         except Exception as exc:
             layer.rollBack()

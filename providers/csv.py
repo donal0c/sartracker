@@ -147,8 +147,8 @@ class FileCSVProvider(Provider):
         positions = []
 
         try:
-            f = open(filepath, 'r', encoding='utf-8')
-        except (IOError, OSError) as e:
+            f = open(filepath, 'r', encoding='utf-8', errors='replace')
+        except (IOError, OSError, UnicodeDecodeError) as e:
             raise ProviderDataError(
                 f"Cannot read CSV file {filepath}: {str(e)}",
                 provider_name='csv',

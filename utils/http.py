@@ -249,7 +249,8 @@ class HttpClient:
                         error_detail = response.json().get('message', '')
                         if error_detail:
                             error_msg += f": {error_detail}"
-                    except:
+                    except (ValueError, KeyError, AttributeError, TypeError):
+                        # JSON decode error, missing key, or unexpected response structure
                         pass
 
                     logger.warning(f"{error_msg} - URL: {url}")

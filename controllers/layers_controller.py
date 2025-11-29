@@ -1215,16 +1215,35 @@ class LayersController:
             logger.info("Clearing device color cache (%s entries)", len(self._shared_device_colors))
             self._shared_device_colors.clear()
 
-        # LIFECYCLE FIX: Explicitly clear manager references for clean garbage collection
-        # While Python GC should handle this, explicit cleanup is safer for life-safety systems
+        # LIFECYCLE FIX: Call cleanup() on managers before nullifying references
+        # This ensures background tasks are cancelled, signals disconnected, etc.
+        # Critical: tracking manager has background tasks that must be cancelled
         try:
             if hasattr(self, 'tracking') and self.tracking:
+                try:
+                    self.tracking.cleanup()
+                except Exception as e:
+                    logger.warning("Tracking manager cleanup error: %s", e)
                 self.tracking = None
             if hasattr(self, 'markers') and self.markers:
+                try:
+                    self.markers.cleanup()
+                except Exception as e:
+                    logger.warning("Markers manager cleanup error: %s", e)
                 self.markers = None
             if hasattr(self, 'drawings') and self.drawings:
+                try:
+                    self.drawings.cleanup()
+                except Exception as e:
+                    logger.warning("Drawings manager cleanup error: %s", e)
                 self.drawings = None
             if hasattr(self, 'helicopters') and self.helicopters:
+                # helicopters is a module-level manager, check for cleanup method
+                if hasattr(self.helicopters, 'cleanup'):
+                    try:
+                        self.helicopters.cleanup()
+                    except Exception as e:
+                        logger.warning("Helicopters manager cleanup error: %s", e)
                 self.helicopters = None
         except Exception as e:
             logger.exception("Manager cleanup error: %s", e)

@@ -82,7 +82,11 @@ class SecureStore:
         try:
             b = base64.b64decode(data.encode('ascii'))
             return b.decode('utf-8')
-        except Exception:
+        except Exception as exc:
+            # CRITICAL FIX: Log decryption failures to help diagnose auth issues
+            # An empty return causes "wrong password" errors when the real issue
+            # is corrupted stored credentials (BUG-022)
+            LOGGER.warning("Failed to decode stored credential (may be corrupted): %s", exc)
             return ""
 
     @classmethod

@@ -14,6 +14,19 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.PyQt.QtCore import Qt, QTimer, pyqtSignal, QSettings, QObject
 from qgis.PyQt.QtGui import QColor, QFont, QIcon
+try:
+    from qgis.PyQt.sip import isdeleted as sip_isdeleted
+except ImportError:
+    try:
+        import sip
+        sip_isdeleted = sip.isdeleted
+    except ImportError:
+        # Fallback: always assume objects are valid
+        sip_isdeleted = lambda obj: False
+
+# Create sip namespace for compatibility
+class sip:
+    isdeleted = staticmethod(sip_isdeleted)
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Callable, Tuple
 import json
@@ -103,19 +116,25 @@ class SARPanel(QDockWidget):
         self._setup_ui()
         self._configure_layer_console()
 
+        # Connect marker_log_widget signals using named methods for proper cleanup
+        # (CRITICAL FIX: BUG-017 - Lambda signals cannot be disconnected)
+        self._marker_log_connections: List[Tuple[Any, Callable]] = []
         if hasattr(self, "marker_log_widget"):
-            self.marker_log_widget.edit_requested.connect(
-                lambda marker_type, marker_id: self.marker_edit_requested.emit(marker_type, marker_id)
-            )
-            self.marker_log_widget.delete_requested.connect(
-                lambda marker_type, marker_id: self.marker_delete_requested.emit(marker_type, marker_id)
-            )
-            self.marker_log_widget.zoom_requested.connect(
-                lambda lat, lon: self.marker_zoom_requested.emit(lat, lon)
-            )
-            self.marker_log_widget.open_attachment_requested.connect(
-                lambda path: self._on_open_attachment_requested(path)
-            )
+            conn1 = (self.marker_log_widget.edit_requested, self._on_marker_edit_requested)
+            conn1[0].connect(conn1[1])
+            self._marker_log_connections.append(conn1)
+
+            conn2 = (self.marker_log_widget.delete_requested, self._on_marker_delete_requested)
+            conn2[0].connect(conn2[1])
+            self._marker_log_connections.append(conn2)
+
+            conn3 = (self.marker_log_widget.zoom_requested, self._on_marker_zoom_requested)
+            conn3[0].connect(conn3[1])
+            self._marker_log_connections.append(conn3)
+
+            conn4 = (self.marker_log_widget.open_attachment_requested, self._on_open_attachment_requested)
+            conn4[0].connect(conn4[1])
+            self._marker_log_connections.append(conn4)
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
@@ -165,6 +184,18 @@ class SARPanel(QDockWidget):
     def _on_open_attachment_requested(self, path: str):
         """Bubble attachment open requests to the plugin."""
         self.attachment_open_requested.emit(path)
+
+    def _on_marker_edit_requested(self, marker_type: str, marker_id: str):
+        """Forward marker edit request to the plugin."""
+        self.marker_edit_requested.emit(marker_type, marker_id)
+
+    def _on_marker_delete_requested(self, marker_type: str, marker_id: str):
+        """Forward marker delete request to the plugin."""
+        self.marker_delete_requested.emit(marker_type, marker_id)
+
+    def _on_marker_zoom_requested(self, lat: float, lon: float):
+        """Forward marker zoom request to the plugin."""
+        self.marker_zoom_requested.emit(lat, lon)
 
     def _current_user_name(self) -> str:
         """Get the current user name for audit logging with fallbacks."""
@@ -1866,10 +1897,18 @@ class SARPanel(QDockWidget):
 
             else:
                 # Exit Focus Mode - restore panels
+                # CRITICAL FIX (BUG-025): Guard against deleted panels
+                # User may have closed a panel while it was hidden, causing crash
                 restored = 0
                 for panel in self.hidden_panels:
-                    panel.setVisible(True)
-                    restored += 1
+                    try:
+                        # Check if Qt object is still valid before accessing
+                        if panel and not sip.isdeleted(panel):
+                            panel.setVisible(True)
+                            restored += 1
+                    except (RuntimeError, AttributeError):
+                        # Panel was destroyed - skip it
+                        pass
 
                 self.hidden_panels = []
 
@@ -2013,6 +2052,28 @@ class SARPanel(QDockWidget):
                     except (TypeError, RuntimeError, AttributeError):
                         pass
                 self._mission_controller_connections = []
+
+            # CRITICAL FIX: Disconnect marker_log_widget signals (BUG-017)
+            if hasattr(self, '_marker_log_connections'):
+                for signal, handler in list(self._marker_log_connections):
+                    try:
+                        parent = getattr(signal, '__self__', None)
+                        if parent and isinstance(parent, QObject):
+                            try:
+                                _ = parent.objectName()
+                            except (RuntimeError, AttributeError):
+                                continue
+                        signal.disconnect(handler)
+                    except (TypeError, RuntimeError, AttributeError):
+                        pass
+                self._marker_log_connections = []
+
+            # CRITICAL FIX: Clean up marker_log_widget (BUG-019)
+            if hasattr(self, 'marker_log_widget') and self.marker_log_widget:
+                try:
+                    self.marker_log_widget.cleanup()
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Error cleaning up marker log widget: {exc}")
 
             if hasattr(self, '_detach_catalog_signals'):
                 self._detach_catalog_signals()

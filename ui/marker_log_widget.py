@@ -223,3 +223,51 @@ class MarkerLogWidget(QWidget):
         record = self._selected_record()
         if record and record.get("attachment_path"):
             self.open_attachment_requested.emit(record["attachment_path"])
+
+    def cleanup(self):
+        """
+        Clean up internal resources and signal connections.
+
+        Called during plugin unload to ensure no signal leaks.
+        Disconnects all internal widget signals before destruction.
+        """
+        try:
+            # Disconnect internal signal connections
+            try:
+                self.type_filter.currentIndexChanged.disconnect(self._apply_filters)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.table.itemSelectionChanged.disconnect(self._update_button_state)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.table.itemDoubleClicked.disconnect(self._emit_edit_from_item)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.refresh_button.clicked.disconnect(self.refresh)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.zoom_button.clicked.disconnect(self._emit_zoom)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.open_attachment_button.clicked.disconnect(self._emit_open_attachment)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.edit_button.clicked.disconnect(self._emit_edit)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.delete_button.clicked.disconnect(self._emit_delete)
+            except (TypeError, RuntimeError):
+                pass
+
+            # Clear data references
+            self._data_fetcher = None
+            self._records = []
+        except Exception as exc:
+            print(f"[MarkerLogWidget] Warning: Error during cleanup: {exc}")

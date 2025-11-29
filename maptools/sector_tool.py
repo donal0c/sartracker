@@ -76,13 +76,25 @@ class SearchSectorTool(QgsMapTool):
         point = self.toMapCoordinates(event.pos())
 
         # Transform to WGS84 for consistent calculations
-        canvas_crs = self.canvas.mapSettings().destinationCrs()
-        transform = QgsCoordinateTransform(
-            canvas_crs,
-            self.wgs84,
-            QgsProject.instance()
-        )
-        point_wgs84 = transform.transform(point)
+        # CRITICAL FIX (BUG-026): Add exception handling for coordinate transforms
+        try:
+            canvas_crs = self.canvas.mapSettings().destinationCrs()
+            transform = QgsCoordinateTransform(
+                canvas_crs,
+                self.wgs84,
+                QgsProject.instance()
+            )
+            point_wgs84 = transform.transform(point)
+        except Exception as exc:
+            from qgis.utils import iface
+            from ..utils.notify import warning
+            warning(
+                iface.messageBar(),
+                "Sector Tool",
+                f"Coordinate transform failed: {exc}. Please check the map CRS.",
+                duration=5
+            )
+            return
 
         if self.state == self.STATE_START:
             # First click: Set center

@@ -1246,14 +1246,46 @@ class SettingsPanel(QDockWidget):
 
         print(f"[SETTINGS_PANEL] Provider list refreshed ({self.provider_combo.count()} entries)")
 
+    def cleanup(self):
+        """
+        Clean up resources before destruction.
+
+        Disconnects internal signal connections and releases references.
+        Called during plugin unload to ensure proper cleanup.
+        """
+        try:
+            # All internal signals connect to methods on self, and signal
+            # emitters are child widgets. Qt handles cleanup when the parent
+            # is destroyed. However, for safety and to support explicit cleanup
+            # before destruction, we disconnect critical signals here.
+
+            # Disconnect value-change signals to prevent any late notifications
+            try:
+                self.auto_refresh_checkbox.stateChanged.disconnect(self._on_auto_refresh_changed)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.auto_save_checkbox.stateChanged.disconnect(self._on_auto_save_changed)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                self.provider_combo.currentTextChanged.disconnect(self._on_provider_changed)
+            except (TypeError, RuntimeError):
+                pass
+
+            print("[SETTINGS_PANEL] Settings panel cleanup complete")
+        except Exception as exc:
+            print(f"[SETTINGS_PANEL] Warning: Error during cleanup: {exc}")
+
     def closeEvent(self, event):
         """
         Handle widget close event.
 
-        Cleanup before closing (no timers in this widget, but good practice).
+        Cleanup before closing.
 
         Args:
             event: Close event
         """
+        self.cleanup()
         print("[SETTINGS_PANEL] Settings panel closing")
         super().closeEvent(event)
