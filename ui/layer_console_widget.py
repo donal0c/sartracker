@@ -1685,15 +1685,19 @@ class LayerConsoleWidget(QWidget):
                         return layer.get("feature_count", 0)
 
         # Fallback: Get from catalog service
+        # Attempt to retrieve feature count from catalog service with diagnostic logging
         if self._catalog:
             try:
                 layer_info = self._catalog.get_layer(layer_id)
                 if layer_info:
                     return layer_info.feature_count
-            except Exception:
-                pass
+            except Exception as e:
+                # Log the exception without blocking, but provide diagnostic information
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to retrieve feature count for layer {layer_id}: {str(e)}")
 
-        return 0
+        return 0  # Return 0 if unable to retrieve feature count
 
     def _get_layer_display_name(self, layer_id: str) -> str:
         """

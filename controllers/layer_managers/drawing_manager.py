@@ -38,7 +38,8 @@ from ...layers import LayerIds
 from ...utils.drawing_math import (
     geodesic_bearing_endpoint,
     geodesic_circle_points,
-    geodesic_sector_points
+    geodesic_sector_points,
+    calculate_sector_arc_length
 )
 from ...utils.drawing_validation import (
     validate_point,
@@ -1178,6 +1179,7 @@ class DrawingLayerManager(BaseLayerManager):
             QgsField("start_bearing", QVariant.Double),   # Double - start bearing (degrees)
             QgsField("end_bearing", QVariant.Double),     # Double - end bearing (degrees)
             QgsField("radius_m", QVariant.Double),        # Double - radius in meters
+            QgsField("arc_length_deg", QVariant.Double),  # Double - arc length in degrees (BUG-034 fix)
             QgsField("area_sqkm", QVariant.Double),       # Double - area in square km
             QgsField("priority", QVariant.String),        # String - High/Medium/Low
             QgsField("color", QVariant.String),           # String - hex color
@@ -1240,6 +1242,10 @@ class DrawingLayerManager(BaseLayerManager):
 
         sector_geom = QgsGeometry.fromPolygonXY([points])
 
+        # Calculate arc length (BUG-034 fix)
+        # CRITICAL: This determines search area size for SAR operations
+        arc_length_deg = calculate_sector_arc_length(start_bearing, end_bearing)
+
         # Calculate area using WGS84 ellipsoid
         distance_calc = QgsDistanceArea()
         distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
@@ -1247,7 +1253,7 @@ class DrawingLayerManager(BaseLayerManager):
         area_sqm = distance_calc.measureArea(sector_geom)
         area_sqkm = area_sqm / 1000000.0
 
-        logger.debug(f"Sector '{name}': bearings {start_bearing:.1f}°-{end_bearing:.1f}°, radius={radius_m:.2f}m, area={area_sqkm:.4f}km²")
+        logger.debug(f"Sector '{name}': bearings {start_bearing:.1f}°-{end_bearing:.1f}°, arc={arc_length_deg:.1f}°, radius={radius_m:.2f}m, area={area_sqkm:.4f}km²")
 
         # Create feature
         feature = QgsFeature(layer.fields())
@@ -1261,6 +1267,7 @@ class DrawingLayerManager(BaseLayerManager):
             start_bearing,
             end_bearing,
             radius_m,
+            arc_length_deg,  # BUG-034 fix: store calculated arc length
             area_sqkm,
             priority,
             color,
@@ -1415,6 +1422,13 @@ class DrawingLayerManager(BaseLayerManager):
                 points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
                 new_geometry = QgsGeometry.fromPolygonXY([points])
 
+                # Recalculate arc length (BUG-034 fix)
+                # CRITICAL: Arc length must be recalculated when bearings change
+                new_arc_length_deg = calculate_sector_arc_length(
+                    float(new_start_bearing),
+                    float(new_end_bearing)
+                )
+
                 # Recalculate area
                 distance_calc = QgsDistanceArea()
                 distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
@@ -1425,6 +1439,12 @@ class DrawingLayerManager(BaseLayerManager):
                 # Update geometry
                 if not layer.changeGeometry(feature_id, new_geometry):
                     raise RuntimeError("Failed to update sector geometry")
+
+                # Update arc_length_deg attribute (BUG-034 fix)
+                arc_length_field_index = layer.fields().indexFromName('arc_length_deg')
+                if arc_length_field_index != -1:
+                    if not layer.changeAttributeValue(feature_id, arc_length_field_index, new_arc_length_deg):
+                        raise RuntimeError("Failed to update arc_length_deg")
 
                 # Update area attribute
                 area_field_index = layer.fields().indexFromName('area_sqkm')
@@ -1625,6 +1645,10 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             int: Feature ID of added label
         """
+        # Validate text is not empty or whitespace-only
+        if not text or not text.strip():
+            raise ValueError("Text label cannot be empty or whitespace-only")
+
         try:
             validate_point(location_wgs84, "location_wgs84")
             validate_font_size(font_size, "font_size")
@@ -1632,6 +1656,9 @@ class DrawingLayerManager(BaseLayerManager):
         except Exception as exc:
             self._notify_error("Add Text Label Failed", str(exc))
             raise
+
+        # Use stripped text (remove leading/trailing whitespace)
+        text = text.strip()
 
         layer = self._get_or_create_text_labels_layer()
 

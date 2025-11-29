@@ -249,7 +249,13 @@ class MarkerLayerManager(BaseLayerManager):
         if not name or not name.strip():
             raise ValueError("Marker name cannot be empty")
 
-        # Validate coordinates
+        # Validate coordinate types first
+        if not isinstance(lat, (int, float)):
+            raise TypeError(f"Latitude must be a number, got {type(lat).__name__}")
+        if not isinstance(lon, (int, float)):
+            raise TypeError(f"Longitude must be a number, got {type(lon).__name__}")
+
+        # Validate coordinate ranges
         if not (-90 <= lat <= 90):
             raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
 
@@ -258,10 +264,14 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Validate optional Irish Grid coordinates if provided
         if irish_grid_e is not None:
+            if not isinstance(irish_grid_e, (int, float)):
+                raise TypeError(f"Irish Grid easting must be a number, got {type(irish_grid_e).__name__}")
             if not (0 <= irish_grid_e <= 1000000):
                 raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
 
         if irish_grid_n is not None:
+            if not isinstance(irish_grid_n, (int, float)):
+                raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
@@ -368,7 +378,13 @@ class MarkerLayerManager(BaseLayerManager):
         if not name or not name.strip():
             raise ValueError("Marker name cannot be empty")
 
-        # Validate coordinates
+        # Validate coordinate types first
+        if not isinstance(lat, (int, float)):
+            raise TypeError(f"Latitude must be a number, got {type(lat).__name__}")
+        if not isinstance(lon, (int, float)):
+            raise TypeError(f"Longitude must be a number, got {type(lon).__name__}")
+
+        # Validate coordinate ranges
         if not (-90 <= lat <= 90):
             raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
 
@@ -377,10 +393,14 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Validate optional Irish Grid coordinates if provided
         if irish_grid_e is not None:
+            if not isinstance(irish_grid_e, (int, float)):
+                raise TypeError(f"Irish Grid easting must be a number, got {type(irish_grid_e).__name__}")
             if not (0 <= irish_grid_e <= 1000000):
                 raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
 
         if irish_grid_n is not None:
+            if not isinstance(irish_grid_n, (int, float)):
+                raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
@@ -485,7 +505,13 @@ class MarkerLayerManager(BaseLayerManager):
         if not name or not name.strip():
             raise ValueError("Marker name cannot be empty")
 
-        # Validate coordinates
+        # Validate coordinate types first
+        if not isinstance(lat, (int, float)):
+            raise TypeError(f"Latitude must be a number, got {type(lat).__name__}")
+        if not isinstance(lon, (int, float)):
+            raise TypeError(f"Longitude must be a number, got {type(lon).__name__}")
+
+        # Validate coordinate ranges
         if not (-90 <= lat <= 90):
             raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
 
@@ -494,10 +520,14 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Validate optional Irish Grid coordinates if provided
         if irish_grid_e is not None:
+            if not isinstance(irish_grid_e, (int, float)):
+                raise TypeError(f"Irish Grid easting must be a number, got {type(irish_grid_e).__name__}")
             if not (0 <= irish_grid_e <= 1000000):
                 raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
 
         if irish_grid_n is not None:
+            if not isinstance(irish_grid_n, (int, float)):
+                raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
@@ -617,7 +647,13 @@ class MarkerLayerManager(BaseLayerManager):
         if not name or not name.strip():
             raise ValueError("Casualty name/identifier cannot be empty")
 
-        # Validate coordinates
+        # Validate coordinate types first
+        if not isinstance(lat, (int, float)):
+            raise TypeError(f"Latitude must be a number, got {type(lat).__name__}")
+        if not isinstance(lon, (int, float)):
+            raise TypeError(f"Longitude must be a number, got {type(lon).__name__}")
+
+        # Validate coordinate ranges
         if not (-90 <= lat <= 90):
             raise ValueError(f"Invalid latitude: {lat}. Must be between -90 and 90")
 
@@ -626,10 +662,14 @@ class MarkerLayerManager(BaseLayerManager):
 
         # Validate optional Irish Grid coordinates if provided
         if irish_grid_e is not None:
+            if not isinstance(irish_grid_e, (int, float)):
+                raise TypeError(f"Irish Grid easting must be a number, got {type(irish_grid_e).__name__}")
             if not (0 <= irish_grid_e <= 1000000):
                 raise ValueError(f"Invalid Irish Grid easting: {irish_grid_e}. Must be between 0 and 1,000,000")
 
         if irish_grid_n is not None:
+            if not isinstance(irish_grid_n, (int, float)):
+                raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
@@ -704,9 +744,22 @@ class MarkerLayerManager(BaseLayerManager):
     # =========================================================================
 
     def _feature_to_record(self, marker_type: str, layer: QgsVectorLayer, feature: QgsFeature) -> Dict[str, object]:
-        """Convert QgsFeature to lightweight dict for UI consumption."""
-        lat = feature["lat"]
-        lon = feature["lon"]
+        """Convert QgsFeature to lightweight dict for UI consumption.
+
+        Uses safe field access to avoid KeyError on malformed layers.
+        """
+        def safe_attr(field_name, default=None):
+            """Safely get attribute value, returning default if field missing."""
+            try:
+                idx = layer.fields().indexOf(field_name)
+                if idx == -1:
+                    return default
+                return feature.attribute(idx)
+            except Exception:
+                return default
+
+        lat = safe_attr("lat")
+        lon = safe_attr("lon")
         if (lat is None or lon is None) and feature.geometry() and not feature.geometry().isEmpty():
             point = feature.geometry().asPoint()
             if point:
@@ -714,20 +767,20 @@ class MarkerLayerManager(BaseLayerManager):
                 lon = lon or point.x()
 
         return {
-            "id": feature["id"],
+            "id": safe_attr("id"),
             "type": marker_type,
-            "name": feature["name"],
-            "description": feature["description"],
-            "created": feature["created"],
-            "created_at": feature["created_at"],
-            "updated_at": feature["updated_at"],
-            "updated_by": feature["updated_by"],
-            "coordinator_ids": feature["coordinator_ids"],
-            "attachment_path": feature["attachment_path"],
+            "name": safe_attr("name"),
+            "description": safe_attr("description"),
+            "created": safe_attr("created"),
+            "created_at": safe_attr("created_at"),
+            "updated_at": safe_attr("updated_at"),
+            "updated_by": safe_attr("updated_by"),
+            "coordinator_ids": safe_attr("coordinator_ids"),
+            "attachment_path": safe_attr("attachment_path"),
             "lat": lat,
             "lon": lon,
-            "irish_grid_e": feature["irish_grid_e"],
-            "irish_grid_n": feature["irish_grid_n"],
+            "irish_grid_e": safe_attr("irish_grid_e"),
+            "irish_grid_n": safe_attr("irish_grid_n"),
             "layer_id": layer.id(),
             "feature_id": feature.id()
         }

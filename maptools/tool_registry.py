@@ -162,8 +162,17 @@ class ToolRegistry(QObject):
         try:
             # Option 1: Use iface action if available (preserves toolbar state)
             if self.iface and hasattr(self.iface, 'actionPan'):
-                self.iface.actionPan().trigger()
-                print("[REGISTRY] Set default tool via iface.actionPan()")
+                # BUG-056 fix: Check action exists before triggering
+                pan_action = self.iface.actionPan()
+                if pan_action:
+                    pan_action.trigger()
+                    print("[REGISTRY] Set default tool via iface.actionPan()")
+                else:
+                    # Fall through to option 2 if action is None
+                    if not self._pan_tool:
+                        self._pan_tool = QgsMapToolPan(self.canvas)
+                    self.canvas.setMapTool(self._pan_tool)
+                    print("[REGISTRY] Set default tool via QgsMapToolPan (actionPan was None)")
             else:
                 # Option 2: Create and set pan tool directly
                 if not self._pan_tool:

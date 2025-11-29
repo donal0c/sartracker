@@ -193,13 +193,41 @@ class FileCSVProvider(Provider):
                         # Parse attributes
                         attrs = self._parse_attributes(row.get('Attributes', ''))
 
+                        # Parse and validate coordinates
+                        lat = float(row['Latitude'])
+                        lon = float(row['Longitude'])
+
+                        # Validate coordinate ranges (skip invalid positions)
+                        if not (-90 <= lat <= 90):
+                            continue  # Invalid latitude, skip row
+                        if not (-180 <= lon <= 180):
+                            continue  # Invalid longitude, skip row
+
+                        # Validate timestamp format (BUG-041 fix)
+                        # CRITICAL: Invalid timestamps can cause wrong "latest" position
+                        timestamp_str = row.get('Time', '')
+                        if not timestamp_str:
+                            continue  # No timestamp, skip row
+
+                        # Validate timestamp is parseable
+                        try:
+                            # Try ISO format first (most common)
+                            datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        except (ValueError, AttributeError, TypeError):
+                            try:
+                                # Fallback: try common format YYYY-MM-DD HH:MM:SS
+                                datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
+                            except (ValueError, AttributeError, TypeError):
+                                # Invalid timestamp format, skip this row
+                                continue
+
                         # Build position dict
                         position = {
                             'device_id': device_name,
                             'name': device_name,
-                            'lat': float(row['Latitude']),
-                            'lon': float(row['Longitude']),
-                            'ts': row['Time'],  # Keep as string (ISO format)
+                            'lat': lat,
+                            'lon': lon,
+                            'ts': timestamp_str,  # Validated timestamp string
                             'altitude': float(row['Altitude'].replace(' m', '')) if row.get('Altitude') else None,
                             'speed': float(row['Speed'].replace(' kn', '')) if row.get('Speed') else None,
                             'battery': attrs.get('batteryLevel'),
@@ -310,10 +338,23 @@ class FileCSVProvider(Provider):
                 device_positions[device_name].append(positions[-1])
 
         # For each device, select position with maximum (newest) timestamp
-        # ISO timestamps (YYYY-MM-DD HH:MM:SS) compare correctly as strings
+        # Use datetime parsing for reliable comparison (handles various formats)
+        def parse_timestamp(ts_str):
+            """Parse timestamp string to datetime for comparison."""
+            try:
+                # Try ISO format first (most common)
+                return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+            except (ValueError, AttributeError):
+                try:
+                    # Fallback: try common format YYYY-MM-DD HH:MM:SS
+                    return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except (ValueError, AttributeError):
+                    # Last resort: return epoch (will sort to beginning)
+                    return datetime.min
+
         current_positions = []
         for device_name, positions in device_positions.items():
-            latest = max(positions, key=lambda x: x['ts'])
+            latest = max(positions, key=lambda x: parse_timestamp(x['ts']))
             current_positions.append(latest)
 
         return current_positions
@@ -345,11 +386,21 @@ class FileCSVProvider(Provider):
             
             # Filter by time if specified
             if since_iso:
-                since_dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
-                positions = [
-                    p for p in positions
-                    if datetime.fromisoformat(p['ts'].replace('Z', '+00:00')) >= since_dt
-                ]
+                try:
+                    since_dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
+                    filtered_positions = []
+                    for p in positions:
+                        try:
+                            p_ts = datetime.fromisoformat(p['ts'].replace('Z', '+00:00'))
+                            if p_ts >= since_dt:
+                                filtered_positions.append(p)
+                        except (ValueError, AttributeError):
+                            # Can't parse timestamp, include position to be safe
+                            filtered_positions.append(p)
+                    positions = filtered_positions
+                except (ValueError, AttributeError):
+                    # Can't parse since_iso, skip filtering
+                    pass
             
             all_positions.extend(positions)
         
@@ -445,12 +496,26 @@ class FileCSVProvider(Provider):
         Test if CSV file(s) exist and can be read.
 
         Returns:
-            True if CSV files found and readable
+            True if CSV files found and readable, False with diagnostic logging if issues occur
         """
         try:
+            import logging
+            logger = logging.getLogger(__name__)
+
             csv_files = self._get_csv_files()
-            return len(csv_files) > 0
-        except Exception:
+
+            if not csv_files:
+                logger.warning(f"No CSV files found in path: {self.csv_path}")
+                return False
+
+            # Log number of CSV files found
+            logger.info(f"Found {len(csv_files)} CSV files in path")
+            return True
+
+        except Exception as e:
+            # Critical: Log the actual exception details for diagnostics
+            logger = logging.getLogger(__name__)
+            logger.error(f"Connection test failed for CSV provider: {str(e)}")
             return False
 
     def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':

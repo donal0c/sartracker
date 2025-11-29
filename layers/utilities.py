@@ -211,10 +211,16 @@ def count_features_in_layer(layer: QgsVectorLayer) -> int:
     """
     try:
         if not layer or not layer.isValid():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("Feature count retrieval attempted with invalid layer")
             return 0
         return layer.featureCount()
-    except:
-        return 0
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Error retrieving feature count: {str(e)}")
+        return 0  # Preserve existing behavior
 
 
 def get_layer_statistics(layer: QgsVectorLayer) -> dict:

@@ -61,7 +61,9 @@ class BaseDrawingTool(QgsMapTool):
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        self.itm = QgsCoordinateReferenceSystem("EPSG:29903")  # Irish Grid
+        # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
+        # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
+        self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
 
         # Distance calculator (geodesic)
         self.distance_calc = QgsDistanceArea()

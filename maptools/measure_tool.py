@@ -12,10 +12,12 @@ from qgis.core import (
 from qgis.gui import QgsMapTool, QgsRubberBand
 from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QCursor, QColor
-from math import atan2, degrees
+import math
 
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import CrossCursor
+# Import shared geodesic utilities
+from ..utils.drawing_math import geodesic_bearing
 
 
 class MeasureTool(QgsMapTool):
@@ -127,18 +129,13 @@ class MeasureTool(QgsMapTool):
         distance_m = self.distance_calc.measureLine(point1_wgs84, point2_wgs84)
         distance_km = distance_m / 1000.0
 
-        # Calculate bearing (azimuth)
-        # Bearing is the angle from north (0°) clockwise to the line
-        dx = point2_wgs84.x() - point1_wgs84.x()
-        dy = point2_wgs84.y() - point1_wgs84.y()
-
-        # atan2 gives angle from east, convert to bearing from north
-        angle_rad = atan2(dx, dy)
-        bearing = degrees(angle_rad)
-
-        # Normalize to 0-360
-        if bearing < 0:
-            bearing += 360
+        # Calculate bearing using geodesic formula (BUG-035 fix)
+        # Uses shared utility function to ensure consistency across codebase
+        # Provides <0.1° accuracy for SAR operational distances
+        bearing = geodesic_bearing(
+            point1_wgs84.x(), point1_wgs84.y(),
+            point2_wgs84.x(), point2_wgs84.y()
+        )
 
         return distance_m, distance_km, bearing
 

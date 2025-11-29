@@ -103,10 +103,24 @@ class MissionMetadataDialog(BaseDialog):
     # ------------------------------------------------------------------#
     # Helpers
     # ------------------------------------------------------------------#
+    # Maximum length for coordinator names (reasonable database/display limit)
+    MAX_COORDINATOR_NAME_LENGTH = 100
+
     def _add_new_coordinator(self):
         name = self.new_coordinator_input.text().strip()
         if not name:
             return
+
+        # Validate length
+        if len(name) > self.MAX_COORDINATOR_NAME_LENGTH:
+            from qgis.PyQt.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Invalid Name",
+                f"Coordinator name is too long (max {self.MAX_COORDINATOR_NAME_LENGTH} characters)"
+            )
+            return
+
         self.new_coordinator_input.clear()
 
         item = QListWidgetItem(name)

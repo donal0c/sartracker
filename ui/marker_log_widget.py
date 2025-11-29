@@ -202,17 +202,29 @@ class MarkerLogWidget(QWidget):
     def _emit_edit_from_item(self, item: QTreeWidgetItem):
         record = item.data(0, Qt.UserRole)
         if record:
-            self.edit_requested.emit(record.get("type"), record.get("id"))
+            # Ensure str values (signal expects str, str)
+            marker_type = record.get("type") or ""
+            marker_id = record.get("id") or ""
+            if marker_type and marker_id:
+                self.edit_requested.emit(marker_type, marker_id)
 
     def _emit_edit(self):
         record = self._selected_record()
         if record:
-            self.edit_requested.emit(record.get("type"), record.get("id"))
+            # Ensure str values (signal expects str, str)
+            marker_type = record.get("type") or ""
+            marker_id = record.get("id") or ""
+            if marker_type and marker_id:
+                self.edit_requested.emit(marker_type, marker_id)
 
     def _emit_delete(self):
         record = self._selected_record()
         if record:
-            self.delete_requested.emit(record.get("type"), record.get("id"))
+            # Ensure str values (signal expects str, str)
+            marker_type = record.get("type") or ""
+            marker_id = record.get("id") or ""
+            if marker_type and marker_id:
+                self.delete_requested.emit(marker_type, marker_id)
 
     def _emit_zoom(self):
         record = self._selected_record()

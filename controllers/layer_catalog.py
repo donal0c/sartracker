@@ -23,7 +23,7 @@ from qgis.core import (
 
 from ..layers import LayerManager, LayerIds, GroupNames, get_layer_by_id
 from ..layers.schema import get_expected_structure, LAYER_NAME_TO_ID
-from ..utils.notify import warning as notify_warning, error as notify_error
+from ..utils.notify import info as notify_info, warning as notify_warning, error as notify_error
 from ..utils.task_manager import TaskManager
 
 
@@ -558,6 +558,16 @@ class LayerCatalogService(QObject):
             return self._message_bar
         self._message_bar = self._resolve_message_bar()
         return self._message_bar
+
+    def _notify_info(self, title: str, message: str) -> None:
+        """Show informational notification (BUG-059 fix: user feedback for cache rebuild)."""
+        bar = self._message_bar_safe()
+        if not bar:
+            return
+        try:
+            notify_info(bar, title, message, duration=3)
+        except Exception:
+            logger.debug("LayerCatalogService info notification suppressed", exc_info=True)
 
     def _notify_warning(self, title: str, message: str) -> None:
         bar = self._message_bar_safe()
@@ -1201,7 +1211,23 @@ class LayerCatalogService(QObject):
         This is a public method that can be called by LayersController or other components.
         """
         logger.info("Rescanning all layers for catalog rebuild")
-        self._build_cache()
+        # BUG-059 fix: Defer cache rebuild to improve UI responsiveness
+        self._notify_info("Layer Catalog", "Rebuilding layer cache...")
+        QTimer.singleShot(10, self._build_cache_with_notification)
+
+    def _build_cache_with_notification(self):
+        """
+        Build cache and show completion notification.
+
+        BUG-059 fix: Wrapper around _build_cache() that provides user feedback.
+        Called via QTimer.singleShot to improve perceived UI responsiveness.
+        """
+        try:
+            self._build_cache()
+            logger.info("Layer catalog cache rebuild complete")
+        except Exception as e:
+            logger.exception("Cache rebuild failed")
+            self._notify_error("Layer Catalog", f"Cache rebuild failed: {e}")
 
     def refresh_layer(self, layer_id: str, full: bool = False) -> None:
         """
@@ -1589,8 +1615,11 @@ class LayerCatalogService(QObject):
 
         try:
             logger.info("Mission store changed to %s", new_path)
-            # Force full cache rebuild (layer providers changed: memory ↔ ogr)
-            self._build_cache()
+            # BUG-059 fix: Defer cache rebuild to next event loop iteration
+            # This allows UI to update before the blocking operation, improving perceived responsiveness
+            # Note: Layer operations MUST run on UI thread (Qt requirement), so we cannot use QgsTask
+            self._notify_info("Layer Catalog", "Rebuilding layer cache...")
+            QTimer.singleShot(10, self._build_cache_with_notification)
         except Exception as e:
             logger.exception("Error handling mission store change")
             self._notify_error("Mission Store", f"Could not reload mission data: {e}")

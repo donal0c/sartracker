@@ -203,19 +203,17 @@ def _configure_helicopter_labels(layer: QgsVectorLayer, color: str):
 
     label_settings.setFormat(text_format)
 
-    # Set label placement (above point)
+    # Set label placement (above point) with Qt5/Qt6 compatibility
     try:
-        # Try Qt6 enum style first
-        from qgis.core import QgsPalLayerSettings
-        if hasattr(QgsPalLayerSettings, 'Placement'):
-            # Qt6
-            label_settings.placement = QgsPalLayerSettings.Placement.OverPoint
-        else:
-            # Qt5
+        label_settings.placement = QgsPalLayerSettings.Placement.OverPoint
+    except AttributeError:
+        try:
             label_settings.placement = QgsPalLayerSettings.OverPoint
-    except:
-        # Fallback for older QGIS
-        label_settings.placement = 0  # OverPoint
+        except AttributeError:
+            # Defensive fallback for very old QGIS APIs - use numeric constant
+            # 0 typically corresponds to OverPoint placement
+            print("[HelicopterManager] Warning: Using numeric fallback (0) for label placement - very old QGIS API detected")
+            label_settings.placement = 0
 
     # Apply labeling
     layer.setLabeling(QgsVectorLayerSimpleLabeling(label_settings))

@@ -4,23 +4,29 @@ Search Sector Tool
 
 Custom QGIS map tool for creating search sectors (pie slice/wedge shapes).
 Useful for SAR operations to define directional search areas.
+
+BUG-054 Fix: Now inherits from BaseDrawingTool for consistency with other drawing tools.
 """
 
 from qgis.core import (
     QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsGeometry, QgsFeature, QgsVectorLayer, QgsField,
-    QgsWkbTypes, QgsDistanceArea
+    QgsWkbTypes
 )
-from qgis.gui import QgsMapTool, QgsRubberBand, QgsVertexMarker
+from qgis.gui import QgsRubberBand, QgsVertexMarker
 from qgis.PyQt.QtCore import pyqtSignal
 from qgis.PyQt.QtGui import QCursor, QColor
 import math
 
+# Import base class and utilities
+from .base_drawing_tool import BaseDrawingTool
 # Import Qt5/Qt6 compatible constants
-from ..utils.qt_compat import CrossCursor, Key_Escape
+from ..utils.qt_compat import CrossCursor, LeftButton, Key_Escape
+# Import shared geometry utilities
+from ..utils.drawing_math import calculate_sector_arc_length
 
 
-class SearchSectorTool(QgsMapTool):
+class SearchSectorTool(BaseDrawingTool):
     """
     Map tool for creating search sectors (wedge/pie slice shapes).
 
@@ -47,32 +53,29 @@ class SearchSectorTool(QgsMapTool):
         Args:
             canvas: QGIS map canvas
         """
+        # BUG-054 fix: Call BaseDrawingTool initialization
+        # This sets up wgs84, itm, distance_calc, rubber_bands, and cursor
         super().__init__(canvas)
-        self.canvas = canvas
-        self.setCursor(QCursor(CrossCursor))
 
-        # Tool state
+        # Sector-specific state
         self.state = self.STATE_START
         self.center = None
         self.radius = None
         self.start_angle = None
         self.end_angle = None
 
-        # Visual feedback elements
+        # Sector-specific visual feedback elements
         self.center_marker = None
         self.radius_band = None
         self.sector_band = None
 
-        # Setup coordinate systems
-        self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-
-        # Distance calculator
-        self.distance_calc = QgsDistanceArea()
-        self.distance_calc.setSourceCrs(self.wgs84, QgsProject.instance().transformContext())
-        self.distance_calc.setEllipsoid('WGS84')
-
     def canvasPressEvent(self, event):
         """Handle mouse click - multi-step sector creation."""
+        # BUG-052 fix: Only respond to left mouse button
+        # Right-click should not advance state, allows for context menu/cancel
+        if event.button() != LeftButton:
+            return
+
         point = self.toMapCoordinates(event.pos())
 
         # Transform to WGS84 for consistent calculations
@@ -198,6 +201,22 @@ class SearchSectorTool(QgsMapTool):
         # Normalize to 0-360
         return (bearing + 360) % 360
 
+    def _calculate_arc_length(self, start_angle, end_angle):
+        """
+        Calculate the clockwise arc length between two bearings.
+
+        Delegates to the shared utility function in utils.drawing_math to ensure
+        consistency across all sector calculations in the codebase.
+
+        Args:
+            start_angle: Start bearing in degrees (0 = North, can be any value)
+            end_angle: End bearing in degrees (can be any value)
+
+        Returns:
+            float: Arc length in degrees (0 to 360)
+        """
+        return calculate_sector_arc_length(start_angle, end_angle)
+
     def create_sector_geometry(self, center, radius, start_angle, end_angle):
         """
         Create a sector (wedge) geometry.
@@ -213,29 +232,40 @@ class SearchSectorTool(QgsMapTool):
         """
         points = [center]  # Start at center
 
-        # Normalize angles
+        # Calculate arc length using shared, validated logic
+        arc_length = self._calculate_arc_length(start_angle, end_angle)
+
+        # Normalize angles for geometry generation
         start = start_angle % 360
         end = end_angle % 360
-
-        # Handle arc direction (always go clockwise)
         if end < start:
             end += 360
+        elif start == end:
+            # Full circle case
+            end = start + 360
 
         # Number of segments for the arc
-        arc_length = end - start
         segments = max(10, int(arc_length / 5))  # One point every 5 degrees
 
         # Create arc points
+        # Apply latitude correction for longitude distortion
+        # At higher latitudes, longitude degrees are "narrower" than latitude degrees
+        center_lat_rad = math.radians(center.y())
+        cos_lat = math.cos(center_lat_rad)
+
         for i in range(segments + 1):
             angle = start + (arc_length * i / segments)
             angle_rad = math.radians(angle)
 
             # Approximate distance in degrees
-            dist_deg = radius / 111000.0  # Rough approximation
+            # 111000m = 1 degree latitude (constant)
+            # Longitude degree varies by latitude: 111000m * cos(lat)
+            dist_deg_lat = radius / 111000.0
+            dist_deg_lon = radius / (111000.0 * cos_lat) if cos_lat > 0.01 else dist_deg_lat
 
-            # Calculate point position
-            dx = dist_deg * math.sin(angle_rad)
-            dy = dist_deg * math.cos(angle_rad)
+            # Calculate point position with latitude correction
+            dx = dist_deg_lon * math.sin(angle_rad)  # Longitude offset (corrected)
+            dy = dist_deg_lat * math.cos(angle_rad)  # Latitude offset (no correction needed)
 
             point = QgsPointXY(
                 center.x() + dx,
@@ -277,12 +307,12 @@ class SearchSectorTool(QgsMapTool):
             self.end_angle
         )
 
-        # Calculate arc length
-        arc_length = abs(self.end_angle - self.start_angle)
-        if arc_length > 180:
-            arc_length = 360 - arc_length
+        # Calculate arc length using shared, validated logic
+        # CRITICAL: This MUST match the geometry calculation to ensure
+        # area metadata accurately reflects the drawn sector
+        arc_length = self._calculate_arc_length(self.start_angle, self.end_angle)
 
-        # Calculate area (approximate)
+        # Calculate area (approximate) - use actual arc length
         area_sqm = (math.pi * self.radius * self.radius) * (arc_length / 360)
         area_sqkm = area_sqm / 1000000
 
@@ -339,8 +369,10 @@ class SearchSectorTool(QgsMapTool):
 
     def show_radius_line(self, start, end):
         """Show line indicating radius."""
+        # BUG-053 fix: Properly clean up old rubber band before creating new one
         if self.radius_band:
             self.canvas.scene().removeItem(self.radius_band)
+            self.radius_band = None
 
         # Create line geometry
         line = QgsGeometry.fromPolylineXY([start, end])
@@ -359,6 +391,9 @@ class SearchSectorTool(QgsMapTool):
         self.radius_band.setColor(QColor(255, 0, 0, 200))
         self.radius_band.setWidth(2)
         self.radius_band.setToGeometry(line, None)
+        # BUG-053/054 fix: Track rubber band for proper cleanup via base class
+        if self.radius_band not in self.rubber_bands:
+            self.rubber_bands.append(self.radius_band)
 
     def show_radius_preview(self, center, current):
         """Show preview of radius."""
@@ -366,8 +401,10 @@ class SearchSectorTool(QgsMapTool):
 
     def show_sector_preview(self, center, radius, start_angle, current_angle):
         """Show preview of sector."""
+        # BUG-053 fix: Properly clean up old rubber band before creating new one
         if self.sector_band:
             self.canvas.scene().removeItem(self.sector_band)
+            self.sector_band = None
 
         # Create sector geometry
         geometry = self.create_sector_geometry(center, radius, start_angle, current_angle)
@@ -387,6 +424,9 @@ class SearchSectorTool(QgsMapTool):
         self.sector_band.setStrokeColor(QColor(0, 100, 255, 200))
         self.sector_band.setWidth(2)
         self.sector_band.setToGeometry(geometry, None)
+        # BUG-053/054 fix: Track rubber band for proper cleanup via base class
+        if self.sector_band not in self.rubber_bands:
+            self.rubber_bands.append(self.sector_band)
 
     def reset(self):
         """Reset tool to initial state."""
@@ -401,28 +441,28 @@ class SearchSectorTool(QgsMapTool):
             self.canvas.scene().removeItem(self.center_marker)
             self.center_marker = None
 
-        if self.radius_band:
-            self.canvas.scene().removeItem(self.radius_band)
-            self.radius_band = None
-
-        if self.sector_band:
-            self.canvas.scene().removeItem(self.sector_band)
-            self.sector_band = None
+        # BUG-053/054 fix: Use base class clear_rubber_bands() for consistent cleanup
+        # This properly cleans up all tracked rubber bands
+        self.clear_rubber_bands()
+        self.radius_band = None
+        self.sector_band = None
 
     def activate(self):
         """Called when tool is activated."""
+        # BUG-054 fix: Base class handles cursor and rubber band cleanup
         super().activate()
-        self.canvas.setCursor(QCursor(CrossCursor))
+        # Reset sector-specific state
         self.reset()
 
     def deactivate(self):
         """Called when tool is deactivated."""
+        # BUG-054 fix: Base class handles rubber band cleanup
         super().deactivate()
+        # Reset sector-specific state
         self.reset()
 
-    def isZoomTool(self):
-        """Return False - this is not a zoom tool."""
-        return False
+    # BUG-054 fix: Removed isZoomTool(), isEditTool(), isTransient()
+    # These are inherited from BaseDrawingTool with correct defaults
 
     def isTransient(self):
         """Return False - tool stays active for multiple clicks."""

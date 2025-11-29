@@ -140,6 +140,15 @@ except Exception as e:
     LayerManager = None
     print(f"ERROR importing LayerManager: {e}")
 
+# Import schema constants used for layer recovery safeguards
+try:
+    from .layers.schema import GroupNames
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('layers.schema.GroupNames', e, traceback.format_exc()))
+    GroupNames = None
+    print(f"ERROR importing GroupNames: {e}")
+
 # Import ProviderController (Phase 3)
 try:
     from .controllers.provider_controller import ProviderController
@@ -2290,6 +2299,9 @@ class sartracker:
         clears the project layers), rebuild the structure so layers stay visible.
         """
         try:
+            if not GroupNames:
+                print("[SARTRACKER] Cannot recover layers: GroupNames unavailable")
+                return
             root = QgsProject.instance().layerTreeRoot()
             sar_group = root.findGroup(GroupNames.ROOT) if root else None
             if sar_group:

@@ -302,7 +302,10 @@ def prepare_breadcrumb_segments(
             lon = _validate_coordinate(pos.get('lon'), -180.0, 180.0, 'longitude')
             timestamp = pos.get('ts')
             ts_dt = _normalize_iso_timestamp(timestamp)
-        except Exception:
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Skipping point for device {device_id if 'device_id' in locals() else 'unknown'}: {str(e)}")
             stats['skipped_points'] += 1
             continue
 
@@ -513,6 +516,11 @@ class TraccarRefreshTask(ProviderRefreshTask):
         Returns:
             True if successful, False if error occurred
         """
+        # BUG-049 fix: Check provider exists before calling methods
+        if not self.provider:
+            self.error_message = "Provider no longer available"
+            return False
+
         # Create thread-local session for this task
         session = self.provider._create_session()
         fallback_features = None

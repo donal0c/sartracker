@@ -31,7 +31,13 @@ class CoordinateConverterDialog(BaseDialog):
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        self.itm = QgsCoordinateReferenceSystem("EPSG:29903")
+        # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
+        # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
+        self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
+
+        # BUG-057 fix: Track timers to prevent crashes on early dialog close
+        self.copy_timer = None
+        self.goto_timer = None
 
         self._setup_ui()
 
@@ -204,6 +210,19 @@ class CoordinateConverterDialog(BaseDialog):
                 easting = float(self.easting_input.text().strip().replace(',', ''))
                 northing = float(self.northing_input.text().strip().replace(',', ''))
 
+                # Validate Irish Grid (ITM) coordinate ranges
+                # ITM valid ranges for Ireland: E ~400000-800000, N ~500000-1000000
+                if not (400000 <= easting <= 800000):
+                    self.result_label.setText(
+                        "❌ Error: Easting must be between 400,000 and 800,000 for Irish Grid (ITM)"
+                    )
+                    return
+                if not (500000 <= northing <= 1000000):
+                    self.result_label.setText(
+                        "❌ Error: Northing must be between 500,000 and 1,000,000 for Irish Grid (ITM)"
+                    )
+                    return
+
                 # Transform
                 transform = QgsCoordinateTransform(
                     self.itm,
@@ -252,8 +271,12 @@ class CoordinateConverterDialog(BaseDialog):
             self.copy_button.setEnabled(False)
 
             # Reset after 1 second
+            # BUG-057 fix: Store timer reference for cleanup
             from qgis.PyQt.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: self._reset_copy_button(original_text))
+            self.copy_timer = QTimer()
+            self.copy_timer.setSingleShot(True)
+            self.copy_timer.timeout.connect(lambda: self._reset_copy_button(original_text))
+            self.copy_timer.start(1000)
 
     def _reset_copy_button(self, original_text):
         """Reset copy button after brief delay."""
@@ -270,10 +293,25 @@ class CoordinateConverterDialog(BaseDialog):
             self.goto_button.setText("✓ Map Updated!")
             self.goto_button.setEnabled(False)
 
+            # BUG-057 fix: Store timer reference for cleanup
             from qgis.PyQt.QtCore import QTimer
-            QTimer.singleShot(1000, lambda: self._reset_goto_button(original_text))
+            self.goto_timer = QTimer()
+            self.goto_timer.setSingleShot(True)
+            self.goto_timer.timeout.connect(lambda: self._reset_goto_button(original_text))
+            self.goto_timer.start(1000)
 
     def _reset_goto_button(self, original_text):
         """Reset goto button after brief delay."""
         self.goto_button.setText(original_text)
         self.goto_button.setEnabled(True)
+
+    def closeEvent(self, event):
+        """Handle dialog close - cancel any pending timers."""
+        # BUG-057 fix: Stop timers to prevent callbacks on deleted dialog
+        if hasattr(self, 'copy_timer') and self.copy_timer:
+            self.copy_timer.stop()
+            self.copy_timer = None
+        if hasattr(self, 'goto_timer') and self.goto_timer:
+            self.goto_timer.stop()
+            self.goto_timer = None
+        super().closeEvent(event)

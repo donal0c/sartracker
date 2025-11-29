@@ -855,7 +855,11 @@ class SARPanel(QDockWidget):
         self._set_button_state(self.pause_button, "flashOn", self._pause_flash)
 
     def _format_seconds(self, seconds: float) -> str:
-        total = max(0, int(seconds or 0))
+        import math
+        # Guard against NaN/Inf values which would crash int()
+        if seconds is None or not math.isfinite(seconds):
+            seconds = 0.0
+        total = max(0, int(seconds))
         hours, remainder = divmod(total, 3600)
         minutes, secs = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
@@ -975,48 +979,9 @@ class SARPanel(QDockWidget):
             self.layer_console_widget.set_catalog_fetcher(self._get_layer_console_data)
             self.layer_console_widget.refresh(full=True)
 
-    def _attach_catalog_signals(self):
-        """Attach catalog change signals for live refresh."""
-        catalog = getattr(self._layers_controller, "catalog", None)
-        if not catalog:
-            return
-        connections = [
-            (catalog.model_changed, self._on_catalog_model_changed),
-            (catalog.layer_updated, self._on_catalog_model_changed),
-            (catalog.feature_count_changed, self._on_catalog_feature_count_changed)
-        ]
-        for signal, handler in connections:
-            try:
-                signal.connect(handler)
-                self._layer_console_connections.append((signal, handler))
-            except Exception as exc:
-                print(f"[SARPanel] Warning: Failed to attach catalog signal: {exc}")
-
-    def _detach_catalog_signals(self):
-        """Disconnect catalog signal handlers."""
-        for signal, handler in list(self._layer_console_connections):
-            try:
-                # CRITICAL: Check if signal's parent object still exists
-                # Attempting to disconnect from a deleted object causes QGIS crash
-                parent = getattr(signal, '__self__', None)
-                if parent is None:
-                    continue  # Signal parent already deleted, skip
-
-                # Additional safety: Check if parent is a QObject and still valid
-                from qgis.PyQt.QtCore import QObject
-                if isinstance(parent, QObject):
-                    try:
-                        # Try to access a basic property - will fail if object deleted
-                        _ = parent.objectName()
-                    except (RuntimeError, AttributeError):
-                        # Object deleted, skip disconnect
-                        continue
-
-                signal.disconnect(handler)
-            except (TypeError, RuntimeError, AttributeError):
-                # Signal already disconnected, object deleted, or other Qt issue
-                pass
-        self._layer_console_connections = []
+    # BUG-058 fix: Removed _attach_catalog_signals() and _detach_catalog_signals()
+    # These methods were never called and represented dead code. The _layer_console_connections
+    # list was always empty, making _detach a no-op despite being called in cleanup.
 
     def _get_layer_console_data(self) -> Dict[str, Any]:
         """Fetch catalog payload for console widget."""
@@ -1309,8 +1274,9 @@ class SARPanel(QDockWidget):
             marker_type = self._marker_layer_to_type[layer_id]
             try:
                 feature = self._layers_controller.markers.get_marker_feature(marker_type, str(feature_id))
-            except Exception:
-                self._notify(warning, "Zoom", "Marker unavailable")
+            except Exception as e:
+                # BUG-047 fix: Include actual error details for better diagnostics
+                self._notify(warning, "Zoom", f"Marker unavailable: {str(e)}")
                 return
         else:
             layer = self._layers_controller.layer_manager.get_layer(layer_id) if hasattr(self._layers_controller, "layer_manager") else None
@@ -1463,6 +1429,10 @@ class SARPanel(QDockWidget):
             raise ValueError("Feature id is required")
         if isinstance(value, bool):
             raise ValueError("Invalid feature id")
+        # Check for float truncation
+        if isinstance(value, float):
+            if value != int(value):
+                print(f"[SARPanel] Warning: Float feature id {value} truncated to {int(value)}")
         return int(str(int(value)))
 
     def _message_bar(self):
@@ -2075,8 +2045,7 @@ class SARPanel(QDockWidget):
                 except Exception as exc:
                     print(f"[SARTRACKER] Warning: Error cleaning up marker log widget: {exc}")
 
-            if hasattr(self, '_detach_catalog_signals'):
-                self._detach_catalog_signals()
+            # BUG-058 fix: Removed _detach_catalog_signals() call (dead code)
 
             if hasattr(self, 'layer_console_widget') and self.layer_console_widget:
                 try:

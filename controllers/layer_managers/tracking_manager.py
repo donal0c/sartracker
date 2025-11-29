@@ -72,6 +72,9 @@ class TrackingLayerManager(BaseLayerManager):
         self.task_manager = task_manager
         self.first_load = True  # Track if this is first data load for auto-zoom
         self._breadcrumb_task_id: Optional[str] = None
+        # BUG-060 fix: Track temp directories for cleanup
+        self._temp_export_dirs: List[str] = []
+        self._cleanup_old_temp_dirs()
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -86,6 +89,8 @@ class TrackingLayerManager(BaseLayerManager):
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
         self._cancel_breadcrumb_task()
+        # BUG-060 fix: Clean up temp export directories
+        self._cleanup_temp_dirs()
         super().cleanup()
 
     def _log_tracking_event(self, layer: QgsVectorLayer, layer_type: str, action: str, **extra):
@@ -973,6 +978,8 @@ class TrackingLayerManager(BaseLayerManager):
             raise ValueError(f"No breadcrumbs found for device {device_id}")
 
         temp_dir = tempfile.mkdtemp(prefix="sartracker_export_")
+        # BUG-060 fix: Track temp directory for cleanup
+        self._temp_export_dirs.append(temp_dir)
         path = os.path.join(temp_dir, f"{device_id}_track.geojson")
 
         try:
@@ -987,8 +994,51 @@ class TrackingLayerManager(BaseLayerManager):
             if result != QgsVectorFileWriter.NoError:
                 raise RuntimeError(f"Export failed: {error_message}")
         except Exception:
+            # BUG-060 fix: Remove from tracking list on failure
+            if temp_dir in self._temp_export_dirs:
+                self._temp_export_dirs.remove(temp_dir)
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
         logger.info("[TrackingManager] Exported track for %s to %s", device_id, path)
         return path
+
+    def _cleanup_temp_dirs(self):
+        """
+        Clean up all tracked temporary export directories.
+
+        BUG-060 fix: Called during plugin cleanup to prevent temp directory accumulation.
+        """
+        for temp_dir in self._temp_export_dirs[:]:  # Copy list to allow modification during iteration
+            try:
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.debug("[TrackingManager] Cleaned up temp directory: %s", temp_dir)
+            except Exception as e:
+                logger.warning("[TrackingManager] Failed to clean up temp directory %s: %s", temp_dir, e)
+        self._temp_export_dirs.clear()
+
+    def _cleanup_old_temp_dirs(self):
+        """
+        Clean up old sartracker_export_* directories from previous sessions.
+
+        BUG-060 fix: Called during initialization to clean up temp directories left
+        behind by crashes or improper shutdowns.
+        """
+        try:
+            temp_root = tempfile.gettempdir()
+            # Find all sartracker_export_* directories
+            for entry in os.listdir(temp_root):
+                if entry.startswith("sartracker_export_"):
+                    old_dir = os.path.join(temp_root, entry)
+                    try:
+                        if os.path.isdir(old_dir):
+                            # Check if it's old (more than 1 hour)
+                            dir_age = datetime.now().timestamp() - os.path.getmtime(old_dir)
+                            if dir_age > 3600:  # 1 hour
+                                shutil.rmtree(old_dir, ignore_errors=True)
+                                logger.debug("[TrackingManager] Cleaned up old temp directory: %s", old_dir)
+                    except Exception as e:
+                        logger.debug("[TrackingManager] Could not clean up old temp directory %s: %s", old_dir, e)
+        except Exception as e:
+            logger.debug("[TrackingManager] Could not scan temp directory for old exports: %s", e)

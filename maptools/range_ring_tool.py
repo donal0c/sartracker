@@ -357,6 +357,8 @@ class RangeRingTool(BaseDrawingTool):
             # Reset for next ring set
             self.center_point = None
             self.clear_rubber_bands()
+            # BUG-051 fix: Deactivate tool after creating rings
+            self.canvas.unsetMapTool(self)
 
     def _get_lpb_color(self, percentile):
         """
@@ -399,4 +401,6 @@ class RangeRingTool(BaseDrawingTool):
         """Cancel current operation."""
         self.center_point = None
         self.clear_rubber_bands()
+        # BUG-055 fix: Properly unset map tool when canceling
+        self.canvas.unsetMapTool(self)
         self.drawing_cancelled.emit()
