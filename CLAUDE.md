@@ -1,54 +1,77 @@
-# SAR Tracker - Project Knowledge for AI Assistants
+# SAR Tracker – CLAUDE.md (Life‑Safety Critical)
 
-> **Note**: This is the Claude-specific documentation file with comprehensive patterns.
-> For general AI assistant instructions, see [AGENTS.md](./AGENTS.md).
-> Other AI assistants should refer to AGENTS.md first, then consult this file for detailed patterns.
-
-## 🚨 CRITICAL SAFETY CONTEXT
-
-**Classification:** LIFE-SAFETY CRITICAL SYSTEM
-**Domain:** Mountain Search and Rescue Operations
-**Impact:** Failures can result in loss of life during active rescue operations
-
-**Before making ANY changes:**
-- Understand that rescue coordinators depend on this software in life-or-death situations
-- Test thoroughly across Qt5 and Qt6 (QGIS 3.28 - 3.44+)
-- Never skip error handling or input validation
-- Follow all mandatory patterns documented below
-- When uncertain, consult detailed documentation and ask for review
+> **Note for AI assistants (especially Claude Code):**
+> This file defines high‑priority guardrails, workflows, and patterns for working on the SAR Tracker QGIS plugin.
+> For general AI instructions and non‑Claude tools, see **AGENTS.md** first, then return here.
 
 ---
 
-## PROJECT OVERVIEW
+## 🚨 CRITICAL GUARDRAILS
+
+**Classification:** LIFE‑SAFETY CRITICAL SYSTEM
+**Domain:** Mountain Search and Rescue Operations
+**Impact:** Failures can result in loss of life during active rescue operations.
+
+Before making **any** change:
+
+1. **Lives > Features** – Never trade safety or reliability for speed, scope, or aesthetics.
+2. **Respect existing safety patterns** – Do **not** bypass:
+
+   * `utils.qt_compat` (Qt5/Qt6 compatibility)
+   * `utils.dialog_utils.BaseDialog`
+   * `utils.task_manager.TaskManager`
+3. **Validate everything** – Treat all user input (especially coordinates, file paths, device IDs) as untrusted.
+4. **Non‑blocking UI** – Long‑running operations must run in background tasks; the map UI must remain responsive.
+5. **Multi‑version compatibility** – All changes must work on **Qt5 and Qt6** (QGIS 3.28 – 3.44+).
+6. **No silent failures** – Errors must be handled gracefully and surfaced to the user with actionable messages.
+7. **Human review for high‑impact changes** – Any change affecting:
+
+   * Position/coordinate handling
+   * Mission timing or status
+   * Background task lifecycle
+   * Storage of mission or tracking data
+
+   **All such changes require explicit human review before merge.**
+
+If you are unsure about implications of a change: **stop, narrow the scope, and request review.**
+
+---
+
+## PROJECT CONTEXT
 
 **Type:** QGIS Plugin (Python)
-**Version:** 0.3.1
 **Team:** Kerry Mountain Rescue Team, Ireland
-**QGIS Compatibility:** 3.28+ (Qt5 and Qt6)
+**Version:** 0.3.1
+**QGIS:** 3.28+ (Qt5 and Qt6)
 **Python:** 3.8+
 
 ### Core Purpose
-Real-time tracking and tactical mapping console for Search and Rescue operations. Enables rescue coordinators to:
-- Track rescue personnel positions in real-time
-- Manage missions with precise time tracking
-- Place tactical markers (IPP/LKP, clues, hazards)
-- Draw search areas, bearing lines, range rings
-- Coordinate multi-team operations
-- Work reliably in offline/poor connectivity scenarios
+
+SAR Tracker is a real‑time tracking and tactical mapping console for mountain search and rescue operations. It is used by rescue coordinators to:
+
+* Track personnel positions in near real‑time
+* Manage missions and time tracking
+* Place tactical markers (IPP/LKP, clues, hazards)
+* Draw search areas, bearing lines, range rings
+* Coordinate multi‑team operations
+* Operate reliably in **offline / poor connectivity** conditions
+
+Use this mental model whenever changing code:
+
+> **This plugin is part of the safety equipment rescuers rely on in bad weather, poor visibility, and limited bandwidth.**
 
 ---
 
-## ARCHITECTURE QUICK REFERENCE
+## ARCHITECTURE MAP (HIGH‑LEVEL)
 
-### Module Structure
-```
+```text
 sartracker/
-├── utils/                    # ⚠️ CRITICAL: Compatibility & safety layer
-│   ├── qt_compat.py         # Qt5/Qt6 enum compatibility (MANDATORY)
-│   ├── dialog_utils.py      # SafeQDialog base class (fixes blank dialogs)
-│   ├── task_manager.py      # Background task lifecycle
-│   ├── secure_store.py      # Credential security (system keychain)
-│   └── notify.py            # User notifications
+├── utils/                    # CRITICAL: Compatibility & safety layer
+│   ├── qt_compat.py          # Qt5/Qt6 enum compatibility (MANDATORY)
+│   ├── dialog_utils.py       # SafeQDialog base class (fixes blank dialogs)
+│   ├── task_manager.py       # Background task lifecycle & safety guards
+│   ├── secure_store.py       # Credential security (system keychain)
+│   └── notify.py             # User notifications
 │
 ├── controllers/
 │   ├── layers_controller.py       # Layer orchestration
@@ -77,220 +100,217 @@ sartracker/
 ```
 
 ### Critical Dependencies
-- **Bundled:** requests, urllib3, charset_normalizer (in `vendor/site-packages`)
-- **QGIS Core:** QgsTask, QgsVectorLayer, QgsCoordinateTransform
-- **Storage:** GeoPackage layers, system keychain for credentials
+
+* **Bundled:** `requests`, `urllib3`, `charset_normalizer` (in `vendor/site-packages`)
+* **QGIS Core:** `QgsTask`, `QgsVectorLayer`, `QgsCoordinateTransform`, `QgsProject`
+* **Storage:** GeoPackage layers; system keychain for credentials
+
+When editing code, prefer **extending existing controllers/managers/tools** over adding new ad‑hoc scripts or one‑off modules.
 
 ---
 
-## MANDATORY CODING PATTERNS
+## STANDARD WORKFLOWS
 
-### Pattern 1: Qt Imports (100% Compliance Required)
-```python
-# ✅ CORRECT - Always use qgis.PyQt
-from qgis.PyQt.QtCore import Qt, QTimer
-from qgis.PyQt.QtWidgets import QDialog, QPushButton
-from qgis.PyQt.QtGui import QIcon, QColor
+These workflows are **mandatory** for Claude when making non‑trivial changes.
 
-# ❌ WRONG - NEVER import PyQt5/PyQt6 directly
-from PyQt5.QtCore import Qt      # Breaks in Qt6
-from PyQt6.QtWidgets import QDialog  # Breaks in Qt5
-```
+### 1. Bug Fix Workflow (CRITICAL)
 
-### Pattern 2: Qt Enums (100% Compliance Required)
-```python
-# ✅ CORRECT - Import from utils.qt_compat
-from utils.qt_compat import (
-    LeftButton, RightButton,
-    Key_Escape, Key_Return,
-    Checked, Unchecked,
-    CrossCursor, ArrowCursor,
-    dialog_exec, DialogAccepted, DialogRejected
-)
+1. **Understand the bug**
 
-if event.button() == LeftButton:
-    self.handle_click()
+   * Read the issue description and any references to `docs/incident_log.md` or `issues_to_address.md`.
+   * Locate the relevant modules in `controllers/`, `providers/`, `maptools/`, or `ui/`.
+2. **Reproduce safely**
 
-# ❌ WRONG - Direct Qt enum usage
-from qgis.PyQt.QtCore import Qt
-if event.button() == Qt.LeftButton:  # Breaks in Qt6
-    pass
-```
+   * Reproduce the bug in a controlled environment if possible (non‑live, test data).
+   * Note QGIS version and Qt version if relevant.
+3. **Propose a minimal fix**
 
-**Why:** Qt6 moved enums to scoped namespaces (Qt.MouseButton.LeftButton vs Qt.LeftButton). Our compatibility layer handles both versions.
+   * Outline a short plan in bullets: *what to change, why it is safe, and which tests to run*.
+   * Highlight any impact on coordinates, mission state, or background tasks.
+4. **Implement incrementally**
 
-### Pattern 3: Dialog Base Classes (CRITICAL)
-```python
-# ✅ CORRECT - Prevents blank dialog bug
-from utils.dialog_utils import BaseDialog
-from utils.qt_compat import dialog_exec, DialogAccepted
+   * Make small, localized changes following the patterns in `docs/AI_CODE_REFERENCE.md`.
+   * Keep safety and compatibility checks in place.
+5. **Test**
 
-class MyDialog(BaseDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("My Dialog")
-        # ... setup UI
+   * Run the relevant automated checks (see **Testing & Commands** below).
+   * Manually confirm no regressions in basic workflows.
+6. **Summarize**
 
-# Usage
-dialog = MyDialog(parent=iface.mainWindow())
-if dialog_exec(dialog) == DialogAccepted:
-    process_data()
+   * Provide a concise description of:
 
-# ❌ WRONG - Direct QDialog inheritance
-from qgis.PyQt.QtWidgets import QDialog
-class MyDialog(QDialog):  # May render blank on Windows Qt 5.15
-    pass
-```
+     * Root cause
+     * Fix implemented
+     * Tests run and results
 
-**Why:** Qt 5.15.x has blank dialog rendering bugs on Windows. BaseDialog applies automatic workarounds.
+Do **not** perform large refactors as part of a bug fix.
 
-### Pattern 4: Background Tasks (LIFE-SAFETY CRITICAL)
-```python
-# ✅ CORRECT - Use TaskManager
-from utils.task_manager import TaskManager
+### 2. New Feature / Enhancement Workflow
 
-class MyPlugin:
-    def __init__(self):
-        self.task_manager = TaskManager()
+1. **Clarify requirements**
 
-    def start_work(self):
-        task = self.provider.create_refresh_task("Loading")
-        self.task_manager.start_task(
-            task=task,
-            on_complete=self._on_complete,
-            on_error=self._on_error,
-            task_id="refresh"
-        )
+   * Confirm feature scope, especially around safety, offline use, and performance.
+   * Identify which layers, providers, and UI panels are involved.
+2. **Consult design docs**
 
-    def _on_complete(self, task):
-        # CRITICAL: Check components exist before processing
-        if not self.layers_controller or not self.sar_panel:
-            print("[PLUGIN] Task completed after unload, ignoring")
-            return
+   * Read the relevant sections of `docs/architecture.md` and `docs/AI_CODE_REFERENCE.md`.
+3. **Plan first**
 
-        result = task.get_result()
-        self.update_ui(result)
+   * Draft a short plan: data flow, UI changes, failure modes, tests.
+   * Explicitly call out how you will preserve safety and compatibility.
+4. **Implement in small steps**
 
-    def unload(self):
-        if self.task_manager:
-            self.task_manager.cancel_all()
+   * Start with data and background tasks.
+   * Then wire UI and interaction patterns.
+   * Use existing patterns for dialogs, tasks, and validation; do not invent new ones casually.
+5. **Test thoroughly**
 
-# ❌ WRONG - Direct signal connection
-task.taskCompleted.connect(self._on_complete)  # Signal leak!
-QgsApplication.taskManager().addTask(task)
-# Problem: Signals remain connected after plugin unload → crash
-```
+   * Run automated checks.
+   * Exercise the feature under:
 
-**Why:** TaskManager automatically manages signal lifecycle, preventing handlers from firing after plugin unload.
+     * Poor/no connectivity
+     * Plugin reloads
+     * Invalid inputs
 
-### Pattern 5: Input Validation (MANDATORY)
-```python
-# ✅ CORRECT - Always validate user input
-def add_marker(self, name, lat, lon, marker_type="ipp_lkp"):
-    """Add marker with comprehensive validation."""
-    # Validate name
-    if not name or not name.strip():
-        raise ValueError("Marker name cannot be empty")
+### 3. Refactor / Cleanup Workflow
 
-    # Validate latitude
-    if not isinstance(lat, (int, float)) or not (-90 <= lat <= 90):
-        raise ValueError(f"Invalid latitude: {lat}. Must be -90 to 90")
+1. **Only refactor when necessary** and when there is time to test properly.
+2. **Maintain behaviour** – refactors must not change:
 
-    # Validate longitude
-    if not isinstance(lon, (int, float)) or not (-180 <= lon <= 180):
-        raise ValueError(f"Invalid longitude: {lon}. Must be -180 to 180")
+   * Coordinate conversions
+   * Validation rules
+   * Background task lifecycle
+3. **Work in small steps**
 
-    # Validate marker type
-    valid_types = ["ipp_lkp", "clue", "hazard"]
-    if marker_type not in valid_types:
-        raise ValueError(f"Invalid marker type: {marker_type}")
+   * Refactor one module or concern at a time.
+   * Run tests between each logical step.
+4. **Document why**
 
-    # Now safe to proceed
-    # ...
+   * Add small comments where a refactor clarifies safety or lifecycle logic.
 
-# ❌ WRONG - No validation
-def add_marker(self, name, lat, lon):
-    self.create_marker(name, lat, lon)  # What if lat=999?
-```
+For all workflows: **ask for human review** for changes that might affect field safety.
 
-**Why:** Invalid coordinates can endanger rescuers. Life-safety system requires bulletproof validation.
+---
+
+## MANDATORY PATTERNS (SUMMARY)
+
+Details and full examples for all patterns live in **`docs/AI_CODE_REFERENCE.md`**.
+Use that document for in‑depth examples. This section is a **high‑level checklist**.
+
+### Qt Imports
+
+* **Never** import `PyQt5` or `PyQt6` directly.
+* Always import from `qgis.PyQt`:
+
+  * `from qgis.PyQt.QtCore import Qt, QTimer`
+  * `from qgis.PyQt.QtWidgets import QDialog, QPushButton`
+* If you find a direct PyQt5/PyQt6 import: treat it as a bug and fix it.
+
+### Qt Enums & Dialog Execution
+
+* Do **not** use raw enums like `Qt.LeftButton` or `Qt.Checked`.
+* Always import enums and dialog helpers from `utils.qt_compat`, e.g.:
+
+  * `LeftButton`, `RightButton`
+  * `Key_Escape`, `Key_Return`
+  * `Checked`, `Unchecked`
+  * `CrossCursor`, `ArrowCursor`
+  * `dialog_exec`, `DialogAccepted`, `DialogRejected`
+* For dialogs, always call `dialog_exec(dialog)`; do not use `.exec()` / `.exec_()` directly.
+
+### Dialog Base Class (CRITICAL)
+
+* All dialogs must inherit from `utils.dialog_utils.BaseDialog`.
+* Do **not** create new `QDialog` subclasses directly.
+* Reason: Qt 5.15.x on Windows can render dialogs blank; `BaseDialog` includes workarounds.
+
+### Background Tasks & Async Safety (LIFE‑SAFETY CRITICAL)
+
+* Use `utils.task_manager.TaskManager` for all long‑running or background operations.
+* Do **not** connect `QgsTask` signals directly to plugin methods.
+* In async callbacks:
+
+  * Guard against components being `None` or unloaded.
+  * Log and exit early if UI or controllers are missing.
+* In plugin `unload()`:
+
+  * Ensure `TaskManager.cancel_all()` is called.
+
+### Input Validation (MANDATORY)
+
+* All user input must be validated before use, especially:
+
+  * Marker names and descriptions
+  * Coordinates (lat/lon, eastings/northings)
+  * File paths and device IDs
+* Example coordinate rules:
+
+  * Latitude: numeric, between **‑90** and **90**
+  * Longitude: numeric, between **‑180** and **180**
+* Invalid input must raise a clear error and surface an actionable message to the user.
+
+### Coordinate Handling (CRITICAL)
+
+* Treat coordinate transform logic as safety‑critical.
+* Use the existing shared pattern in the codebase (see `docs/AI_CODE_REFERENCE.md#coordinate-handling`).
+* Typical approach:
+
+  * Validate numeric inputs.
+  * Use `QgsCoordinateReferenceSystem`, `QgsCoordinateTransform`, and `QgsProject`.
+  * Convert from local CRS (e.g. EPSG:2157 ITM) to WGS84 (EPSG:4326) for lat/lon.
+* On any transform failure: raise a clear error; do **not** silently continue with bad data.
+
+### Lifecycle & Resource Cleanup
+
+* Timers must be created with a parent (`QTimer(self)` or similar) to avoid leaks.
+* Signals must be disconnected (or their owners destroyed) in `unload()`.
+* Background tasks and long‑lived objects must not reference destroyed UI components.
 
 ---
 
 ## COMMON PITFALLS TO AVOID
 
-1. **Qt Enum Incompatibility** → Always use `utils.qt_compat`
-2. **Blocking UI** → Use QgsTask for operations >100ms
-3. **Insecure Storage** → Never store credentials in QSettings/config files
-4. **Missing Error Handling** → Every external operation needs try/except
-5. **No Defensive Guards** → Async handlers must check component existence
-6. **Timer Leaks** → Always create timers with parent: `QTimer(self)`
-7. **Signal Leaks** → Track connections, disconnect in `unload()`
-8. **Direct Dialog Exec** → Use `dialog_exec()` wrapper, not `.exec()` or `.exec_()`
+1. **Qt Enum Incompatibility** – Using raw Qt enums instead of `utils.qt_compat`.
+2. **Blocking UI** – Running heavy I/O or computations on the main thread.
+3. **Insecure Storage** – Storing credentials in plain text or QSettings.
+4. **Missing Error Handling** – Allowing exceptions to bubble up and crash the plugin.
+5. **No Defensive Guards** – Assuming controllers/UI still exist in async callbacks.
+6. **Timer & Signal Leaks** – Creating timers or signal connections without lifecycles tied to the plugin.
+7. **Ad‑hoc Coordinate Logic** – Implementing custom transforms instead of using the shared pattern.
+
+If you see any of the above in existing code, treat it as **technical debt with safety impact** and flag it.
 
 ---
 
-## TESTING REQUIREMENTS
+## TESTING & COMMANDS
 
-### Pre-Commit Checklist
-```bash
-# Run automated compatibility checks
-./tools/check_compatibility.sh
+### Pre‑Commit Checklist
 
-# Expected output:
-# ✅ PASS - No direct PyQt5/PyQt6 imports
-# ✅ PASS - No direct Qt enum usage
-# ✅ PASS - All dialogs use BaseDialog
-# ✅ PASS - All dialog execution uses wrapper
-# ✅ PASS - All notifications use utils.notify
-```
+Before considering a change "safe":
+
+* [ ] Run compatibility checks:
+
+  * `./tools/check_compatibility.sh`
+* [ ] Confirm no direct PyQt5/PyQt6 imports
+* [ ] Confirm no direct Qt enum usage
+* [ ] Confirm dialogs use `BaseDialog` and `dialog_exec`
+* [ ] Confirm notifications go through `utils.notify`
 
 ### Critical Test Scenarios
-- [ ] Works in Qt5 (QGIS 3.28, 3.34)
-- [ ] Works in Qt6 (QGIS 3.40, 3.44+)
-- [ ] Dialogs render correctly (not blank)
-- [ ] All user inputs validated
-- [ ] Error cases handled gracefully
-- [ ] Coordinate transformations accurate
-- [ ] Plugin reload doesn't crash
-- [ ] Background tasks cancel cleanly on unload
 
-### Async Operations Testing (CRITICAL)
-```python
-# Test reload during background operation
-from qgis.utils import plugins, reloadPlugin
+At minimum, for relevant areas:
 
-for i in range(10):
-    plugin = plugins.get('sartracker')
-    plugin._on_refresh_data()  # Start async operation
-    reloadPlugin('sartracker')  # Immediate reload
-    print(f"Reload cycle {i+1} complete")
-# Expected: No crashes, no AttributeError
-```
+* [ ] QGIS Qt5 (e.g. 3.28, 3.34) – plugin loads, main flows work
+* [ ] QGIS Qt6 (e.g. 3.40, 3.44+) – same behaviour, no regressions
+* [ ] Dialogs render correctly (no blank dialogs)
+* [ ] User inputs are validated and rejected safely when invalid
+* [ ] Error cases show clear messages (no silent crashes)
+* [ ] Coordinate transformations are accurate and consistent
+* [ ] Plugin reloads (via `reloadPlugin('sartracker')`) do not crash
+* [ ] Background tasks cancel cleanly on unload
 
----
+### Development Commands (Reference)
 
-## DOCUMENTATION REFERENCES
-
-### Primary Documentation
-- **`docs/AI_CODE_REFERENCE.md`** - Comprehensive coding patterns and rules (1300+ lines)
-- **`docs/architecture.md`** - System architecture and hardening features
-- **`FUTURE_WORK/Server/post_audit_recommendations.md`** - Recent Traccar HTTP audit findings
-
-### Development Guides
-- **`FUTURE_WORK/ROADMAP.md`** - Planned features and priorities
-- **`FUTURE_WORK/testing_and_qa.md`** - QA procedures
-- **`tests/csv_regression_checklist.md`** - Known regression tests
-
-### Field Incidents
-- **`docs/incident_log.md`** - Field failures and mitigations (if exists)
-- **`issues_to_address.md`** - Active backlog (if exists)
-
----
-
-## QUICK COMMAND REFERENCE
-
-### Development Commands
 ```bash
 # Run compatibility checks
 ./tools/check_compatibility.sh
@@ -300,21 +320,17 @@ python tools/preflight_check.py
 
 # Update vendor dependencies
 python tools/vendor_deps.py --refresh
-
-# Run smoke test (from QGIS Python console)
-from sartracker.tools.smoketest import run_smoke_test
-from qgis.utils import iface
-run_smoke_test(iface)
 ```
 
-### Common Operations
+From QGIS Python console, typical operations:
+
 ```python
-# Get plugin instance (from QGIS Python console)
-from qgis.utils import plugins
+from qgis.utils import plugins, reloadPlugin
+
+# Get plugin instance
 sar = plugins.get('sartracker')
 
 # Reload plugin
-from qgis.utils import reloadPlugin
 reloadPlugin('sartracker')
 
 # Show diagnostics
@@ -323,137 +339,90 @@ sar._show_diagnostics()
 
 ---
 
-## ERROR HANDLING PATTERN
-
-```python
-# Standard error handling for layer operations
-def commit_feature_changes(self, layer, feature):
-    """Commit feature changes with proper error handling."""
-    try:
-        if not layer.isEditable():
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing: {layer.name()}")
-
-        if not layer.addFeature(feature):
-            raise RuntimeError(f"Failed to add feature: {layer.name()}")
-
-        if not layer.commitChanges():
-            errors = layer.commitErrors()
-            raise RuntimeError(f"Commit failed: {', '.join(errors)}")
-
-        return True
-
-    except Exception as e:
-        # Rollback on any error
-        if layer.isEditable():
-            layer.rollBack()
-
-        # Notify user with actionable message
-        from utils.notify import error
-        error(self.iface.messageBar(), "Layer Error", str(e))
-
-        # Re-raise for caller
-        raise
-```
-
----
-
-## COORDINATE HANDLING (CRITICAL)
-
-```python
-# Always validate and document coordinate systems
-def convert_to_wgs84(self, easting, northing, source_crs_id=2157):
-    """Convert coordinates to WGS84.
-
-    Args:
-        easting: Easting in source CRS
-        northing: Northing in source CRS
-        source_crs_id: Source CRS EPSG code (default: 2157 = Irish Grid ITM)
-
-    Returns:
-        Tuple of (latitude, longitude) in WGS84 decimal degrees
-
-    Raises:
-        ValueError: If coordinates invalid
-        RuntimeError: If transformation fails
-    """
-    # Validate inputs
-    if not isinstance(easting, (int, float)) or not isinstance(northing, (int, float)):
-        raise ValueError("Coordinates must be numeric")
-
-    try:
-        from qgis.core import QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsPointXY
-
-        source_crs = QgsCoordinateReferenceSystem(source_crs_id)
-        wgs84_crs = QgsCoordinateReferenceSystem(4326)  # WGS84 EPSG
-
-        if not source_crs.isValid():
-            raise RuntimeError(f"Invalid source CRS: {source_crs_id}")
-
-        transform = QgsCoordinateTransform(source_crs, wgs84_crs, QgsProject.instance())
-        point = QgsPointXY(easting, northing)
-        transformed = transform.transform(point)
-
-        return (transformed.y(), transformed.x())  # (lat, lon)
-
-    except Exception as e:
-        raise RuntimeError(f"Coordinate transformation failed: {e}")
-```
-
----
-
 ## AI ASSISTANT GUIDELINES
 
 ### When Making Changes
-1. **Read Documentation First** - Check `docs/AI_CODE_REFERENCE.md` for detailed patterns
-2. **Check Existing Code** - Find similar implementations for consistency
-3. **Consider Edge Cases** - Offline mode, network failures, invalid input
-4. **Add Error Handling** - Never let exceptions crash the plugin
-5. **Validate All Input** - Especially coordinates, user text, file paths
-6. **Test Both Qt Versions** - Must work in Qt5 and Qt6
-7. **Update Tests** - Add test coverage for new functionality
-8. **Document Safety Decisions** - Explain why for life-safety code
 
-### Priority Order (Non-Negotiable)
-1. **Safety** - Lives depend on reliability
-2. **Compatibility** - Must work on all supported QGIS versions (Qt5/Qt6)
-3. **Security** - Protect credentials, validate input
-4. **Performance** - UI must remain responsive (use background tasks)
-5. **Features** - New capabilities
+When you, as an AI assistant, are asked to edit this codebase:
 
-### Code Review Questions to Ask Yourself
-- Does this work in both Qt5 and Qt6?
-- What happens if the network fails?
-- What happens if the user enters invalid data?
-- What happens if the plugin is reloaded during this operation?
-- Will this block the UI thread?
-- Are credentials stored securely?
-- Is coordinate validation comprehensive?
-- Does this follow existing patterns?
+1. **Read relevant docs first**
+
+   * Always check `docs/AI_CODE_REFERENCE.md` for patterns related to the area you’re changing.
+   * For architecture‑level questions, read `docs/architecture.md`.
+2. **Study existing code**
+
+   * Find similar implementations and follow their patterns.
+3. **Consider edge cases**
+
+   * Offline mode, network failures, invalid input, plugin reloads.
+4. **Add or preserve error handling**
+
+   * Do not remove try/except blocks around external operations.
+   * Ensure errors are surfaced via `utils.notify`.
+5. **Validate all inputs**
+
+   * Especially coordinates, mission identifiers, device IDs, and user‑supplied text.
+6. **Check multi‑version behaviour**
+
+   * Code must run correctly on both Qt5 and Qt6.
+7. **Update or add tests where appropriate**
+
+   * Keep tests focused and practical; do not generate huge test suites without being asked.
+8. **Document safety‑critical decisions briefly**
+
+   * When making a choice that affects safety, add a short comment or note explaining why.
+
+### Priority Order (Non‑Negotiable)
+
+1. **Safety** – Human life and rescuer safety
+2. **Compatibility** – Supported QGIS versions and Qt5/Qt6
+3. **Security** – Credentials and sensitive data
+4. **Performance & UX** – Responsive UI, appropriate polling intervals
+5. **New Features** – Only after the above are satisfied
+
+### Code Review Self‑Check
+
+Before finalizing a change, ask yourself:
+
+* Does this work in both Qt5 and Qt6 environments?
+* What happens if the network fails or is slow?
+* How is invalid input handled at each entry point?
+* What happens if the plugin is reloaded during this operation?
+* Could this block the UI thread?
+* Are credentials and sensitive values stored securely?
+* Have I reused existing patterns instead of inventing new ones?
+
+If any answer is unclear or worrying, **stop and request human review.**
+
+### Documentation Scope
+
+* Do **not** create long design documents, multi‑page reports, or speculative summaries unless explicitly asked.
+* Short, focused artefacts **are allowed and encouraged** when they improve safety or future understanding, for example:
+
+  * A brief change summary for a PR
+  * A short note added to an incident log entry
 
 ---
 
 ## KEY PRINCIPLES
 
-1. **Safety First** - Lives depend on this code working correctly
-2. **Validate Everything** - Trust no input, especially coordinates
-3. **Handle All Errors** - Never let exceptions crash the plugin silently
-4. **Test Thoroughly** - Both Qt5 and Qt6, online and offline
-5. **Document Clearly** - Others will maintain this code in emergencies
-6. **Follow Patterns** - Use established compatibility patterns
-7. **Ask Questions** - When in doubt, consult docs and ask for review
-8. **Defensive Guards** - All async handlers check component existence
-9. **Clean Lifecycle** - Disconnect signals, stop timers, cancel tasks in `unload()`
-10. **No Assumptions** - Components may be deleted at any time
-11. **No Extra Docs** - Do not create extra documentation unless specifically asked to do so. This includes summaries, reports, etc.
+1. **Safety First** – Lives depend on this code working correctly under stress.
+2. **Validate Everything** – Especially coordinates and mission‑critical inputs.
+3. **Handle All Errors** – No unhandled exceptions that can crash the plugin.
+4. **Test Thoroughly** – Across Qt5/Qt6, online/offline, and key workflows.
+5. **Follow Established Patterns** – Use compatibility and safety helpers as designed.
+6. **Defensive Programming** – Assume components may be missing or destroyed.
+7. **Clean Lifecycle** – Disconnect signals, stop timers, cancel tasks in `unload()`.
+8. **Minimal Surprises** – Prefer small, clear changes over clever or complex ones.
+9. **Ask Questions** – When in doubt, consult docs and request review.
 
 ---
 
 ## REMEMBER
 
-This is not just software. This is a tool that rescue coordinators depend on when lives are at stake. Every feature you add, every line you write, every bug you fix—it all matters.
+This is not just software. It is part of the equipment rescuers rely on during real missions, often in bad weather, at night, and with limited connectivity.
 
-A rescue volunteer's safety may depend on this plugin working correctly in the field, in poor conditions, with unreliable connectivity.
+Every feature you add, every bug you fix, and every refactor you perform has the potential to affect people’s safety.
 
 **Take your time. Follow the guidelines. Test thoroughly. Never compromise on quality.**
 
@@ -461,6 +430,8 @@ A rescue volunteer's safety may depend on this plugin working correctly in the f
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2025-11-22
-**For Questions:** See `docs/AI_CODE_REFERENCE.md` for comprehensive patterns and examples
+**Document Version:** 1.1 (rewritten for Claude Code optimization)
+
+**Last Updated:** 2025‑11‑29
+
+**For Detailed Patterns & Examples:** See `docs/AI_CODE_REFERENCE.md`.
