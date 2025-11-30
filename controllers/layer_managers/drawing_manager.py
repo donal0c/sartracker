@@ -50,7 +50,7 @@ from ...utils.drawing_validation import (
     validate_font_size,
     validate_width
 )
-from ...utils.exceptions import LayerTransactionError, LayerLockError
+from ...utils.exceptions import LayerTransactionError, LayerLockError, GeometryError
 from ...utils.notify import error as notify_error
 
 
@@ -1200,6 +1200,35 @@ class DrawingLayerManager(BaseLayerManager):
         self._log_drawing_event(layer, "SECTORS", "created")
         return self._require_valid_layer(layer, self.SECTORS_LAYER_NAME)
 
+    def _assert_valid_sector_geometry(self, geometry: QgsGeometry, name: str):
+        """Ensure generated sector polygon is valid before committing."""
+        if not geometry or geometry.isEmpty():
+            raise GeometryError(f"Sector '{name}' generated an empty geometry.", geometry_type="polygon")
+
+        try:
+            validation_results = geometry.validateGeometry() or []
+        except Exception as exc:
+            raise GeometryError(
+                f"Sector '{name}' geometry validation failed: {exc}",
+                geometry_type="polygon"
+            ) from exc
+
+        if validation_results:
+            issues = []
+            for result in validation_results:
+                message = None
+                if hasattr(result, "what") and callable(getattr(result, "what")):
+                    try:
+                        message = result.what()
+                    except Exception:
+                        message = None
+                message = message or getattr(result, "description", None) or str(result)
+                issues.append(message)
+            raise GeometryError(
+                f"Sector '{name}' geometry is invalid: {'; '.join(issues)}",
+                geometry_type="polygon"
+            )
+
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
                    start_bearing: float, end_bearing: float, radius_m: float,
                    priority: str = "Medium", color: str = "#FF6464") -> int:
@@ -1230,17 +1259,21 @@ class DrawingLayerManager(BaseLayerManager):
 
         layer = self._get_or_create_sectors_layer()
 
-        points_deg = geodesic_sector_points(
-            center_wgs84.x(),
-            center_wgs84.y(),
-            start_bearing,
-            end_bearing,
-            radius_m,
-            num_segments=36
-        )
-        points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
-
-        sector_geom = QgsGeometry.fromPolygonXY([points])
+        try:
+            points_deg = geodesic_sector_points(
+                center_wgs84.x(),
+                center_wgs84.y(),
+                start_bearing,
+                end_bearing,
+                radius_m,
+                num_segments=36
+            )
+            points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
+            sector_geom = QgsGeometry.fromPolygonXY([points])
+            self._assert_valid_sector_geometry(sector_geom, name)
+        except GeometryError as exc:
+            self._notify_error("Add Sector Failed", str(exc))
+            raise
 
         # Calculate arc length (BUG-034 fix)
         # CRITICAL: This determines search area size for SAR operations

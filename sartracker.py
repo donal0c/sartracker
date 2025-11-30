@@ -417,6 +417,8 @@ class sartracker:
         self.coords_update_timer = None  # Timer to throttle coordinate updates
         self._map_canvas_connected = False  # Track xyCoordinates signal connection (Issue #4)
         self._coords_updates_enabled = False  # Guard for timer callbacks
+        self._safe_mode_active = False  # Import failure safe-mode flag
+        self._safe_mode_reason = None  # Human-readable Safe Mode reason
 
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
@@ -493,6 +495,41 @@ class sartracker:
         before being registered or may not be registered at all.
         """
         return all(getattr(self, name, None) for name in attrs)
+
+    def _enter_safe_mode(self, reason: str):
+        """Disable operational actions after fatal import failures."""
+        self._safe_mode_active = True
+        self._safe_mode_reason = reason
+        keep_enabled = {
+            getattr(self, "diagnostics_action", None),
+            getattr(self, "smoketest_action", None)
+        }
+        for action in self.actions:
+            if not action or action in keep_enabled:
+                continue
+            try:
+                action.setEnabled(False)
+                action.setToolTip("Disabled due to critical import failure. Use Diagnostics for details.")
+            except Exception:
+                pass
+        print(f"[SARTRACKER] Safe mode enabled: {reason}")
+
+    def _safe_mode_block(self, action_label: str, *, allow_diagnostics: bool = False) -> bool:
+        """
+        Return True if action should be blocked due to safe mode (import failure).
+        """
+        if not getattr(self, "_safe_mode_active", False):
+            return False
+        if allow_diagnostics:
+            return False
+        reason = self._safe_mode_reason or "Plugin failed to load due to critical import errors."
+        self._notify(
+            "error",
+            "SAR Tracker Safe Mode",
+            f"{action_label} is unavailable: {reason}",
+            duration=6
+        )
+        return True
 
     def _current_mission_paths(self) -> Optional[MissionPaths]:
         """Build MissionPaths from current state if available."""
@@ -1206,6 +1243,8 @@ class sartracker:
         # Show import failure dialog using BaseDialog (Issue #2 fix)
         dialog = ImportFailureDialog(error_summary, parent=self.iface.mainWindow())
         dialog_exec(dialog)
+        failure_reason = f"{errors[0][0]}: {errors[0][1]}"
+        self._enter_safe_mode(failure_reason)
 
     def _show_settings(self):
         """
@@ -1214,6 +1253,8 @@ class sartracker:
         Opens or focuses the Settings panel when user clicks Settings menu item.
         Guards against initialization failure.
         """
+        if self._safe_mode_block("Settings panel"):
+            return
         # CRITICAL GUARD: Check if settings panel exists (defensive guard Pattern 9)
         if not self.settings_panel:
             # Settings panel failed to initialize - show user-friendly error
@@ -1233,6 +1274,8 @@ class sartracker:
 
     def _show_diagnostics(self):
         """Show diagnostics dialog with error handling."""
+        if self._safe_mode_block("Diagnostics", allow_diagnostics=True):
+            return
         try:
             from .ui.diagnostics_panel import DiagnosticsPanel
             from .utils.qt_compat import dialog_exec
@@ -1250,6 +1293,8 @@ class sartracker:
 
     def _run_smoke_test(self):
         """Run smoke test with error handling."""
+        if self._safe_mode_block("Smoke Test", allow_diagnostics=True):
+            return
         try:
             from .tools.smoketest import run_smoke_test
             run_smoke_test(self.iface)
@@ -1622,6 +1667,8 @@ class sartracker:
         If imports failed during initGui(), self.sar_panel will be None.
         Show user-friendly error instead of crashing with AttributeError.
         """
+        if self._safe_mode_block("SAR Tracker panel"):
+            return
         # CRITICAL GUARD: Check if panel exists (Issue #3 fix)
         # Panel may be None if imports failed during initialization
         if not self.sar_panel:

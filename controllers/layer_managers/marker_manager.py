@@ -11,6 +11,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 from datetime import datetime, timezone
 import uuid
 from typing import Dict, List, Optional
+from contextlib import contextmanager
 
 from qgis.core import (
     QgsVectorLayer, QgsFeature, QgsGeometry,
@@ -22,7 +23,7 @@ from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
-from ...utils.exceptions import LayerTransactionError
+from ...utils.exceptions import LayerTransactionError, LayerLockError, LayerError
 
 
 class MarkerLayerManager(BaseLayerManager):
@@ -93,6 +94,115 @@ class MarkerLayerManager(BaseLayerManager):
     def _current_timestamp(self) -> str:
         """Return ISO timestamp for audit fields (timezone-aware UTC)."""
         return datetime.now(timezone.utc).isoformat()
+
+    @contextmanager
+    def _layer_transaction(self, layer: QgsVectorLayer, layer_name: str, operation: str):
+        """
+        Context manager enforcing safe edit session lifecycle for marker layers.
+        """
+        if not layer or not layer.isValid():
+            raise LayerError(f"{layer_name} layer is unavailable or invalid.", layer_name=layer_name)
+        if layer.isEditable():
+            raise LayerLockError(layer_name)
+
+        cleanup_attempted = False
+
+        def _cleanup(raise_on_failure: bool, reason: str) -> Optional[str]:
+            nonlocal cleanup_attempted
+            cleanup_attempted = True
+            context = f"{operation}::{reason}" if reason else operation
+            return self._safe_close_layer_edit(layer, layer_name, context, raise_on_failure=raise_on_failure)
+
+        try:
+            try:
+                started = layer.startEditing()
+            except Exception as exc:
+                details = str(exc)
+                cleanup_note = _cleanup(False, "start_editing_exception")
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
+                raise LayerTransactionError(layer_name, "start editing", details=details) from exc
+
+            if not started:
+                cleanup_note = _cleanup(False, "start_editing_failed")
+                details = operation
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
+                raise LayerTransactionError(layer_name, "start editing", details=details)
+
+            yield layer
+
+            if not layer.commitChanges():
+                errors = layer.commitErrors()
+                details = "; ".join(errors) if errors else operation
+                cleanup_note = _cleanup(False, "commit_failure")
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
+                raise LayerTransactionError(layer_name, "commit changes", details=details)
+        except LayerError:
+            _cleanup(False, "layer_error")
+            raise
+        except Exception as exc:
+            details = str(exc)
+            cleanup_note = _cleanup(False, "exception")
+            if cleanup_note:
+                details = f"{details} | cleanup: {cleanup_note}"
+            raise LayerTransactionError(layer_name, operation, details=details) from exc
+        finally:
+            if not cleanup_attempted:
+                self._safe_close_layer_edit(layer, layer_name, f"{operation}::finalize", raise_on_failure=True)
+
+    def _safe_close_layer_edit(
+        self,
+        layer: Optional[QgsVectorLayer],
+        layer_name: str,
+        context: str,
+        raise_on_failure: bool = False
+    ) -> Optional[str]:
+        """
+        Ensure marker layers exit edit mode, logging failures for diagnostics.
+        """
+        if not layer or not layer.isValid():
+            return None
+
+        try:
+            editable = layer.isEditable()
+        except Exception as exc:
+            message = f"isEditable() check failed: {exc}"
+            if raise_on_failure:
+                raise LayerTransactionError(layer_name, context, details=message) from exc
+            print(f"[MarkerLayerManager] CRITICAL: {layer_name} cleanup state unknown ({context}): {message}")
+            return message
+
+        if not editable:
+            return None
+
+        issues: List[str] = []
+        try:
+            result = layer.rollBack()
+            if result is False:
+                issues.append("rollBack returned False")
+        except RuntimeError as exc:
+            issues.append(f"RuntimeError: {exc}")
+        except Exception as exc:
+            issues.append(f"rollback exception: {exc}")
+
+        try:
+            editable = layer.isEditable()
+        except Exception as exc:
+            issues.append(f"isEditable() post-check failed: {exc}")
+            editable = True
+
+        if editable:
+            if not issues:
+                issues.append("layer remained editable after rollback attempt")
+            message = "; ".join(issues)
+            if raise_on_failure:
+                raise LayerTransactionError(layer_name, context, details=message)
+            print(f"[MarkerLayerManager] CRITICAL: {layer_name} cleanup failed ({context}): {message}")
+            return message
+
+        return None
 
     def _get_marker_layer(self, marker_type: str) -> QgsVectorLayer:
         """Return persistent layer for a marker type."""
@@ -304,34 +414,13 @@ class MarkerLayerManager(BaseLayerManager):
         ))
         self._apply_feature_attributes(layer, feature, attributes)
 
-        # Add to layer with error handling
-        try:
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.IPP_LKP_LAYER_NAME} layer - layer may be locked or read-only")
-
-            if not layer.addFeature(feature):
-                layer.rollBack()
+        with self._layer_transaction(layer, self.IPP_LKP_LAYER_NAME, "add marker") as edit_layer:
+            if not edit_layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to {self.IPP_LKP_LAYER_NAME} layer")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit changes to {self.IPP_LKP_LAYER_NAME} layer: {', '.join(errors)}")
-
-            # Force immediate visual update
-            layer.triggerRepaint()
-
-            self._log_marker_event(layer, self._marker_log_label("ipp_lkp"), "add", marker_id=marker_id, name=name)
-            return marker_id
-
-        except Exception as e:
-            # Ensure layer is not left in editing state
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                self.IPP_LKP_LAYER_NAME,
-                "add marker",
-                details=str(e)
-            )
+        layer.triggerRepaint()
+        self._log_marker_event(layer, self._marker_log_label("ipp_lkp"), "add", marker_id=marker_id, name=name)
+        return marker_id
 
     # =========================================================================
     # Clues Layer (Evidence found during search)
@@ -431,34 +520,13 @@ class MarkerLayerManager(BaseLayerManager):
         ))
         self._apply_feature_attributes(layer, feature, attributes)
 
-        # Add to layer with error handling
-        try:
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.CLUES_LAYER_NAME} layer - layer may be locked or read-only")
-
-            if not layer.addFeature(feature):
-                layer.rollBack()
+        with self._layer_transaction(layer, self.CLUES_LAYER_NAME, "add marker") as edit_layer:
+            if not edit_layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to {self.CLUES_LAYER_NAME} layer")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit changes to {self.CLUES_LAYER_NAME} layer: {', '.join(errors)}")
-
-            # Force immediate visual update
-            layer.triggerRepaint()
-
-            self._log_marker_event(layer, self._marker_log_label("clue"), "add", marker_id=marker_id, name=name)
-            return marker_id
-
-        except Exception as e:
-            # Ensure layer is not left in editing state
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                self.CLUES_LAYER_NAME,
-                "add marker",
-                details=str(e)
-            )
+        layer.triggerRepaint()
+        self._log_marker_event(layer, self._marker_log_label("clue"), "add", marker_id=marker_id, name=name)
+        return marker_id
 
     # =========================================================================
     # Hazards Layer (Safety warnings)
@@ -558,34 +626,13 @@ class MarkerLayerManager(BaseLayerManager):
         ))
         self._apply_feature_attributes(layer, feature, attributes)
 
-        # Add to layer with error handling
-        try:
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.HAZARDS_LAYER_NAME} layer - layer may be locked or read-only")
-
-            if not layer.addFeature(feature):
-                layer.rollBack()
+        with self._layer_transaction(layer, self.HAZARDS_LAYER_NAME, "add marker") as edit_layer:
+            if not edit_layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to {self.HAZARDS_LAYER_NAME} layer")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit changes to {self.HAZARDS_LAYER_NAME} layer: {', '.join(errors)}")
-
-            # Force immediate visual update
-            layer.triggerRepaint()
-
-            self._log_marker_event(layer, self._marker_log_label("hazard"), "add", marker_id=marker_id, name=name)
-            return marker_id
-
-        except Exception as e:
-            # Ensure layer is not left in editing state
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                self.HAZARDS_LAYER_NAME,
-                "add marker",
-                details=str(e)
-            )
+        layer.triggerRepaint()
+        self._log_marker_event(layer, self._marker_log_label("hazard"), "add", marker_id=marker_id, name=name)
+        return marker_id
 
     # =========================================================================
     # Casualties Layer (Found injured or deceased persons)
@@ -702,42 +749,22 @@ class MarkerLayerManager(BaseLayerManager):
         ))
         self._apply_feature_attributes(layer, feature, attributes)
 
-        # Add to layer with proper transaction handling (Issue #3 pattern)
-        try:
-            if not layer.startEditing():
-                raise RuntimeError(f"Failed to start editing {self.CASUALTIES_LAYER_NAME} layer - layer may be locked or read-only")
-
-            if not layer.addFeature(feature):
-                layer.rollBack()
+        with self._layer_transaction(layer, self.CASUALTIES_LAYER_NAME, "add marker") as edit_layer:
+            if not edit_layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to {self.CASUALTIES_LAYER_NAME} layer")
 
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit changes to {self.CASUALTIES_LAYER_NAME} layer: {', '.join(errors)}")
+        layer.triggerRepaint()
 
-            # Force immediate visual update
-            layer.triggerRepaint()
-
-            self._log_marker_event(
-                layer,
-                self._marker_log_label("casualty"),
-                "add",
-                marker_id=marker_id,
-                name=name,
-                condition=condition,
-                evacuation_priority=evacuation_priority
-            )
-            return marker_id
-
-        except Exception as e:
-            # Ensure layer is not left in editing state (Issue #3 fix)
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                self.CASUALTIES_LAYER_NAME,
-                "add marker",
-                details=str(e)
-            )
+        self._log_marker_event(
+            layer,
+            self._marker_log_label("casualty"),
+            "add",
+            marker_id=marker_id,
+            name=name,
+            condition=condition,
+            evacuation_priority=evacuation_priority
+        )
+        return marker_id
 
     # =========================================================================
     # Marker listing / CRUD helpers
@@ -818,41 +845,22 @@ class MarkerLayerManager(BaseLayerManager):
         if not feature:
             raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
 
-        if not layer.startEditing():
-            raise RuntimeError(f"Failed to start editing {layer.name()} layer - layer may be locked or read-only")
-        try:
-            # Build complete attribute update dictionary
-            audit_attrs = self._build_audit_attributes(
-                include_created=False,
-                updated_by=updated_by or updates.get("updated_by"),
-                coordinator_ids=updates.get("coordinator_ids"),
-                attachment_path=updates.get("attachment_path")
-            )
-            all_updates = {**(updates or {}), **audit_attrs}
+        audit_attrs = self._build_audit_attributes(
+            include_created=False,
+            updated_by=updated_by or updates.get("updated_by"),
+            coordinator_ids=updates.get("coordinator_ids"),
+            attachment_path=updates.get("attachment_path")
+        )
+        all_updates = {**(updates or {}), **audit_attrs}
 
-            # Use changeAttributeValue() for reliable updates (avoid feature copy issues)
-            fields = layer.fields()
+        with self._layer_transaction(layer, layer.name(), "update marker") as edit_layer:
+            fields = edit_layer.fields()
             for field_name, value in all_updates.items():
                 field_index = fields.indexOf(field_name)
                 if field_index == -1:
                     continue
-                if not layer.changeAttributeValue(feature.id(), field_index, value):
-                    layer.rollBack()
+                if not edit_layer.changeAttributeValue(feature.id(), field_index, value):
                     raise RuntimeError(f"Failed to update marker '{marker_id}' field '{field_name}'")
-
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit marker update: {', '.join(errors)}")
-        except Exception as exc:
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                layer.name(),
-                "update marker",
-                details=str(exc)
-            ) from exc
-        # No finally block needed - commitChanges() exits edit mode on success,
-        # and rollBack is handled in the except block on failure
 
         layer.triggerRepaint()
         self._log_marker_event(layer, self._marker_log_label(marker_type), "update", marker_id=marker_id)
@@ -865,26 +873,9 @@ class MarkerLayerManager(BaseLayerManager):
         if not feature:
             raise ValueError(f"Marker '{marker_id}' not found for type '{marker_type}'")
 
-        if not layer.startEditing():
-            raise RuntimeError(f"Failed to start editing {layer.name()} layer - layer may be locked or read-only")
-        try:
-            if not layer.deleteFeature(feature.id()):
-                layer.rollBack()
+        with self._layer_transaction(layer, layer.name(), "delete marker") as edit_layer:
+            if not edit_layer.deleteFeature(feature.id()):
                 raise RuntimeError(f"Failed to delete marker '{marker_id}'")
-
-            if not layer.commitChanges():
-                errors = layer.commitErrors()
-                raise RuntimeError(f"Failed to commit marker deletion: {', '.join(errors)}")
-        except Exception as exc:
-            if layer.isEditable():
-                layer.rollBack()
-            raise LayerTransactionError(
-                layer.name(),
-                "delete marker",
-                details=str(exc)
-            ) from exc
-        # No finally block needed - commitChanges() exits edit mode on success,
-        # and rollBack is handled in the except block on failure
 
         layer.triggerRepaint()
         self._log_marker_event(layer, self._marker_log_label(marker_type), "delete", marker_id=marker_id)

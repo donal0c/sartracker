@@ -583,7 +583,9 @@ class TraccarHttpProvider(Provider):
             try:
                 progress_callback(fraction)
             except Exception as progress_err:
-                logger.debug("Breadcrumb progress callback failed: %s", progress_err)
+                message = f"Breadcrumb progress callback failed: {progress_err}"
+                logger.error(message)
+                raise ProviderError(message) from progress_err
 
         if _should_cancel():
             logger.info("Breadcrumb fetch canceled before start")

@@ -13,7 +13,7 @@ Qt5/Qt6 Compatible: Uses QGIS QgsTask API.
 """
 
 from functools import partial
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, Set
 from qgis.core import QgsTask, QgsApplication
 from qgis.PyQt.QtCore import QObject
 
@@ -48,6 +48,7 @@ class TaskManager(QObject):
         super().__init__()
         self._active_tasks: Dict[str, QgsTask] = {}
         self._task_connections: Dict[str, Dict[str, Callable]] = {}
+        self._cancelled_tasks: Set[str] = set()
 
     def start_task(
         self,
@@ -110,11 +111,11 @@ class TaskManager(QObject):
             callback raises an exception.
         """
         try:
-            # Call user callback
+            if task_id in self._cancelled_tasks:
+                return
             if callback:
                 callback(task)
         finally:
-            # Always clean up, even if callback crashes
             self._cleanup_task(task_id, task)
 
     def _handle_error(self, task_id: str, task: QgsTask, callback: Optional[Callable]):
@@ -131,11 +132,11 @@ class TaskManager(QObject):
             callback raises an exception.
         """
         try:
-            # Call user callback
+            if task_id in self._cancelled_tasks:
+                return
             if callback:
                 callback(task)
         finally:
-            # Always clean up, even if callback crashes
             self._cleanup_task(task_id, task)
 
     def _cleanup_task(self, task_id: str, task: QgsTask):
@@ -152,8 +153,9 @@ class TaskManager(QObject):
         """
         self._disconnect_task_signals(task_id, task)
 
-        # Remove from active tasks
+        # Remove bookkeeping for this task
         self._active_tasks.pop(task_id, None)
+        self._cancelled_tasks.discard(task_id)
 
     def cancel_task(self, task_id: str) -> bool:
         """
@@ -177,10 +179,9 @@ class TaskManager(QObject):
         self._disconnect_task_signals(task_id, task)
 
         try:
-            # Cancel task
             task.cancel()
+            self._cancelled_tasks.add(task_id)
         except (RuntimeError, TypeError):
-            # Task might have completed or been destroyed
             pass
 
         # Remove from tracking
