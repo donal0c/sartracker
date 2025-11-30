@@ -52,6 +52,15 @@ if plugin_parent and plugin_parent not in sys.path:
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QInputDialog
+try:
+    from qgis.PyQt.sip import isdeleted as sip_isdeleted
+except ImportError:  # pragma: no cover - fallback for PyQt versions without qgis.PyQt.sip
+    try:
+        import sip
+        sip_isdeleted = sip.isdeleted
+    except Exception:
+        def sip_isdeleted(_obj):
+            return False
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsPointXY, QgsRectangle, QgsApplication
@@ -407,6 +416,7 @@ class sartracker:
         self.last_coords_point = None  # Last mouse position (for throttling)
         self.coords_update_timer = None  # Timer to throttle coordinate updates
         self._map_canvas_connected = False  # Track xyCoordinates signal connection (Issue #4)
+        self._coords_updates_enabled = False  # Guard for timer callbacks
 
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
@@ -499,6 +509,9 @@ class sartracker:
     def _setup_status_bar_coords(self) -> bool:
         """Initialize coordinate label, timer, and map canvas listener."""
         try:
+            if self._coords_updates_enabled:
+                return True  # Already initialized
+
             self.coords_label = QLabel()
             self.coords_label.setMinimumWidth(550)
             self.coords_label.setMaximumWidth(550)  # Fixed width prevents jitter
@@ -517,6 +530,7 @@ class sartracker:
             self.coords_update_timer = QTimer(self.iface.mainWindow())
             self.coords_update_timer.timeout.connect(self._update_coords_display)
             self.coords_update_timer.start(50)
+            self._coords_updates_enabled = True
 
             # Connect to map canvas mouse movement (stores point, actual update happens on timer)
             # Store connection reference for proper cleanup in unload() (Issue #4)
@@ -531,10 +545,41 @@ class sartracker:
                 "Coordinate status display failed to initialize.",
                 duration=5
             )
+            self._disable_coords_updates("coordinate status bar setup failed")
             self._map_canvas_connected = False
             self.coords_update_timer = None
             self.coords_label = None
             return False
+
+    def _disable_coords_updates(self, reason: Optional[str] = None):
+        """
+        Stop coordinate update timers and disconnect their signals safely.
+
+        Args:
+            reason: Optional diagnostic string logged once to help trace lifecycle issues.
+        """
+        if reason:
+            print(f"[SARTRACKER] Disabling coordinate updates: {reason}")
+
+        self._coords_updates_enabled = False
+        timer = self.coords_update_timer
+        if timer:
+            try:
+                timer.timeout.disconnect(self._update_coords_display)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                if timer.isActive():
+                    timer.stop()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
+            self.coords_update_timer = None
+
+        self.last_coords_point = None
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -835,7 +880,7 @@ class sartracker:
             self.marker_controller = None
 
         # Initialize marker map tool
-        self.marker_tool = MarkerMapTool(self.iface.mapCanvas())
+        self.marker_tool = MarkerMapTool(self.iface.mapCanvas(), self.iface)
         self.marker_tool.marker_clicked.connect(self._on_marker_clicked)
 
         # Initialize measure tool
@@ -1369,13 +1414,8 @@ class sartracker:
                 self.iface.removeToolBarIcon(action)
 
             # Stop coordinate update timer
-            if self.coords_update_timer:
-                try:
-                    self.coords_update_timer.stop()
-                    self.coords_update_timer.deleteLater()
-                except:
-                    pass
-                self.coords_update_timer = None
+            if self.coords_update_timer or self._coords_updates_enabled:
+                self._disable_coords_updates("plugin unload")
 
             # Remove coordinate label from status bar
             if self.coords_label:
@@ -3228,9 +3268,16 @@ class sartracker:
         """
         # Defensive check: Ensure our widgets haven't been destroyed
         # This prevents crashes if disconnect failed or event arrived during unload
-        if not self.coords_label or not self.coords_update_timer:
+        if not self._coords_updates_enabled or not self.coords_label or not self.coords_update_timer:
             # Plugin is being/has been unloaded, ignore event silently
             # (This is normal during unload, not an error condition)
+            return
+        try:
+            if sip_isdeleted(self.coords_label):
+                self._disable_coords_updates("coordinate label deleted during mouse move")
+                return
+        except Exception:
+            # sip.isdeleted can throw if sip unavailable; fail closed
             return
 
         # Safe to proceed - store point for timer-based update
@@ -3244,14 +3291,59 @@ class sartracker:
         SAFETY: Timer may fire during unload or after widgets destroyed.
         Check existence before accessing Qt objects.
         """
-        # Defensive checks
-        if not self.coords_label or not self.last_coords_point:
+        if not self._coords_updates_enabled:
+            return
+
+        label = self.coords_label
+        if not label:
+            self._disable_coords_updates("coordinate label missing before update")
             return
 
         try:
-            # Get canvas CRS
-            canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+            if sip_isdeleted(label):
+                self.coords_label = None
+                self._disable_coords_updates("coordinate label deleted before update")
+                return
+        except Exception:
+            # If sip is unavailable fall back to defensive disable
+            self.coords_label = None
+            self._disable_coords_updates("unable to verify coordinate label state")
+            return
 
+        if not self.last_coords_point:
+            return
+
+        try:
+            canvas = self.iface.mapCanvas()
+        except RuntimeError as exc:
+            self._disable_coords_updates(f"map canvas unavailable: {exc}")
+            return
+
+        if not canvas:
+            self._disable_coords_updates("map canvas not available")
+            return
+
+        try:
+            if sip_isdeleted(canvas):
+                self._disable_coords_updates("map canvas deleted")
+                return
+        except Exception:
+            # If sip isn't available just stop the timer to avoid crashes
+            self._disable_coords_updates("unable to verify map canvas state")
+            return
+
+        try:
+            map_settings = canvas.mapSettings()
+            canvas_crs = map_settings.destinationCrs()
+        except RuntimeError as exc:
+            self._disable_coords_updates(f"map settings destroyed: {exc}")
+            return
+
+        if not canvas_crs.isValid() or not self.wgs84.isValid() or not self.itm.isValid():
+            # CRS stack is not ready yet (project loading/unloading)
+            return
+
+        try:
             # Transform to WGS84
             transform_to_wgs84 = QgsCoordinateTransform(
                 canvas_crs,
@@ -3282,6 +3374,7 @@ class sartracker:
             # This is expected during cleanup - mark widget as invalid
             print(f"[SARTRACKER] Coordinate label destroyed, stopping updates")
             self.coords_label = None
+            self._disable_coords_updates("coordinate label destroyed during update")
             return
 
         except Exception as e:

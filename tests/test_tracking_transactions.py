@@ -99,6 +99,35 @@ class _FakeFeatureLayer(_FakeLayerBase):
         return list(self._feature_ids)
 
 
+class _FailStartLayer(_FakeLayerBase):
+    """Layer whose startEditing toggles editable but reports failure."""
+
+    def startEditing(self):
+        self._editable = True
+        return False
+
+
+class _RaiseStartLayer(_FakeLayerBase):
+    """Layer whose startEditing raises after enabling edit state."""
+
+    def startEditing(self):
+        self._editable = True
+        raise RuntimeError("boom")
+
+
+class _StickyLayer(_FakeLayerBase):
+    """Layer that never leaves editable mode."""
+
+    def commitChanges(self):
+        # Pretend commit succeeded but keep editable True to simulate provider bug
+        return True
+
+    def rollBack(self):
+        # rollBack silently fails and leaves editable flag untouched
+        self.rollback_calls += 1
+        return False
+
+
 def test_layer_transaction_rolls_back_on_commit_failure():
     mgr = _build_manager()
     layer = _FakeLayerBase(commit_success=False)
@@ -138,3 +167,36 @@ def test_clear_layer_features_raises_when_delete_fails():
 
     with pytest.raises(RuntimeError):
         mgr._clear_layer_features(layer, "Layer Z")
+
+
+def test_layer_transaction_handles_start_editing_failure_without_lock():
+    mgr = _build_manager()
+    layer = _FailStartLayer()
+
+    with pytest.raises(LayerTransactionError):
+        with mgr._layer_transaction(layer, "Fail Layer", "unit op"):
+            pytest.fail("layer transaction should not yield control on start failure")
+
+    assert not layer.isEditable()
+
+
+def test_layer_transaction_handles_start_editing_exception_without_lock():
+    mgr = _build_manager()
+    layer = _RaiseStartLayer()
+
+    with pytest.raises(LayerTransactionError):
+        with mgr._layer_transaction(layer, "Raise Layer", "unit op"):
+            pytest.fail("layer transaction should not yield control on start exception")
+
+    assert not layer.isEditable()
+
+
+def test_layer_transaction_raises_when_layer_stays_editable():
+    mgr = _build_manager()
+    layer = _StickyLayer()
+
+    with pytest.raises(LayerTransactionError):
+        with mgr._layer_transaction(layer, "Sticky Layer", "unit op"):
+            pass
+
+    assert layer.rollback_calls == 2  # rollback attempted at least twice

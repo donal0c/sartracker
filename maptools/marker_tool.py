@@ -6,6 +6,7 @@ Custom QGIS map tool for adding POI and Casualty markers by clicking on map.
 """
 
 import logging
+from typing import Optional
 
 from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsMapTool
@@ -30,16 +31,19 @@ class MarkerMapTool(QgsMapTool):
     
     marker_clicked = pyqtSignal(float, float, float, float)  # lat, lon, e, n
     
-    def __init__(self, canvas):
+    def __init__(self, canvas, iface=None):
         """
         Initialize marker map tool.
         
         Args:
             canvas: QGIS map canvas
+            iface: Optional QGIS interface for user notifications
         """
         super().__init__(canvas)
         self.canvas = canvas
+        self.iface = iface
         self.setCursor(QCursor(CrossCursor))
+        self._message_bar = None
         
         # Setup coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -52,6 +56,20 @@ class MarkerMapTool(QgsMapTool):
         
         # Get canvas CRS
         canvas_crs = self.canvas.mapSettings().destinationCrs()
+
+        if not canvas_crs.isValid():
+            self._report_transform_failure(
+                "Project CRS Unavailable",
+                "Cannot determine map coordinate reference system. Check project CRS settings."
+            )
+            return
+
+        if not self.wgs84.isValid() or not self.itm.isValid():
+            self._report_transform_failure(
+                "Coordinate Systems Not Ready",
+                "Marker tool coordinate references failed to initialize. Restart the plugin or QGIS."
+            )
+            return
 
         # MARKER-TRANSFORM fix: Add error handling for coordinate transforms
         try:
@@ -71,9 +89,12 @@ class MarkerMapTool(QgsMapTool):
             )
             itm_point = transform_to_itm.transform(point)
         except Exception as e:
-            error_msg = f"Failed to transform marker coordinates: {e}"
-            logger.error(error_msg)
-            notify_warning("Coordinate transform failed", error_msg)
+            detail = (
+                f"Could not transform map point from {canvas_crs.authid()} to "
+                f"WGS84/ITM: {e}"
+            )
+            logger.exception("Marker transform failure: %s", detail)
+            self._report_transform_failure("Coordinate transform failed", detail)
             return  # Don't emit signal with bad coordinates
         
         # Emit signal with coordinates
@@ -112,3 +133,27 @@ class MarkerMapTool(QgsMapTool):
     def isEditTool(self):
         """Return True - this is an editing tool."""
         return True
+
+    def _message_bar_safe(self):
+        """Return cached message bar if iface provides one."""
+        if self._message_bar:
+            return self._message_bar
+        iface = getattr(self, "iface", None)
+        if not iface or not hasattr(iface, "messageBar"):
+            return None
+
+        try:
+            self._message_bar = iface.messageBar()
+        except Exception:
+            self._message_bar = None
+        return self._message_bar
+
+    def _report_transform_failure(self, title: str, detail: str):
+        """Log and display coordinate transform failures."""
+        logger.warning("%s: %s", title, detail)
+        bar = self._message_bar_safe()
+        if bar:
+            try:
+                notify_warning(bar, title, detail, duration=6)
+            except Exception:
+                logger.debug("Marker tool notification suppressed", exc_info=True)

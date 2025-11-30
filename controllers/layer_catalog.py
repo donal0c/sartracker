@@ -11,9 +11,11 @@ Phase 1 Deliverable - Part of CalTopo Console Foundation
 """
 
 import logging
+import sqlite3
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Set, Callable
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Set, Callable, Tuple
 
 from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
 from qgis.core import (
@@ -515,6 +517,7 @@ class LayerCatalogService(QObject):
 
         # Cleanup flag (CRITICAL FIX: Prevents handlers from firing during cleanup)
         self._cleanup_in_progress = False
+        self._layer_lock_alerts: Dict[str, datetime] = {}
 
         # Build initial cache
         try:
@@ -1517,7 +1520,129 @@ class LayerCatalogService(QObject):
         if not layer or not layer.isValid():
             return
 
+        lock_info = self._detect_geopackage_lock(layer_id, layer)
+        if lock_info:
+            self._handle_locked_layer(layer_id, layer, lock_info)
+            return
+
         self._schedule_refresh([(layer_id, layer)])
+
+    def _extract_geopackage_path(self, layer: QgsVectorLayer) -> Optional[Path]:
+        """Extract GeoPackage path from a QgsVectorLayer source string."""
+        try:
+            provider_name = ""
+            data_provider = layer.dataProvider() if hasattr(layer, "dataProvider") else None
+            if data_provider:
+                provider_name = (data_provider.name() or "").lower()
+            elif hasattr(layer, "providerType"):
+                provider_name = (layer.providerType() or "").lower()
+        except Exception:
+            provider_name = ""
+
+        if provider_name not in ("ogr",):
+            return None
+
+        try:
+            source = layer.source()
+        except Exception:
+            return None
+
+        if not source:
+            return None
+
+        base = source.split("|", 1)[0].strip()
+        if base.startswith("file://"):
+            base = base[7:]
+
+        if not base.lower().endswith(".gpkg"):
+            return None
+
+        return Path(base)
+
+    def _detect_geopackage_lock(
+        self,
+        layer_id: str,
+        layer: QgsVectorLayer
+    ) -> Optional[Tuple[Path, str]]:
+        """Return lock details if the GeoPackage is currently locked."""
+        gpkg_path = self._extract_geopackage_path(layer)
+        if not gpkg_path or not gpkg_path.exists():
+            return None
+
+        conn = None
+        try:
+            conn = sqlite3.connect(str(gpkg_path), timeout=0.05)
+            conn.execute("PRAGMA schema_version;")
+        except sqlite3.OperationalError as exc:
+            message = str(exc) or "database is locked"
+            lowered = message.lower()
+            if "locked" in lowered or "busy" in lowered:
+                logger.warning(
+                    "GeoPackage lock detected for %s (%s): %s",
+                    layer_id,
+                    gpkg_path,
+                    message
+                )
+                return gpkg_path, message
+        except Exception as exc:
+            logger.debug(
+                "GeoPackage lock probe failed for %s (%s): %s",
+                layer_id,
+                gpkg_path,
+                exc,
+                exc_info=True
+            )
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return None
+
+    def _handle_locked_layer(
+        self,
+        layer_id: str,
+        layer: QgsVectorLayer,
+        lock_info: Tuple[Path, str]
+    ) -> None:
+        """Notify user and retry refresh when GeoPackage is locked."""
+        gpkg_path, reason = lock_info
+        now = datetime.now(timezone.utc)
+        last_alert = self._layer_lock_alerts.get(layer_id)
+        should_notify = not last_alert or (now - last_alert).total_seconds() >= 15
+
+        if should_notify:
+            layer_name = ""
+            try:
+                layer_name = layer.name()
+            except Exception:
+                layer_name = layer_id
+            friendly_name = layer_name or layer_id
+
+            message = (
+                f"{friendly_name} is locked by another application "
+                f"(GeoPackage: {gpkg_path.name}). Retrying shortly."
+            )
+            if reason:
+                message = f"{message} Details: {reason}"
+
+            self._notify_warning("Mission Store Locked", message)
+            self._layer_lock_alerts[layer_id] = now
+
+        self._schedule_lock_retry(layer_id)
+
+    def _schedule_lock_retry(self, layer_id: str, delay_ms: int = 1000) -> None:
+        """Retry scheduling a layer refresh after a short delay."""
+        if self._cleanup_in_progress:
+            return
+
+        def _retry():
+            if self._cleanup_in_progress:
+                return
+            self._schedule_layer_refresh_by_id(layer_id)
+
+        QTimer.singleShot(delay_ms, _retry)
 
     def _wire_layer_signals(self, layer_id: str, layer: QgsVectorLayer) -> None:
         """Connect per-layer signals so catalog stays in sync with edits."""

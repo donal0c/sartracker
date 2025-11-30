@@ -2,6 +2,7 @@
 """Unit tests for controllers.layer_catalog helper utilities."""
 
 import json
+import sqlite3
 import types
 
 import pytest
@@ -94,7 +95,31 @@ def _make_service(layer_catalog, layer_manager):
     svc._signal_connections = []
     svc._layer_signal_connections = {}
     svc._refresh_timer = None
+    svc._layer_lock_alerts = {}
     return svc
+
+
+def _make_gpkg_layer(layer_catalog, path):
+    class FakeLayer:
+        def __init__(self, p):
+            self._path = str(p)
+
+        def isValid(self):
+            return True
+
+        def dataProvider(self):
+            return types.SimpleNamespace(name=lambda: "ogr")
+
+        def providerType(self):
+            return "ogr"
+
+        def source(self):
+            return f"{self._path}|layername=alpha"
+
+        def name(self):
+            return "Alpha"
+
+    return FakeLayer(path)
 
 
 class StubTaskManager:
@@ -336,6 +361,42 @@ def test_get_catalog_snapshot_warns_on_mission_store_error(monkeypatch):
     assert snapshot["layer_count"] == 2
     assert snapshot["total_features"] == 8
     assert any("Mission store lookup failed" in warning for warning in snapshot["warnings"])
+
+
+def test_detect_geopackage_lock_returns_none_when_available(monkeypatch, tmp_path):
+    layer_catalog = _install_catalog_module(monkeypatch)
+    gpkg = tmp_path / "mission.gpkg"
+    conn = sqlite3.connect(gpkg)
+    conn.execute("CREATE TABLE t(id INTEGER);")
+    conn.commit()
+    conn.close()
+
+    svc = _make_service(layer_catalog, MetadataStubLayerManager())
+    layer = _make_gpkg_layer(layer_catalog, gpkg)
+
+    lock_info = svc._detect_geopackage_lock("LAYER_ALPHA", layer)
+    assert lock_info is None
+
+
+def test_detect_geopackage_lock_detects_busy_store(monkeypatch, tmp_path):
+    layer_catalog = _install_catalog_module(monkeypatch)
+    gpkg = tmp_path / "mission.gpkg"
+    conn = sqlite3.connect(gpkg)
+    conn.execute("CREATE TABLE t(id INTEGER);")
+    conn.commit()
+    conn.execute("BEGIN EXCLUSIVE;")
+
+    svc = _make_service(layer_catalog, MetadataStubLayerManager())
+    layer = _make_gpkg_layer(layer_catalog, gpkg)
+
+    lock_info = svc._detect_geopackage_lock("LAYER_ALPHA", layer)
+    assert lock_info is not None
+    path_obj, reason = lock_info
+    assert path_obj == gpkg
+    assert "lock" in reason.lower() or "busy" in reason.lower()
+
+    conn.rollback()
+    conn.close()
 
 
 def test_start_console_model_task_uses_task_manager(monkeypatch):

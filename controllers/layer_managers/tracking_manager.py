@@ -134,27 +134,118 @@ class TrackingLayerManager(BaseLayerManager):
             raise LayerError(f"{layer_name} layer is unavailable or invalid.", layer_name=layer_name)
         if layer.isEditable():
             raise LayerLockError(layer_name)
-        if not layer.startEditing():
-            raise LayerTransactionError(layer_name, "start editing", details=operation)
+        cleanup_attempted = False
+
+        def _cleanup(raise_on_failure: bool, reason: str) -> Optional[str]:
+            nonlocal cleanup_attempted
+            cleanup_attempted = True
+            context = f"{operation}::{reason}" if reason else operation
+            return self._safe_close_layer_edit(layer, layer_name, context, raise_on_failure=raise_on_failure)
 
         try:
+            try:
+                started = layer.startEditing()
+            except Exception as exc:
+                details = str(exc)
+                cleanup_note = _cleanup(False, "start_editing_exception")
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
+                raise LayerTransactionError(layer_name, "start editing", details=details) from exc
+
+            if not started:
+                cleanup_note = _cleanup(False, "start_editing_failed")
+                details = operation
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
+                raise LayerTransactionError(layer_name, "start editing", details=details)
+
             yield layer
             if not layer.commitChanges():
                 errors = layer.commitErrors()
                 details = "; ".join(errors) if errors else operation
+                cleanup_note = _cleanup(False, "commit_failure")
+                if cleanup_note:
+                    details = f"{details} | cleanup: {cleanup_note}"
                 raise LayerTransactionError(layer_name, "commit changes", details=details)
         except LayerError:
-            layer.rollBack()
+            _cleanup(False, "layer_error")
             raise
         except Exception as exc:
-            layer.rollBack()
-            raise LayerTransactionError(layer_name, operation, details=str(exc)) from exc
+            details = str(exc)
+            cleanup_note = _cleanup(False, "exception")
+            if cleanup_note:
+                details = f"{details} | cleanup: {cleanup_note}"
+            raise LayerTransactionError(layer_name, operation, details=details) from exc
         finally:
-            if layer.isEditable():
-                try:
-                    layer.rollBack()
-                except RuntimeError:
-                    pass
+            if not cleanup_attempted:
+                self._safe_close_layer_edit(layer, layer_name, f"{operation}::finalize", raise_on_failure=True)
+
+    def _safe_close_layer_edit(
+        self,
+        layer: Optional[QgsVectorLayer],
+        layer_name: str,
+        context: str,
+        raise_on_failure: bool = False
+    ) -> Optional[str]:
+        """
+        Ensure layer exits edit mode, logging/raising if rollback fails.
+
+        Args:
+            layer: Target QgsVectorLayer
+            layer_name: Human-readable layer name
+            context: Diagnostic context string
+            raise_on_failure: When True, raise if the layer remains editable
+
+        Returns:
+            Optional string describing cleanup issues (None when successful).
+        """
+        if not layer or not layer.isValid():
+            return None
+
+        try:
+            editable = layer.isEditable()
+        except Exception as exc:
+            message = f"isEditable() check failed: {exc}"
+            if raise_on_failure:
+                raise LayerTransactionError(layer_name, context, details=message) from exc
+            logger.critical("Layer %s cleanup state unknown (%s): %s", layer_name, context, message)
+            return message
+
+        if not editable:
+            return None
+
+        issues = []
+        try:
+            result = layer.rollBack()
+            # rollBack returns bool in QGIS; None indicates failure as well
+            if result is False:
+                issues.append("rollBack returned False")
+        except RuntimeError as exc:
+            issues.append(f"RuntimeError: {exc}")
+        except Exception as exc:
+            issues.append(f"rollback exception: {exc}")
+
+        try:
+            editable = layer.isEditable()
+        except Exception as exc:
+            issues.append(f"isEditable() post-check failed: {exc}")
+            editable = True
+
+        if editable:
+            if not issues:
+                issues.append("layer remained editable after rollback attempt")
+            message = "; ".join(issues)
+            if raise_on_failure:
+                raise LayerTransactionError(layer_name, context, details=message)
+            logger.critical(
+                "Layer %s cleanup failed (%s): %s",
+                layer_name,
+                context,
+                message
+            )
+            return message
+
+        return None
 
     def _clear_layer_features(self, layer: QgsVectorLayer, layer_name: str):
         """Efficiently clear all features, falling back when truncate unsupported."""

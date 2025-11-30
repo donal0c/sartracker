@@ -12,6 +12,7 @@ proper signal disconnection and cleanup.
 Qt5/Qt6 Compatible: Uses QGIS QgsTask API.
 """
 
+from functools import partial
 from typing import Optional, Callable, Dict
 from qgis.core import QgsTask, QgsApplication
 from qgis.PyQt.QtCore import QObject
@@ -46,6 +47,7 @@ class TaskManager(QObject):
         """Initialize task manager."""
         super().__init__()
         self._active_tasks: Dict[str, QgsTask] = {}
+        self._task_connections: Dict[str, Dict[str, Callable]] = {}
 
     def start_task(
         self,
@@ -79,17 +81,22 @@ class TaskManager(QObject):
         self._active_tasks[task_id] = task
 
         # Connect signals with automatic cleanup
-        if on_complete:
-            task.taskCompleted.connect(lambda: self._handle_complete(task_id, task, on_complete))
-        if on_error:
-            task.taskTerminated.connect(lambda: self._handle_error(task_id, task, on_error))
+        complete_slot = partial(self._handle_complete, task_id, task, on_complete)
+        error_slot = partial(self._handle_error, task_id, task, on_error)
+        task.taskCompleted.connect(complete_slot)
+        task.taskTerminated.connect(error_slot)
+
+        self._task_connections[task_id] = {
+            "complete": complete_slot,
+            "error": error_slot
+        }
 
         # Start task via QGIS task manager
         QgsApplication.taskManager().addTask(task)
 
         return task_id
 
-    def _handle_complete(self, task_id: str, task: QgsTask, callback: Callable):
+    def _handle_complete(self, task_id: str, task: QgsTask, callback: Optional[Callable]):
         """
         Internal completion handler with cleanup.
 
@@ -104,12 +111,13 @@ class TaskManager(QObject):
         """
         try:
             # Call user callback
-            callback(task)
+            if callback:
+                callback(task)
         finally:
             # Always clean up, even if callback crashes
             self._cleanup_task(task_id, task)
 
-    def _handle_error(self, task_id: str, task: QgsTask, callback: Callable):
+    def _handle_error(self, task_id: str, task: QgsTask, callback: Optional[Callable]):
         """
         Internal error handler with cleanup.
 
@@ -124,7 +132,8 @@ class TaskManager(QObject):
         """
         try:
             # Call user callback
-            callback(task)
+            if callback:
+                callback(task)
         finally:
             # Always clean up, even if callback crashes
             self._cleanup_task(task_id, task)
@@ -141,13 +150,7 @@ class TaskManager(QObject):
             Disconnects all signals to prevent future accidental firing,
             which could occur if the task object is still referenced elsewhere.
         """
-        try:
-            # Disconnect all signals (prevents future accidental firing)
-            task.taskCompleted.disconnect()
-            task.taskTerminated.disconnect()
-        except (RuntimeError, TypeError):
-            # Already disconnected or destroyed
-            pass
+        self._disconnect_task_signals(task_id, task)
 
         # Remove from active tasks
         self._active_tasks.pop(task_id, None)
@@ -170,13 +173,8 @@ class TaskManager(QObject):
         if not task:
             return False
 
-        try:
-            # Disconnect signals first (Issue #6: prevents handlers during cancel)
-            task.taskCompleted.disconnect()
-            task.taskTerminated.disconnect()
-        except (RuntimeError, TypeError):
-            # Signal already disconnected or object destroyed
-            pass
+        # Disconnect signals first (Issue #6: prevents handlers during cancel)
+        self._disconnect_task_signals(task_id, task)
 
         try:
             # Cancel task
@@ -220,3 +218,23 @@ class TaskManager(QObject):
             List of task identifiers for all active tasks
         """
         return list(self._active_tasks.keys())
+
+    def _disconnect_task_signals(self, task_id: str, task: QgsTask):
+        """
+        Disconnect stored signal handlers for a task without affecting other listeners.
+        """
+        handlers = self._task_connections.pop(task_id, {})
+        complete_handler = handlers.get("complete")
+        error_handler = handlers.get("error")
+
+        if complete_handler:
+            try:
+                task.taskCompleted.disconnect(complete_handler)
+            except (RuntimeError, TypeError):
+                pass
+
+        if error_handler:
+            try:
+                task.taskTerminated.disconnect(error_handler)
+            except (RuntimeError, TypeError):
+                pass
