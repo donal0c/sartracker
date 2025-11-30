@@ -14,6 +14,10 @@ from qgis.core import QgsProject, QgsVectorLayer, QgsLayerTreeGroup
 from qgis.PyQt.QtGui import QColor
 import hashlib
 import os
+import threading
+import logging
+
+logger = logging.getLogger(__name__)
 
 from ...layers import (
     GroupNames,
@@ -25,6 +29,13 @@ from ...layers import (
 
 
 LAYER_DIAGNOSTICS_ENV = "SARTRACKER_LAYER_DIAGNOSTICS"
+
+
+# BUG-014 FIX: Global layer edit lock to prevent concurrent edit race conditions
+# This lock is shared across all manager instances to ensure only one edit
+# transaction can occur at a time across the entire plugin.
+# LIFE-SAFETY CRITICAL: Prevents data corruption during concurrent operations.
+_global_layer_edit_lock = threading.RLock()
 
 
 class BaseLayerManager(ABC):
@@ -324,3 +335,97 @@ class BaseLayerManager(ABC):
 
     def _get_layer_by_id(self, layer_id: str) -> Optional[QgsVectorLayer]:
         return self._require_layer_manager().get_layer(layer_id)
+
+    # ------------------------------------------------------------------
+    # BUG-012/BUG-014 FIX: Concurrent Edit Prevention
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def acquire_layer_edit_lock(timeout: float = 5.0) -> bool:
+        """
+        Acquire the global layer edit lock.
+
+        BUG-014 FIX: Provides thread-safe concurrent edit prevention.
+        All layer edit operations should acquire this lock before starting
+        a transaction to prevent race conditions.
+
+        Args:
+            timeout: Maximum time to wait for lock (seconds). Default 5s.
+
+        Returns:
+            bool: True if lock acquired, False if timeout occurred.
+
+        LIFE-SAFETY CRITICAL: This lock prevents data corruption during
+        concurrent layer modifications which could compromise rescue operations.
+        """
+        acquired = _global_layer_edit_lock.acquire(timeout=timeout)
+        if not acquired:
+            logger.warning(
+                "Layer edit lock acquisition timed out after %.1fs - "
+                "possible deadlock or long-running transaction",
+                timeout
+            )
+        return acquired
+
+    @staticmethod
+    def release_layer_edit_lock():
+        """
+        Release the global layer edit lock.
+
+        BUG-014 FIX: Must be called after completing or aborting a layer
+        edit transaction. Always call in a finally block to ensure release.
+        """
+        try:
+            _global_layer_edit_lock.release()
+        except RuntimeError:
+            # Lock not held - already released or never acquired
+            logger.debug("Layer edit lock release called but lock not held")
+
+    def _validate_layer_for_edit(self, layer: Optional[QgsVectorLayer], layer_name: str) -> QgsVectorLayer:
+        """
+        Validate a layer is suitable for editing operations.
+
+        BUG-012/BUG-013 FIX: Comprehensive validation to prevent operations
+        on stale, invalid, or already-locked layers.
+
+        Args:
+            layer: Layer to validate
+            layer_name: Name for error messages
+
+        Returns:
+            QgsVectorLayer: The validated layer
+
+        Raises:
+            LayerError: If layer is None, invalid, or unavailable
+            LayerLockError: If layer is already in edit mode
+        """
+        from ...utils.exceptions import LayerError, LayerLockError
+
+        # Check layer exists
+        if layer is None:
+            raise LayerError(
+                f"{layer_name} layer is not available. "
+                "The layer may have been deleted or the project changed.",
+                layer_name=layer_name
+            )
+
+        # Check layer is still valid (not deleted/corrupted)
+        if not layer.isValid():
+            raise LayerError(
+                f"{layer_name} layer is invalid. "
+                "The layer data source may be corrupted or unavailable.",
+                layer_name=layer_name
+            )
+
+        # Check layer is not already being edited (potential nested transaction)
+        if layer.isEditable():
+            raise LayerLockError(layer_name)
+
+        # Additional validation: check layer still exists in project
+        if self.project and not self.project.mapLayer(layer.id()):
+            raise LayerError(
+                f"{layer_name} layer no longer exists in the project.",
+                layer_name=layer_name
+            )
+
+        return layer

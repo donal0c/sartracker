@@ -352,6 +352,8 @@ class sartracker:
         # Phase 1 Refactor: Initialize lifecycle manager for coordinated startup/teardown
         self.lifecycle = PluginLifecycleManager(iface, log_prefix="[SARTRACKER]")
         self._app_is_quitting = False
+        # BUG-019/BUG-021 FIX: Flag to prevent callbacks during plugin unload
+        self._is_unloading = False
 
         # Create centralized error handler (Issue #3)
         self.error_handler = ErrorHandler(self.iface.messageBar())
@@ -1330,6 +1332,15 @@ class sartracker:
     def unload(self):
         """Removes the plugin menu item and icon from QGIS GUI."""
         try:
+            # BUG-019/BUG-021 FIX: Set unloading flag immediately to protect callbacks
+            self._is_unloading = True
+
+            # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
+            # This must happen before any other cleanup to prevent timer callbacks
+            # from firing while components are being torn down.
+            if self.coords_update_timer or self._coords_updates_enabled:
+                self._disable_coords_updates("plugin unload (early cleanup)")
+
             if self.layer_manager:
                 try:
                     self.layer_manager.set_application_closing(True)
@@ -2583,9 +2594,20 @@ class sartracker:
         SAFETY: May be called after plugin unload if signal disconnect failed
         or task completed during unload. Check component existence.
         """
+        # BUG-021 FIX: Comprehensive guards for callback safety
+        # Check if plugin is being unloaded or components are missing
+        if self._is_unloading or self._app_is_quitting:
+            print("[SARTRACKER] Refresh completed during plugin unload, ignoring results")
+            return
+
         # CRITICAL GUARD: Check if plugin components still exist
         if not self.layers_controller or not self.sar_panel:
             print("[SARTRACKER] Refresh completed after plugin unload, ignoring results")
+            return
+
+        # BUG-021 FIX: Additional guard - check task_manager is available
+        if not self.task_manager:
+            print("[SARTRACKER] Refresh completed but task manager unavailable")
             return
 
         try:
@@ -2893,6 +2915,18 @@ class sartracker:
         SAFETY: May be called after plugin unload if signal disconnect failed.
         Check component existence before accessing.
         """
+        # BUG-021 FIX: Comprehensive guards for callback safety
+        # Check if plugin is being unloaded or app is quitting
+        if self._is_unloading or self._app_is_quitting:
+            print("[SARTRACKER] Connection test completed during plugin unload, ignoring")
+            # Clean up shadow state
+            self._pending_provider = None
+            self._pending_provider_name = None
+            self._pending_provider_config = None
+            self._pending_provider_metadata = None
+            self._pending_provider_task = None
+            return
+
         # CRITICAL GUARD: Check if plugin components still exist (Pattern 9)
         if not self.sar_panel:
             print("[SARTRACKER] Connection test completed after plugin unload, ignoring")
@@ -2902,6 +2936,11 @@ class sartracker:
             self._pending_provider_config = None
             self._pending_provider_metadata = None
             self._pending_provider_task = None
+            return
+
+        # BUG-021 FIX: Check iface and messageBar availability
+        if not self.iface:
+            print("[SARTRACKER] Connection test completed but iface unavailable")
             return
 
         try:

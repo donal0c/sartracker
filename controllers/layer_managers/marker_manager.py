@@ -205,16 +205,74 @@ class MarkerLayerManager(BaseLayerManager):
         return None
 
     def _get_marker_layer(self, marker_type: str) -> QgsVectorLayer:
-        """Return persistent layer for a marker type."""
+        """
+        Return persistent layer for a marker type with validity checks.
+
+        BUG-013 FIX: Added explicit layer validity checks to prevent
+        operations on stale or invalid layer references.
+
+        Args:
+            marker_type: Type of marker ('ipp_lkp', 'clue', 'hazard', 'casualty')
+
+        Returns:
+            QgsVectorLayer: Valid marker layer
+
+        Raises:
+            ValueError: If marker_type is unknown
+            LayerError: If layer is invalid or unavailable
+        """
         meta = self.MARKER_TYPE_MAP.get(marker_type)
         if not meta:
             raise ValueError(f"Unknown marker type: {marker_type}")
+
         style_factory = getattr(self, meta["style_fn"])
-        return self._ensure_schema_layer(
+        layer = self._ensure_schema_layer(
             meta["layer_id"],
             fallback_name=meta["fallback"],
             style_factory=style_factory
         )
+
+        # BUG-013 FIX: Explicit validity checks
+        layer_name = meta["fallback"]
+
+        if layer is None:
+            # Log warning once per layer to avoid spam
+            if layer_name not in self._invalid_layer_warnings:
+                self._invalid_layer_warnings.add(layer_name)
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Marker layer '%s' could not be created or retrieved",
+                    layer_name
+                )
+            raise LayerError(
+                f"Marker layer '{layer_name}' is not available. "
+                "The layer may need to be recreated.",
+                layer_name=layer_name
+            )
+
+        if not layer.isValid():
+            # Log warning once per layer to avoid spam
+            if layer_name not in self._invalid_layer_warnings:
+                self._invalid_layer_warnings.add(layer_name)
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Marker layer '%s' exists but is invalid - data source may be corrupted",
+                    layer_name
+                )
+            raise LayerError(
+                f"Marker layer '{layer_name}' is invalid. "
+                "Check the layer data source and project settings.",
+                layer_name=layer_name
+            )
+
+        # Check layer still exists in project (guard against deletion)
+        if self.project and not self.project.mapLayer(layer.id()):
+            raise LayerError(
+                f"Marker layer '{layer_name}' was removed from project.",
+                layer_name=layer_name
+            )
+
+        return layer
 
     def _marker_log_label(self, marker_type: str) -> str:
         """Return standardized label used in diagnostics."""

@@ -13,9 +13,13 @@ Qt5/Qt6 Compatible: Uses QGIS QgsTask API.
 """
 
 from functools import partial
-from typing import Optional, Callable, Dict, Set
+from typing import Optional, Callable, Dict, Set, Any
 from qgis.core import QgsTask, QgsApplication
 from qgis.PyQt.QtCore import QObject
+import logging
+import traceback
+
+logger = logging.getLogger(__name__)
 
 
 class TaskManager(QObject):
@@ -49,6 +53,9 @@ class TaskManager(QObject):
         self._active_tasks: Dict[str, QgsTask] = {}
         self._task_connections: Dict[str, Dict[str, Callable]] = {}
         self._cancelled_tasks: Set[str] = set()
+        # BUG-015 FIX: Track error states for comprehensive error handling
+        self._task_errors: Dict[str, Dict[str, Any]] = {}
+        self._shutting_down: bool = False
 
     def start_task(
         self,
@@ -101,6 +108,8 @@ class TaskManager(QObject):
         """
         Internal completion handler with cleanup.
 
+        BUG-015 FIX: Enhanced error handling to prevent silent failures.
+
         Args:
             task_id: Task identifier
             task: QgsTask that completed
@@ -111,16 +120,47 @@ class TaskManager(QObject):
             callback raises an exception.
         """
         try:
-            if task_id in self._cancelled_tasks:
+            # BUG-015 FIX: Check if we're shutting down or task was cancelled
+            if self._shutting_down:
+                logger.debug("Task %s completed but manager is shutting down - skipping callback", task_id)
                 return
+            if task_id in self._cancelled_tasks:
+                logger.debug("Task %s completed but was already cancelled - skipping callback", task_id)
+                return
+
             if callback:
-                callback(task)
+                try:
+                    callback(task)
+                except Exception as callback_exc:
+                    # BUG-015 FIX: Log callback exceptions instead of letting them escape
+                    logger.error(
+                        "Task %s completion callback raised exception: %s\n%s",
+                        task_id,
+                        callback_exc,
+                        traceback.format_exc()
+                    )
+                    # Store error for potential retrieval
+                    self._task_errors[task_id] = {
+                        "type": "callback_error",
+                        "exception": callback_exc,
+                        "traceback": traceback.format_exc(),
+                        "phase": "complete"
+                    }
+        except Exception as handler_exc:
+            # BUG-015 FIX: Catch any unexpected errors in the handler itself
+            logger.error(
+                "Task %s completion handler failed unexpectedly: %s",
+                task_id,
+                handler_exc
+            )
         finally:
             self._cleanup_task(task_id, task)
 
     def _handle_error(self, task_id: str, task: QgsTask, callback: Optional[Callable]):
         """
         Internal error handler with cleanup.
+
+        BUG-015 FIX: Enhanced error handling with comprehensive state tracking.
 
         Args:
             task_id: Task identifier
@@ -132,10 +172,42 @@ class TaskManager(QObject):
             callback raises an exception.
         """
         try:
-            if task_id in self._cancelled_tasks:
+            # BUG-015 FIX: Check if we're shutting down or task was cancelled
+            if self._shutting_down:
+                logger.debug("Task %s errored but manager is shutting down - skipping callback", task_id)
                 return
+            if task_id in self._cancelled_tasks:
+                logger.debug("Task %s errored but was already cancelled - skipping callback", task_id)
+                return
+
+            # BUG-015 FIX: Log the task error for diagnostics
+            logger.warning("Task %s terminated/errored", task_id)
+
             if callback:
-                callback(task)
+                try:
+                    callback(task)
+                except Exception as callback_exc:
+                    # BUG-015 FIX: Log callback exceptions instead of letting them escape
+                    logger.error(
+                        "Task %s error callback raised exception: %s\n%s",
+                        task_id,
+                        callback_exc,
+                        traceback.format_exc()
+                    )
+                    # Store error for potential retrieval
+                    self._task_errors[task_id] = {
+                        "type": "callback_error",
+                        "exception": callback_exc,
+                        "traceback": traceback.format_exc(),
+                        "phase": "error"
+                    }
+        except Exception as handler_exc:
+            # BUG-015 FIX: Catch any unexpected errors in the handler itself
+            logger.error(
+                "Task %s error handler failed unexpectedly: %s",
+                task_id,
+                handler_exc
+            )
         finally:
             self._cleanup_task(task_id, task)
 
@@ -192,15 +264,23 @@ class TaskManager(QObject):
         """
         Cancel all active tasks (call during shutdown).
 
+        BUG-015 FIX: Sets shutdown flag to prevent callbacks during teardown.
+
         Note:
             This is the primary method called during plugin unload().
             It ensures NO task handlers will fire after unload completes.
         """
+        # BUG-015 FIX: Set shutdown flag to prevent callbacks from firing
+        self._shutting_down = True
+
         # Get list of task IDs (avoid modifying dict during iteration)
         task_ids = list(self._active_tasks.keys())
 
         for task_id in task_ids:
             self.cancel_task(task_id)
+
+        # BUG-015 FIX: Clear error tracking on shutdown
+        self._task_errors.clear()
 
     def get_active_count(self) -> int:
         """
@@ -239,3 +319,55 @@ class TaskManager(QObject):
                 task.taskTerminated.disconnect(error_handler)
             except (RuntimeError, TypeError):
                 pass
+
+    # ------------------------------------------------------------------
+    # BUG-015 FIX: Error state retrieval methods
+    # ------------------------------------------------------------------
+
+    def get_task_error(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get error information for a task if any occurred.
+
+        BUG-015 FIX: Allows callers to check for errors that occurred
+        during callback execution.
+
+        Args:
+            task_id: Task identifier
+
+        Returns:
+            Dict with error details or None if no error recorded
+        """
+        return self._task_errors.get(task_id)
+
+    def clear_task_error(self, task_id: str):
+        """
+        Clear error information for a task.
+
+        BUG-015 FIX: Call after handling or acknowledging an error.
+
+        Args:
+            task_id: Task identifier
+        """
+        self._task_errors.pop(task_id, None)
+
+    def has_errors(self) -> bool:
+        """
+        Check if any tasks have recorded errors.
+
+        BUG-015 FIX: Quick check for error conditions.
+
+        Returns:
+            True if any task errors are recorded
+        """
+        return len(self._task_errors) > 0
+
+    def is_shutting_down(self) -> bool:
+        """
+        Check if manager is in shutdown state.
+
+        BUG-015 FIX: Allows callbacks to check shutdown state.
+
+        Returns:
+            True if cancel_all() has been called
+        """
+        return self._shutting_down

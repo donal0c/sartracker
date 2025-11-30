@@ -69,6 +69,12 @@ class BaseDrawingTool(QgsMapTool):
         # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
         self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
 
+        # BUG-016 FIX: Validate CRS at initialization
+        if not self.wgs84.isValid():
+            logger.error("WGS84 CRS (EPSG:4326) failed to initialize - coordinate transforms will fail")
+        if not self.itm.isValid():
+            logger.error("ITM CRS (EPSG:2157) failed to initialize - Irish Grid transforms will fail")
+
         # Distance calculator (geodesic)
         self.distance_calc = QgsDistanceArea()
         self.distance_calc.setSourceCrs(
@@ -87,6 +93,8 @@ class BaseDrawingTool(QgsMapTool):
         """
         Transform point from canvas CRS to WGS84.
 
+        BUG-016 FIX: Added explicit CRS validity checks before transformation.
+
         Args:
             point: QgsPointXY in canvas CRS
 
@@ -94,10 +102,27 @@ class BaseDrawingTool(QgsMapTool):
             QgsPointXY in WGS84
 
         Raises:
-            RuntimeError: If coordinate transformation fails
+            RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
+
+            # BUG-016 FIX: Validate canvas CRS
+            if not canvas_crs or not canvas_crs.isValid():
+                error_msg = "Canvas CRS is not available or invalid. Check project CRS settings."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
+            # BUG-016 FIX: Validate target CRS
+            if not self.wgs84.isValid():
+                error_msg = "WGS84 CRS (EPSG:4326) is not available. QGIS installation may be corrupted."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
             if canvas_crs.authid() == "EPSG:4326":
                 return point
 
@@ -106,7 +131,19 @@ class BaseDrawingTool(QgsMapTool):
                 self.wgs84,
                 QgsProject.instance()
             )
+
+            # BUG-016 FIX: Validate transform is valid
+            if not transform.isValid():
+                error_msg = f"Coordinate transform from {canvas_crs.authid()} to WGS84 is not valid."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
             return transform.transform(point)
+        except RuntimeError:
+            # Re-raise our own RuntimeErrors (from validation checks above)
+            raise
         except Exception as e:
             # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
             error_msg = f"Failed to transform coordinates from {canvas_crs.authid() if canvas_crs else 'Unknown'} to WGS84: {e}"
@@ -119,6 +156,8 @@ class BaseDrawingTool(QgsMapTool):
         """
         Transform point from canvas CRS to Irish Grid (ITM).
 
+        BUG-016 FIX: Added explicit CRS validity checks before transformation.
+
         Args:
             point: QgsPointXY in canvas CRS
 
@@ -126,11 +165,28 @@ class BaseDrawingTool(QgsMapTool):
             QgsPointXY in ITM
 
         Raises:
-            RuntimeError: If coordinate transformation fails
+            RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
-            if canvas_crs.authid() == "EPSG:29903":
+
+            # BUG-016 FIX: Validate canvas CRS
+            if not canvas_crs or not canvas_crs.isValid():
+                error_msg = "Canvas CRS is not available or invalid. Check project CRS settings."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
+            # BUG-016 FIX: Validate target CRS
+            if not self.itm.isValid():
+                error_msg = "ITM CRS (EPSG:2157) is not available. QGIS installation may be corrupted."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
+            if canvas_crs.authid() == "EPSG:2157":
                 return point
 
             transform = QgsCoordinateTransform(
@@ -138,7 +194,19 @@ class BaseDrawingTool(QgsMapTool):
                 self.itm,
                 QgsProject.instance()
             )
+
+            # BUG-016 FIX: Validate transform is valid
+            if not transform.isValid():
+                error_msg = f"Coordinate transform from {canvas_crs.authid()} to ITM is not valid."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
             return transform.transform(point)
+        except RuntimeError:
+            # Re-raise our own RuntimeErrors (from validation checks above)
+            raise
         except Exception as e:
             # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
             error_msg = f"Failed to transform coordinates from {canvas_crs.authid() if canvas_crs else 'Unknown'} to ITM: {e}"
@@ -151,6 +219,8 @@ class BaseDrawingTool(QgsMapTool):
         """
         Transform point from WGS84 to canvas CRS.
 
+        BUG-016 FIX: Added explicit CRS validity checks before transformation.
+
         Args:
             point: QgsPointXY in WGS84
 
@@ -158,10 +228,27 @@ class BaseDrawingTool(QgsMapTool):
             QgsPointXY in canvas CRS
 
         Raises:
-            RuntimeError: If coordinate transformation fails
+            RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
             canvas_crs = self.canvas.mapSettings().destinationCrs()
+
+            # BUG-016 FIX: Validate canvas CRS
+            if not canvas_crs or not canvas_crs.isValid():
+                error_msg = "Canvas CRS is not available or invalid. Check project CRS settings."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
+            # BUG-016 FIX: Validate source CRS
+            if not self.wgs84.isValid():
+                error_msg = "WGS84 CRS (EPSG:4326) is not available. QGIS installation may be corrupted."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
             if canvas_crs.authid() == "EPSG:4326":
                 return point
 
@@ -170,7 +257,19 @@ class BaseDrawingTool(QgsMapTool):
                 canvas_crs,
                 QgsProject.instance()
             )
+
+            # BUG-016 FIX: Validate transform is valid
+            if not transform.isValid():
+                error_msg = f"Coordinate transform from WGS84 to {canvas_crs.authid()} is not valid."
+                logger.error(error_msg)
+                error = RuntimeError(error_msg)
+                self.drawing_error.emit(error)
+                raise error
+
             return transform.transform(point)
+        except RuntimeError:
+            # Re-raise our own RuntimeErrors (from validation checks above)
+            raise
         except Exception as e:
             # TRANSFORM-SILENT fix: Raise error instead of silently returning wrong coordinates
             error_msg = f"Failed to transform coordinates from WGS84 to {canvas_crs.authid() if canvas_crs else 'Unknown'}: {e}"

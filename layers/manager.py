@@ -1780,8 +1780,10 @@ class LayerManager(QObject):
         Returns:
             Metadata with timezone-aware datetimes
         """
-        if self._metadata_migration_in_progress:
-            return metadata
+        # BUG-020 FIX: Use thread-safe lock for atomic flag checking
+        with self._metadata_lock:
+            if self._metadata_migration_in_progress:
+                return metadata
 
         if 'updated_at' in metadata:
             try:
@@ -1798,15 +1800,19 @@ class LayerManager(QObject):
                         metadata['updated_at'] = dt_aware.isoformat()
 
                         # Write back to storage to persist migration
+                        # BUG-020 FIX: Use lock for atomic flag setting
                         try:
-                            self._metadata_migration_in_progress = True
+                            with self._metadata_lock:
+                                self._metadata_migration_in_progress = True
                             self.set_layer_metadata(layer_id, metadata)
                             print(f"[LayerManager] Migrated timestamp persisted for {layer_id}")
                         except Exception as e:
                             print(f"[LayerManager] Warning: Could not persist migrated timestamp: {e}")
                             self._notify_metadata_warning(f"Could not persist migrated timestamp for {layer_id}: {e}")
                         finally:
-                            self._metadata_migration_in_progress = False
+                            # BUG-020 FIX: Ensure flag is always cleared under lock
+                            with self._metadata_lock:
+                                self._metadata_migration_in_progress = False
             except (ValueError, TypeError, AttributeError) as e:
                 print(f"[LayerManager] Warning: Could not migrate datetime for {layer_id}: {e}")
 

@@ -130,6 +130,99 @@ class DrawingLayerManager(BaseLayerManager):
             )
         return layer
 
+    # ------------------------------------------------------------------
+    # BUG-017 FIX: Layer Recreation Logic
+    # ------------------------------------------------------------------
+
+    def _get_or_recreate_layer(
+        self,
+        layer_id: str,
+        layer_name: str,
+        style_factory,
+        allow_recreate: bool = True
+    ) -> QgsVectorLayer:
+        """
+        Get a valid layer or attempt to recreate it if invalid.
+
+        BUG-017 FIX: Provides fallback layer recreation when a layer becomes
+        invalid (e.g., due to GeoPackage lock, project changes, or corruption).
+
+        Args:
+            layer_id: The schema layer ID
+            layer_name: Human-readable layer name for logging
+            style_factory: Method to apply styling to the layer
+            allow_recreate: If True, attempt to recreate invalid layers
+
+        Returns:
+            QgsVectorLayer: A valid layer
+
+        Raises:
+            LayerTransactionError: If layer cannot be obtained or recreated
+        """
+        # First attempt: get existing layer
+        try:
+            layer = self._ensure_schema_layer(
+                layer_id,
+                fallback_name=layer_name,
+                style_factory=style_factory
+            )
+
+            if layer and layer.isValid():
+                return layer
+
+        except Exception as e:
+            logger.warning(
+                "Initial layer retrieval failed for '%s': %s",
+                layer_name, e
+            )
+
+        if not allow_recreate:
+            raise LayerTransactionError(
+                layer_name=layer_name,
+                operation="layer access",
+                details="Layer is invalid and recreation not allowed"
+            )
+
+        # BUG-017 FIX: Attempt layer recreation
+        logger.warning(
+            "Layer '%s' is invalid, attempting recreation...",
+            layer_name
+        )
+
+        try:
+            # Clear any cached references
+            if self.layer_manager:
+                self.layer_manager.invalidate_cache(layer_id)
+
+            # Re-ensure the layer (will create fresh if needed)
+            layer = self._ensure_schema_layer(
+                layer_id,
+                fallback_name=layer_name,
+                style_factory=style_factory
+            )
+
+            if layer and layer.isValid():
+                logger.info(
+                    "Successfully recreated layer '%s'",
+                    layer_name
+                )
+                return layer
+
+        except Exception as recreate_exc:
+            logger.error(
+                "Layer recreation failed for '%s': %s",
+                layer_name,
+                recreate_exc
+            )
+
+        # All attempts failed
+        raise LayerTransactionError(
+            layer_name=layer_name,
+            operation="layer recreation",
+            details=f"Could not obtain or recreate layer '{layer_name}'. "
+                    "Check GeoPackage file locks and project settings."
+        )
+
     def _notify_error(self, title: str, message: str):
         """Show a user-facing error if iface/messageBar is available."""
         if not getattr(self, "iface", None):
