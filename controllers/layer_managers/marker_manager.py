@@ -8,7 +8,7 @@ Each marker type has its own layer with appropriate fields and styling.
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from typing import Dict, List, Optional
 
@@ -91,8 +91,8 @@ class MarkerLayerManager(BaseLayerManager):
         self._log_layer_snapshot(layer, f"{marker_type}::{action}", payload)
 
     def _current_timestamp(self) -> str:
-        """Return ISO timestamp for audit fields."""
-        return datetime.utcnow().isoformat()
+        """Return ISO timestamp for audit fields (timezone-aware UTC)."""
+        return datetime.now(timezone.utc).isoformat()
 
     def _get_marker_layer(self, marker_type: str) -> QgsVectorLayer:
         """Return persistent layer for a marker type."""
@@ -766,7 +766,7 @@ class MarkerLayerManager(BaseLayerManager):
                 lat = lat or point.y()
                 lon = lon or point.x()
 
-        return {
+        record = {
             "id": safe_attr("id"),
             "type": marker_type,
             "name": safe_attr("name"),
@@ -784,6 +784,15 @@ class MarkerLayerManager(BaseLayerManager):
             "layer_id": layer.id(),
             "feature_id": feature.id()
         }
+
+        # Add casualty-specific medical triage fields (BUG FIX: CASUALTY-FIELDS)
+        if marker_type == "casualty":
+            record["condition"] = safe_attr("condition")
+            record["treatment"] = safe_attr("treatment")
+            record["evacuation_priority"] = safe_attr("evacuation_priority")
+            record["found_by"] = safe_attr("found_by")
+
+        return record
 
     def list_markers(self) -> List[Dict[str, object]]:
         """Return all markers across managed layers."""

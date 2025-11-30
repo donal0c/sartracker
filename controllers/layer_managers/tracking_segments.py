@@ -182,20 +182,26 @@ def build_segments_from_positions(
                 curr_time = parse_iso_timestamp(pos["ts"])
                 gap_minutes = (curr_time - prev_time).total_seconds() / 60.0
             except Exception as exc:  # pragma: no cover - defensive logging upstream
+                # SAFETY: Cannot determine time gap with invalid timestamps.
+                # Force a segment break rather than guessing - prevents incorrect
+                # joining of positions that may be hours/days apart.
                 print(
-                    f"Warning: Could not parse timestamp for device {device_id}: {exc}. "
-                    "Treating as continuous segment."
+                    f"ERROR: Could not parse timestamp for device {device_id}: {exc}. "
+                    "Forcing segment break for safety."
                 )
-                gap_minutes = 0
+                gap_minutes = float('inf')  # Force segment break
 
             if gap_minutes > time_gap_minutes:
-                if len(current_segment) > 1:
+                # Save segment even if it contains only one point - single position
+                # reports are valuable in SAR operations (e.g., distress signals)
+                if len(current_segment) >= 1:
                     segments.append(_segment_from_points(device_id, current_segment[0]["name"], current_segment))
                 current_segment = [pos]
             else:
                 current_segment.append(pos)
 
-        if len(current_segment) > 1:
+        # Save final segment, including single-point segments
+        if len(current_segment) >= 1:
             segments.append(_segment_from_points(device_id, current_segment[0]["name"], current_segment))
 
     return segments
@@ -262,7 +268,8 @@ def validate_processed_segments(
             continue
         if not name or not isinstance(name, str):
             name = device_id
-        if not isinstance(points, list) or len(points) < 2:
+        # Allow single-point segments (isolated position reports are valid)
+        if not isinstance(points, list) or len(points) < 1:
             continue
 
         processed_points = []
@@ -284,7 +291,8 @@ def validate_processed_segments(
 
             processed_points.append({"lat": lat, "lon": lon, "ts": point.get("ts")})
 
-        if valid_segment and len(processed_points) >= 2:
+        # Include single-point segments (valid for isolated position reports)
+        if valid_segment and len(processed_points) >= 1:
             validated.append({"device_id": device_id, "name": name, "points": processed_points})
 
     return validated if validated else []

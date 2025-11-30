@@ -901,7 +901,9 @@ class LayerManager(QObject):
 
         # Add fields
         if layer_def.fields:
-            layer.startEditing()
+            # BUG FIX: DATA-PERSIST-2 - Check startEditing() return value
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {layer_def.name} - layer may be locked or read-only")
             try:
                 for field_def in layer_def.fields:
                     field = self._create_field(field_def)
@@ -1341,8 +1343,10 @@ class LayerManager(QObject):
             raise RuntimeError(f"Layer not found for category: {category}")
 
         try:
-            # Add feature to layer
-            layer.startEditing()
+            # Add feature to layer (BUG FIX: DATA-PERSIST-2)
+            if not layer.startEditing():
+                raise RuntimeError(f"Failed to start editing {layer.name()} - layer may be locked or read-only")
+
             if not layer.addFeature(feature):
                 raise RuntimeError(f"Failed to add feature to layer: {layer.name()}")
 

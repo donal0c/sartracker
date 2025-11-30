@@ -11,8 +11,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 import logging
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import shutil
 import tempfile
@@ -931,7 +930,8 @@ class TrackingLayerManager(BaseLayerManager):
             logger.warning("Breadcrumbs layer missing timestamp field; cannot prune")
             return 0
 
-        threshold = datetime.utcnow() - timedelta(hours=float(older_than_hours))
+        # Use timezone-aware datetime to prevent Python 3.9+ comparison crashes
+        threshold = datetime.now(timezone.utc) - timedelta(hours=float(older_than_hours))
         feature_ids = []
         for feature in layer.getFeatures(QgsFeatureRequest()):
             ts_val = feature.attribute(ts_idx)
@@ -939,6 +939,9 @@ class TrackingLayerManager(BaseLayerManager):
                 continue
             try:
                 ts = parse_iso_timestamp(str(ts_val))
+                # Make ts timezone-aware if it's naive (defensive safety)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
             except Exception:
                 continue
             if ts < threshold:
