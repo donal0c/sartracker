@@ -9,9 +9,13 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
 from datetime import datetime, timezone
+import logging
+import math
 import uuid
 from typing import Dict, List, Optional
 from contextlib import contextmanager
+
+logger = logging.getLogger(__name__)
 
 from qgis.core import (
     QgsVectorLayer, QgsFeature, QgsGeometry,
@@ -288,12 +292,61 @@ class MarkerLayerManager(BaseLayerManager):
         return None
 
     def _apply_feature_attributes(self, layer: QgsVectorLayer, feature: QgsFeature, data: Dict[str, object]):
-        """Set feature attributes by field name safely."""
+        """
+        Set feature attributes by field name safely.
+
+        BUG-039 FIX: Added type validation to prevent silent type mismatches
+        that could cause data truncation or precision loss.
+        """
         fields = layer.fields()
         for key, value in data.items():
             idx = fields.indexOf(key)
             if idx == -1:
                 continue
+
+            # BUG-039 FIX: Validate and coerce types to prevent silent truncation
+            field = fields.at(idx)
+            field_type = field.type()
+
+            # Type validation for safety-critical data
+            if value is not None:
+                # String field: ensure string conversion and check length
+                if field_type == 10:  # QString
+                    str_value = str(value) if not isinstance(value, str) else value
+                    max_len = field.length()
+                    if max_len > 0 and len(str_value) > max_len:
+                        logger.warning(
+                            "BUG-039: String truncation for field '%s': %d chars > max %d",
+                            key, len(str_value), max_len
+                        )
+                        str_value = str_value[:max_len]
+                    value = str_value
+
+                # Integer field: check for overflow
+                elif field_type == 2:  # Int
+                    if isinstance(value, float):
+                        logger.debug("BUG-039: Converting float to int for field '%s'", key)
+                        value = int(value)
+                    elif isinstance(value, str):
+                        try:
+                            value = int(value)
+                        except ValueError:
+                            logger.warning("BUG-039: Cannot convert '%s' to int for field '%s'", value, key)
+                            continue
+
+                # Double field: check for special values
+                elif field_type == 6:  # Double
+                    if isinstance(value, str):
+                        try:
+                            value = float(value)
+                        except ValueError:
+                            logger.warning("BUG-039: Cannot convert '%s' to float for field '%s'", value, key)
+                            continue
+                    if isinstance(value, float):
+                        if math.isnan(value) or math.isinf(value):
+                            logger.warning("BUG-039: Invalid float value (NaN/Inf) for field '%s'", key)
+                            continue
+
             feature.setAttribute(idx, value)
 
     def _build_audit_attributes(
@@ -845,11 +898,41 @@ class MarkerLayerManager(BaseLayerManager):
 
         lat = safe_attr("lat")
         lon = safe_attr("lon")
+        # BUG-059 FIX: Add explicit geometry type validation before coordinate extraction
         if (lat is None or lon is None) and feature.geometry() and not feature.geometry().isEmpty():
-            point = feature.geometry().asPoint()
-            if point:
-                lat = lat or point.y()
-                lon = lon or point.x()
+            geom = feature.geometry()
+            # Only extract coordinates from valid point geometries
+            from qgis.core import QgsWkbTypes
+            geom_type = geom.type()
+            if geom_type == QgsWkbTypes.PointGeometry:
+                point = geom.asPoint()
+                # Validate extracted point is not empty (0,0 could indicate invalid extraction)
+                if point and not (point.x() == 0 and point.y() == 0):
+                    extracted_lat = point.y()
+                    extracted_lon = point.x()
+                    # Validate coordinates are in reasonable range
+                    if -90 <= extracted_lat <= 90 and -180 <= extracted_lon <= 180:
+                        lat = lat if lat is not None else extracted_lat
+                        lon = lon if lon is not None else extracted_lon
+                        logger.debug(
+                            "BUG-059: Extracted coordinates from geometry for marker %s: lat=%s, lon=%s",
+                            safe_attr("id"), lat, lon
+                        )
+                    else:
+                        logger.warning(
+                            "BUG-059: Invalid coordinates extracted from geometry for marker %s: lat=%s, lon=%s",
+                            safe_attr("id"), extracted_lat, extracted_lon
+                        )
+                else:
+                    logger.warning(
+                        "BUG-059: Empty or zero-point geometry for marker %s",
+                        safe_attr("id")
+                    )
+            else:
+                logger.warning(
+                    "BUG-059: Non-point geometry type %s for marker %s, skipping coordinate extraction",
+                    geom_type, safe_attr("id")
+                )
 
         record = {
             "id": safe_attr("id"),

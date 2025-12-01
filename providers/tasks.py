@@ -7,6 +7,7 @@ Base class and implementations for provider-specific background tasks.
 Qt5/Qt6 Compatible: Uses QgsTask API.
 """
 
+import logging
 from typing import Dict, List, Optional, Any, Callable
 from collections import defaultdict
 from datetime import datetime
@@ -14,6 +15,8 @@ from abc import ABC, abstractmethod
 from qgis.core import QgsTask
 
 from ..utils.exceptions import ProviderNetworkError, ProviderAuthError, ProviderDataError
+
+logger = logging.getLogger(__name__)
 
 # Default line-break threshold (minutes) for breadcrumb segmentation.
 # Mirrors TrackingLayerManager.update_breadcrumbs default to keep UI behavior consistent.
@@ -33,6 +36,9 @@ class ProviderRefreshTask(QgsTask):
     - Always check isCanceled() between major operations
     - Store results/errors in instance variables, NOT in GUI
 
+    BUG-036 FIX: Provides centralized cancellation management via
+    check_cancellation() method for consistent state handling.
+
     Qt5/Qt6 Compatible: QgsTask works identically in both versions.
     """
 
@@ -48,6 +54,38 @@ class ProviderRefreshTask(QgsTask):
         self.provider = provider
         self.results: Optional[Dict[str, List]] = None
         self.error_message: Optional[str] = None
+        # BUG-036 FIX: Track if cancellation cleanup has been performed
+        self._cancellation_cleanup_done = False
+
+    def check_cancellation(self, context: str = "") -> bool:
+        """
+        BUG-036 FIX: Centralized cancellation check with consistent state management.
+
+        Use this method instead of isCanceled() directly to ensure:
+        1. Consistent logging of cancellation events
+        2. Single point for cancellation state management
+        3. Optional context for debugging cancellation points
+
+        Args:
+            context: Optional description of where cancellation is being checked
+
+        Returns:
+            True if task has been cancelled, False otherwise
+        """
+        if self.isCanceled():
+            if context and not self._cancellation_cleanup_done:
+                print(f"[TASK] Cancellation detected at: {context}")
+            return True
+        return False
+
+    def mark_cancellation_cleanup_done(self):
+        """
+        BUG-036 FIX: Mark that cancellation cleanup has been performed.
+
+        Call this after performing cleanup in finally blocks to prevent
+        duplicate cleanup operations and logging.
+        """
+        self._cancellation_cleanup_done = True
 
     @abstractmethod
     def run(self) -> bool:
@@ -89,27 +127,28 @@ class CSVRefreshTask(ProviderRefreshTask):
             True if successful, False if error occurred
         """
         try:
+            # BUG-054 FIX: Use centralized cancellation check for consistent logging
             # Check for cancellation before starting
-            if self.isCanceled():
+            if self.check_cancellation("CSV task start"):
                 return False
 
             # Parse current positions (uses file-level caching)
             current = self.provider.get_current()
 
             # Check for cancellation after each major operation
-            if self.isCanceled():
+            if self.check_cancellation("CSV after get_current"):
                 return False
 
             # Parse breadcrumbs (historical trail)
             breadcrumbs = self.provider.get_breadcrumbs()
 
-            if self.isCanceled():
+            if self.check_cancellation("CSV after get_breadcrumbs"):
                 return False
 
             # Get device list
             devices = self.provider.get_devices()
 
-            if self.isCanceled():
+            if self.check_cancellation("CSV after get_devices"):
                 return False
 
             # Store results for main thread retrieval
@@ -201,9 +240,14 @@ class ConnectionTestTask(QgsTask):
                         if session:
                             session.close()
                             if was_cancelled:
-                                print("[CONNECTION_TEST] Session closed after cancellation")
+                                logger.debug("CONNECTION_TEST: Session closed after cancellation")
                     except Exception as e:
-                        print(f"Warning: Error closing session in ConnectionTestTask: {e}")
+                        # BUG-061 FIX: Use proper logging for session close errors
+                        logger.warning(
+                            "BUG-061: Error closing session in ConnectionTestTask: %s - "
+                            "potential connection pool resource leak",
+                            e
+                        )
             else:
                 # CSV or other provider without session support
                 self.success = self.provider.test_connection()
@@ -531,8 +575,9 @@ class TraccarRefreshTask(ProviderRefreshTask):
         fallback_features = None
 
         try:
+            # BUG-054 FIX: Use centralized cancellation check for consistent logging
             # Check for cancellation before starting
-            if self.isCanceled():
+            if self.check_cancellation("Traccar task start"):
                 return False
 
             # Fetch devices with session
@@ -570,8 +615,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 self.error_message = f"Unexpected error fetching devices: {str(e)}"
                 return False
 
-            # Check for cancellation
-            if self.isCanceled():
+            # BUG-054 FIX: Check for cancellation with context
+            if self.check_cancellation("Traccar after get_devices"):
                 return False
 
             # Update progress
@@ -597,8 +642,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 self.error_message = f"Failed to fetch current positions: {str(e)}"
                 return False
 
-            # Check for cancellation
-            if self.isCanceled():
+            # BUG-054 FIX: Check for cancellation with context
+            if self.check_cancellation("Traccar after get_current"):
                 return False
 
             # Update progress
@@ -637,8 +682,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
             else:
                 _breadcrumb_progress(1.0)
 
-            # Check for cancellation
-            if self.isCanceled():
+            # BUG-054 FIX: Check for cancellation with context
+            if self.check_cancellation("Traccar after get_breadcrumbs"):
                 return False
 
             # Pre-process breadcrumbs so the main thread only builds QgsFeatures
@@ -649,8 +694,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     cancel_check=self.isCanceled
                 )
                 if breadcrumb_processing is None:
-                    if self.isCanceled():
-                        print("[TRACCAR_TASK] Breadcrumb processing canceled")
+                    # BUG-054 FIX: Use check_cancellation for consistent logging
+                    if self.check_cancellation("Traccar breadcrumb processing"):
                         return False
                     # Fall back to empty payload if processing failed without cancellation
                     breadcrumb_processing = {
@@ -659,8 +704,31 @@ class TraccarRefreshTask(ProviderRefreshTask):
                         'time_gap_minutes': float(DEFAULT_BREADCRUMB_GAP_MINUTES)
                     }
             except Exception as proc_err:
-                print(f"[TRACCAR_TASK] Breadcrumb preprocessing failed: {proc_err}")
-                breadcrumb_processing = None
+                # BUG-065 FIX: Enhanced error logging and fallback for breadcrumb processing failure
+                logger.error(
+                    "BUG-065: Breadcrumb preprocessing failed: %s - "
+                    "falling back to empty payload. Historical tracking data may be incomplete.",
+                    proc_err,
+                    exc_info=True
+                )
+                # Provide empty fallback payload instead of None to prevent downstream errors
+                breadcrumb_processing = {
+                    'segments': [],
+                    'stats': {'error': str(proc_err)},
+                    'time_gap_minutes': float(DEFAULT_BREADCRUMB_GAP_MINUTES)
+                }
+
+            # BUG-050 FIX: Validate results before storing
+            # Ensure all lists are actual lists to prevent downstream errors
+            if not isinstance(current, list):
+                print(f"[TRACCAR_TASK] BUG-050: Invalid current type {type(current).__name__}, using empty list")
+                current = []
+            if not isinstance(breadcrumbs, list):
+                print(f"[TRACCAR_TASK] BUG-050: Invalid breadcrumbs type {type(breadcrumbs).__name__}, using empty list")
+                breadcrumbs = []
+            if not isinstance(devices, list):
+                print(f"[TRACCAR_TASK] BUG-050: Invalid devices type {type(devices).__name__}, using empty list")
+                devices = []
 
             # Store results for main thread retrieval
             self.results = {
@@ -702,6 +770,11 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 if session:
                     session.close()
                     if was_cancelled:
-                        print("[TRACCAR_TASK] Session closed after cancellation")
+                        logger.debug("TRACCAR_TASK: Session closed after cancellation")
             except Exception as e:
-                print(f"Warning: Error closing session in TraccarRefreshTask: {e}")
+                # BUG-061 FIX: Use proper logging for session close errors
+                logger.warning(
+                    "BUG-061: Error closing session in TraccarRefreshTask: %s - "
+                    "potential connection pool resource leak",
+                    e
+                )

@@ -1228,6 +1228,32 @@ class TraccarHttpProvider(Provider):
                 self._purge_cache_file("Invalid cache structure")
                 return None
 
+            # BUG-066 FIX: Granular validation of cached feature data
+            features = cache_data.get('features')
+            if not isinstance(features, list):
+                logger.warning("BUG-066: Cache features is not a list, purging cache")
+                self._purge_cache_file("features not a list")
+                return None
+
+            # Validate each feature has minimum required fields
+            valid_features = []
+            for i, feat in enumerate(features):
+                if not isinstance(feat, dict):
+                    logger.debug("BUG-066: Cache feature %d is not a dict, skipping", i)
+                    continue
+                # Must have at least lat/lon to be useful
+                if 'lat' in feat and 'lon' in feat:
+                    valid_features.append(feat)
+                else:
+                    logger.debug("BUG-066: Cache feature %d missing lat/lon, skipping", i)
+
+            if len(valid_features) < len(features):
+                logger.warning(
+                    "BUG-066: Filtered %d invalid features from cache (%d -> %d valid)",
+                    len(features) - len(valid_features), len(features), len(valid_features)
+                )
+            cache_data['features'] = valid_features
+
             timestamp_str = cache_data.get('timestamp')
             try:
                 cache_time = parse_iso(timestamp_str)

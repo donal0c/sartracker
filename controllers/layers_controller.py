@@ -24,7 +24,7 @@ from .layer_managers.drawing_manager import DrawingLayerManager
 from .layer_catalog import LayerCatalogService
 from ..layers.helicopter_manager import HelicopterLayerManager
 from ..layers import LayerManager as SchemaLayerManager, GroupNames, LayerIds
-from ..utils.exceptions import LayerTransactionError, LayerLockError
+from ..utils.exceptions import LayerTransactionError, LayerLockError, LayerError
 from ..utils.notify import error as notify_error, warning as notify_warning
 
 
@@ -141,16 +141,41 @@ class LayersController:
         """
         Execute a manager call with consistent exception logging.
 
+        BUG-055 FIX: Enhanced exception handling with:
+        - Exception chaining to preserve original traceback
+        - Specific handling for known exception types
+        - Better context-specific error messages
+
         Args:
             operation: Human-friendly operation description
             func: Callable to execute
         """
         try:
             return func(*args, **kwargs)
-        except Exception as exc:
-            logger.exception("LayersController %s failed: %s", operation, exc)
-            self._notify_error("Layer Operation Failed", f"{operation} failed: {exc}")
+        except LayerLockError as exc:
+            # Layer is busy - recoverable, less severe
+            logger.warning("LayersController %s: layer busy - %s", operation, exc)
+            self._notify_error(exc.title, str(exc.message))
             raise
+        except LayerTransactionError as exc:
+            # Transaction failed - log with full context
+            logger.error(
+                "LayersController %s failed on layer '%s' during '%s': %s",
+                operation, exc.layer_name, exc.operation, exc.details or "no details"
+            )
+            self._notify_error(exc.title, str(exc.message))
+            raise
+        except LayerError as exc:
+            # Other layer errors
+            logger.error("LayersController %s failed: %s", operation, exc, exc_info=True)
+            self._notify_error(exc.title, str(exc.message))
+            raise
+        except Exception as exc:
+            # Unknown errors - log full traceback and wrap with context
+            logger.exception("LayersController %s failed with unexpected error: %s", operation, exc)
+            self._notify_error("Layer Operation Failed", f"{operation} failed: {exc}")
+            # BUG-055 FIX: Use exception chaining to preserve original traceback
+            raise RuntimeError(f"{operation} failed: {exc}") from exc
 
     def _apply_layer_edit(self, layer, operation: str, edit_fn: Callable):
         """

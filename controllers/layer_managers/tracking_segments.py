@@ -8,10 +8,13 @@ unit-tested without a running QGIS environment.
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -155,11 +158,31 @@ def _coerce_coordinates(lat_value: Any, lon_value: Any, index: int) -> (float, f
     return lat, lon
 
 
+# BUG-038 FIX: Maximum positions to process in memory
+# Beyond this limit, positions are truncated to prevent memory exhaustion.
+# 100,000 positions at ~200 bytes each ≈ 20MB memory usage
+MAX_POSITIONS_IN_MEMORY = 100000
+
+
 def build_segments_from_positions(
     positions: List[Dict[str, Any]],
     time_gap_minutes: float,
 ) -> List[Dict[str, Any]]:
-    """Reproduce legacy segmentation logic for fallback scenarios."""
+    """
+    Reproduce legacy segmentation logic for fallback scenarios.
+
+    BUG-038 FIX: Enforces MAX_POSITIONS_IN_MEMORY limit to prevent
+    memory exhaustion with large datasets. Keeps most recent positions.
+    """
+    # BUG-038 FIX: Memory guard - truncate if over limit
+    if len(positions) > MAX_POSITIONS_IN_MEMORY:
+        logger.warning(
+            "BUG-038 memory guard - truncating %d positions to %d (keeping most recent)",
+            len(positions), MAX_POSITIONS_IN_MEMORY
+        )
+        # Keep the most recent positions (assumes list is somewhat chronological)
+        positions = positions[-MAX_POSITIONS_IN_MEMORY:]
+
     device_positions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for pos in positions:
         device_positions[pos["device_id"]].append(pos)
@@ -181,13 +204,25 @@ def build_segments_from_positions(
                 prev_time = parse_iso_timestamp(prev_pos["ts"])
                 curr_time = parse_iso_timestamp(pos["ts"])
                 gap_minutes = (curr_time - prev_time).total_seconds() / 60.0
+
+                # BUG-067 FIX: Handle out-of-order timestamps (negative gap)
+                if gap_minutes < 0:
+                    logger.warning(
+                        "BUG-067: Out-of-order timestamps for device %s: "
+                        "prev=%s, curr=%s (gap=%.1f min). Forcing segment break.",
+                        device_id, prev_pos.get("ts"), pos.get("ts"), gap_minutes
+                    )
+                    gap_minutes = float('inf')  # Force segment break for safety
+
             except Exception as exc:  # pragma: no cover - defensive logging upstream
                 # SAFETY: Cannot determine time gap with invalid timestamps.
                 # Force a segment break rather than guessing - prevents incorrect
                 # joining of positions that may be hours/days apart.
-                print(
-                    f"ERROR: Could not parse timestamp for device {device_id}: {exc}. "
-                    "Forcing segment break for safety."
+                # BUG-067 FIX: Use proper logging instead of print
+                logger.error(
+                    "BUG-067: Could not parse timestamp for device %s: %s "
+                    "(prev_ts=%s, curr_ts=%s). Forcing segment break for safety.",
+                    device_id, exc, prev_pos.get("ts"), pos.get("ts")
                 )
                 gap_minutes = float('inf')  # Force segment break
 

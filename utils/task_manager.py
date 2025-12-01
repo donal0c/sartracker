@@ -17,6 +17,7 @@ from typing import Optional, Callable, Dict, Set, Any
 from qgis.core import QgsTask, QgsApplication
 from qgis.PyQt.QtCore import QObject
 import logging
+import time
 import traceback
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,18 @@ class TaskManager(QObject):
 
             if callback:
                 try:
+                    # BUG-057 FIX: Track callback execution time for diagnostics
+                    callback_start = time.monotonic()
                     callback(task)
+                    callback_duration = time.monotonic() - callback_start
+
+                    # BUG-057 FIX: Warn about slow callbacks that may block UI
+                    if callback_duration > 0.5:  # 500ms threshold
+                        logger.warning(
+                            "BUG-057: Task %s completion callback took %.2fs (slow callback may block UI)",
+                            task_id,
+                            callback_duration
+                        )
                 except Exception as callback_exc:
                     # BUG-015 FIX: Log callback exceptions instead of letting them escape
                     logger.error(
@@ -185,7 +197,18 @@ class TaskManager(QObject):
 
             if callback:
                 try:
+                    # BUG-057 FIX: Track callback execution time for diagnostics
+                    callback_start = time.monotonic()
                     callback(task)
+                    callback_duration = time.monotonic() - callback_start
+
+                    # BUG-057 FIX: Warn about slow callbacks that may block UI
+                    if callback_duration > 0.5:  # 500ms threshold
+                        logger.warning(
+                            "BUG-057: Task %s error callback took %.2fs (slow callback may block UI)",
+                            task_id,
+                            callback_duration
+                        )
                 except Exception as callback_exc:
                     # BUG-015 FIX: Log callback exceptions instead of letting them escape
                     logger.error(

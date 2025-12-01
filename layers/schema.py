@@ -10,11 +10,223 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all Qt imports.
 """
 
 from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+import logging
+import threading
+
+logger = logging.getLogger(__name__)
 
 
 # Schema version - increment when structure changes
 SAR_LAYER_SCHEMA_VERSION = 3
+
+
+# =============================================================================
+# BUG-028 FIX: Migration Status Tracking
+# =============================================================================
+
+
+class MigrationStatus(Enum):
+    """Status values for migration tracking."""
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"  # For optional migrations that don't apply
+
+
+@dataclass
+class MigrationRecord:
+    """
+    Record of a single migration attempt.
+
+    BUG-028 FIX: Tracks migration status to detect and recover from
+    partial migrations that could leave data in inconsistent states.
+    """
+    migration_id: str
+    from_version: int
+    to_version: int
+    status: MigrationStatus = MigrationStatus.PENDING
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    error_message: Optional[str] = None
+    affected_layers: List[str] = field(default_factory=list)
+    rollback_available: bool = False
+
+
+class MigrationTracker:
+    """
+    Thread-safe tracker for schema migration status.
+
+    BUG-028 FIX: Provides version tracking for partial migrations to:
+    1. Detect incomplete migrations from previous sessions
+    2. Prevent repeated migration attempts
+    3. Enable recovery from failed migrations
+    4. Track which layers were affected by each migration
+
+    LIFE-SAFETY CRITICAL: Incomplete migrations can corrupt layer data
+    which could compromise rescue operations.
+    """
+
+    _instance: Optional['MigrationTracker'] = None
+    _lock = threading.RLock()
+
+    def __new__(cls):
+        """Singleton pattern for global migration state."""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._initialized = False
+            return cls._instance
+
+    def __init__(self):
+        """Initialize migration tracker (only once due to singleton)."""
+        if getattr(self, '_initialized', False):
+            return
+
+        self._migrations: Dict[str, MigrationRecord] = {}
+        self._current_schema_version = SAR_LAYER_SCHEMA_VERSION
+        self._initialized = True
+
+    def start_migration(
+        self,
+        migration_id: str,
+        from_version: int,
+        to_version: int,
+        affected_layers: Optional[List[str]] = None
+    ) -> MigrationRecord:
+        """
+        Record the start of a migration.
+
+        Args:
+            migration_id: Unique identifier for this migration
+            from_version: Schema version before migration
+            to_version: Target schema version
+            affected_layers: List of layer names that will be modified
+
+        Returns:
+            MigrationRecord for tracking this migration
+        """
+        with self._lock:
+            if migration_id in self._migrations:
+                existing = self._migrations[migration_id]
+                if existing.status == MigrationStatus.IN_PROGRESS:
+                    logger.warning(
+                        "Migration %s already in progress - possible incomplete "
+                        "migration from previous session",
+                        migration_id
+                    )
+                elif existing.status == MigrationStatus.COMPLETED:
+                    logger.info("Migration %s already completed, skipping", migration_id)
+                    return existing
+
+            record = MigrationRecord(
+                migration_id=migration_id,
+                from_version=from_version,
+                to_version=to_version,
+                status=MigrationStatus.IN_PROGRESS,
+                started_at=datetime.utcnow().isoformat(),
+                affected_layers=affected_layers or []
+            )
+            self._migrations[migration_id] = record
+            logger.info(
+                "Started migration %s: v%d -> v%d (layers: %s)",
+                migration_id, from_version, to_version,
+                ", ".join(affected_layers or ["none"])
+            )
+            return record
+
+    def complete_migration(self, migration_id: str, rollback_available: bool = False):
+        """
+        Record successful completion of a migration.
+
+        Args:
+            migration_id: Identifier of completed migration
+            rollback_available: Whether rollback data was preserved
+        """
+        with self._lock:
+            if migration_id not in self._migrations:
+                logger.warning("Completing unknown migration: %s", migration_id)
+                return
+
+            record = self._migrations[migration_id]
+            record.status = MigrationStatus.COMPLETED
+            record.completed_at = datetime.utcnow().isoformat()
+            record.rollback_available = rollback_available
+            logger.info(
+                "Completed migration %s (rollback %s)",
+                migration_id,
+                "available" if rollback_available else "not available"
+            )
+
+    def fail_migration(self, migration_id: str, error_message: str):
+        """
+        Record a failed migration.
+
+        Args:
+            migration_id: Identifier of failed migration
+            error_message: Description of what went wrong
+        """
+        with self._lock:
+            if migration_id not in self._migrations:
+                logger.warning("Failing unknown migration: %s", migration_id)
+                return
+
+            record = self._migrations[migration_id]
+            record.status = MigrationStatus.FAILED
+            record.completed_at = datetime.utcnow().isoformat()
+            record.error_message = error_message
+            logger.error(
+                "Migration %s FAILED: %s",
+                migration_id, error_message
+            )
+
+    def get_migration_status(self, migration_id: str) -> Optional[MigrationRecord]:
+        """Get the status of a specific migration."""
+        with self._lock:
+            return self._migrations.get(migration_id)
+
+    def has_incomplete_migrations(self) -> List[MigrationRecord]:
+        """
+        Check for incomplete migrations that may need recovery.
+
+        Returns:
+            List of migrations that are IN_PROGRESS or FAILED
+        """
+        with self._lock:
+            return [
+                record for record in self._migrations.values()
+                if record.status in (MigrationStatus.IN_PROGRESS, MigrationStatus.FAILED)
+            ]
+
+    def is_migration_needed(self, from_version: int, to_version: int) -> bool:
+        """
+        Check if a migration should be performed.
+
+        Args:
+            from_version: Current schema version
+            to_version: Target schema version
+
+        Returns:
+            True if migration should proceed
+        """
+        migration_id = f"v{from_version}_to_v{to_version}"
+        with self._lock:
+            existing = self._migrations.get(migration_id)
+            if existing and existing.status == MigrationStatus.COMPLETED:
+                return False
+            return from_version < to_version
+
+    def clear_all(self):
+        """Clear all migration records (for testing)."""
+        with self._lock:
+            self._migrations.clear()
+
+
+# Global migration tracker instance
+migration_tracker = MigrationTracker()
 
 # Root group name
 ROOT_GROUP_NAME = "SAR Tracker"

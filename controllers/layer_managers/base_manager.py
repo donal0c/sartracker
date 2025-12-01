@@ -145,7 +145,32 @@ class BaseLayerManager(ABC):
             g = 50 + ((hash_int >> 16) % 206)
             b = 50 + ((hash_int >> 32) % 206)
 
-            self.device_colors[device_id] = QColor(r, g, b)
+            new_color = QColor(r, g, b)
+
+            # BUG-052 FIX: Detect color collisions with existing devices
+            # If collision detected, adjust color by rotating hue
+            for existing_id, existing_color in self.device_colors.items():
+                if existing_id != device_id:
+                    # Check if colors are too similar (within 30 units on each channel)
+                    r_diff = abs(new_color.red() - existing_color.red())
+                    g_diff = abs(new_color.green() - existing_color.green())
+                    b_diff = abs(new_color.blue() - existing_color.blue())
+
+                    if r_diff < 30 and g_diff < 30 and b_diff < 30:
+                        # Collision detected - adjust by rotating color
+                        logger.debug(
+                            "BUG-052: Color collision detected between '%s' and '%s', adjusting",
+                            device_id, existing_id
+                        )
+                        # Use second half of hash to shift color
+                        shift = int.from_bytes(hash_bytes[8:12], byteorder='big')
+                        r = 50 + ((r + shift) % 206)
+                        g = 50 + ((g + (shift >> 8)) % 206)
+                        b = 50 + ((b + (shift >> 16)) % 206)
+                        new_color = QColor(r, g, b)
+                        break
+
+            self.device_colors[device_id] = new_color
 
         # Return a defensive copy to prevent mutation
         cached_color = self.device_colors[device_id]
@@ -335,6 +360,65 @@ class BaseLayerManager(ABC):
 
     def _get_layer_by_id(self, layer_id: str) -> Optional[QgsVectorLayer]:
         return self._require_layer_manager().get_layer(layer_id)
+
+    def _verify_layer_freshness(self, layer: Optional[QgsVectorLayer], layer_name: str) -> Optional[QgsVectorLayer]:
+        """
+        BUG-040 FIX: Verify a stored layer reference is still valid and fresh.
+
+        This method should be called when using a previously-obtained layer
+        reference to detect stale references that may have become invalid
+        since they were acquired.
+
+        Args:
+            layer: Previously stored layer reference to verify
+            layer_name: Layer name for logging
+
+        Returns:
+            The layer if valid and fresh, None if stale/invalid
+
+        Note:
+            Does NOT raise exceptions - returns None for stale layers.
+            Use _validate_layer_for_edit for stricter validation before edits.
+        """
+        if layer is None:
+            logger.debug("BUG-040: Layer reference is None for '%s'", layer_name)
+            return None
+
+        # Check Python object still exists and is valid
+        try:
+            is_valid = layer.isValid()
+        except RuntimeError:
+            # C++ object deleted (sip wrapper pointing to deleted object)
+            logger.warning(
+                "BUG-040: Stale layer reference for '%s' - C++ object deleted",
+                layer_name
+            )
+            return None
+
+        if not is_valid:
+            logger.warning(
+                "BUG-040: Layer '%s' is no longer valid (source unavailable)",
+                layer_name
+            )
+            return None
+
+        # Verify layer still registered with project
+        if self.project:
+            try:
+                if not self.project.mapLayer(layer.id()):
+                    logger.warning(
+                        "BUG-040: Layer '%s' no longer registered with project",
+                        layer_name
+                    )
+                    return None
+            except Exception as e:
+                logger.warning(
+                    "BUG-040: Error checking project registration for '%s': %s",
+                    layer_name, e
+                )
+                return None
+
+        return layer
 
     # ------------------------------------------------------------------
     # BUG-012/BUG-014 FIX: Concurrent Edit Prevention

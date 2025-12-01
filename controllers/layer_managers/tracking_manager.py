@@ -65,6 +65,12 @@ class TrackingLayerManager(BaseLayerManager):
 
     ASYNC_SEGMENT_THRESHOLD = 1500  # Minimum breadcrumb points before offloading
 
+    # BUG-032 FIX: Memory cap for breadcrumb trail accumulation
+    # Limits the maximum number of breadcrumb segments to prevent memory exhaustion
+    # during long missions. Value chosen to balance history retention vs memory usage.
+    # At ~500 bytes per segment (geometry + attributes), 10000 segments ≈ 5MB
+    MAX_BREADCRUMB_SEGMENTS = 10000
+
     def __init__(self, iface, shared_device_colors=None, layer_manager=None, task_manager=None):
         """Initialize tracking layer manager."""
         super().__init__(iface, shared_device_colors, layer_manager)
@@ -290,8 +296,17 @@ class TrackingLayerManager(BaseLayerManager):
             return False
         return self._start_breadcrumb_task(positions, gap_minutes, total_inputs)
 
+    # BUG-042 FIX: Maximum positions for background task to prevent memory exhaustion
+    # Limits task memory to a safe level. Larger datasets should be chunked.
+    MAX_TASK_POSITIONS = 50000
+
     def _start_breadcrumb_task(self, positions: List[Dict], gap_minutes: float, total_inputs: int) -> bool:
-        """Create and queue a QgsTask that sanitizes and segments breadcrumbs."""
+        """
+        Create and queue a QgsTask that sanitizes and segments breadcrumbs.
+
+        BUG-042 FIX: Enforces MAX_TASK_POSITIONS limit to prevent memory
+        exhaustion in background tasks.
+        """
         task_manager = getattr(self, "task_manager", None)
         if not task_manager:
             return False
@@ -299,6 +314,16 @@ class TrackingLayerManager(BaseLayerManager):
         create_task = getattr(QgsTask, "fromFunction", None)
         if not create_task:
             return False
+
+        # BUG-042 FIX: Memory guard for background task
+        # Truncate positions to prevent excessive memory usage in background task
+        if len(positions) > self.MAX_TASK_POSITIONS:
+            logger.warning(
+                "BUG-042: Task memory guard - truncating %d positions to %d for background processing",
+                len(positions), self.MAX_TASK_POSITIONS
+            )
+            positions = positions[-self.MAX_TASK_POSITIONS:]
+            total_inputs = self.MAX_TASK_POSITIONS
 
         try:
             positions_snapshot = [dict(pos) for pos in positions]
@@ -496,6 +521,9 @@ class TrackingLayerManager(BaseLayerManager):
         Clears existing features and adds new position for each device.
         Uses efficient truncate() method for clearing when available.
 
+        BUG-027 FIX: Uses global layer edit lock to prevent race conditions
+        during concurrent position updates from multiple sources.
+
         Args:
             positions: List of position dicts from tracking provider
                 Expected keys: device_id, name, ts, lat, lon,
@@ -503,6 +531,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         Raises:
             ValueError: If position data is invalid
+            LayerLockError: If unable to acquire edit lock (concurrent operation in progress)
         """
         # Validate positions list
         if not isinstance(positions, list):
@@ -520,44 +549,56 @@ class TrackingLayerManager(BaseLayerManager):
         # Get or create layer
         layer = self._get_or_create_current_layer()
 
-        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "update current positions") as edit_layer:
-            self._clear_layer_features(edit_layer, self.CURRENT_LAYER_NAME)
+        # BUG-027 FIX: Acquire global lock to prevent concurrent position updates
+        # This prevents race conditions when multiple refresh operations occur simultaneously
+        if not self.acquire_layer_edit_lock(timeout=10.0):
+            raise LayerLockError(
+                f"{self.CURRENT_LAYER_NAME} - concurrent update in progress. "
+                "Please wait for the current operation to complete."
+            )
 
-            for pos in valid_positions:
-                feature = QgsFeature(edit_layer.fields())
-                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
-                feature.setAttributes([
-                    pos['device_id'],
-                    pos['name'],
-                    pos['ts'],
-                    pos.get('altitude'),
-                    pos.get('speed'),
-                    pos.get('battery')
-                ])
-                if not edit_layer.addFeature(feature):
-                    raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
-
-        # Apply styling (outside transaction - failures here don't affect data)
         try:
-            self._apply_current_positions_style(layer)
-        except Exception as e:
-            logger.warning("Failed to apply styling to %s: %s", self.CURRENT_LAYER_NAME, e)
+            with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "update current positions") as edit_layer:
+                self._clear_layer_features(edit_layer, self.CURRENT_LAYER_NAME)
 
-        # Zoom to extent ONLY on first load
-        if self.first_load and valid_positions:
-            self.iface.mapCanvas().setExtent(layer.extent())
-            self.iface.mapCanvas().refresh()
-            self.first_load = False
-        else:
-            # Just repaint the layer, not the whole canvas
-            layer.triggerRepaint()
+                for pos in valid_positions:
+                    feature = QgsFeature(edit_layer.fields())
+                    feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
+                    feature.setAttributes([
+                        pos['device_id'],
+                        pos['name'],
+                        pos['ts'],
+                        pos.get('altitude'),
+                        pos.get('speed'),
+                        pos.get('battery')
+                    ])
+                    if not edit_layer.addFeature(feature):
+                        raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
 
-        self._log_tracking_event(
-            layer,
-            "CURRENT",
-            "update",
-            payload_items=len(valid_positions)
-        )
+            # Apply styling (outside transaction - failures here don't affect data)
+            try:
+                self._apply_current_positions_style(layer)
+            except Exception as e:
+                logger.warning("Failed to apply styling to %s: %s", self.CURRENT_LAYER_NAME, e)
+
+            # Zoom to extent ONLY on first load
+            if self.first_load and valid_positions:
+                self.iface.mapCanvas().setExtent(layer.extent())
+                self.iface.mapCanvas().refresh()
+                self.first_load = False
+            else:
+                # Just repaint the layer, not the whole canvas
+                layer.triggerRepaint()
+
+            self._log_tracking_event(
+                layer,
+                "CURRENT",
+                "update",
+                payload_items=len(valid_positions)
+            )
+        finally:
+            # BUG-027 FIX: Always release lock, even on error
+            self.release_layer_edit_lock()
 
     def _apply_current_positions_style(self, layer: QgsVectorLayer):
         """
@@ -766,8 +807,22 @@ class TrackingLayerManager(BaseLayerManager):
     def _replace_breadcrumb_layer_features(self, layer: QgsVectorLayer, segments: List[Dict[str, Any]]):
         """
         Replace layer features with provided segments using safe transactions.
+
+        BUG-032 FIX: Enforces MAX_BREADCRUMB_SEGMENTS limit to prevent memory
+        exhaustion during long missions. Keeps most recent segments.
         """
         segments = segments or []
+
+        # BUG-032 FIX: Enforce memory cap on breadcrumb segments
+        # Keep the most recent segments (end of list) if over limit
+        if len(segments) > self.MAX_BREADCRUMB_SEGMENTS:
+            discarded_count = len(segments) - self.MAX_BREADCRUMB_SEGMENTS
+            segments = segments[-self.MAX_BREADCRUMB_SEGMENTS:]
+            logger.warning(
+                "BUG-032: Breadcrumb memory cap enforced - discarded %d oldest segments, "
+                "keeping %d most recent (limit: %d)",
+                discarded_count, len(segments), self.MAX_BREADCRUMB_SEGMENTS
+            )
 
         with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "update breadcrumbs") as edit_layer:
             self._clear_layer_features(edit_layer, self.BREADCRUMBS_LAYER_NAME)

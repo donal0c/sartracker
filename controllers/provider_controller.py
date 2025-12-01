@@ -71,6 +71,11 @@ class ProviderController(QObject):
         self.iface = iface
         self.task_manager = task_manager
 
+        # BUG-030 FIX: Shutdown flag for thread-safe callback guards
+        # This flag is checked atomically in callbacks to prevent accessing
+        # destroyed objects during plugin shutdown
+        self._is_shutting_down = False
+
         # Active provider state
         self.provider: Optional[Provider] = None
         self.provider_name: Optional[str] = None
@@ -221,6 +226,12 @@ class ProviderController(QObject):
 
         SAFETY: May be called after controller destruction (Pattern 9).
         """
+        # BUG-030 FIX: Enhanced thread-safe guard for controller destruction
+        # Check shutdown flag FIRST (atomic boolean check), then object references
+        if self._is_shutting_down:
+            print("[PROVIDER_CONTROLLER] Connection test completed during shutdown - ignoring")
+            return
+
         # CRITICAL GUARD: Check if controller still exists (Pattern 9)
         if not self.iface or not self.task_manager:
             print("[PROVIDER_CONTROLLER] Connection test completed after controller destroyed")
@@ -348,6 +359,12 @@ class ProviderController(QObject):
 
         SAFETY: May be called after controller destruction (Pattern 9).
         """
+        # BUG-030 FIX: Enhanced thread-safe guard for controller destruction
+        # Check shutdown flag FIRST (atomic boolean check), then object references
+        if self._is_shutting_down:
+            print("[PROVIDER_CONTROLLER] Connection test error during shutdown - ignoring")
+            return
+
         # CRITICAL GUARD: Check if controller still exists (Pattern 9)
         if not self.iface or not self.task_manager:
             print("[PROVIDER_CONTROLLER] Connection test error after controller destroyed")
@@ -590,9 +607,17 @@ class ProviderController(QObject):
         Stops polling timer before controller destruction.
         This method should be called from the plugin's unload() sequence.
 
+        BUG-030 FIX: Sets shutdown flag FIRST to prevent callbacks from
+        accessing destroyed objects during cleanup.
+
         Qt5/Qt6 Compatible: Uses QTimer.isActive(), .stop().
         """
         try:
+            # BUG-030 FIX: Set shutdown flag FIRST to prevent in-flight callbacks
+            # from accessing destroyed objects. This is atomic (single assignment)
+            # and checked at the start of all async callback handlers.
+            self._is_shutting_down = True
+
             # Stop polling timer (Pattern 7: Layer 2)
             if hasattr(self, 'poll_timer') and self.poll_timer:
                 if self.poll_timer.isActive():

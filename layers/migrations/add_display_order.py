@@ -11,10 +11,13 @@ LIFE-SAFETY CRITICAL: Handle all errors gracefully, never corrupt existing data.
 Qt5/Qt6 Compatible: Uses QGIS API only.
 """
 
+import logging
 from qgis.core import QgsField, QgsVectorLayer, QgsFeatureRequest
 from qgis.PyQt.QtCore import QVariant
 from typing import List
-from ..schema import LayerIds
+from ..schema import LayerIds, migration_tracker
+
+logger = logging.getLogger(__name__)
 
 
 # Layers that need display_order field for manual ordering
@@ -55,7 +58,7 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
     # ========================================================================
 
     if not layer or not layer.isValid():
-        print(f"[Migration] ERROR: Layer {layer_id} is invalid or not available")
+        logger.error("BUG-053: Layer %s is invalid or not available", layer_id)
         return False
 
     # ========================================================================
@@ -64,10 +67,19 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
 
     # Check if field already exists
     if layer.fields().indexFromName('display_order') != -1:
-        print(f"[Migration] Layer {layer_id} already has display_order field")
+        logger.debug("Layer %s already has display_order field", layer_id)
         return False
 
-    print(f"[Migration] Adding display_order field to {layer_id}...")
+    logger.info("Adding display_order field to %s...", layer_id)
+
+    # BUG-053 FIX: Track migration status for recovery from partial migrations
+    migration_id = f"display_order_{layer_id}"
+    migration_tracker.start_migration(
+        migration_id=migration_id,
+        from_version=2,
+        to_version=3,
+        affected_layers=[layer_id]
+    )
 
     # ========================================================================
     # STEP 3: START TRANSACTION
@@ -75,12 +87,12 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
 
     # Check if layer is already being edited (safety check)
     if layer.isEditable():
-        print(f"[Migration] WARNING: Layer {layer_id} is already in edit mode, skipping")
+        logger.warning("BUG-053: Layer %s is already in edit mode, skipping migration", layer_id)
         return False
 
     # Start editing
     if not layer.startEditing():
-        print(f"[Migration] ERROR: Failed to start editing {layer_id}")
+        logger.error("BUG-053: Failed to start editing %s", layer_id)
         return False
 
     try:
@@ -99,7 +111,7 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
         if field_index == -1:
             raise RuntimeError("display_order field not found after add")
 
-        print(f"[Migration] Added display_order field to {layer_id} at index {field_index}")
+        logger.info("Added display_order field to %s at index %d", layer_id, field_index)
 
         # ====================================================================
         # STEP 5: BACKFILL VALUES
@@ -110,7 +122,25 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
         updated_count = 0
         features = list(layer.getFeatures(QgsFeatureRequest()))
 
-        print(f"[Migration] Backfilling {len(features)} features...")
+        # BUG-068 FIX: Warn about large layer migrations
+        feature_count = len(features)
+        if feature_count > 10000:
+            logger.warning(
+                "BUG-068: Large layer migration for %s with %d features - this may take time",
+                layer_id, feature_count
+            )
+        # BUG-068 FIX: Safety limit for very large layers
+        MAX_MIGRATION_FEATURES = 500000
+        if feature_count > MAX_MIGRATION_FEATURES:
+            logger.error(
+                "BUG-068: Layer %s has %d features, exceeds safe migration limit of %d",
+                layer_id, feature_count, MAX_MIGRATION_FEATURES
+            )
+            raise RuntimeError(
+                f"Layer too large for migration: {feature_count} features exceeds limit of {MAX_MIGRATION_FEATURES}"
+            )
+
+        logger.info("Backfilling %d features...", feature_count)
 
         for feature in features:
             feature_id = feature.id()
@@ -125,7 +155,7 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
 
             # Progress indicator for large layers
             if updated_count % 100 == 0:
-                print(f"[Migration] Backfilled {updated_count}/{len(features)} features...")
+                logger.debug("Backfilled %d/%d features...", updated_count, len(features))
 
         # ====================================================================
         # STEP 6: COMMIT CHANGES
@@ -136,7 +166,10 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
             errors = layer.commitErrors()
             raise RuntimeError(f"Commit failed: {', '.join(errors)}")
 
-        print(f"[Migration] ✓ Added display_order to {layer_id}, backfilled {updated_count} features")
+        # BUG-053 FIX: Mark migration as completed
+        migration_tracker.complete_migration(migration_id, rollback_available=False)
+
+        logger.info("Migration complete: Added display_order to %s, backfilled %d features", layer_id, updated_count)
         return True
 
     except Exception as e:
@@ -144,14 +177,13 @@ def migrate_layer(layer: QgsVectorLayer, layer_id: str) -> bool:
         # STEP 7: ROLLBACK ON ERROR
         # ====================================================================
 
-        print(f"[Migration] ERROR: Migration failed for {layer_id}: {e}")
+        logger.error("BUG-053: Migration failed for %s: %s", layer_id, e, exc_info=True)
 
         # Rollback to prevent partial migration
         layer.rollBack()
 
-        # Log full error for diagnostics
-        import traceback
-        traceback.print_exc()
+        # BUG-053 FIX: Mark migration as failed with error details
+        migration_tracker.fail_migration(migration_id, str(e))
 
         return False
 
@@ -204,8 +236,8 @@ def run_migration(layer_manager) -> dict:
         'failed': []
     }
 
-    print("[Migration] Starting display_order migration...")
-    print(f"[Migration] Layers to migrate: {len(LAYERS_TO_MIGRATE)}")
+    logger.info("Starting display_order migration...")
+    logger.info("Layers to migrate: %d", len(LAYERS_TO_MIGRATE))
 
     # ========================================================================
     # MIGRATE EACH LAYER
@@ -216,13 +248,13 @@ def run_migration(layer_manager) -> dict:
         try:
             layer = layer_manager.get_layer(layer_id)
         except Exception as e:
-            print(f"[Migration] WARNING: Failed to get layer {layer_id}: {e}")
+            logger.warning("Failed to get layer %s: %s", layer_id, e)
             results['skipped'].append(layer_id)
             continue
 
         # Check if layer exists
         if not layer or not layer.isValid():
-            print(f"[Migration] WARNING: Layer {layer_id} not found or invalid, skipping")
+            logger.warning("Layer %s not found or invalid, skipping", layer_id)
             results['skipped'].append(layer_id)
             continue
 
@@ -242,19 +274,19 @@ def run_migration(layer_manager) -> dict:
     # REPORT RESULTS
     # ========================================================================
 
-    print("\n[Migration] ===== Migration Complete =====")
-    print(f"[Migration] Migrated: {len(results['migrated'])} layers")
+    logger.info("===== Migration Complete =====")
+    logger.info("Migrated: %d layers", len(results['migrated']))
     if results['migrated']:
-        print(f"[Migration]   - {', '.join(results['migrated'])}")
+        logger.info("  Migrated: %s", ', '.join(results['migrated']))
 
-    print(f"[Migration] Skipped: {len(results['skipped'])} layers")
+    logger.info("Skipped: %d layers", len(results['skipped']))
     if results['skipped']:
-        print(f"[Migration]   - {', '.join(results['skipped'])}")
+        logger.debug("  Skipped: %s", ', '.join(results['skipped']))
 
-    print(f"[Migration] Failed: {len(results['failed'])} layers")
     if results['failed']:
-        print(f"[Migration]   - {', '.join(results['failed'])}")
-        print("[Migration] WARNING: Some migrations failed. Check logs above for details.")
+        logger.warning("Failed: %d layers - %s", len(results['failed']), ', '.join(results['failed']))
+    else:
+        logger.info("Failed: 0 layers")
 
     return results
 

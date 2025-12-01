@@ -10,10 +10,13 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
 import json
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable, Any
 from threading import RLock
+
+logger = logging.getLogger(__name__)
 from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal, QCoreApplication, QEvent
 from qgis.core import (
     QgsProject,
@@ -158,6 +161,8 @@ class LayerManager(QObject):
         self.project = QgsProject.instance()
         self._layer_cache: Dict[str, QgsVectorLayer] = {}
         self._group_cache: Dict[str, QgsLayerTreeGroup] = {}
+        # BUG-044 FIX: Thread-safe lock for concurrent cache access
+        self._cache_lock = RLock()
         self._signals_connected = False
         self._project_cleared_connected = False
         self._application_closing = False
@@ -904,6 +909,11 @@ class LayerManager(QObject):
             # BUG FIX: DATA-PERSIST-2 - Check startEditing() return value
             if not layer.startEditing():
                 raise RuntimeError(f"Failed to start editing {layer_def.name} - layer may be locked or read-only")
+
+            # BUG-041 FIX: Track edit state explicitly for robust error recovery
+            edit_started = True
+            commit_succeeded = False
+
             try:
                 for field_def in layer_def.fields:
                     field = self._create_field(field_def)
@@ -914,14 +924,29 @@ class LayerManager(QObject):
                     errors = layer.commitErrors()
                     raise RuntimeError(f"Failed to commit field changes: {errors}")
 
+                commit_succeeded = True
+                edit_started = False  # Edit session ended with commit
+
             except Exception as e:
-                layer.rollBack()
+                # BUG-041 FIX: Explicit rollback with error handling
+                if edit_started:
+                    try:
+                        layer.rollBack()
+                        edit_started = False
+                    except Exception as rollback_error:
+                        # Log rollback failure - layer may be in inconsistent state
+                        print(f"BUG-041 WARNING: Rollback failed for {layer_def.name}: {rollback_error}")
                 raise RuntimeError(f"Error adding fields: {e}")
 
             finally:
-                # Safety net: Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
+                # BUG-041 FIX: Safety net with explicit state check and logging
+                # Ensure layer is NEVER left in edit mode (Issue #3 critical fix)
                 if layer.isEditable():
-                    layer.rollBack()
+                    print(f"BUG-041 WARNING: Layer {layer_def.name} still editable in finally - forcing rollback")
+                    try:
+                        layer.rollBack()
+                    except Exception as final_rollback_error:
+                        print(f"BUG-041 ERROR: Final rollback failed for {layer_def.name}: {final_rollback_error}")
 
         return layer
 
@@ -1073,26 +1098,30 @@ class LayerManager(QObject):
         """
         Get a layer by its SAR Tracker layer ID.
 
+        BUG-044 FIX: Uses _cache_lock for thread-safe cache access.
+
         Args:
             layer_id: SAR Tracker layer ID from LayerIds
 
         Returns:
             QgsVectorLayer if found, None otherwise
         """
-        # Check cache first
-        if layer_id in self._layer_cache:
-            cached_layer = self._layer_cache[layer_id]
-            if self._layer_exists(cached_layer):
-                return cached_layer
-            else:
-                del self._layer_cache[layer_id]
+        # BUG-044 FIX: Thread-safe cache access
+        with self._cache_lock:
+            # Check cache first
+            if layer_id in self._layer_cache:
+                cached_layer = self._layer_cache[layer_id]
+                if self._layer_exists(cached_layer):
+                    return cached_layer
+                else:
+                    del self._layer_cache[layer_id]
 
-        # Search project
-        layer = self._find_layer_by_id(layer_id)
-        if layer:
-            self._layer_cache[layer_id] = layer
+            # Search project
+            layer = self._find_layer_by_id(layer_id)
+            if layer:
+                self._layer_cache[layer_id] = layer
 
-        return layer
+            return layer
 
     def ensure_persistent_layer(self, layer_id: str) -> QgsVectorLayer:
         """
@@ -1274,18 +1303,35 @@ class LayerManager(QObject):
         """
         Export an existing memory layer into the mission store.
 
+        BUG-062 FIX: Enhanced validation and error handling for safer migration.
+
         Args:
             layer: Source memory-backed layer
             layer_def: Target schema definition
 
         Returns:
             The newly created persistent layer
+
+        Raises:
+            RuntimeError: If migration fails
+            ValueError: If layer is invalid for migration
         """
         if not self._mission_store_enabled():
             raise RuntimeError("Mission store is not configured")
 
         if not layer or layer.providerType() != "memory":
             raise ValueError("Only memory layers can be migrated")
+
+        # BUG-062 FIX: Pre-migration validation
+        if not layer.isValid():
+            logger.error("BUG-062: Cannot migrate invalid layer '%s'", layer_def.layer_id)
+            raise ValueError(f"Layer '{layer_def.layer_id}' is not valid")
+
+        source_feature_count = layer.featureCount()
+        logger.info(
+            "BUG-062: Starting migration of layer '%s' with %d features",
+            layer_def.layer_id, source_feature_count
+        )
 
         options = _create_save_vector_options()
         options.driverName = self.MISSION_STORE_DRIVER
@@ -1303,13 +1349,28 @@ class LayerManager(QObject):
         )
 
         if result != _EXPORT_NO_ERROR:
+            # BUG-062 FIX: Enhanced error logging
+            logger.error(
+                "BUG-062: Layer migration failed for '%s': %s (error code: %s)",
+                layer_def.layer_id, error_message, result
+            )
             raise RuntimeError(
                 f"Failed to migrate layer '{layer_def.layer_id}' to mission store: {error_message}"
             )
 
         persistent_layer = self._load_persistent_layer(layer_def)
         if not persistent_layer:
+            logger.error("BUG-062: Failed to load persistent layer '%s' after migration", layer_def.layer_id)
             raise RuntimeError(f"Persistent layer '{layer_def.layer_id}' could not be loaded after migration")
+
+        # BUG-062 FIX: Post-migration validation - verify feature count
+        target_feature_count = persistent_layer.featureCount()
+        if target_feature_count != source_feature_count:
+            logger.warning(
+                "BUG-062: Feature count mismatch after migration of '%s': "
+                "source=%d, target=%d - possible data loss",
+                layer_def.layer_id, source_feature_count, target_feature_count
+            )
 
         style = QgsMapLayerStyle()
         if style.readFromLayer(layer):
@@ -1317,6 +1378,11 @@ class LayerManager(QObject):
 
         persistent_layer.setCustomProperty('sartracker:layer_id', layer_def.layer_id)
         persistent_layer.triggerRepaint()
+
+        logger.info(
+            "BUG-062: Successfully migrated layer '%s' with %d features",
+            layer_def.layer_id, target_feature_count
+        )
         return persistent_layer
 
     def route_feature(self, category: str, feature):
@@ -1420,9 +1486,14 @@ class LayerManager(QObject):
         return issues
 
     def clear_cache(self):
-        """Clear all cached layer and group references."""
-        self._layer_cache.clear()
-        self._group_cache.clear()
+        """
+        Clear all cached layer and group references.
+
+        BUG-044 FIX: Uses _cache_lock for thread-safe cache clearing.
+        """
+        with self._cache_lock:
+            self._layer_cache.clear()
+            self._group_cache.clear()
         self._log("INFO", "Cleared layer cache")
 
     # ------------------------------------------------------------------
@@ -1694,6 +1765,11 @@ class LayerManager(QObject):
         except Exception as e:
             print(f"[LayerManager] Failed to repair project metadata: {e}")
 
+    # BUG-043 FIX: Maximum metadata size to prevent memory exhaustion
+    MAX_METADATA_SIZE = 100000  # 100KB max serialized size
+    MAX_METADATA_KEYS = 100     # Maximum number of keys in metadata dict
+    MAX_STRING_LENGTH = 10000   # Maximum string value length
+
     def _sanitize_metadata(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
         """
         Sanitize metadata for JSON serialization.
@@ -1701,21 +1777,43 @@ class LayerManager(QObject):
         Converts non-serializable types to serializable equivalents.
         Skips fields that cannot be converted.
 
+        BUG-043 FIX: Added size limits and validation to prevent memory
+        exhaustion and potential injection attacks.
+
         Args:
             metadata: Metadata dictionary (may contain non-serializable types)
 
         Returns:
             Sanitized metadata dictionary (all values JSON-serializable)
         """
+        # BUG-043 FIX: Validate input type
+        if not isinstance(metadata, dict):
+            print(f"[LayerManager] BUG-043: Invalid metadata type: {type(metadata).__name__}")
+            return {}
+
+        # BUG-043 FIX: Limit number of keys to prevent DoS
+        if len(metadata) > self.MAX_METADATA_KEYS:
+            print(f"[LayerManager] BUG-043: Truncating metadata from {len(metadata)} to {self.MAX_METADATA_KEYS} keys")
+            metadata = dict(list(metadata.items())[:self.MAX_METADATA_KEYS])
+
         sanitized = {}
 
         for key, value in metadata.items():
+            # BUG-043 FIX: Validate key is a string
+            if not isinstance(key, str):
+                print(f"[LayerManager] BUG-043: Skipping non-string key: {type(key).__name__}")
+                continue
+
             # Handle datetime objects
             if isinstance(value, datetime):
                 sanitized[key] = value.isoformat()
 
             # Handle basic JSON-serializable types
             elif isinstance(value, (str, int, float, bool, type(None))):
+                # BUG-043 FIX: Truncate oversized strings
+                if isinstance(value, str) and len(value) > self.MAX_STRING_LENGTH:
+                    print(f"[LayerManager] BUG-043: Truncating string field '{key}' from {len(value)} to {self.MAX_STRING_LENGTH} chars")
+                    value = value[:self.MAX_STRING_LENGTH]
                 sanitized[key] = value
 
             # Handle lists (recursive sanitization)

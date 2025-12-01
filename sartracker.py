@@ -419,6 +419,9 @@ class sartracker:
         self.coords_update_timer = None  # Timer to throttle coordinate updates
         self._map_canvas_connected = False  # Track xyCoordinates signal connection (Issue #4)
         self._coords_updates_enabled = False  # Guard for timer callbacks
+        # BUG-058 FIX: Prevent overlapping timer callbacks and unnecessary updates
+        self._coords_update_in_progress = False  # Guard against overlapping callbacks
+        self._coords_point_changed = False  # Track if mouse moved since last update
         self._safe_mode_active = False  # Import failure safe-mode flag
         self._safe_mode_reason = None  # Human-readable Safe Mode reason
 
@@ -490,13 +493,35 @@ class sartracker:
             self._log_exception("_clear_loading_state", exc)
 
     def _components_ready(self, *attrs) -> bool:
-        """Return True if all named attributes are truthy.
+        """
+        Return True if all named attributes are truthy and valid.
+
+        BUG-048 FIX: Enhanced validation to check for deleted Qt objects
+        and catch RuntimeErrors from sip wrappers pointing to deleted C++ objects.
 
         Note: This checks actual instance attributes, NOT the lifecycle registry.
         The registry tracks components for cleanup, but components may exist
         before being registered or may not be registered at all.
         """
-        return all(getattr(self, name, None) for name in attrs)
+        for name in attrs:
+            obj = getattr(self, name, None)
+            if not obj:
+                return False
+
+            # BUG-048 FIX: Check if Qt object has been deleted
+            try:
+                if sip_isdeleted(obj):
+                    print(f"[SARTRACKER] BUG-048: Component '{name}' has been deleted")
+                    return False
+            except (TypeError, AttributeError):
+                # Not a Qt object or sip not available - just check truthiness
+                pass
+            except Exception as e:
+                # Any other error suggests invalid state
+                print(f"[SARTRACKER] BUG-048: Error checking component '{name}': {e}")
+                return False
+
+        return True
 
     def _enter_safe_mode(self, reason: str):
         """Disable operational actions after fatal import failures."""
@@ -1379,16 +1404,23 @@ class sartracker:
             # ============================================================
 
             # Disconnect map canvas mouse move signal
-            if self._map_canvas_connected:
-                try:
+            # BUG-045 FIX: Always attempt disconnection regardless of flag state
+            # Flag may be out of sync due to exceptions during setup
+            try:
+                if self.iface and self.iface.mapCanvas():
                     self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
                     print("[SARTRACKER] xyCoordinates signal disconnected successfully")
-                except (TypeError, RuntimeError) as e:
-                    # TypeError: Signal not connected (initGui never completed)
-                    # RuntimeError: C++ object already deleted
-                    print(f"[SARTRACKER] Warning: Could not disconnect xyCoordinates: {e}")
-                finally:
-                    self._map_canvas_connected = False
+            except (TypeError, RuntimeError) as e:
+                # TypeError: Signal not connected (initGui never completed)
+                # RuntimeError: C++ object already deleted
+                if self._map_canvas_connected:
+                    # Only warn if we expected to be connected
+                    print(f"[SARTRACKER] BUG-045: Could not disconnect xyCoordinates: {e}")
+            except Exception as e:
+                # BUG-045 FIX: Catch any other exceptions to ensure cleanup continues
+                print(f"[SARTRACKER] BUG-045: Unexpected error disconnecting xyCoordinates: {e}")
+            finally:
+                self._map_canvas_connected = False
 
             if self.mission_controller:
                 try:
@@ -2875,7 +2907,8 @@ class sartracker:
             print(f"[SARTRACKER] Provider validation task started for: {provider_name}")
 
         except Exception as e:
-            # Reset state on error during provider creation
+            # BUG-063 FIX: Comprehensive state reset on error during provider creation
+            # Reset all state variables to ensure consistent plugin state
             self._refresh_in_progress = False
             self._clear_loading_state()
 
@@ -2886,12 +2919,20 @@ class sartracker:
                 duration=5
             )
 
-            # Clean up shadow state (DO NOT touch self.provider)
+            # BUG-063 FIX: Clean up ALL shadow state (DO NOT touch self.provider)
+            # This ensures no stale references remain after error
             self._pending_provider = None
             self._pending_provider_name = None
             self._pending_provider_config = None
             self._pending_provider_metadata = None
+            self._pending_provider_task = None  # BUG-063: Clear task reference
 
+            # BUG-063 FIX: Log error with context for diagnostics
+            import logging
+            logging.getLogger(__name__).error(
+                "BUG-063: Provider creation failed for '%s': %s - state reset complete",
+                provider_name, e
+            )
             print(f"[SARTRACKER] Provider creation failed: {e}")
 
     def _on_connection_test_complete(self, task):
@@ -3200,11 +3241,12 @@ class sartracker:
             # Last resort error handling
             self._log_exception("_on_connection_test_error", e)
 
-            # Best effort: clean up shadow state
+            # BUG-063 FIX: Best effort comprehensive state cleanup
             self._pending_provider = None
             self._pending_provider_name = None
             self._pending_provider_config = None
             self._pending_provider_metadata = None
+            self._pending_provider_task = None  # BUG-063: Clear task reference
             self._refresh_in_progress = False
 
             try:
@@ -3368,6 +3410,8 @@ class sartracker:
 
         # Safe to proceed - store point for timer-based update
         self.last_coords_point = point
+        # BUG-058 FIX: Mark that we have a new point to process
+        self._coords_point_changed = True
 
     def _update_coords_display(self):
         """
@@ -3376,102 +3420,126 @@ class sartracker:
 
         SAFETY: Timer may fire during unload or after widgets destroyed.
         Check existence before accessing Qt objects.
+
+        BUG-049 FIX: Added early exit checks for unload/quit states.
+        BUG-058 FIX: Prevents overlapping callbacks and skips if no mouse movement.
         """
+        # BUG-049 FIX: Early exit if plugin is being unloaded or app is quitting
+        if getattr(self, '_is_unloading', False) or getattr(self, '_app_is_quitting', False):
+            return
+
         if not self._coords_updates_enabled:
             return
 
-        label = self.coords_label
-        if not label:
-            self._disable_coords_updates("coordinate label missing before update")
+        # BUG-058 FIX: Prevent overlapping timer callbacks
+        if self._coords_update_in_progress:
             return
 
+        # BUG-058 FIX: Skip if no new mouse movement since last update
+        if not self._coords_point_changed:
+            return
+
+        # BUG-058 FIX: Mark callback as in progress and reset changed flag
+        self._coords_update_in_progress = True
+        self._coords_point_changed = False
+
         try:
-            if sip_isdeleted(label):
+            label = self.coords_label
+            if not label:
+                self._disable_coords_updates("coordinate label missing before update")
+                return
+
+            try:
+                if sip_isdeleted(label):
+                    self.coords_label = None
+                    self._disable_coords_updates("coordinate label deleted before update")
+                    return
+            except Exception:
+                # If sip is unavailable fall back to defensive disable
                 self.coords_label = None
-                self._disable_coords_updates("coordinate label deleted before update")
+                self._disable_coords_updates("unable to verify coordinate label state")
                 return
-        except Exception:
-            # If sip is unavailable fall back to defensive disable
-            self.coords_label = None
-            self._disable_coords_updates("unable to verify coordinate label state")
-            return
 
-        if not self.last_coords_point:
-            return
-
-        try:
-            canvas = self.iface.mapCanvas()
-        except RuntimeError as exc:
-            self._disable_coords_updates(f"map canvas unavailable: {exc}")
-            return
-
-        if not canvas:
-            self._disable_coords_updates("map canvas not available")
-            return
-
-        try:
-            if sip_isdeleted(canvas):
-                self._disable_coords_updates("map canvas deleted")
+            if not self.last_coords_point:
                 return
-        except Exception:
-            # If sip isn't available just stop the timer to avoid crashes
-            self._disable_coords_updates("unable to verify map canvas state")
-            return
 
-        try:
-            map_settings = canvas.mapSettings()
-            canvas_crs = map_settings.destinationCrs()
-        except RuntimeError as exc:
-            self._disable_coords_updates(f"map settings destroyed: {exc}")
-            return
+            try:
+                canvas = self.iface.mapCanvas()
+            except RuntimeError as exc:
+                self._disable_coords_updates(f"map canvas unavailable: {exc}")
+                return
 
-        if not canvas_crs.isValid() or not self.wgs84.isValid() or not self.itm.isValid():
-            # CRS stack is not ready yet (project loading/unloading)
-            return
+            if not canvas:
+                self._disable_coords_updates("map canvas not available")
+                return
 
-        try:
-            # Transform to WGS84
-            transform_to_wgs84 = QgsCoordinateTransform(
-                canvas_crs,
-                self.wgs84,
-                QgsProject.instance()
-            )
-            wgs84_point = transform_to_wgs84.transform(self.last_coords_point)
+            try:
+                if sip_isdeleted(canvas):
+                    self._disable_coords_updates("map canvas deleted")
+                    return
+            except Exception:
+                # If sip isn't available just stop the timer to avoid crashes
+                self._disable_coords_updates("unable to verify map canvas state")
+                return
 
-            # Transform to Irish Grid (ITM)
-            transform_to_itm = QgsCoordinateTransform(
-                canvas_crs,
-                self.itm,
-                QgsProject.instance()
-            )
-            itm_point = transform_to_itm.transform(self.last_coords_point)
+            try:
+                map_settings = canvas.mapSettings()
+                canvas_crs = map_settings.destinationCrs()
+            except RuntimeError as exc:
+                self._disable_coords_updates(f"map settings destroyed: {exc}")
+                return
 
-            # Format display text with fixed-width formatting
-            coords_text = (
-                f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
-                f"Irish Grid: E:{int(itm_point.x()):7d}  N:{int(itm_point.y()):7d}"
-            )
+            if not canvas_crs.isValid() or not self.wgs84.isValid() or not self.itm.isValid():
+                # CRS stack is not ready yet (project loading/unloading)
+                return
 
-            # Update label (may raise RuntimeError if widget C++ object destroyed)
-            self.coords_label.setText(coords_text)
+            try:
+                # Transform to WGS84
+                transform_to_wgs84 = QgsCoordinateTransform(
+                    canvas_crs,
+                    self.wgs84,
+                    QgsProject.instance()
+                )
+                wgs84_point = transform_to_wgs84.transform(self.last_coords_point)
 
-        except RuntimeError as e:
-            # Qt C++ object has been deleted but Python wrapper still exists
-            # This is expected during cleanup - mark widget as invalid
-            print(f"[SARTRACKER] Coordinate label destroyed, stopping updates")
-            self.coords_label = None
-            self._disable_coords_updates("coordinate label destroyed during update")
-            return
+                # Transform to Irish Grid (ITM)
+                transform_to_itm = QgsCoordinateTransform(
+                    canvas_crs,
+                    self.itm,
+                    QgsProject.instance()
+                )
+                itm_point = transform_to_itm.transform(self.last_coords_point)
 
-        except Exception as e:
-            # Log unexpected errors instead of silent pass
-            # This helps diagnose real bugs vs normal cleanup issues
-            print(f"[SARTRACKER] Warning: Error updating coordinates display: {e}")
-            # Don't spam console - only log first occurrence
-            if not hasattr(self, '_coords_error_logged'):
-                import traceback
-                print(traceback.format_exc())
-                self._coords_error_logged = True
+                # Format display text with fixed-width formatting
+                coords_text = (
+                    f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
+                    f"Irish Grid: E:{int(itm_point.x()):7d}  N:{int(itm_point.y()):7d}"
+                )
+
+                # Update label (may raise RuntimeError if widget C++ object destroyed)
+                self.coords_label.setText(coords_text)
+
+            except RuntimeError as e:
+                # Qt C++ object has been deleted but Python wrapper still exists
+                # This is expected during cleanup - mark widget as invalid
+                print(f"[SARTRACKER] Coordinate label destroyed, stopping updates")
+                self.coords_label = None
+                self._disable_coords_updates("coordinate label destroyed during update")
+                return
+
+            except Exception as e:
+                # Log unexpected errors instead of silent pass
+                # This helps diagnose real bugs vs normal cleanup issues
+                print(f"[SARTRACKER] Warning: Error updating coordinates display: {e}")
+                # Don't spam console - only log first occurrence
+                if not hasattr(self, '_coords_error_logged'):
+                    import traceback
+                    print(traceback.format_exc())
+                    self._coords_error_logged = True
+
+        finally:
+            # BUG-058 FIX: Always reset in-progress flag
+            self._coords_update_in_progress = False
 
     def _on_add_poi_requested(self):
         """Handle Add IPP/LKP button click from SAR Panel."""

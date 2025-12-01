@@ -10,6 +10,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
 import logging
+import math
 
 from qgis.core import (
     QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
@@ -89,11 +90,60 @@ class BaseDrawingTool(QgsMapTool):
         # State
         self.is_active = False
 
+    def _validate_coordinate(self, x: float, y: float, context: str) -> None:
+        """
+        BUG-031 FIX: Validate coordinate values for NaN, Infinity, and valid ranges.
+
+        Args:
+            x: X coordinate (longitude for WGS84, easting for projected CRS)
+            y: Y coordinate (latitude for WGS84, northing for projected CRS)
+            context: Description of operation for error messages
+
+        Raises:
+            RuntimeError: If coordinates are invalid (NaN, Infinity, or out of range)
+
+        LIFE-SAFETY CRITICAL: Invalid coordinates could lead rescue teams to wrong locations.
+        """
+        # Check for NaN
+        if math.isnan(x) or math.isnan(y):
+            error_msg = f"Invalid coordinate during {context}: NaN value detected (x={x}, y={y})"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        # Check for Infinity
+        if math.isinf(x) or math.isinf(y):
+            error_msg = f"Invalid coordinate during {context}: Infinite value detected (x={x}, y={y})"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+    def _validate_wgs84_range(self, lon: float, lat: float, context: str) -> None:
+        """
+        BUG-031 FIX: Validate WGS84 coordinates are within valid ranges.
+
+        Args:
+            lon: Longitude (-180 to 180)
+            lat: Latitude (-90 to 90)
+            context: Description of operation for error messages
+
+        Raises:
+            RuntimeError: If coordinates are out of valid WGS84 range
+        """
+        if not (-180.0 <= lon <= 180.0):
+            error_msg = f"Invalid longitude during {context}: {lon} is outside valid range [-180, 180]"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+        if not (-90.0 <= lat <= 90.0):
+            error_msg = f"Invalid latitude during {context}: {lat} is outside valid range [-90, 90]"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
     def transform_to_wgs84(self, point):
         """
         Transform point from canvas CRS to WGS84.
 
         BUG-016 FIX: Added explicit CRS validity checks before transformation.
+        BUG-031 FIX: Added NaN/Infinity checks before and after transformation.
 
         Args:
             point: QgsPointXY in canvas CRS
@@ -105,6 +155,9 @@ class BaseDrawingTool(QgsMapTool):
             RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
+            # BUG-031 FIX: Validate input coordinates before transformation
+            self._validate_coordinate(point.x(), point.y(), "transform_to_wgs84 input")
+
             canvas_crs = self.canvas.mapSettings().destinationCrs()
 
             # BUG-016 FIX: Validate canvas CRS
@@ -124,6 +177,8 @@ class BaseDrawingTool(QgsMapTool):
                 raise error
 
             if canvas_crs.authid() == "EPSG:4326":
+                # BUG-031 FIX: Still validate WGS84 range even when no transform needed
+                self._validate_wgs84_range(point.x(), point.y(), "transform_to_wgs84 passthrough")
                 return point
 
             transform = QgsCoordinateTransform(
@@ -140,7 +195,13 @@ class BaseDrawingTool(QgsMapTool):
                 self.drawing_error.emit(error)
                 raise error
 
-            return transform.transform(point)
+            result = transform.transform(point)
+
+            # BUG-031 FIX: Validate output coordinates after transformation
+            self._validate_coordinate(result.x(), result.y(), "transform_to_wgs84 output")
+            self._validate_wgs84_range(result.x(), result.y(), "transform_to_wgs84 output")
+
+            return result
         except RuntimeError:
             # Re-raise our own RuntimeErrors (from validation checks above)
             raise
@@ -157,6 +218,7 @@ class BaseDrawingTool(QgsMapTool):
         Transform point from canvas CRS to Irish Grid (ITM).
 
         BUG-016 FIX: Added explicit CRS validity checks before transformation.
+        BUG-031 FIX: Added NaN/Infinity checks before and after transformation.
 
         Args:
             point: QgsPointXY in canvas CRS
@@ -168,6 +230,9 @@ class BaseDrawingTool(QgsMapTool):
             RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
+            # BUG-031 FIX: Validate input coordinates before transformation
+            self._validate_coordinate(point.x(), point.y(), "transform_to_itm input")
+
             canvas_crs = self.canvas.mapSettings().destinationCrs()
 
             # BUG-016 FIX: Validate canvas CRS
@@ -187,6 +252,8 @@ class BaseDrawingTool(QgsMapTool):
                 raise error
 
             if canvas_crs.authid() == "EPSG:2157":
+                # BUG-031 FIX: Still validate output even when no transform needed
+                self._validate_coordinate(point.x(), point.y(), "transform_to_itm passthrough")
                 return point
 
             transform = QgsCoordinateTransform(
@@ -203,7 +270,12 @@ class BaseDrawingTool(QgsMapTool):
                 self.drawing_error.emit(error)
                 raise error
 
-            return transform.transform(point)
+            result = transform.transform(point)
+
+            # BUG-031 FIX: Validate output coordinates after transformation
+            self._validate_coordinate(result.x(), result.y(), "transform_to_itm output")
+
+            return result
         except RuntimeError:
             # Re-raise our own RuntimeErrors (from validation checks above)
             raise
@@ -220,6 +292,7 @@ class BaseDrawingTool(QgsMapTool):
         Transform point from WGS84 to canvas CRS.
 
         BUG-016 FIX: Added explicit CRS validity checks before transformation.
+        BUG-031 FIX: Added NaN/Infinity checks before and after transformation.
 
         Args:
             point: QgsPointXY in WGS84
@@ -231,6 +304,10 @@ class BaseDrawingTool(QgsMapTool):
             RuntimeError: If coordinate transformation fails or CRS is invalid
         """
         try:
+            # BUG-031 FIX: Validate input coordinates before transformation
+            self._validate_coordinate(point.x(), point.y(), "transform_from_wgs84 input")
+            self._validate_wgs84_range(point.x(), point.y(), "transform_from_wgs84 input")
+
             canvas_crs = self.canvas.mapSettings().destinationCrs()
 
             # BUG-016 FIX: Validate canvas CRS
@@ -266,7 +343,12 @@ class BaseDrawingTool(QgsMapTool):
                 self.drawing_error.emit(error)
                 raise error
 
-            return transform.transform(point)
+            result = transform.transform(point)
+
+            # BUG-031 FIX: Validate output coordinates after transformation
+            self._validate_coordinate(result.x(), result.y(), "transform_from_wgs84 output")
+
+            return result
         except RuntimeError:
             # Re-raise our own RuntimeErrors (from validation checks above)
             raise

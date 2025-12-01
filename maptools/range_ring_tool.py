@@ -345,9 +345,8 @@ class RangeRingTool(BaseDrawingTool):
             })
 
         except Exception as e:
-            print(f"Error creating range rings: {e}")
-            import traceback
-            traceback.print_exc()
+            # BUG-037 FIX: Use logger instead of print for consistent error propagation
+            logger.error("Error creating range rings: %s", e, exc_info=True)
             # Emit error signal for error handler (Issue #3)
             self.drawing_error.emit(
                 DrawingError(f"Failed to create range rings: {str(e)}", tool_name="Range Ring")

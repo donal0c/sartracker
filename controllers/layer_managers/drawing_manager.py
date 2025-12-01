@@ -130,6 +130,31 @@ class DrawingLayerManager(BaseLayerManager):
             )
         return layer
 
+    def _check_transaction_isolation(self, layer: QgsVectorLayer, operation: str) -> None:
+        """
+        Check if layer is available for a new transaction.
+
+        BUG-060 FIX: Provides explicit transaction conflict detection with logging.
+        This helps diagnose concurrent edit issues and potential race conditions.
+
+        Args:
+            layer: Layer to check
+            operation: Description of the operation being attempted
+
+        Raises:
+            LayerLockError: If layer is already in edit mode (transaction conflict)
+        """
+        if layer.isEditable():
+            # BUG-060 FIX: Log transaction conflict for diagnostics
+            logger.warning(
+                "BUG-060: Transaction conflict detected on layer '%s' during '%s' - "
+                "layer is already in edit mode. This may indicate a race condition "
+                "or unclosed transaction.",
+                layer.name(),
+                operation
+            )
+            raise LayerLockError(layer.name())
+
     # ------------------------------------------------------------------
     # BUG-017 FIX: Layer Recreation Logic
     # ------------------------------------------------------------------
@@ -2219,6 +2244,9 @@ class DrawingLayerManager(BaseLayerManager):
         """
         Bulk delete search areas.
 
+        BUG-033 FIX: Uses global layer edit lock to prevent race conditions
+        during bulk operations.
+
         Args:
             feature_ids: List of feature IDs to delete
             updated_by: Coordinator name for audit trail
@@ -2229,6 +2257,7 @@ class DrawingLayerManager(BaseLayerManager):
         Raises:
             ValueError: If feature_ids empty
             LayerTransactionError: If deletion fails
+            LayerLockError: If unable to acquire edit lock
         """
         if not feature_ids:
             return 0
@@ -2244,39 +2273,50 @@ class DrawingLayerManager(BaseLayerManager):
         if layer.isEditable():
             raise LayerLockError(layer.name())
 
-        if not layer.startEditing():
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="start editing",
-                details="Bulk delete operation"
+        # BUG-033 FIX: Acquire global lock to prevent race conditions during bulk operations
+        if not self.acquire_layer_edit_lock(timeout=10.0):
+            raise LayerLockError(
+                f"{layer.name()} - concurrent bulk operation in progress. "
+                "Please wait for the current operation to complete."
             )
 
         try:
-            deleted = 0
-            for feature_id in feature_ids:
-                if layer.deleteFeature(feature_id):
-                    deleted += 1
+            if not layer.startEditing():
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="start editing",
+                    details="Bulk delete operation"
+                )
 
-            self._safe_commit(layer, "bulk_delete", "SEARCH_AREAS", {"deleted": deleted})
+            try:
+                deleted = 0
+                for feature_id in feature_ids:
+                    if layer.deleteFeature(feature_id):
+                        deleted += 1
 
-            layer.triggerRepaint()
-            logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} search areas")
+                self._safe_commit(layer, "bulk_delete", "SEARCH_AREAS", {"deleted": deleted})
 
-            return deleted
+                layer.triggerRepaint()
+                logger.debug(f"Bulk deleted {deleted}/{len(feature_ids)} search areas")
 
-        except Exception as e:
-            layer.rollBack()
-            raise LayerTransactionError(
-                layer_name=layer.name(),
-                operation="bulk delete features",
-                details=str(e)
-            ) from e
+                return deleted
+
+            except Exception as e:
+                layer.rollBack()
+                raise LayerTransactionError(
+                    layer_name=layer.name(),
+                    operation="bulk delete features",
+                    details=str(e)
+                ) from e
+            finally:
+                if layer and layer.isValid() and layer.isEditable():
+                    try:
+                        layer.rollBack()
+                    except RuntimeError:
+                        pass
         finally:
-            if layer and layer.isValid() and layer.isEditable():
-                try:
-                    layer.rollBack()
-                except RuntimeError:
-                    pass
+            # BUG-033 FIX: Always release lock, even on error
+            self.release_layer_edit_lock()
 
     # =========================================================================
     # RANGE RINGS - Full CRUD Operations

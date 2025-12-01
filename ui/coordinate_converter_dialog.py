@@ -5,6 +5,9 @@ Coordinate Converter Dialog
 Convert between Irish Grid (ITM) and WGS84 coordinates.
 """
 
+import logging
+import math
+
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLineEdit, QLabel, QGroupBox, QRadioButton,
@@ -15,8 +18,10 @@ from qgis.PyQt.QtCore import pyqtSignal
 from ..utils.dialog_utils import BaseDialog
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsProject, QgsPointXY, QgsRectangle
+    QgsProject, QgsPointXY, QgsRectangle, QgsCsException
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CoordinateConverterDialog(BaseDialog):
@@ -191,18 +196,37 @@ class CoordinateConverterDialog(BaseDialog):
                 point = QgsPointXY(lon, lat)
                 itm_point = transform.transform(point)
 
+                # BUG-056 FIX: Validate transform result is not NaN/Inf
+                if math.isnan(itm_point.x()) or math.isnan(itm_point.y()):
+                    logger.error("BUG-056: Transform produced NaN result for lat=%s, lon=%s", lat, lon)
+                    self.result_label.setText(
+                        "❌ Error: Transformation produced invalid coordinates.\n"
+                        "The input coordinates may be outside the supported region."
+                    )
+                    return
+                if math.isinf(itm_point.x()) or math.isinf(itm_point.y()):
+                    logger.error("BUG-056: Transform produced Inf result for lat=%s, lon=%s", lat, lon)
+                    self.result_label.setText(
+                        "❌ Error: Transformation produced infinite coordinates.\n"
+                        "Please check your input values."
+                    )
+                    return
+
                 # Store results
                 self.last_lat = lat
                 self.last_lon = lon
 
                 # Display results
+                # BUG-029 FIX: Use round() instead of int() to preserve precision
+                # int() truncates (e.g., 95553.7 -> 95553), while round() gives nearest integer
+                # For search and rescue, every meter of accuracy matters
                 result_text = (
                     f"<b>WGS84 Input:</b><br>"
                     f"Latitude: {lat:.6f}°N<br>"
                     f"Longitude: {lon:.6f}°E<br><br>"
                     f"<b>Irish Grid (ITM) Output:</b><br>"
-                    f"Easting: {int(itm_point.x()):,}<br>"
-                    f"Northing: {int(itm_point.y()):,}"
+                    f"Easting: {round(itm_point.x()):,}<br>"
+                    f"Northing: {round(itm_point.y()):,}"
                 )
 
             else:
@@ -210,16 +234,20 @@ class CoordinateConverterDialog(BaseDialog):
                 easting = float(self.easting_input.text().strip().replace(',', ''))
                 northing = float(self.northing_input.text().strip().replace(',', ''))
 
-                # Validate Irish Grid (ITM) coordinate ranges
-                # ITM valid ranges for Ireland: E ~400000-800000, N ~500000-1000000
-                if not (400000 <= easting <= 800000):
+                # BUG-069 FIX: Use consistent Irish Grid (ITM) validation ranges
+                # matching marker_manager.py for consistency across the codebase.
+                # Full ITM grid range: E 0-1,000,000, N 0-1,500,000
+                # Typical Ireland range: E ~400,000-800,000, N ~500,000-1,000,000
+                if not (0 <= easting <= 1000000):
                     self.result_label.setText(
-                        "❌ Error: Easting must be between 400,000 and 800,000 for Irish Grid (ITM)"
+                        "❌ Error: Easting must be between 0 and 1,000,000 for Irish Grid (ITM)\n"
+                        "(Typical Ireland range: 400,000-800,000)"
                     )
                     return
-                if not (500000 <= northing <= 1000000):
+                if not (0 <= northing <= 1500000):
                     self.result_label.setText(
-                        "❌ Error: Northing must be between 500,000 and 1,000,000 for Irish Grid (ITM)"
+                        "❌ Error: Northing must be between 0 and 1,500,000 for Irish Grid (ITM)\n"
+                        "(Typical Ireland range: 500,000-1,000,000)"
                     )
                     return
 
@@ -232,15 +260,32 @@ class CoordinateConverterDialog(BaseDialog):
                 point = QgsPointXY(easting, northing)
                 wgs84_point = transform.transform(point)
 
+                # BUG-056 FIX: Validate transform result is not NaN/Inf
+                if math.isnan(wgs84_point.x()) or math.isnan(wgs84_point.y()):
+                    logger.error("BUG-056: Transform produced NaN result for E=%s, N=%s", easting, northing)
+                    self.result_label.setText(
+                        "❌ Error: Transformation produced invalid coordinates.\n"
+                        "The Irish Grid coordinates may be outside the valid region."
+                    )
+                    return
+                if math.isinf(wgs84_point.x()) or math.isinf(wgs84_point.y()):
+                    logger.error("BUG-056: Transform produced Inf result for E=%s, N=%s", easting, northing)
+                    self.result_label.setText(
+                        "❌ Error: Transformation produced infinite coordinates.\n"
+                        "Please check your input values."
+                    )
+                    return
+
                 # Store results
                 self.last_lat = wgs84_point.y()
                 self.last_lon = wgs84_point.x()
 
                 # Display results
+                # BUG-029 FIX: Use round() instead of int() for consistent precision handling
                 result_text = (
                     f"<b>Irish Grid (ITM) Input:</b><br>"
-                    f"Easting: {int(easting):,}<br>"
-                    f"Northing: {int(northing):,}<br><br>"
+                    f"Easting: {round(easting):,}<br>"
+                    f"Northing: {round(northing):,}<br><br>"
                     f"<b>WGS84 Output:</b><br>"
                     f"Latitude: {wgs84_point.y():.6f}°N<br>"
                     f"Longitude: {wgs84_point.x():.6f}°E"
@@ -254,9 +299,30 @@ class CoordinateConverterDialog(BaseDialog):
             self.goto_button.setEnabled(True)
 
         except ValueError as e:
-            self.result_label.setText(f"❌ Error: Invalid number format. Please enter valid coordinates.")
+            # BUG-056 FIX: Specific error for input format issues
+            logger.warning("BUG-056: Coordinate input format error: %s", e)
+            self.result_label.setText(
+                "❌ Error: Invalid number format. Please enter valid numeric coordinates.\n"
+                "Example: Latitude 53.34, Longitude -6.26"
+            )
+        except QgsCsException as e:
+            # BUG-056 FIX: Specific error for CRS/transformation issues
+            logger.error("BUG-056: Coordinate transformation CRS error: %s", e)
+            self.result_label.setText(
+                "❌ Error: Coordinate system transformation failed.\n"
+                "The coordinate reference systems may be incompatible or invalid."
+            )
+        except RuntimeError as e:
+            # BUG-056 FIX: Specific error for QGIS runtime transform errors
+            logger.error("BUG-056: Coordinate transformation runtime error: %s", e)
+            self.result_label.setText(
+                f"❌ Error: Transformation calculation failed.\n"
+                f"Details: {str(e)}"
+            )
         except Exception as e:
-            self.result_label.setText(f"❌ Error: {str(e)}")
+            # BUG-056 FIX: Log unexpected errors for diagnostics
+            logger.exception("BUG-056: Unexpected coordinate conversion error: %s", e)
+            self.result_label.setText(f"❌ Error: An unexpected error occurred: {str(e)}")
 
     def _on_copy(self):
         """Copy results to clipboard."""

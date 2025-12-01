@@ -1512,12 +1512,40 @@ class LayerCatalogService(QObject):
         return _handler
 
     def _schedule_layer_refresh_by_id(self, layer_id: str) -> None:
-        """Schedule refresh for a single layer id by looking up the QgsVectorLayer."""
+        """
+        Schedule refresh for a single layer id by looking up the QgsVectorLayer.
+
+        BUG-034 FIX: Enhanced layer validity checking with comprehensive logging
+        and project registration verification.
+        """
         if not self.layer_manager:
+            logger.debug("Layer refresh skipped - no layer_manager available")
             return
 
         layer = self.layer_manager.get_layer(layer_id)
-        if not layer or not layer.isValid():
+
+        # BUG-034 FIX: Enhanced layer validity checking with detailed logging
+        if not layer:
+            logger.warning(
+                "BUG-034: Layer %s not found in layer_manager - may have been deleted",
+                layer_id
+            )
+            return
+
+        if not layer.isValid():
+            logger.warning(
+                "BUG-034: Layer %s exists but is invalid (corrupted or source unavailable)",
+                layer_id
+            )
+            return
+
+        # BUG-034 FIX: Additional check - verify layer still registered with project
+        project = QgsProject.instance()
+        if project and not project.mapLayer(layer.id()):
+            logger.warning(
+                "BUG-034: Layer %s exists and is valid but not registered with current project",
+                layer_id
+            )
             return
 
         lock_info = self._detect_geopackage_lock(layer_id, layer)

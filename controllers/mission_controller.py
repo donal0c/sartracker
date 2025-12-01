@@ -20,10 +20,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
+import logging
 import threading
 
 from qgis.PyQt.QtCore import QObject, QSettings, QTimer, pyqtSignal
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -70,6 +73,15 @@ class MissionController(QObject):
     SETTINGS_KEY_PAUSE_STARTED = f"{SETTINGS_PREFIX}/mission_pause_started"
     SETTINGS_KEY_RESUME_STATE = f"{SETTINGS_PREFIX}/mission_resume_state"
 
+    # BUG-064 FIX: Explicit state transition matrix
+    # Maps current_state -> set of valid target states
+    VALID_TRANSITIONS: Dict[MissionState, Set[MissionState]] = {
+        MissionState.IDLE: {MissionState.ACTIVE},  # Start mission
+        MissionState.ACTIVE: {MissionState.PAUSED, MissionState.FINISHED},  # Pause or finish
+        MissionState.PAUSED: {MissionState.ACTIVE, MissionState.FINISHED},  # Resume or finish
+        MissionState.FINISHED: {MissionState.IDLE},  # Reset
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._state: MissionState = MissionState.IDLE
@@ -102,6 +114,35 @@ class MissionController(QObject):
     def is_active(self) -> bool:
         return self._state in (MissionState.ACTIVE, MissionState.PAUSED)
 
+    def _validate_transition(self, target_state: MissionState) -> bool:
+        """
+        BUG-064 FIX: Validate state transition against explicit transition matrix.
+
+        Args:
+            target_state: The state we want to transition to
+
+        Returns:
+            bool: True if transition is valid
+
+        Raises:
+            RuntimeError: If transition is invalid
+        """
+        valid_targets = self.VALID_TRANSITIONS.get(self._state, set())
+        if target_state not in valid_targets:
+            logger.warning(
+                "BUG-064: Invalid state transition attempted: %s -> %s (valid: %s)",
+                self._state.value, target_state.value,
+                [s.value for s in valid_targets]
+            )
+            raise RuntimeError(
+                f"Invalid state transition: cannot go from {self._state.value} to {target_state.value}"
+            )
+        logger.debug(
+            "BUG-064: Valid state transition: %s -> %s",
+            self._state.value, target_state.value
+        )
+        return True
+
     def start_mission(self, name: str) -> bool:
         """
         Start a new mission.
@@ -116,14 +157,18 @@ class MissionController(QObject):
         if not mission_name:
             raise ValueError("Mission name cannot be empty")
 
-        if self.is_active():
-            raise RuntimeError("Cannot start a new mission while one is already active")
+        # BUG-064 FIX: Use explicit state transition validation
+        self._validate_transition(MissionState.ACTIVE)
 
         self._reset_internal_state()
         self._mission_name = mission_name
         self._mission_start_ts = _utcnow()
-        self._state = MissionState.ACTIVE
-        self._timer.start()
+
+        # BUG-047 FIX: Use timing lock for atomic state + timer update
+        # Prevents race conditions between state transitions and timer ticks
+        with self._timing_lock:
+            self._state = MissionState.ACTIVE
+            self._timer.start()
 
         self._emit_state_changed()
         self._emit_timing_update(force=True)
@@ -194,13 +239,17 @@ class MissionController(QObject):
                 self._paused_total_seconds += pause_delta
 
         final_timing = self._compute_timing(now)
-        self._state = MissionState.FINISHED
+
+        # BUG-047 FIX: Use timing lock for atomic state + timer update
+        with self._timing_lock:
+            self._state = MissionState.FINISHED
+            self._timer.stop()
+
         self._emit_state_changed(extra_context={
             "final_elapsed_seconds": final_timing.elapsed_seconds,
             "final_active_seconds": final_timing.active_seconds
         })
 
-        self._timer.stop()
         self._clear_saved_state()
         self._update_resume_state("idle")
 
@@ -221,7 +270,12 @@ class MissionController(QObject):
     # ------------------------------------------------------------------
 
     def load_saved_state(self) -> Optional[Dict[str, str]]:
-        """Return saved mission state from QSettings if mission was paused."""
+        """
+        Return saved mission state from QSettings if mission was paused.
+
+        BUG-046 FIX: Added comprehensive validation of restored state data
+        to prevent corrupted or invalid state from being loaded.
+        """
         settings = QSettings()
         paused = settings.value(self.SETTINGS_KEY_PAUSED, False, bool)
         if not paused:
@@ -242,11 +296,52 @@ class MissionController(QObject):
             self._clear_saved_state()
             return None
 
+        # BUG-046 FIX: Validate mission name
+        mission_name_clean = str(mission_name).strip()
+        if not mission_name_clean or len(mission_name_clean) > 500:
+            print(f"[MissionController] BUG-046: Invalid mission name, clearing state")
+            self._clear_saved_state()
+            return None
+
+        # BUG-046 FIX: Validate start_time is a valid ISO timestamp
+        start_time_clean = str(start_time_str).strip()
+        try:
+            parsed_start = datetime.fromisoformat(start_time_clean)
+            # Sanity check: start time should not be in the future
+            if parsed_start > _utcnow():
+                print(f"[MissionController] BUG-046: Start time in future, clearing state")
+                self._clear_saved_state()
+                return None
+        except (TypeError, ValueError) as e:
+            print(f"[MissionController] BUG-046: Invalid start_time format: {e}")
+            self._clear_saved_state()
+            return None
+
+        # BUG-046 FIX: Validate paused_seconds is non-negative
+        try:
+            paused_seconds_float = float(paused_seconds) if paused_seconds else 0.0
+            if paused_seconds_float < 0:
+                print(f"[MissionController] BUG-046: Negative paused_seconds, resetting to 0")
+                paused_seconds_float = 0.0
+        except (TypeError, ValueError):
+            paused_seconds_float = 0.0
+
+        # BUG-046 FIX: Validate pause_started if present
+        pause_started_clean = ""
+        if pause_started:
+            pause_started_clean = str(pause_started).strip()
+            if pause_started_clean:
+                try:
+                    datetime.fromisoformat(pause_started_clean)
+                except (TypeError, ValueError) as e:
+                    print(f"[MissionController] BUG-046: Invalid pause_started format: {e}")
+                    pause_started_clean = ""
+
         return {
-            "name": str(mission_name).strip(),
-            "start_time": str(start_time_str).strip(),
-            "paused_seconds": float(paused_seconds) if paused_seconds else 0.0,
-            "pause_started": str(pause_started).strip() if pause_started else ""
+            "name": mission_name_clean,
+            "start_time": start_time_clean,
+            "paused_seconds": paused_seconds_float,
+            "pause_started": pause_started_clean
         }
 
     def clear_saved_state(self):
@@ -392,10 +487,21 @@ class MissionController(QObject):
         self.mission_state_changed.emit(self._state, context)
 
     def _on_timer_tick(self):
-        if not self.is_active():
-            self._timer.stop()
-            return
-        self._emit_timing_update()
+        """
+        Handle timer tick for mission timing updates.
+
+        BUG-035 FIX: Uses timing lock to ensure atomic state checks and
+        prevent race conditions between timer ticks and state transitions.
+        """
+        # BUG-035 FIX: Use timing lock for atomic state check
+        # This prevents race where state changes between is_active() and _emit_timing_update()
+        with self._timing_lock:
+            if not self.is_active():
+                # Stop timer if mission is no longer active
+                if self._timer.isActive():
+                    self._timer.stop()
+                return
+            self._emit_timing_update()
 
     # ------------------------------------------------------------------
     # Persistence helpers

@@ -203,9 +203,20 @@ class FileCSVProvider(Provider):
 
                 reader = csv.DictReader(_streaming_lines())
 
+                # BUG-051 FIX: Track skipped rows for logging
+                skipped_invalid = 0
+                skipped_coord_range = 0
+                skipped_no_timestamp = 0
+                skipped_bad_timestamp = 0
+                skipped_malformed = 0
+                total_rows = 0
+
                 for row in reader:
+                    total_rows += 1
+
                     # Skip invalid rows
                     if row.get('Valid', '').strip().upper() not in ('TRUE', '1'):
+                        skipped_invalid += 1
                         continue
 
                     try:
@@ -218,14 +229,17 @@ class FileCSVProvider(Provider):
 
                         # Validate coordinate ranges (skip invalid positions)
                         if not (-90 <= lat <= 90):
+                            skipped_coord_range += 1
                             continue  # Invalid latitude, skip row
                         if not (-180 <= lon <= 180):
+                            skipped_coord_range += 1
                             continue  # Invalid longitude, skip row
 
                         # Validate timestamp format (BUG-041 fix)
                         # CRITICAL: Invalid timestamps can cause wrong "latest" position
                         timestamp_str = row.get('Time', '')
                         if not timestamp_str:
+                            skipped_no_timestamp += 1
                             continue  # No timestamp, skip row
 
                         # Validate timestamp is parseable
@@ -238,6 +252,7 @@ class FileCSVProvider(Provider):
                                 datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
                             except (ValueError, AttributeError, TypeError):
                                 # Invalid timestamp format, skip this row
+                                skipped_bad_timestamp += 1
                                 continue
 
                         # Build position dict
@@ -259,7 +274,23 @@ class FileCSVProvider(Provider):
 
                     except (ValueError, KeyError) as e:
                         # Skip malformed rows (non-critical, some rows may be metadata)
+                        skipped_malformed += 1
                         continue
+
+                # BUG-051 FIX: Log summary of skipped rows if significant
+                total_skipped = skipped_invalid + skipped_coord_range + skipped_no_timestamp + skipped_bad_timestamp + skipped_malformed
+                if total_skipped > 0:
+                    print(f"[CSV_PROVIDER] BUG-051: Parsed {len(positions)}/{total_rows} rows from {filepath}")
+                    if skipped_invalid > 0:
+                        print(f"[CSV_PROVIDER]   - Skipped {skipped_invalid} invalid rows (Valid != TRUE)")
+                    if skipped_coord_range > 0:
+                        print(f"[CSV_PROVIDER]   - Skipped {skipped_coord_range} rows with out-of-range coordinates")
+                    if skipped_no_timestamp > 0:
+                        print(f"[CSV_PROVIDER]   - Skipped {skipped_no_timestamp} rows with missing timestamp")
+                    if skipped_bad_timestamp > 0:
+                        print(f"[CSV_PROVIDER]   - Skipped {skipped_bad_timestamp} rows with unparseable timestamp")
+                    if skipped_malformed > 0:
+                        print(f"[CSV_PROVIDER]   - Skipped {skipped_malformed} malformed rows")
 
                 return device_name, positions
 
