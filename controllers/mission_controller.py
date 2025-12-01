@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, Optional
+import threading
 
 from qgis.PyQt.QtCore import QObject, QSettings, QTimer, pyqtSignal
 
@@ -78,6 +79,10 @@ class MissionController(QObject):
         self._paused_total_seconds: float = 0.0
         self._last_emitted: MissionTiming = MissionTiming(0.0, 0.0)
 
+        # BUG-022 FIX: Thread-safe lock for timing calculations
+        # Prevents race conditions during rapid pause/resume operations
+        self._timing_lock = threading.RLock()
+
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._on_timer_tick)
@@ -127,12 +132,20 @@ class MissionController(QObject):
         return True
 
     def pause_mission(self) -> bool:
-        """Pause an active mission."""
-        if self._state != MissionState.ACTIVE:
-            return False
+        """
+        Pause an active mission.
 
-        self._pause_started_at = _utcnow()
-        self._state = MissionState.PAUSED
+        BUG-022 FIX: Uses timing lock to prevent race conditions during
+        rapid pause/resume sequences.
+        """
+        # BUG-022 FIX: Atomic state transition with lock
+        with self._timing_lock:
+            if self._state != MissionState.ACTIVE:
+                return False
+
+            self._pause_started_at = _utcnow()
+            self._state = MissionState.PAUSED
+
         self._emit_state_changed()
         self._emit_timing_update(force=True)
         self._save_paused_state()
@@ -140,18 +153,26 @@ class MissionController(QObject):
         return True
 
     def resume_mission(self) -> bool:
-        """Resume a paused mission."""
-        if self._state != MissionState.PAUSED:
-            return False
+        """
+        Resume a paused mission.
 
-        now = _utcnow()
-        if self._pause_started_at:
-            pause_delta = (now - self._pause_started_at).total_seconds()
-            if pause_delta > 0:
-                self._paused_total_seconds += pause_delta
+        BUG-022 FIX: Uses timing lock to prevent race conditions during
+        rapid pause/resume sequences. Ensures atomic update of pause timing.
+        """
+        # BUG-022 FIX: Atomic state transition with lock
+        with self._timing_lock:
+            if self._state != MissionState.PAUSED:
+                return False
 
-        self._pause_started_at = None
-        self._state = MissionState.ACTIVE
+            now = _utcnow()
+            if self._pause_started_at:
+                pause_delta = (now - self._pause_started_at).total_seconds()
+                if pause_delta > 0:
+                    self._paused_total_seconds += pause_delta
+
+            self._pause_started_at = None
+            self._state = MissionState.ACTIVE
+
         if not self._timer.isActive():
             self._timer.start()
 
@@ -318,16 +339,37 @@ class MissionController(QObject):
         self._last_emitted = MissionTiming(0.0, 0.0)
 
     def _compute_timing(self, now: Optional[datetime] = None) -> MissionTiming:
+        """
+        Compute elapsed and active timing for the current mission.
+
+        BUG-022/BUG-023 FIX: Uses timing lock for thread safety and rounds
+        values to limit floating-point precision loss in long missions.
+
+        Args:
+            now: Optional timestamp (defaults to UTC now)
+
+        Returns:
+            MissionTiming with elapsed and active seconds
+        """
         now = now or _utcnow()
         if not self._mission_start_ts:
             return MissionTiming(0.0, 0.0)
 
-        elapsed = max(0.0, (now - self._mission_start_ts).total_seconds())
-        paused = self._paused_total_seconds
-        if self._pause_started_at:
-            paused += max(0.0, (now - self._pause_started_at).total_seconds())
+        # BUG-022 FIX: Use lock to ensure consistent reads of timing state
+        with self._timing_lock:
+            elapsed = max(0.0, (now - self._mission_start_ts).total_seconds())
+            paused = self._paused_total_seconds
+            if self._pause_started_at:
+                paused += max(0.0, (now - self._pause_started_at).total_seconds())
 
         active = max(0.0, elapsed - paused)
+
+        # BUG-023 FIX: Round to 1 decimal place to limit floating-point
+        # precision loss during long-duration missions (24+ hours).
+        # This prevents cumulative errors from affecting displayed time.
+        elapsed = round(elapsed, 1)
+        active = round(active, 1)
+
         return MissionTiming(elapsed, active)
 
     def _emit_timing_update(self, *, force: bool = False):

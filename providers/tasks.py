@@ -194,9 +194,14 @@ class ConnectionTestTask(QgsTask):
                     if not self.success:
                         _update_error_from_status()
                 finally:
-                    # CRITICAL: Close session to release connections
+                    # BUG-026 FIX: Comprehensive session cleanup
+                    # CRITICAL: Close session to release connections regardless of success/failure
+                    was_cancelled = self.isCanceled()
                     try:
-                        session.close()
+                        if session:
+                            session.close()
+                            if was_cancelled:
+                                print("[CONNECTION_TEST] Session closed after cancellation")
                     except Exception as e:
                         print(f"Warning: Error closing session in ConnectionTestTask: {e}")
             else:
@@ -684,8 +689,19 @@ class TraccarRefreshTask(ProviderRefreshTask):
             return False
 
         finally:
+            # BUG-026 FIX: Comprehensive resource cleanup on completion or cancellation
+            # This ensures sessions are ALWAYS closed and resources released.
+            was_cancelled = self.isCanceled()
+            if was_cancelled:
+                print("[TRACCAR_TASK] Task was cancelled - cleaning up resources")
+                # Clear any partial results to prevent stale data usage
+                self.results = None
+
             # CRITICAL: Close session to release connections
             try:
-                session.close()
+                if session:
+                    session.close()
+                    if was_cancelled:
+                        print("[TRACCAR_TASK] Session closed after cancellation")
             except Exception as e:
                 print(f"Warning: Error closing session in TraccarRefreshTask: {e}")

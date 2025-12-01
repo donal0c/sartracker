@@ -157,21 +157,28 @@ class FileCSVProvider(Provider):
 
         try:
             with f:
-                lines = f.readlines()
+                # BUG-025 FIX: Use chunked reading to prevent memory exhaustion
+                # with large CSV files. Read header section first, then stream data.
 
-                # Extract device name from header (line 4: "Device:,eoc,,,,,,")
-                for line in lines[:10]:  # Check first 10 lines for device name
-                    if line.startswith('Device:'):
+                # Phase 1: Read header section (first 50 lines max) to find structure
+                header_lines = []
+                header_idx = -1
+                for i, line in enumerate(f):
+                    header_lines.append(line)
+
+                    # Check for device name in first 10 lines
+                    if i < 10 and line.startswith('Device:'):
                         parts = line.strip().split(',')
                         if len(parts) > 1 and parts[1]:
                             device_name = parts[1]
-                        break
 
-                # Find the header row (contains "Valid,Time,Latitude")
-                header_idx = -1
-                for i, line in enumerate(lines):
+                    # Check for header row
                     if 'Valid' in line and 'Time' in line and 'Latitude' in line:
                         header_idx = i
+                        break
+
+                    # Safety limit - if we haven't found headers in 50 lines, stop
+                    if i >= 50:
                         break
 
                 if header_idx == -1:
@@ -181,8 +188,20 @@ class FileCSVProvider(Provider):
                         recoverable=False
                     )
 
-                # Parse CSV data starting after header
-                reader = csv.DictReader(lines[header_idx:])
+                # BUG-025 FIX: Stream remaining data instead of loading all at once
+                # Build header row from the identified header line
+                import io
+                header_line = header_lines[header_idx]
+
+                # Create a streaming reader that starts from the header line
+                # and continues with remaining file content
+                def _streaming_lines():
+                    """Generator that yields header + remaining file lines."""
+                    yield header_line
+                    for line in f:
+                        yield line
+
+                reader = csv.DictReader(_streaming_lines())
 
                 for row in reader:
                     # Skip invalid rows
