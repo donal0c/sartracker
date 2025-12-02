@@ -54,6 +54,9 @@ class ProviderRefreshTask(QgsTask):
         self.provider = provider
         self.results: Optional[Dict[str, List]] = None
         self.error_message: Optional[str] = None
+        # BUG-079 FIX: Track error type for structured error handling
+        # Possible values: "auth", "network", "data", "cancelled", "unknown"
+        self.error_type: str = "unknown"
         # BUG-036 FIX: Track if cancellation cleanup has been performed
         self._cancellation_cleanup_done = False
 
@@ -160,10 +163,22 @@ class CSVRefreshTask(ProviderRefreshTask):
 
             return True
 
+        except ProviderDataError as e:
+            # BUG-079 FIX: Specific handling for data errors (malformed CSV, missing columns, etc.)
+            self.error_message = f"[DATA_ERROR] {str(e)}"
+            self.error_type = "data"
+            return False
+        except (IOError, OSError, FileNotFoundError, PermissionError) as e:
+            # BUG-079 FIX: Specific handling for file system errors
+            self.error_message = f"[FILE_ERROR] {str(e)}"
+            self.error_type = "file"
+            return False
         except Exception as e:
+            # BUG-079 FIX: Generic error with type information
             # Capture error for main thread handling
-            # CRITICAL: Do NOT show error dialogs here - we're in background thread
-            self.error_message = str(e)
+            # CRITICAL: DO NOT show error dialogs here - we're in background thread
+            self.error_message = f"[{type(e).__name__}] {str(e)}"
+            self.error_type = "unknown"
             return False
 
 
@@ -750,10 +765,32 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
             return True
 
+        except ProviderAuthError as e:
+            # BUG-079 FIX: Specific handling for authentication errors
+            self.error_message = f"[AUTH_ERROR] {str(e)}"
+            self.error_type = "auth"
+            return False
+        except ProviderNetworkError as e:
+            # BUG-079 FIX: Specific handling for network errors
+            self.error_message = f"[NETWORK_ERROR] {str(e)}"
+            self.error_type = "network"
+            return False
+        except ProviderDataError as e:
+            # BUG-079 FIX: Specific handling for data errors
+            self.error_message = f"[DATA_ERROR] {str(e)}"
+            self.error_type = "data"
+            return False
+        except (ConnectionError, TimeoutError) as e:
+            # BUG-079 FIX: Specific handling for low-level network errors
+            self.error_message = f"[CONNECTION_ERROR] {str(e)}"
+            self.error_type = "network"
+            return False
         except Exception as e:
+            # BUG-079 FIX: Generic error with type information
             # Capture error for main thread handling
-            # CRITICAL: Do NOT show error dialogs here - we're in background thread
-            self.error_message = str(e)
+            # CRITICAL: DO NOT show error dialogs here - we're in background thread
+            self.error_message = f"[{type(e).__name__}] {str(e)}"
+            self.error_type = "unknown"
             return False
 
         finally:

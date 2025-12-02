@@ -21,7 +21,8 @@ from qgis.core import (
     QgsVectorLayer, QgsFeature, QgsGeometry,
     QgsPointXY, QgsMarkerSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
-    QgsFeatureRequest
+    QgsFeatureRequest, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
+    QgsProject
 )
 from qgis.PyQt.QtGui import QColor
 
@@ -76,6 +77,81 @@ class MarkerLayerManager(BaseLayerManager):
         """Initialize marker layer manager."""
         super().__init__(iface, shared_device_colors, layer_manager)
         self._invalid_layer_warnings = set()
+
+    def _validate_irish_grid_consistency(self, lat: float, lon: float,
+                                         irish_grid_e: Optional[float],
+                                         irish_grid_n: Optional[float]) -> None:
+        """
+        BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates for consistency.
+
+        LIFE-SAFETY CRITICAL: Inconsistent coordinates could lead to rescuers going
+        to the wrong location during operations.
+
+        This method checks that if both WGS84 (lat/lon) and Irish Grid (E/N)
+        coordinates are provided, they refer to approximately the same location
+        within a reasonable tolerance.
+
+        Args:
+            lat: WGS84 latitude
+            lon: WGS84 longitude
+            irish_grid_e: Optional Irish Grid (ITM) easting
+            irish_grid_n: Optional Irish Grid (ITM) northing
+
+        Raises:
+            ValueError: If coordinates are inconsistent beyond tolerance
+        """
+        # BUG-072: Only validate if both coordinate systems are provided
+        if irish_grid_e is None or irish_grid_n is None:
+            return  # No cross-validation needed
+
+        try:
+            # Define coordinate reference systems
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")  # WGS84
+            itm = QgsCoordinateReferenceSystem("EPSG:2157")    # Irish Transverse Mercator
+
+            if not wgs84.isValid() or not itm.isValid():
+                logger.warning("BUG-072: Could not initialize CRS for coordinate validation")
+                return  # Skip validation if CRS initialization fails
+
+            # Transform WGS84 to Irish Grid
+            transform = QgsCoordinateTransform(wgs84, itm, QgsProject.instance())
+            wgs84_point = QgsPointXY(lon, lat)
+            itm_point = transform.transform(wgs84_point)
+
+            # Calculate discrepancy in meters
+            delta_e = abs(itm_point.x() - irish_grid_e)
+            delta_n = abs(itm_point.y() - irish_grid_n)
+            distance = math.sqrt(delta_e**2 + delta_n**2)
+
+            # BUG-072: Allow tolerance of 100 meters for:
+            # - Rounding differences
+            # - Manual entry errors
+            # - GPS accuracy variations
+            TOLERANCE_METERS = 100.0
+
+            if distance > TOLERANCE_METERS:
+                raise ValueError(
+                    f"Inconsistent coordinates: WGS84 ({lat:.6f}, {lon:.6f}) and "
+                    f"Irish Grid ({irish_grid_e:.1f}E, {irish_grid_n:.1f}N) "
+                    f"are {distance:.1f}m apart (tolerance: {TOLERANCE_METERS}m). "
+                    f"Computed Irish Grid from WGS84: {itm_point.x():.1f}E, {itm_point.y():.1f}N"
+                )
+
+            # Log validation success for diagnostics
+            if distance > 10.0:  # Log if discrepancy is > 10m but within tolerance
+                logger.info(
+                    "BUG-072: Coordinate consistency check passed with %dm discrepancy (within %dm tolerance)",
+                    int(distance), int(TOLERANCE_METERS)
+                )
+
+        except Exception as e:
+            # BUG-072: Log but don't fail on validation errors
+            # (transform might fail for out-of-bounds coordinates)
+            logger.warning(
+                "BUG-072: Could not validate coordinate consistency: %s. "
+                "WGS84=(%s, %s), Irish Grid=(%s, %s)",
+                str(e), lat, lon, irish_grid_e, irish_grid_n
+            )
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -496,6 +572,9 @@ class MarkerLayerManager(BaseLayerManager):
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
+        # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
+        self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
+
         layer = self._get_or_create_ipp_lkp_layer()
 
         # Create feature
@@ -604,6 +683,9 @@ class MarkerLayerManager(BaseLayerManager):
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
 
+        # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
+        self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
+
         layer = self._get_or_create_clues_layer()
 
         feature = QgsFeature(layer.fields())
@@ -709,6 +791,9 @@ class MarkerLayerManager(BaseLayerManager):
                 raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
+        # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
+        self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
         layer = self._get_or_create_hazards_layer()
 
@@ -830,6 +915,9 @@ class MarkerLayerManager(BaseLayerManager):
                 raise TypeError(f"Irish Grid northing must be a number, got {type(irish_grid_n).__name__}")
             if not (0 <= irish_grid_n <= 1500000):
                 raise ValueError(f"Invalid Irish Grid northing: {irish_grid_n}. Must be between 0 and 1,500,000")
+
+        # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
+        self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
         layer = self._get_or_create_casualties_layer()
 

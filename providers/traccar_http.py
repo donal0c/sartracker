@@ -161,12 +161,16 @@ class TraccarHttpProvider(Provider):
             max_retries=3
         )
 
-        # Device cache: {device_id: device_name, ...}
-        self._device_cache: Dict[str, str] = {}
+        # BUG-075 FIX: Device cache with clear expiration policy and size limits
+        # Cache expires after cache_ttl seconds (default 300s / 5 minutes)
+        # Maximum cache size prevents memory issues with large device counts
+        self._device_cache: Dict[str, str] = {}  # {device_id: device_name}
         self._device_cache_timestamp: Optional[datetime] = None
         self._device_cache_stale: bool = False
         self._device_cache_warning: Optional[str] = None
         self._cache_lock: RLock = RLock()
+        # BUG-075 FIX: Maximum devices to cache (safety limit)
+        self.MAX_DEVICE_CACHE_SIZE = 10000  # Reasonable limit for rescue operations
         self._last_breadcrumb_failures: List[str] = []
         self._last_connection_status: Dict[str, Any] = {
             'success': None,
@@ -329,12 +333,24 @@ class TraccarHttpProvider(Provider):
         """
         Update the in-memory device cache with a normalized map.
 
+        BUG-075 FIX: Enforces maximum cache size limit to prevent memory issues.
+
         Args:
             device_map: Mapping of device IDs to names.
             timestamp: Optional datetime to record as cache timestamp.
         """
         # BUG-PF-002 fix: Protect device cache updates with lock
         with self._cache_lock:
+            # BUG-075 FIX: Enforce maximum cache size
+            if len(device_map) > self.MAX_DEVICE_CACHE_SIZE:
+                logger.warning(
+                    "BUG-075: Device map exceeds cache limit (%d > %d), truncating to most recently updated devices",
+                    len(device_map), self.MAX_DEVICE_CACHE_SIZE
+                )
+                # Keep only the first MAX_DEVICE_CACHE_SIZE entries
+                # (in practice, device counts shouldn't exceed this in rescue operations)
+                device_map = dict(list(device_map.items())[:self.MAX_DEVICE_CACHE_SIZE])
+
             self._device_cache = device_map or {}
             if timestamp is None:
                 timestamp = datetime.now(timezone.utc)

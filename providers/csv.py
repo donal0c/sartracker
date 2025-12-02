@@ -146,13 +146,58 @@ class FileCSVProvider(Provider):
         device_name = os.path.basename(filepath).replace('.csv', '')
         positions = []
 
-        try:
-            f = open(filepath, 'r', encoding='utf-8', errors='replace')
-        except (IOError, OSError, UnicodeDecodeError) as e:
+        # BUG-070 FIX: Proper encoding detection to prevent silent data corruption
+        # LIFE-SAFETY CRITICAL: Silently replacing characters could corrupt coordinates or timestamps
+        #
+        # Strategy:
+        # 1. Try UTF-8 strict (most common, no data loss)
+        # 2. Try UTF-8 with BOM
+        # 3. Try common Western encodings (latin-1, windows-1252)
+        # 4. Last resort: UTF-8 with replacement (with warning)
+
+        encodings_to_try = [
+            ('utf-8', 'strict', 'UTF-8'),
+            ('utf-8-sig', 'strict', 'UTF-8 with BOM'),
+            ('latin-1', 'strict', 'Latin-1/ISO-8859-1'),
+            ('windows-1252', 'strict', 'Windows-1252'),
+            ('utf-8', 'replace', 'UTF-8 with character replacement (data may be corrupted)')
+        ]
+
+        f = None
+        encoding_used = None
+
+        for encoding, errors, description in encodings_to_try:
+            try:
+                f = open(filepath, 'r', encoding=encoding, errors=errors)
+                encoding_used = (encoding, errors, description)
+                break  # Successfully opened
+            except (IOError, OSError) as e:
+                # File access error - don't try other encodings
+                raise ProviderDataError(
+                    f"Cannot access CSV file {filepath}: {str(e)}",
+                    provider_name='csv',
+                    recoverable=True
+                )
+            except UnicodeDecodeError:
+                # Try next encoding
+                continue
+
+        if f is None:
             raise ProviderDataError(
-                f"Cannot read CSV file {filepath}: {str(e)}",
+                f"Cannot decode CSV file {filepath}: tried UTF-8, Latin-1, Windows-1252",
                 provider_name='csv',
                 recoverable=True
+            )
+
+        # BUG-070 FIX: Warn if we had to use replacement encoding
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if encoding_used and encoding_used[1] == 'replace':
+            logger.warning(
+                f"BUG-070: CSV file {filepath} contains invalid UTF-8 characters. "
+                f"Using replacement encoding - data may be corrupted. "
+                f"Please re-export this file with proper UTF-8 encoding."
             )
 
         try:
@@ -305,16 +350,26 @@ class FileCSVProvider(Provider):
                 recoverable=False
             )
     
+    # BUG-080 FIX: Limit maximum CSV files to prevent performance degradation
+    # LIFE-SAFETY CRITICAL: Large directories could cause UI freezes during mission operations
+    MAX_CSV_FILES = 1000  # Reasonable limit for rescue operations
+
     def _get_csv_files(self) -> List[str]:
         """
         Get list of CSV files to process.
 
+        BUG-080 FIX: Limits to MAX_CSV_FILES to prevent performance issues
+        with directories containing thousands of files.
+
         Returns:
-            List of CSV file paths
+            List of CSV file paths (limited to MAX_CSV_FILES)
 
         Raises:
             ProviderDataError: If CSV path does not exist or is inaccessible
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Validate path exists
         if not os.path.exists(self.csv_path):
             raise ProviderDataError(
@@ -324,13 +379,27 @@ class FileCSVProvider(Provider):
             )
 
         if self.is_folder:
+            # BUG-080 FIX: Use glob with limit check
             csv_files = glob.glob(os.path.join(self.csv_path, '*.csv'))
+
             if not csv_files:
                 raise ProviderDataError(
                     f"No CSV files found in directory: {self.csv_path}",
                     provider_name='csv',
                     recoverable=True
                 )
+
+            # BUG-080 FIX: Check for excessive file counts
+            if len(csv_files) > self.MAX_CSV_FILES:
+                logger.warning(
+                    f"BUG-080: Directory contains {len(csv_files)} CSV files, "
+                    f"limiting to {self.MAX_CSV_FILES} most recent files. "
+                    f"Consider organizing files into subdirectories by date/mission."
+                )
+                # Sort by modification time (most recent first) and limit
+                csv_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+                csv_files = csv_files[:self.MAX_CSV_FILES]
+
             return csv_files
         else:
             if not os.path.isfile(self.csv_path):

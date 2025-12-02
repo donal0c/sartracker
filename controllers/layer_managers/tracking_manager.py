@@ -1198,23 +1198,87 @@ class TrackingLayerManager(BaseLayerManager):
         """
         Clean up old sartracker_export_* directories from previous sessions.
 
-        BUG-060 fix: Called during initialization to clean up temp directories left
-        behind by crashes or improper shutdowns.
+        BUG-081 FIX: Enhanced cleanup with:
+        - Age-based deletion (1 hour threshold)
+        - Size tracking for monitoring
+        - Summary statistics for diagnostics
+        - Protection against excessive temp directory accumulation
+
+        LIFE-SAFETY CRITICAL: Prevents disk space issues during missions.
         """
+        cleaned_count = 0
+        cleaned_size_bytes = 0
+        failed_count = 0
+
         try:
             temp_root = tempfile.gettempdir()
+            # BUG-081 FIX: Track all sartracker export directories
+            found_dirs = []
+
             # Find all sartracker_export_* directories
             for entry in os.listdir(temp_root):
                 if entry.startswith("sartracker_export_"):
                     old_dir = os.path.join(temp_root, entry)
+                    if os.path.isdir(old_dir):
+                        found_dirs.append(old_dir)
+
+            if found_dirs:
+                logger.info(
+                    "BUG-081: Found %d temporary export directories to evaluate for cleanup",
+                    len(found_dirs)
+                )
+
+            for old_dir in found_dirs:
+                try:
+                    # BUG-081 FIX: Calculate directory size before deletion
+                    dir_size = 0
                     try:
-                        if os.path.isdir(old_dir):
-                            # Check if it's old (more than 1 hour)
-                            dir_age = datetime.now().timestamp() - os.path.getmtime(old_dir)
-                            if dir_age > 3600:  # 1 hour
-                                shutil.rmtree(old_dir, ignore_errors=True)
-                                logger.debug("[TrackingManager] Cleaned up old temp directory: %s", old_dir)
-                    except Exception as e:
-                        logger.debug("[TrackingManager] Could not clean up old temp directory %s: %s", old_dir, e)
+                        for dirpath, dirnames, filenames in os.walk(old_dir):
+                            for filename in filenames:
+                                filepath = os.path.join(dirpath, filename)
+                                dir_size += os.path.getsize(filepath)
+                    except Exception:
+                        dir_size = 0  # Couldn't calculate size
+
+                    # Check if it's old (more than 1 hour)
+                    dir_age_seconds = datetime.now().timestamp() - os.path.getmtime(old_dir)
+
+                    if dir_age_seconds > 3600:  # 1 hour
+                        shutil.rmtree(old_dir, ignore_errors=True)
+                        cleaned_count += 1
+                        cleaned_size_bytes += dir_size
+                        logger.debug(
+                            "BUG-081: Cleaned up old temp directory: %s (age: %.1f hours, size: %d KB)",
+                            old_dir,
+                            dir_age_seconds / 3600,
+                            dir_size / 1024
+                        )
+                    else:
+                        logger.debug(
+                            "BUG-081: Keeping recent temp directory: %s (age: %.1f minutes)",
+                            old_dir,
+                            dir_age_seconds / 60
+                        )
+                except Exception as e:
+                    failed_count += 1
+                    logger.warning(
+                        "BUG-081: Failed to clean up old temp directory %s: %s",
+                        old_dir, str(e)
+                    )
+
+            # BUG-081 FIX: Log cleanup summary
+            if cleaned_count > 0 or failed_count > 0:
+                logger.info(
+                    "BUG-081: Temp directory cleanup complete - "
+                    "cleaned: %d (%.2f MB), failed: %d, total found: %d",
+                    cleaned_count,
+                    cleaned_size_bytes / (1024 * 1024),
+                    failed_count,
+                    len(found_dirs)
+                )
+
         except Exception as e:
-            logger.debug("[TrackingManager] Could not scan temp directory for old exports: %s", e)
+            logger.warning(
+                "BUG-081: Error during temp directory cleanup: %s",
+                str(e)
+            )

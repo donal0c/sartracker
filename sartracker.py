@@ -1423,14 +1423,25 @@ class sartracker:
                 self._map_canvas_connected = False
 
             if self.mission_controller:
+                # BUG-078 FIX: Enhanced signal disconnection error handling
                 try:
                     self.mission_controller.mission_state_changed.disconnect(self._on_mission_state_changed)
-                except Exception:
+                except TypeError:
+                    # Signal not connected - expected if initialization failed
                     pass
+                except Exception as e:
+                    # BUG-078 FIX: Log unexpected disconnection errors
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting mission_state_changed: {type(e).__name__}: {e}")
+
                 try:
                     self.mission_controller.mission_timing_updated.disconnect(self._on_mission_timing_update)
-                except Exception:
+                except TypeError:
+                    # Signal not connected - expected if initialization failed
                     pass
+                except Exception as e:
+                    # BUG-078 FIX: Log unexpected disconnection errors
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting mission_timing_updated: {type(e).__name__}: {e}")
+
                 self.mission_controller.cleanup()
                 self.mission_controller = None
 
@@ -1588,14 +1599,37 @@ class sartracker:
             # ============================================================
             if self.provider_controller:
                 try:
-                    # Disconnect controller signals
+                    # BUG-078 FIX: Enhanced signal disconnection for provider controller
                     try:
                         self.provider_controller.status_changed.disconnect()
+                    except TypeError:
+                        pass  # Signal not connected
+                    except Exception as e:
+                        print(f"[SARTRACKER] BUG-078: Error disconnecting status_changed: {type(e).__name__}: {e}")
+
+                    try:
                         self.provider_controller.config_error.disconnect()
+                    except TypeError:
+                        pass  # Signal not connected
+                    except Exception as e:
+                        print(f"[SARTRACKER] BUG-078: Error disconnecting config_error: {type(e).__name__}: {e}")
+
+                    try:
                         self.provider_controller.provider_connected.disconnect()
+                    except TypeError:
+                        pass  # Signal not connected
+                    except Exception as e:
+                        print(f"[SARTRACKER] BUG-078: Error disconnecting provider_connected: {type(e).__name__}: {e}")
+
+                    try:
                         self.provider_controller.refresh_requested.disconnect()
-                    except:
-                        pass
+                    except TypeError:
+                        pass  # Signal not connected
+                    except Exception as e:
+                        print(f"[SARTRACKER] BUG-078: Error disconnecting refresh_requested: {type(e).__name__}: {e}")
+                except Exception as e:
+                    # BUG-078 FIX: Outer catch for any failures accessing controller
+                    print(f"[SARTRACKER] BUG-078: Error accessing provider_controller for cleanup: {e}")
 
                     # Call cleanup method (stops polling timer)
                     if hasattr(self.provider_controller, 'cleanup'):
@@ -1635,15 +1669,21 @@ class sartracker:
                         'autosave_requested',
                         'clear_measurements_requested'
                     ]
+                    # BUG-078 FIX: Enhanced panel signal disconnection
                     for signal_name in panel_signals:
                         signal = getattr(self.sar_panel, signal_name, None)
                         if signal:
                             try:
                                 signal.disconnect()
                             except TypeError:
+                                # Signal not connected - expected if initialization incomplete
                                 pass
-                except:
-                    pass  # Signals may not be connected
+                            except Exception as e:
+                                # BUG-078 FIX: Log unexpected errors during disconnection
+                                print(f"[SARTRACKER] BUG-078: Error disconnecting {signal_name}: {type(e).__name__}: {e}")
+                except Exception as e:
+                    # BUG-078 FIX: Log errors accessing panel
+                    print(f"[SARTRACKER] BUG-078: Error accessing sar_panel for cleanup: {e}")
 
                 try:
                     # Remove from dock widget area
@@ -1658,13 +1698,27 @@ class sartracker:
             # PHASE N1: Clean up Settings Panel
             # ============================================================
             if self.settings_panel:
+                # BUG-078 FIX: Enhanced settings panel signal disconnection
                 try:
-                    # Disconnect signals
                     self.settings_panel.settings_changed.disconnect()
+                except TypeError:
+                    pass  # Signal not connected
+                except Exception as e:
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting settings_changed: {type(e).__name__}: {e}")
+
+                try:
                     self.settings_panel.provider_test_requested.disconnect()
+                except TypeError:
+                    pass  # Signal not connected
+                except Exception as e:
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting provider_test_requested: {type(e).__name__}: {e}")
+
+                try:
                     self.settings_panel.provider_save_requested.disconnect()
-                except:
-                    pass  # Signals may not be connected
+                except TypeError:
+                    pass  # Signal not connected
+                except Exception as e:
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting provider_save_requested: {type(e).__name__}: {e}")
 
                 try:
                     # Remove from dock widget area

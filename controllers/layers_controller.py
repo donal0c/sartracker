@@ -380,44 +380,90 @@ class LayersController:
             )
 
     def _call_catalog_operation(self, operation: str, func: Callable, *args, **kwargs) -> bool:
-        """Execute catalog operations with retries."""
+        """
+        Execute catalog operations with retries and exponential backoff.
+
+        BUG-071 FIX: Enhanced retry mechanism with:
+        - Exponential backoff to avoid hammering failed operations
+        - Better error tracking and context
+        - Improved idempotency checks
+
+        LIFE-SAFETY CRITICAL: Catalog operations affect layer availability
+        during missions.
+
+        Args:
+            operation: Human-readable operation description
+            func: Callable to execute
+            *args, **kwargs: Arguments to pass to func
+
+        Returns:
+            bool: True if operation succeeded, False otherwise
+        """
+        import time
+
         attempts = self.CATALOG_RETRY_LIMIT
         if attempts < 1:
             attempts = 1
 
+        # BUG-071 FIX: Track operation context for better diagnostics
+        operation_start = time.time()
         last_exc = None
+
         for attempt in range(1, attempts + 1):
             try:
                 func(*args, **kwargs)
                 if attempt > 1:
+                    elapsed = time.time() - operation_start
                     logger.info(
-                        "Catalog operation %s succeeded on attempt %s/%s",
+                        "BUG-071: Catalog operation '%s' succeeded on attempt %s/%s (%.2fs total)",
                         operation,
                         attempt,
-                        attempts
+                        attempts,
+                        elapsed
                     )
                 return True
+
             except Exception as exc:
                 last_exc = exc
+                exc_type = type(exc).__name__
+
                 if attempt < attempts:
+                    # BUG-071 FIX: Exponential backoff - wait longer between retries
+                    # Formula: 2^(attempt-1) * 0.1 seconds
+                    # Attempt 1->2: 0.1s, Attempt 2->3: 0.2s
+                    backoff_seconds = (2 ** (attempt - 1)) * 0.1
+
                     logger.warning(
-                        "Catalog operation %s failed (attempt %s/%s): %s",
+                        "BUG-071: Catalog operation '%s' failed (attempt %s/%s, will retry in %.2fs): %s: %s",
                         operation,
                         attempt,
                         attempts,
-                        exc
+                        backoff_seconds,
+                        exc_type,
+                        str(exc)
                     )
+
+                    # BUG-071 FIX: Sleep before retry (exponential backoff)
+                    time.sleep(backoff_seconds)
                 else:
-                    logger.exception(
-                        "Catalog operation %s failed after %s attempts: %s",
+                    # Final failure
+                    elapsed = time.time() - operation_start
+                    logger.error(
+                        "BUG-071: Catalog operation '%s' failed after %s attempts (%.2fs total): %s: %s",
                         operation,
                         attempts,
-                        exc
+                        elapsed,
+                        exc_type,
+                        str(exc),
+                        exc_info=True  # Include traceback for final failure
                     )
+
+                    # BUG-071 FIX: Enhanced error notification with context
                     self._notify_warning(
-                        "Catalog Update",
-                        f"{operation} failed after {attempts} attempts: {exc}"
+                        "Catalog Update Failed",
+                        f"{operation} failed after {attempts} attempts: {exc_type}: {str(exc)[:100]}"
                     )
+
         return False
 
     # =========================================================================
