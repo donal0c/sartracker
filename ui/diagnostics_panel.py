@@ -157,28 +157,89 @@ class DiagnosticsPanel(BaseDialog):
         backend_label.setStyleSheet(backend_style)
         form.addRow("<b>Credential Storage:</b>", backend_label)
 
-        # Vendor Bundle Status
-        # Check if requests is coming from vendor/
+        # Vendor Bundle Status + Install Doctor (uses plugin status if available)
+        vendor_text = "❓ Unknown"
+        vendor_style = "color: gray;"
+        cert_text = None
+        doctor_text = None
         try:
-            import requests
-            import sartracker
-            plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
-            vendor_dir = os.path.join(plugin_dir, 'vendor')
-            
-            if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
-                vendor_text = "✅ Active (Bundled)"
+            from qgis.utils import plugins
+            status = {}
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+            vendor_info = status.get('vendor', {}) if status else {}
+            using_vendor = bool(vendor_info.get('using_vendor'))
+            missing = vendor_info.get('missing') or []
+            error_msg = vendor_info.get('error')
+            requests_path = vendor_info.get('requests_path')
+            cert_path = vendor_info.get('certifi_path')
+
+            if error_msg:
+                vendor_text = f"❌ Vendor error: {error_msg}"
+                vendor_style = "color: red;"
+                doctor_text = vendor_text
+            elif missing:
+                vendor_text = f"❌ Missing vendor assets ({len(missing)})"
+                vendor_style = "color: red;"
+                doctor_text = "\n".join(missing)
+            elif using_vendor:
+                vendor_text = f"✅ Active (Bundled)"
                 vendor_style = "color: green;"
-            else:
-                vendor_text = f"ℹ️ System ({requests.__file__})"
+                doctor_text = "All vendor assets present"
+            elif requests_path:
+                vendor_text = f"ℹ️ System ({requests_path})"
                 vendor_style = "color: black;"
+                doctor_text = "Using system requests"
+            else:
+                vendor_text = "❓ Unknown"
+                vendor_style = "color: gray;"
+                doctor_text = "Unable to detect"
+
+            if cert_path:
+                cert_text = cert_path
+            elif vendor_info:
+                cert_text = "Unknown certificate bundle path"
+
+            # Fallback if no status available
+            if not vendor_info:
+                import requests
+                import sartracker
+                plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+                vendor_dir = os.path.join(plugin_dir, 'vendor')
+                if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                    vendor_text = "✅ Active (Bundled)"
+                    vendor_style = "color: green;"
+                    doctor_text = "Vendor detected via import path"
+                else:
+                    vendor_text = f"ℹ️ System ({requests.__file__})"
+                    vendor_style = "color: black;"
+                    doctor_text = "System requests detected via import path"
+                    cert_text = getattr(requests, "__file__", None)
+
         except Exception:
             vendor_text = "❓ Unknown"
             vendor_style = "color: gray;"
+            doctor_text = "Vendor detection failed"
 
-        vendor_label = QLabel(vendor_text)
-        vendor_label.setStyleSheet(vendor_style)
-        vendor_label.setToolTip("Ensures plugin works without installing python libraries")
-        form.addRow("<b>Dependency Bundle:</b>", vendor_label)
+        try:
+            vendor_label = QLabel(vendor_text)
+            vendor_label.setStyleSheet(vendor_style)
+            vendor_label.setToolTip("Ensures plugin works without installing python libraries")
+            form.addRow("<b>Dependency Bundle:</b>", vendor_label)
+            if cert_text:
+                cert_label = QLabel(cert_text)
+                cert_label.setWordWrap(True)
+                cert_label.setTextInteractionFlags(TextSelectableByMouse)
+                form.addRow("<b>Cert Store:</b>", cert_label)
+            if doctor_text:
+                doctor_label = QLabel(doctor_text)
+                doctor_label.setWordWrap(True)
+                doctor_label.setTextInteractionFlags(TextSelectableByMouse)
+                form.addRow("<b>Install Doctor:</b>", doctor_label)
+        except Exception:
+            pass
 
         # Charset Guard Status (moved from Plugin section)
         guard_status = get_charset_guard_status()
@@ -517,16 +578,43 @@ class DiagnosticsPanel(BaseDialog):
         lines.append("")
         lines.append("SECURITY & GUARDS:")
         lines.append(f"  Credential Store:  {SecureStore.get_backend_name()}")
-        
+
+        vendor_info = {}
         try:
-            import requests
-            import sartracker
-            plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
-            vendor_dir = os.path.join(plugin_dir, 'vendor')
-            if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
-                lines.append("  Dependency Bundle: Active (Bundled)")
+            from qgis.utils import plugins
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    vendor_info = sar_plugin.get_plugin_status().get('vendor', {}) or {}
+        except Exception:
+            vendor_info = {}
+
+        try:
+            if vendor_info:
+                if vendor_info.get('error'):
+                    lines.append(f"  Dependency Bundle: ERROR ({vendor_info.get('error')})")
+                elif vendor_info.get('missing'):
+                    lines.append(f"  Dependency Bundle: Missing assets ({len(vendor_info.get('missing'))})")
+                    for missing in vendor_info.get('missing'):
+                        lines.append(f"    - {missing}")
+                elif vendor_info.get('using_vendor'):
+                    lines.append(f"  Dependency Bundle: Active (Bundled)")
+                else:
+                    rp = vendor_info.get('requests_path', 'unknown')
+                    lines.append(f"  Dependency Bundle: System ({rp})")
+                if vendor_info.get('requests_path'):
+                    lines.append(f"  Requests Path:     {vendor_info.get('requests_path')}")
+                if vendor_info.get('certifi_path'):
+                    lines.append(f"  Cert Store:        {vendor_info.get('certifi_path')}")
             else:
-                lines.append(f"  Dependency Bundle: System ({requests.__file__})")
+                import requests
+                import sartracker
+                plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+                vendor_dir = os.path.join(plugin_dir, 'vendor')
+                if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                    lines.append("  Dependency Bundle: Active (Bundled)")
+                else:
+                    lines.append(f"  Dependency Bundle: System ({requests.__file__})")
         except Exception as e:
             lines.append(f"  Dependency Bundle: Check Failed ({e})")
 

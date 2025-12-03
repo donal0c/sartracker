@@ -23,11 +23,13 @@
 """
 from typing import Optional, Dict, List, Any
 from importlib import import_module
+import importlib
 import sys
 import os
 import re
 import shutil
 import math
+import traceback
 from pathlib import Path
 from datetime import datetime
 
@@ -49,6 +51,114 @@ if plugin_parent and plugin_parent not in sys.path:
     sys.path.insert(0, plugin_parent)
     print(f"[SAR Tracker] Added plugin parent to sys.path: {plugin_parent}")
 
+# ---------------------------------------------------------------------------
+# Import tracking and vendor diagnostics
+# ---------------------------------------------------------------------------
+_import_errors = []
+_imports_ok = True
+_vendor_info: Dict[str, Any] = {
+    "using_vendor": False,
+    "requests_path": None,
+    "certifi_path": None,
+    "missing": [],
+    "error": None,
+}
+
+
+def _verify_vendor_bundle(vendor_dir: Path) -> List[str]:
+    """
+    Verify critical vendor assets exist before imports.
+
+    Returns:
+        List of missing file paths (empty if all present).
+    """
+    required = [
+        vendor_dir / "requests" / "__init__.py",
+        vendor_dir / "urllib3" / "__init__.py",
+        vendor_dir / "charset_normalizer" / "__init__.py",
+        vendor_dir / "idna" / "__init__.py",
+        vendor_dir / "certifi" / "cacert.pem",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    return missing
+
+
+def _force_vendor_requests(vendor_dir: Path):
+    """
+    Force requests stack to load from vendor_dir even if system requests was imported.
+
+    Raises:
+        RuntimeError if vendor stack cannot be loaded.
+    """
+    global _vendor_info
+
+    vendor_dir = vendor_dir.resolve()
+    if not vendor_dir.exists():
+        raise RuntimeError(f"Vendor directory not found: {vendor_dir}")
+
+    def _is_vendor_path(path: Path) -> bool:
+        """
+        Accept any sartracker vendor/site-packages path (profile or dev checkout).
+        """
+        try:
+            path = path.resolve()
+        except Exception:
+            return False
+        parts = [str(p) for p in path.parents]
+        return any("sartracker/vendor/site-packages" in str(p) for p in [path] + list(path.parents))
+
+    # If requests is already imported from system, clear it and its dependencies
+    def _is_from_vendor(mod_name: str) -> bool:
+        mod = sys.modules.get(mod_name)
+        try:
+            return vendor_dir in Path(mod.__file__).resolve().parents  # type: ignore[arg-type]
+        except Exception:
+            return False
+
+    if "requests" in sys.modules and not _is_from_vendor("requests"):
+        for name in list(sys.modules.keys()):
+            if name == "requests" or name.startswith(("requests.", "urllib3", "charset_normalizer", "idna", "certifi")):
+                sys.modules.pop(name, None)
+
+    # Ensure vendor path is first for import resolution
+    vendor_str = str(vendor_dir)
+    sys.path = [vendor_str] + [p for p in sys.path if Path(p).resolve() != vendor_dir]
+
+    # Import and validate paths
+    import requests  # noqa: E401
+    import certifi  # noqa: E401
+
+    requests_path = Path(requests.__file__).resolve()
+    cert_path = Path(certifi.where()).resolve()
+
+    if not (_is_vendor_path(requests_path) and _is_vendor_path(cert_path)):
+        raise RuntimeError(
+            f"Requests stack not using vendor bundle. requests: {requests_path}, certifi: {cert_path}"
+        )
+
+    _vendor_info.update(
+        {
+            "using_vendor": True,
+            "requests_path": str(requests_path),
+            "certifi_path": str(cert_path),
+            "missing": [],
+            "error": None,
+        }
+    )
+
+
+# Perform vendor verification and force the vendored requests stack
+try:
+    _vendor_missing: List[str] = _verify_vendor_bundle(Path(vendor_path))
+    if _vendor_missing:
+        raise RuntimeError(f"Missing vendor assets: {', '.join(_vendor_missing)}")
+    _force_vendor_requests(Path(vendor_path))
+except Exception as e:
+    _imports_ok = False
+    _import_errors.append(('vendor.bundle', e, traceback.format_exc()))
+    _vendor_info.update({"missing": list(locals().get("_vendor_missing", [])), "error": str(e)})
+    print(f"[SAR Tracker] ERROR initializing vendor bundle: {e}")
+
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
 from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QInputDialog
@@ -69,7 +179,6 @@ from qgis.core import (
 # Initialize Qt resources from file resources.py
 from .resources import *
 import os.path
-import traceback
 
 # Import Qt5/Qt6 compatible constants and functions
 from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo
@@ -89,10 +198,6 @@ from .services.lifecycle_manager import PluginLifecycleManager, validate_init_pr
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
 # cryptic crashes later in initGui() when attempting to use undefined classes.
-
-# Module-level tracking of import failures (checked in initGui)
-_import_errors = []
-_imports_ok = True
 
 # Ensure optional third-party dependencies (charset detection) are available
 # before importing providers that depend on the requests package.
@@ -1222,6 +1327,7 @@ class sartracker:
         Qt5/Qt6 Compatible: Uses utils.notify helpers and BaseDialog
         """
         # LOGGING: Write errors to a file so user can find them even if dialog fails
+        log_path = None
         try:
             import tempfile
             from datetime import datetime
@@ -1239,10 +1345,13 @@ class sartracker:
             print(f"[SARTRACKER] Failed to write error log: {e}")
 
         # Show persistent message bar warning
+        msg = "Plugin failed to load due to import errors. Check the dialog for details."
+        if log_path:
+            msg += f" Log: {log_path}"
         error(
             self.iface.messageBar(),
             "SAR Tracker - Critical Error",
-            "Plugin failed to load due to import errors. Check the dialog for details.",
+            msg,
             duration=0  # Persistent - stays until user dismisses
         )
 
@@ -1262,6 +1371,8 @@ class sartracker:
         error_summary += "4. Try reinstalling the plugin\n"
         error_summary += "5. Check QGIS Python console for additional details\n"
         error_summary += "6. Ensure you have compatible QGIS version (3.28+)\n\n"
+        if log_path:
+            error_summary += f"Log file: {log_path}\n\n"
         error_summary += "="*70 + "\n"
         error_summary += "TECHNICAL DETAILS (first error):\n"
         error_summary += "="*70 + "\n\n"
@@ -4813,7 +4924,9 @@ class sartracker:
             # NEW: Tool registry status (Issue #2 fix)
             'tool_registry_loaded': False,
             'drawing_tools_available': False,
-            'charset_guard': get_charset_guard_status()
+            'charset_guard': get_charset_guard_status(),
+            # Vendor diagnostics
+            'vendor': dict(_vendor_info) if _vendor_info else {}
         }
 
         try:
