@@ -12,6 +12,7 @@ import zipfile
 import subprocess
 import argparse
 from datetime import datetime
+from fnmatch import fnmatch
 from pathlib import Path
 
 
@@ -99,6 +100,52 @@ Git SHA: {git_sha}
     print(f"✓ Created VERSION.txt (Git SHA: {git_sha})")
 
 
+EXCLUDED_DIRS = {
+    ".git",
+    ".github",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".idea",
+    ".vscode",
+    ".claude",
+    "dist",
+    "build",
+    "archive",
+    "docs",
+    "dev_tools",
+    "fixtures",
+    "From_Eamon",
+    "tests",
+    "FUTURE_WORK",
+    "research",
+    "bug_reports_run2",
+}
+
+EXCLUDED_FILE_PATTERNS = {
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    "*.swp",
+    "*.swo",
+    "*.tmp",
+    "*.log",
+    "*.bak",
+    ".*.swp",
+    "Thumbs.db",
+    ".DS_Store",
+}
+
+CRITICAL_VENDOR_FILES = [
+    Path("vendor/site-packages/certifi/cacert.pem"),
+]
+
+
+def _should_skip_file(filename: str) -> bool:
+    return any(fnmatch(filename, pattern) for pattern in EXCLUDED_FILE_PATTERNS)
+
+
 def create_release_zip(plugin_dir, version, output_dir=None):
     """
     Create release ZIP file.
@@ -111,69 +158,67 @@ def create_release_zip(plugin_dir, version, output_dir=None):
     Returns:
         str: Path to created ZIP file
     """
+    plugin_dir = Path(plugin_dir).resolve()
+
     if output_dir is None:
-        output_dir = os.path.dirname(plugin_dir)
+        output_dir = plugin_dir.parent
+    else:
+        output_dir = Path(output_dir).resolve()
 
     # Create ZIP filename
     date_str = datetime.now().strftime("%Y-%m-%d")
     zip_filename = f"sartracker-v{version}-{date_str}.zip"
-    zip_path = os.path.join(output_dir, zip_filename)
-
-    # Files to include
-    include_patterns = [
-        "*.py",
-        "metadata.txt",
-        "README.md",
-        "icon.png",
-        "VERSION.txt"
-    ]
-
-    # Files/folders to exclude
-    exclude_patterns = [
-        ".git",
-        "__pycache__",
-        "*.pyc",
-        "*.pyo",
-        ".DS_Store",
-        "CURRENT_PLAN.md",
-        "IMPLEMENTATION_PLAN_DETAILED.md",
-        "CURRENT_STATUS.md",
-        ".pytest_cache",
-        "test_*.py",
-        "*_test.py"
-    ]
+    zip_path = output_dir / zip_filename
 
     print(f"📦 Creating release ZIP: {zip_filename}")
+
+    parent_dir = plugin_dir.parent
 
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         files_added = 0
         total_size = 0
 
         for root, dirs, files in os.walk(plugin_dir):
-            # Filter out excluded directories
-            dirs[:] = [d for d in dirs if not any(ex in d for ex in exclude_patterns)]
+            root_path = Path(root)
+            rel_root = root_path.relative_to(parent_dir)
 
-            # Get relative path for ZIP
-            rel_root = os.path.relpath(root, os.path.dirname(plugin_dir))
+            # Filter directories in-place
+            dirs[:] = [
+                d for d in dirs
+                if d not in EXCLUDED_DIRS and not any(fnmatch(d, pattern) for pattern in EXCLUDED_FILE_PATTERNS)
+            ]
 
             for file in files:
-                # Check if file matches include patterns
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, os.path.dirname(plugin_dir))
-
-                # Skip excluded files
-                if any(ex in file or ex in rel_path for ex in exclude_patterns):
+                if _should_skip_file(file):
                     continue
 
-                # Include Python files and specific files
-                if file.endswith('.py') or file in ['metadata.txt', 'README.md', 'icon.png', 'VERSION.txt']:
-                    zipf.write(file_path, rel_path)
-                    files_added += 1
-                    total_size += os.path.getsize(file_path)
+                file_path = root_path / file
+
+                # Skip files living in excluded ancestors (defensive check for symlinks)
+                rel_parts = file_path.relative_to(plugin_dir).parts
+                if any(part in EXCLUDED_DIRS for part in rel_parts[:-1]):
+                    continue
+
+                rel_path = file_path.relative_to(parent_dir)
+                zipf.write(str(file_path), str(rel_path))
+                files_added += 1
+                total_size += file_path.stat().st_size
+
+        # Verify critical vendor assets made it into the source tree (before zipping)
+        missing_vendor_assets = [
+            str(asset) for asset in CRITICAL_VENDOR_FILES
+            if not (plugin_dir / asset).exists()
+        ]
+        if missing_vendor_assets:
+            print("⚠ WARNING: Missing vendor assets:")
+            for asset in missing_vendor_assets:
+                print(f"   - {asset}")
+            print("   The release was created, but SSL/TLS requests may fail without these files.")
+
 
         print(f"✓ Added {files_added} files ({total_size / 1024:.1f} KB)")
 
-    return zip_path
+    return str(zip_path)
 
 
 def main():
