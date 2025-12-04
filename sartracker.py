@@ -98,14 +98,17 @@ def _force_vendor_requests(vendor_dir: Path):
 
     def _is_vendor_path(path: Path) -> bool:
         """
-        Accept any sartracker vendor/site-packages path (profile or dev checkout).
+        Accept any sartracker/vendor/site-packages path (profile or dev checkout), platform-agnostic.
         """
         try:
             path = path.resolve()
         except Exception:
             return False
-        parts = [str(p) for p in path.parents]
-        return any("sartracker/vendor/site-packages" in str(p) for p in [path] + list(path.parents))
+        for candidate in [path] + list(path.parents):
+            parts = [p.lower() for p in candidate.parts]
+            if len(parts) >= 3 and parts[-3:] == ['sartracker', 'vendor', 'site-packages']:
+                return True
+        return vendor_dir in path.parents
 
     # If requests is already imported from system, clear it and its dependencies
     def _is_from_vendor(mod_name: str) -> bool:
