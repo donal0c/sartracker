@@ -456,7 +456,8 @@ class sartracker:
 
         # Phase 1 Refactor: Initialize lifecycle manager for coordinated startup/teardown
         self.lifecycle = PluginLifecycleManager(iface, log_prefix="[SARTRACKER]")
-        self._app_is_quitting = False
+        self._app_is_quitting = False  # QGIS aboutToQuit guard
+        self._skip_layer_ops = False   # Guard to avoid layer mutations during shutdown
         # BUG-019/BUG-021 FIX: Flag to prevent callbacks during plugin unload
         self._is_unloading = False
 
@@ -547,6 +548,12 @@ class sartracker:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    def _should_skip_layer_ops(self) -> bool:
+        """
+        Return True if the app is quitting or plugin is unloading; guards layer mutations.
+        """
+        return bool(self._skip_layer_ops or self._app_is_quitting or self._is_unloading)
+
     def _notify(self, level: str, title: str, message: str, duration: int = 3):
         """Centralized notifier wrapper to simplify messaging and future redirection."""
         bar = self.iface.messageBar() if self.iface else None
@@ -1255,14 +1262,21 @@ class sartracker:
         if SettingsPanel is not None:
             try:
                 self.settings_panel = SettingsPanel(self.iface.mainWindow())
-                self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
-                self.settings_panel.hide()  # Hidden by default, accessible via menu
+                # Always dock the settings panel even if population fails
+                try:
+                    self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
+                    self.settings_panel.hide()  # Hidden by default, accessible via menu
+                except Exception as dock_exc:
+                    print(f"[SARTRACKER] Warning: Failed to dock Settings panel: {dock_exc}")
 
                 # Connect Settings Panel signals
-                self.settings_panel.settings_changed.connect(self._on_settings_changed)
-                self.settings_panel.provider_test_requested.connect(self._on_provider_test_requested)
-                self.settings_panel.provider_save_requested.connect(self._on_provider_save_requested)
-                self.settings_panel.repair_layers_requested.connect(self._on_repair_layers_requested)
+                try:
+                    self.settings_panel.settings_changed.connect(self._on_settings_changed)
+                    self.settings_panel.provider_test_requested.connect(self._on_provider_test_requested)
+                    self.settings_panel.provider_save_requested.connect(self._on_provider_save_requested)
+                    self.settings_panel.repair_layers_requested.connect(self._on_repair_layers_requested)
+                except Exception as sig_exc:
+                    print(f"[SARTRACKER] Warning: Failed to connect Settings panel signals: {sig_exc}")
 
                 # Populate provider dropdown from registry (if controller available)
                 if self.provider_controller and provider_registry:
@@ -1452,6 +1466,7 @@ class sartracker:
         Cancels all tasks immediately to prevent race conditions during QGIS shutdown.
         """
         self._app_is_quitting = True
+        self._skip_layer_ops = True
         if self.layer_manager:
             try:
                 self.layer_manager.set_application_closing(True)
@@ -1470,6 +1485,7 @@ class sartracker:
         try:
             # BUG-019/BUG-021 FIX: Set unloading flag immediately to protect callbacks
             self._is_unloading = True
+            self._skip_layer_ops = True
 
             # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
             # This must happen before any other cleanup to prevent timer callbacks
@@ -2555,6 +2571,9 @@ class sartracker:
         """
         if not self.layer_manager:
             return
+        if self._should_skip_layer_ops():
+            print("[SARTRACKER] Skip layer rebuild (app exiting)")
+            return
 
         project = QgsProject.instance()
 
@@ -2594,6 +2613,9 @@ class sartracker:
         clears the project layers), rebuild the structure so layers stay visible.
         """
         try:
+            if self._should_skip_layer_ops():
+                print("[SARTRACKER] Skip layer recovery (app exiting)")
+                return
             if not GroupNames:
                 print("[SARTRACKER] Cannot recover layers: GroupNames unavailable")
                 return

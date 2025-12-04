@@ -682,6 +682,19 @@ class SARPanel(QDockWidget):
             )
             return
 
+        # Guard against double-start even if UI is out of sync
+        try:
+            if self._mission_controller.state not in (MissionState.IDLE, MissionState.FINISHED):
+                QMessageBox.information(
+                    self,
+                    "Mission Control",
+                    "A mission is already active. Resume, pause/resume, or finish before starting a new mission."
+                )
+                return
+        except Exception:
+            # If state check fails, continue to normal start flow
+            pass
+
         mission_name = self.mission_name_input.text().strip()
         if not mission_name:
             mission_name = f"Mission {datetime.now().strftime('%Y-%m-%d %H:%M')}"
