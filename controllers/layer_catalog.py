@@ -1225,6 +1225,11 @@ class LayerCatalogService(QObject):
         BUG-059 fix: Wrapper around _build_cache() that provides user feedback.
         Called via QTimer.singleShot to improve perceived UI responsiveness.
         """
+        # CRITICAL: This method can be invoked via QTimer.singleShot even after
+        # unload/cleanup begins. Never rebuild the layer tree during teardown.
+        if self._cleanup_in_progress or not self.layer_manager or not self.project:
+            return
+
         try:
             self._build_cache()
             logger.info("Layer catalog cache rebuild complete")
@@ -1399,6 +1404,12 @@ class LayerCatalogService(QObject):
         """Handle layersWillBeRemoved signal."""
         # CRITICAL FIX: Check cleanup flag FIRST
         if self._cleanup_in_progress:
+            return
+
+        # Skip handling during application shutdown to avoid touching layer/cache state
+        # while QGIS C++ is tearing down layers (reduces Windows exit crash risk).
+        layer_manager = getattr(self, "layer_manager", None)
+        if getattr(layer_manager, "_application_closing", False):
             return
 
         # DEFENSIVE GUARD

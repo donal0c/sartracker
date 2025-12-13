@@ -468,6 +468,9 @@ class ProviderController(QObject):
 
         Qt5/Qt6 Compatible: Uses pyqtSignal.
         """
+        if self._is_shutting_down:
+            return False
+
         if not self.provider:
             warning(
                 self.iface.messageBar(),
@@ -487,6 +490,9 @@ class ProviderController(QObject):
 
         SAFETY: Timer may fire after controller destruction (Pattern 7).
         """
+        if self._is_shutting_down:
+            return
+
         # DEFENSIVE GUARD: Check if controller still valid (Pattern 9)
         if not self.provider or not self.iface:
             return

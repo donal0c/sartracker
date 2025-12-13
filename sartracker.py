@@ -37,11 +37,7 @@ from datetime import datetime
 # Ensure bundled dependencies are available before any other imports.
 # This guarantees we use our tested versions of requests, urllib3, etc.
 vendor_path = os.path.join(os.path.dirname(__file__), 'vendor', 'site-packages')
-if os.path.exists(vendor_path):
-    if vendor_path not in sys.path:
-        sys.path.insert(0, vendor_path)
-        print(f"[SAR Tracker] Injected vendor path: {vendor_path}")
-else:
+if not os.path.exists(vendor_path):
     print(f"[SAR Tracker] Warning: Vendor path not found: {vendor_path}")
 
 # Ensure plugin parent is available for package imports (defensive)
@@ -87,34 +83,53 @@ def _force_vendor_requests(vendor_dir: Path):
     """
     Force requests stack to load from vendor_dir even if system requests was imported.
 
-    Raises:
-        RuntimeError if vendor stack cannot be loaded.
+    Non-fatal:
+        If the vendor stack cannot be loaded reliably, fall back to the system
+        requests stack and record details in _vendor_info for diagnostics.
     """
     global _vendor_info
 
-    vendor_dir = vendor_dir.resolve()
+    try:
+        vendor_dir = vendor_dir.resolve()
+    except Exception:
+        vendor_dir = Path(str(vendor_dir))
     if not vendor_dir.exists():
-        raise RuntimeError(f"Vendor directory not found: {vendor_dir}")
+        _vendor_info.update(
+            {
+                "using_vendor": False,
+                "requests_path": None,
+                "certifi_path": None,
+                "missing": _verify_vendor_bundle(vendor_dir),
+                "error": f"Vendor directory not found: {vendor_dir}",
+            }
+        )
+        return False
+
+    def _norm_path(path: Path) -> str:
+        try:
+            return os.path.normcase(os.path.normpath(str(path)))
+        except Exception:
+            return str(path).lower()
+
+    vendor_norm = _norm_path(vendor_dir)
+    vendor_marker = os.path.normcase(os.path.normpath(os.path.join("sartracker", "vendor", "site-packages")))
 
     def _is_vendor_path(path: Path) -> bool:
-        """
-        Accept any sartracker/vendor/site-packages path (profile or dev checkout), platform-agnostic.
-        """
+        """Best-effort check for a path living under sartracker/vendor/site-packages."""
         try:
-            path = path.resolve()
+            path_norm = _norm_path(path)
         except Exception:
             return False
-        for candidate in [path] + list(path.parents):
-            parts = [p.lower() for p in candidate.parts]
-            if len(parts) >= 3 and parts[-3:] == ['sartracker', 'vendor', 'site-packages']:
-                return True
-        return vendor_dir in path.parents
+        if path_norm == vendor_norm or path_norm.startswith(vendor_norm + os.sep):
+            return True
+        # Fallback for cases like Windows 8.3 paths or differing drive casing.
+        return vendor_marker in path_norm
 
     # If requests is already imported from system, clear it and its dependencies
     def _is_from_vendor(mod_name: str) -> bool:
         mod = sys.modules.get(mod_name)
         try:
-            return vendor_dir in Path(mod.__file__).resolve().parents  # type: ignore[arg-type]
+            return _is_vendor_path(Path(mod.__file__).resolve())  # type: ignore[arg-type]
         except Exception:
             return False
 
@@ -125,29 +140,89 @@ def _force_vendor_requests(vendor_dir: Path):
 
     # Ensure vendor path is first for import resolution
     vendor_str = str(vendor_dir)
-    sys.path = [vendor_str] + [p for p in sys.path if Path(p).resolve() != vendor_dir]
+    new_sys_path: List[str] = [vendor_str]
+    for entry in list(sys.path):
+        try:
+            if _norm_path(Path(entry)) == vendor_norm:
+                continue
+        except Exception:
+            pass
+        if entry != vendor_str:
+            new_sys_path.append(entry)
+    sys.path = new_sys_path
 
-    # Import and validate paths
-    import requests  # noqa: E401
-    import certifi  # noqa: E401
+    try:
+        # Import and validate paths
+        import requests  # noqa: E401
+        import certifi  # noqa: E401
 
-    requests_path = Path(requests.__file__).resolve()
-    cert_path = Path(certifi.where()).resolve()
+        requests_path = Path(requests.__file__).resolve()
+        cert_path = Path(certifi.where()).resolve()
 
-    if not (_is_vendor_path(requests_path) and _is_vendor_path(cert_path)):
+        if _is_vendor_path(requests_path) and _is_vendor_path(cert_path):
+            _vendor_info.update(
+                {
+                    "using_vendor": True,
+                    "requests_path": str(requests_path),
+                    "certifi_path": str(cert_path),
+                    "missing": [],
+                    "error": None,
+                }
+            )
+            return True
         raise RuntimeError(
             f"Requests stack not using vendor bundle. requests: {requests_path}, certifi: {cert_path}"
         )
+    except Exception as exc:
+        # Fall back to system requests stack (non-fatal) to keep plugin usable.
+        _vendor_info.update(
+            {
+                "using_vendor": False,
+                "requests_path": None,
+                "certifi_path": None,
+                "missing": [],
+                "error": str(exc),
+            }
+        )
 
-    _vendor_info.update(
-        {
-            "using_vendor": True,
-            "requests_path": str(requests_path),
-            "certifi_path": str(cert_path),
-            "missing": [],
-            "error": None,
-        }
-    )
+        # Remove vendor path from sys.path to avoid mixing vendored/system deps.
+        filtered_sys_path: List[str] = []
+        for entry in list(sys.path):
+            try:
+                if _norm_path(Path(entry)) == vendor_norm:
+                    continue
+            except Exception:
+                pass
+            filtered_sys_path.append(entry)
+        sys.path = filtered_sys_path
+
+        # Clear any partially imported vendor stack
+        for name in list(sys.modules.keys()):
+            if name == "requests" or name.startswith(("requests.", "urllib3", "charset_normalizer", "idna", "certifi")):
+                sys.modules.pop(name, None)
+
+        # Ensure charset helpers exist for minimal requests import compatibility
+        try:
+            from .utils.dependency_guard import ensure_requests_charset_modules
+
+            ensure_requests_charset_modules()
+        except Exception as guard_exc:
+            print(f"[SAR Tracker] Warning: Could not ensure charset helpers: {guard_exc}")
+
+        try:
+            import requests  # noqa: E401
+            import certifi  # noqa: E401
+
+            _vendor_info.update(
+                {
+                    "using_vendor": False,
+                    "requests_path": str(Path(requests.__file__).resolve()),
+                    "certifi_path": str(Path(certifi.where()).resolve()),
+                }
+            )
+        except Exception as sys_exc:
+            _vendor_info.update({"error": f"{_vendor_info.get('error')}; system import failed: {sys_exc}"})
+        return False
 
 
 # Perform vendor verification and force the vendored requests stack
@@ -157,10 +232,8 @@ try:
         raise RuntimeError(f"Missing vendor assets: {', '.join(_vendor_missing)}")
     _force_vendor_requests(Path(vendor_path))
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('vendor.bundle', e, traceback.format_exc()))
     _vendor_info.update({"missing": list(locals().get("_vendor_missing", [])), "error": str(e)})
-    print(f"[SAR Tracker] ERROR initializing vendor bundle: {e}")
+    print(f"[SAR Tracker] Warning: Vendor bundle unavailable, using system dependencies: {e}")
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
@@ -1476,6 +1549,67 @@ class sartracker:
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
 
+        # Stop UI timers early to avoid callbacks into deleted C++ objects during teardown
+        try:
+            if self.coords_update_timer or self._coords_updates_enabled:
+                self._disable_coords_updates("application about to quit")
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to disable coord updates on shutdown: {exc}")
+
+        # Stop provider polling early (critical on Windows exit crash reports)
+        try:
+            if self.provider_controller and hasattr(self.provider_controller, "cleanup"):
+                self.provider_controller.cleanup()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to stop provider controller on shutdown: {exc}")
+
+        # Disconnect project/layer signals and stop related timers early.
+        # This reduces the chance of Python slots running while QGIS C++ is tearing down the layer tree.
+        try:
+            if self.layer_manager:
+                try:
+                    self.layer_manager.disconnect_signals()
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Failed to disconnect layer manager signals on shutdown: {exc}")
+            if self.layers_controller:
+                try:
+                    self.layers_controller.cleanup()
+                except Exception as exc:
+                    print(f"[SARTRACKER] Warning: Failed to clean up layers controller on shutdown: {exc}")
+                finally:
+                    self.layers_controller = None
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Early layers cleanup failed on shutdown: {exc}")
+
+        # Stop mission timer early to prevent late UI updates during shutdown.
+        try:
+            if self.mission_controller and hasattr(self.mission_controller, "cleanup"):
+                self.mission_controller.cleanup()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to stop mission controller on shutdown: {exc}")
+
+        # Best-effort stop SAR panel timers (avoid full cleanup/UI restoration here)
+        try:
+            if self.sar_panel:
+                for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+                    timer = getattr(self.sar_panel, timer_name, None)
+                    if timer:
+                        try:
+                            if timer.isActive():
+                                timer.stop()
+                        except Exception:
+                            pass
+                # Stop Layer Console timers/tasks which may still be active even if
+                # we avoid running full SARPanel.cleanup() during shutdown.
+                layer_console = getattr(self.sar_panel, "layer_console_widget", None)
+                if layer_console and hasattr(layer_console, "cleanup"):
+                    try:
+                        layer_console.cleanup()
+                    except Exception as exc:
+                        print(f"[SARTRACKER] Warning: Failed to clean up layer console on shutdown: {exc}")
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to stop SAR panel timers on shutdown: {exc}")
+
         try:
             if self.task_manager and self.task_manager.get_active_count() > 0:
                 print("[SARTRACKER] Application about to quit - forcing task cancellation")
@@ -1728,47 +1862,50 @@ class sartracker:
             # PHASE 3: Clean up Provider Controller
             # ============================================================
             if self.provider_controller:
+                controller = self.provider_controller
                 try:
                     # BUG-078 FIX: Enhanced signal disconnection for provider controller
                     try:
-                        self.provider_controller.status_changed.disconnect()
+                        controller.status_changed.disconnect()
                     except TypeError:
                         pass  # Signal not connected
                     except Exception as e:
                         print(f"[SARTRACKER] BUG-078: Error disconnecting status_changed: {type(e).__name__}: {e}")
 
                     try:
-                        self.provider_controller.config_error.disconnect()
+                        controller.config_error.disconnect()
                     except TypeError:
                         pass  # Signal not connected
                     except Exception as e:
                         print(f"[SARTRACKER] BUG-078: Error disconnecting config_error: {type(e).__name__}: {e}")
 
                     try:
-                        self.provider_controller.provider_connected.disconnect()
+                        controller.provider_connected.disconnect()
                     except TypeError:
                         pass  # Signal not connected
                     except Exception as e:
                         print(f"[SARTRACKER] BUG-078: Error disconnecting provider_connected: {type(e).__name__}: {e}")
 
                     try:
-                        self.provider_controller.refresh_requested.disconnect()
+                        controller.refresh_requested.disconnect()
                     except TypeError:
                         pass  # Signal not connected
                     except Exception as e:
                         print(f"[SARTRACKER] BUG-078: Error disconnecting refresh_requested: {type(e).__name__}: {e}")
                 except Exception as e:
-                    # BUG-078 FIX: Outer catch for any failures accessing controller
+                    # Defensive: do not let disconnect failures block cleanup
                     print(f"[SARTRACKER] BUG-078: Error accessing provider_controller for cleanup: {e}")
-
-                    # Call cleanup method (stops polling timer)
-                    if hasattr(self.provider_controller, 'cleanup'):
-                        self.provider_controller.cleanup()
-
-                    print("[SARTRACKER] Provider controller cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during provider controller cleanup: {e}")
                 finally:
+                    # CRITICAL: Always stop polling/timers even if disconnecting signals succeeded
+                    try:
+                        if hasattr(controller, "cleanup"):
+                            controller.cleanup()
+                    except Exception as e:
+                        print(f"[SARTRACKER] Warning: Error during provider controller cleanup: {e}")
+                    try:
+                        controller.deleteLater()
+                    except Exception:
+                        pass
                     self.provider_controller = None
             # ============================================================
 
@@ -2754,6 +2891,9 @@ class sartracker:
 
         Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
         """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
         if not self.provider:
             self._notify("warning", "SAR Tracker", "No data source loaded. Please load a data source first.", duration=3)
             return
@@ -4511,6 +4651,9 @@ class sartracker:
 
     def _check_for_paused_mission(self):
         """Check if there's a paused mission and prompt user to resume."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+
         # CRITICAL GUARD: Check if plugin components still exist (Issue #4 fix)
         # Single-shot timer may fire after unload in fast reload scenarios
         if not self.sar_panel or not self.iface or not self.mission_controller:

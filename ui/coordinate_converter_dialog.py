@@ -339,7 +339,7 @@ class CoordinateConverterDialog(BaseDialog):
             # Reset after 1 second
             # BUG-057 fix: Store timer reference for cleanup
             from qgis.PyQt.QtCore import QTimer
-            self.copy_timer = QTimer()
+            self.copy_timer = QTimer(self)
             self.copy_timer.setSingleShot(True)
             self.copy_timer.timeout.connect(lambda: self._reset_copy_button(original_text))
             self.copy_timer.start(1000)
@@ -361,7 +361,7 @@ class CoordinateConverterDialog(BaseDialog):
 
             # BUG-057 fix: Store timer reference for cleanup
             from qgis.PyQt.QtCore import QTimer
-            self.goto_timer = QTimer()
+            self.goto_timer = QTimer(self)
             self.goto_timer.setSingleShot(True)
             self.goto_timer.timeout.connect(lambda: self._reset_goto_button(original_text))
             self.goto_timer.start(1000)

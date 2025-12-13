@@ -26,6 +26,7 @@ from qgis.core import (
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtWidgets import QApplication
 
 from .base_manager import BaseLayerManager
 from .tracking_segments import (
@@ -377,8 +378,12 @@ class TrackingLayerManager(BaseLayerManager):
         if not getattr(self, 'iface', None):
             logger.debug("Breadcrumb task complete but iface gone - plugin unloading")
             return
-        if not getattr(self, '_layer_manager', None):
+        layer_manager = getattr(self, 'layer_manager', None)
+        if not layer_manager:
             logger.debug("Breadcrumb task complete but layer_manager gone - plugin unloading")
+            return
+        if getattr(layer_manager, "_application_closing", False):
+            logger.debug("Breadcrumb task complete during application shutdown - ignoring")
             return
 
         try:
@@ -418,8 +423,12 @@ class TrackingLayerManager(BaseLayerManager):
         if not getattr(self, 'iface', None):
             logger.debug("Breadcrumb task error but iface gone - plugin unloading")
             return
-        if not getattr(self, '_layer_manager', None):
+        layer_manager = getattr(self, 'layer_manager', None)
+        if not layer_manager:
             logger.debug("Breadcrumb task error but layer_manager gone - plugin unloading")
+            return
+        if getattr(layer_manager, "_application_closing", False):
+            logger.debug("Breadcrumb task error during application shutdown - ignoring")
             return
 
         message = task.property("sartracker:error") if hasattr(task, "property") else None
@@ -880,12 +889,27 @@ class TrackingLayerManager(BaseLayerManager):
         2. Preserve user manual color changes
         3. Only add categories for new devices
         """
+        # Avoid mutating renderer while a modal dialog (e.g. symbol selector) is open.
+        # This reduces re-entrancy risk when users change symbology in the layer tree.
+        try:
+            if QApplication.activeModalWidget() is not None:
+                return
+        except Exception:
+            pass
+
         if not bool(layer.customProperty(self.BREADCRUMB_STYLE_MANAGED_PROP, True)):
+            return
+
+        if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
             return
 
         # Get unique device IDs from data
         try:
-            device_ids = layer.uniqueValues(layer.fields().indexOf('device_id'))
+            field_idx = layer.fields().indexFromName("device_id")
+            if field_idx == -1:
+                return
+            device_ids_raw = layer.uniqueValues(field_idx)
+            device_ids = sorted({str(value) for value in device_ids_raw if value is not None and str(value) != ""})
         except Exception as exc:
             # CRITICAL FIX (BUG-024): Log breadcrumb styling failures
             logger.warning("Failed to get device IDs for breadcrumb styling: %s", exc)
@@ -902,7 +926,7 @@ class TrackingLayerManager(BaseLayerManager):
             # UPDATE EXISTING: Safest approach
             # 1. Get existing categories
             existing_categories = current_renderer.categories()
-            existing_ids = {cat.value() for cat in existing_categories}
+            existing_ids = {str(cat.value()) for cat in existing_categories}
             
             # 2. Find new devices that need categories
             new_devices = [d for d in device_ids if d not in existing_ids]
@@ -912,7 +936,7 @@ class TrackingLayerManager(BaseLayerManager):
                 
             # 3. Create categories ONLY for new devices
             for device_id in new_devices:
-                color = self._get_device_color(str(device_id))
+                color = self._get_device_color(device_id)
                 symbol = QgsLineSymbol.createSimple({
                     'color': color.name(),
                     'width': '2',
@@ -938,7 +962,7 @@ class TrackingLayerManager(BaseLayerManager):
             # FIRST LOAD / RESET: Create new renderer
             categories = []
             for device_id in device_ids:
-                color = self._get_device_color(str(device_id))
+                color = self._get_device_color(device_id)
                 symbol = QgsLineSymbol.createSimple({
                     'color': color.name(),
                     'width': '2',
