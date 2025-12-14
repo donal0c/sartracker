@@ -25,7 +25,7 @@ from qgis.core import (
     QgsTask
 )
 from qgis.PyQt.QtGui import QColor
-from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtCore import QVariant, QTimer
 from qgis.PyQt.QtWidgets import QApplication
 
 from .base_manager import BaseLayerManager
@@ -63,6 +63,8 @@ class TrackingLayerManager(BaseLayerManager):
     BREADCRUMBS_LAYER_NAME = "Breadcrumbs"
     BREADCRUMB_STYLE_MANAGED_PROP = "sartracker:breadcrumbs_style_managed"
     BREADCRUMB_STYLE_INITIALIZED_PROP = "sartracker:breadcrumbs_style_initialized"
+    CURRENT_STYLE_MANAGED_PROP = "sartracker:current_style_managed"
+    CURRENT_STYLE_INITIALIZED_PROP = "sartracker:current_style_initialized"
 
     ASYNC_SEGMENT_THRESHOLD = 1500  # Minimum breadcrumb points before offloading
 
@@ -520,6 +522,13 @@ class TrackingLayerManager(BaseLayerManager):
             LayerIds.CURRENT_ACTIVE,
             fallback_name=self.CURRENT_LAYER_NAME
         )
+        try:
+            if layer.customProperty(self.CURRENT_STYLE_MANAGED_PROP, None) is None:
+                layer.setCustomProperty(self.CURRENT_STYLE_MANAGED_PROP, True)
+            if layer.customProperty(self.CURRENT_STYLE_INITIALIZED_PROP, None) is None:
+                layer.setCustomProperty(self.CURRENT_STYLE_INITIALIZED_PROP, False)
+        except Exception:
+            pass
         self._log_tracking_event(layer, "CURRENT", "ensure")
         return layer
 
@@ -542,6 +551,9 @@ class TrackingLayerManager(BaseLayerManager):
             ValueError: If position data is invalid
             LayerLockError: If unable to acquire edit lock (concurrent operation in progress)
         """
+        if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
+            return
+
         # Validate positions list
         if not isinstance(positions, list):
             raise ValueError("positions must be a list")
@@ -585,10 +597,31 @@ class TrackingLayerManager(BaseLayerManager):
                         raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
 
             # Apply styling (outside transaction - failures here don't affect data)
+            # Defer by 1 event loop tick to reduce re-entrancy with layer-tree UI edits.
             try:
-                self._apply_current_positions_style(layer)
+                layer_id = layer.id()
+
+                def _apply_style_deferred(qgis_layer_id=layer_id):
+                    if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
+                        return
+                    if not getattr(self, "project", None):
+                        return
+                    try:
+                        refreshed_layer = self.project.mapLayer(qgis_layer_id)
+                    except Exception:
+                        refreshed_layer = None
+                    if not refreshed_layer:
+                        return
+                    try:
+                        if not refreshed_layer.isValid():
+                            return
+                    except RuntimeError:
+                        return
+                    self._apply_current_positions_style(refreshed_layer)
+
+                QTimer.singleShot(0, _apply_style_deferred)
             except Exception as e:
-                logger.warning("Failed to apply styling to %s: %s", self.CURRENT_LAYER_NAME, e)
+                logger.warning("Failed to schedule styling for %s: %s", self.CURRENT_LAYER_NAME, e)
 
             # Zoom to extent ONLY on first load
             if self.first_load and valid_positions:
@@ -618,11 +651,30 @@ class TrackingLayerManager(BaseLayerManager):
         2. Preserve user manual color changes
         3. Only add categories for new devices
         """
+        # Avoid mutating renderer while a modal dialog (e.g. symbol selector) is open.
+        # This reduces re-entrancy risk when users change symbology in the layer tree.
+        try:
+            if QApplication.activeModalWidget() is not None:
+                return
+        except Exception:
+            pass
+
+        if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
+            return
+
+        try:
+            if not bool(layer.customProperty(self.CURRENT_STYLE_MANAGED_PROP, True)):
+                return
+        except Exception:
+            return
+
         # Get unique device IDs
         try:
-            device_ids = layer.uniqueValues(
-                layer.fields().indexOf('device_id')
-            )
+            field_idx = layer.fields().indexFromName("device_id")
+            if field_idx == -1:
+                return
+            device_ids_raw = layer.uniqueValues(field_idx)
+            device_ids = sorted({str(value) for value in device_ids_raw if value is not None and str(value) != ""})
         except Exception as exc:
             # CRITICAL FIX (BUG-024): Log renderer setup failures instead of silent return
             logger.warning("Failed to get device IDs for styling: %s", exc)
@@ -631,10 +683,16 @@ class TrackingLayerManager(BaseLayerManager):
         # Check if we already have a categorized renderer
         current_renderer = layer.renderer()
 
+        style_initialized = False
+        try:
+            style_initialized = bool(layer.customProperty(self.CURRENT_STYLE_INITIALIZED_PROP, False))
+        except Exception:
+            style_initialized = False
+
         if isinstance(current_renderer, QgsCategorizedSymbolRenderer):
             # UPDATE EXISTING: Safest approach
             existing_categories = current_renderer.categories()
-            existing_ids = {cat.value() for cat in existing_categories}
+            existing_ids = {str(cat.value()) for cat in existing_categories}
 
             new_devices = [d for d in device_ids if d not in existing_ids]
 
@@ -642,7 +700,7 @@ class TrackingLayerManager(BaseLayerManager):
                 return
 
             for device_id in new_devices:
-                color = self._get_device_color(str(device_id))
+                color = self._get_device_color(device_id)
                 symbol = QgsMarkerSymbol.createSimple({
                     'name': 'circle',
                     'color': color.name(),
@@ -654,12 +712,26 @@ class TrackingLayerManager(BaseLayerManager):
                 current_renderer.addCategory(category)
 
             layer.triggerRepaint()
+            try:
+                layer.setCustomProperty(self.CURRENT_STYLE_INITIALIZED_PROP, True)
+            except Exception:
+                pass
 
         else:
+            if style_initialized:
+                # User switched renderer manually - stop auto styling so their custom
+                # symbology persists across refreshes.
+                try:
+                    layer.setCustomProperty(self.CURRENT_STYLE_MANAGED_PROP, False)
+                except Exception:
+                    pass
+                logger.info("Current positions renderer manually overridden; auto styling disabled.")
+                return
+
             # FIRST LOAD / RESET: Create new renderer
             categories = []
             for device_id in device_ids:
-                color = self._get_device_color(str(device_id))
+                color = self._get_device_color(device_id)
                 symbol = QgsMarkerSymbol.createSimple({
                     'name': 'circle',
                     'color': color.name(),
@@ -672,6 +744,10 @@ class TrackingLayerManager(BaseLayerManager):
 
             renderer = QgsCategorizedSymbolRenderer('device_id', categories)
             layer.setRenderer(renderer)
+            try:
+                layer.setCustomProperty(self.CURRENT_STYLE_INITIALIZED_PROP, True)
+            except Exception:
+                pass
 
             # Apply labels (only apply defaults on first load/reset to respect user changes)
             label_settings = QgsPalLayerSettings()

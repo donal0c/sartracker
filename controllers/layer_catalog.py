@@ -1227,7 +1227,13 @@ class LayerCatalogService(QObject):
         """
         # CRITICAL: This method can be invoked via QTimer.singleShot even after
         # unload/cleanup begins. Never rebuild the layer tree during teardown.
-        if self._cleanup_in_progress or not self.layer_manager or not self.project:
+        layer_manager = getattr(self, "layer_manager", None)
+        if (
+            self._cleanup_in_progress
+            or not layer_manager
+            or not self.project
+            or getattr(layer_manager, "_application_closing", False)
+        ):
             return
 
         try:
@@ -1491,6 +1497,11 @@ class LayerCatalogService(QObject):
         if not self.layer_manager or not self._layers:
             return
 
+        # Skip refresh work during application shutdown (reduces Windows exit crash risk)
+        layer_manager = getattr(self, "layer_manager", None)
+        if getattr(layer_manager, "_application_closing", False):
+            return
+
         if not hasattr(self, '_pending_refresh_layers'):
             return
 
@@ -1529,11 +1540,15 @@ class LayerCatalogService(QObject):
         BUG-034 FIX: Enhanced layer validity checking with comprehensive logging
         and project registration verification.
         """
-        if not self.layer_manager:
+        layer_manager = getattr(self, "layer_manager", None)
+        if not layer_manager:
             logger.debug("Layer refresh skipped - no layer_manager available")
             return
 
-        layer = self.layer_manager.get_layer(layer_id)
+        if getattr(layer_manager, "_application_closing", False):
+            return
+
+        layer = layer_manager.get_layer(layer_id)
 
         # BUG-034 FIX: Enhanced layer validity checking with detailed logging
         if not layer:
@@ -1673,11 +1688,15 @@ class LayerCatalogService(QObject):
 
     def _schedule_lock_retry(self, layer_id: str, delay_ms: int = 1000) -> None:
         """Retry scheduling a layer refresh after a short delay."""
-        if self._cleanup_in_progress:
+        layer_manager = getattr(self, "layer_manager", None)
+        if self._cleanup_in_progress or getattr(layer_manager, "_application_closing", False):
             return
 
         def _retry():
             if self._cleanup_in_progress:
+                return
+            lm = getattr(self, "layer_manager", None)
+            if getattr(lm, "_application_closing", False):
                 return
             self._schedule_layer_refresh_by_id(layer_id)
 

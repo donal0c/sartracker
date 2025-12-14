@@ -810,7 +810,11 @@ class TraccarHttpProvider(Provider):
                             cancel_requested = True
                             break
                 finally:
-                    executor.shutdown(wait=not cancel_requested, cancel_futures=cancel_requested)
+                    # Python 3.8 compatibility: cancel_futures was added in 3.9.
+                    try:
+                        executor.shutdown(wait=not cancel_requested, cancel_futures=cancel_requested)
+                    except TypeError:
+                        executor.shutdown(wait=not cancel_requested)
 
                 # Sort by (device_id, timestamp)
                 all_positions.sort(key=lambda x: (x['device_id'], x['ts']))

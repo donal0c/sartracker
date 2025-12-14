@@ -27,7 +27,7 @@ from qgis.core import (
 from qgis.PyQt.QtGui import QColor, QFont
 from qgis.PyQt.QtCore import QVariant
 
-from .schema import LayerIds
+from .schema import LayerIds, GroupNames
 from .utilities import get_group_by_path
 
 
@@ -111,10 +111,35 @@ class HelicopterLayerManager:
             layer.updateFields()
             layer.setCustomProperty('sartracker:layer_id', layer_id)
 
-            group = get_group_by_path(self.project, ["SAR Tracker", "Helicopters"])
-            self.project.addMapLayer(layer, False)
+            group_path = [GroupNames.ROOT, GroupNames.HELICOPTERS]
+
+            # FIX: get_group_by_path() does not take a QgsProject argument.
+            group = get_group_by_path(group_path)
+
+            # If the group doesn't exist (e.g. user deleted it), recreate it so the
+            # layer is not added "invisible" (addMapLayer(..., False) without insertion).
+            if not group:
+                try:
+                    root = self.project.layerTreeRoot()
+                    current = root
+                    if current:
+                        for name in group_path:
+                            found = current.findGroup(name)
+                            if not found:
+                                insert_pos = 0 if name == GroupNames.ROOT else len(current.children())
+                                found = current.insertGroup(insert_pos, name)
+                            current = found
+                        group = current
+                except Exception as exc:
+                    print(f"[HelicopterManager] Warning: Failed to recreate group path {group_path}: {exc}")
+                    group = None
+
             if group:
+                self.project.addMapLayer(layer, False)
                 group.insertLayer(slot - 1, layer)
+            else:
+                # Last-resort: ensure layer is visible in the layer tree
+                self.project.addMapLayer(layer, True)
 
             print(f"[HelicopterManager] Recreated missing Helicopter {slot} layer")
             return layer

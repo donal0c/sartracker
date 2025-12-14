@@ -1281,6 +1281,8 @@ class LayerManager(QObject):
                 return False
 
         def _finished(_task, result):
+            if getattr(self, "_application_closing", False):
+                return
             if result:
                 if on_complete:
                     on_complete(result)

@@ -283,9 +283,16 @@ ensure_requests_charset_modules()
 try:
     from .providers.registry import registry as provider_registry
     from .providers.base import Provider
-    # Trigger provider registration by importing them
-    from .providers import csv, traccar_http
-    # Note: provider_registry now contains registered providers (csv, http_traccar, traccar_http)
+    # Trigger provider registration by importing them.
+    # CSV provider is considered core; HTTP provider is optional (dependency/SSL variance).
+    from .providers import csv  # noqa: F401
+    try:
+        from .providers import traccar_http  # noqa: F401
+    except Exception as e:
+        _import_errors.append(('providers.traccar_http', e, traceback.format_exc()))
+        print(f"[SARTRACKER] Warning: HTTP provider unavailable (continuing offline): {e}")
+        traccar_http = None
+    # Note: provider_registry now contains registered providers (csv + any optional providers that loaded)
 except Exception as e:
     _imports_ok = False
     _import_errors.append(('providers', e, traceback.format_exc()))
@@ -1913,8 +1920,27 @@ class sartracker:
             if self.sar_panel:
                 # Stop all timers BEFORE disconnecting signals (Issue #5 fix)
                 try:
-                    if hasattr(self.sar_panel, 'cleanup'):
+                    # During application shutdown, avoid running full SARPanel.cleanup()
+                    # because it may attempt to restore hidden panels (Focus Mode) and
+                    # touch UI objects that are already being torn down.
+                    if hasattr(self.sar_panel, 'cleanup') and not self._app_is_quitting:
                         self.sar_panel.cleanup()
+                    else:
+                        # Best-effort stop timers + internal widgets without UI restoration
+                        for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+                            timer = getattr(self.sar_panel, timer_name, None)
+                            if timer:
+                                try:
+                                    if timer.isActive():
+                                        timer.stop()
+                                except Exception:
+                                    pass
+                        layer_console = getattr(self.sar_panel, "layer_console_widget", None)
+                        if layer_console and hasattr(layer_console, "cleanup"):
+                            try:
+                                layer_console.cleanup()
+                            except Exception:
+                                pass
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
 
