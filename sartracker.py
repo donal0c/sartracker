@@ -257,7 +257,7 @@ from .resources import *
 import os.path
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo
+from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo, ISODate
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
@@ -549,6 +549,22 @@ class sartracker:
 
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
+        # Common install pitfall: installing the GitHub source ZIP extracts to
+        # `sartracker-main/` or `sartracker-master/` which can break imports and
+        # diagnostics on some machines. Warn early so non-developers can self-fix.
+        try:
+            folder_name = os.path.basename(self.plugin_dir)
+            if folder_name and folder_name != "sartracker":
+                warning(
+                    self.iface.messageBar(),
+                    "SAR Tracker Install",
+                    f"Plugin folder is '{folder_name}' (expected 'sartracker'). "
+                    "If installed from a GitHub source ZIP, rename the folder to 'sartracker' "
+                    "or install from a SAR Tracker release ZIP, then restart QGIS.",
+                    duration=12,
+                )
+        except Exception:
+            pass
         # initialize locale
         try:
             locale_value = QSettings().value('locale/userLocale')
@@ -2464,7 +2480,7 @@ class sartracker:
         resume_dt = dialog.resume_timestamp()
         if resume_dt:
             try:
-                iso_ts = resume_dt.toUTC().toString(Qt.ISODate)
+                iso_ts = resume_dt.toUTC().toString(ISODate)
                 self.layer_manager.set_resume_timestamp(iso_ts)
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to persist resume timestamp: {exc}")

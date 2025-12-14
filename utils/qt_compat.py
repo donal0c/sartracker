@@ -297,6 +297,33 @@ else:  # Qt5
 
 
 # =============================================================================
+# ItemDataRole enums (common ones)
+# =============================================================================
+if QT_VERSION == 6:
+    UserRole = Qt.ItemDataRole.UserRole
+else:  # Qt5
+    UserRole = Qt.UserRole
+
+
+# =============================================================================
+# ContextMenuPolicy enums (common ones)
+# =============================================================================
+if QT_VERSION == 6:
+    CustomContextMenu = Qt.ContextMenuPolicy.CustomContextMenu
+else:  # Qt5
+    CustomContextMenu = Qt.CustomContextMenu
+
+
+# =============================================================================
+# DateFormat enums (common ones)
+# =============================================================================
+if QT_VERSION == 6:
+    ISODate = Qt.DateFormat.ISODate
+else:  # Qt5
+    ISODate = Qt.ISODate
+
+
+# =============================================================================
 # WindowType enums (common ones)
 # =============================================================================
 if QT_VERSION == 6:
@@ -615,6 +642,12 @@ __all__ = [
     'ItemIsEditable',
     'ItemIsDragEnabled',
     'ItemIsDropEnabled',
+    # ItemDataRole
+    'UserRole',
+    # ContextMenuPolicy
+    'CustomContextMenu',
+    # DateFormat
+    'ISODate',
     # WindowType
     'WindowType_Widget',
     'WindowType_Window',

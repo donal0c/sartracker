@@ -431,17 +431,26 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPolylineXY(points_wgs84))
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            name,
-            description,
-            color,
-            width,
-            total_distance,
-            datetime.now().isoformat(),
-            1 if temporary_measure else 0,
-            None  # display_order (set after addFeature)
-        ])
+        # IMPORTANT: Set attributes by field name (not positional list).
+        # Persistent (GeoPackage/OGR) layers may include provider-managed fields
+        # (e.g. fid) that vary by QGIS version/platform, and positional
+        # setAttributes() will fail with "wrong field count".
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "description": description,
+            "color": color,
+            "width": int(width),
+            "distance_m": float(total_distance),
+            "created": datetime.now().isoformat(),
+            "temporary_measure": bool(temporary_measure),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions
@@ -880,24 +889,29 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(polygon_geom)
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            name,
-            team,
-            status,
-            priority,
-            area_sqkm,
-            POA,
-            0.0,  # POD - to be calculated/updated later
-            terrain,
-            search_method,
-            color,
-            "",  # start_time - set when status changes to InProgress
-            "",  # end_time - set when status changes to Completed
-            notes,
-            datetime.now().isoformat(),
-            None  # display_order (set after feature is added)
-        ])
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "team": team,
+            "status": status,
+            "priority": priority,
+            "area_sqkm": float(area_sqkm),
+            "POA": float(POA),
+            "POD": 0.0,  # to be calculated/updated later
+            "terrain": terrain,
+            "search_method": search_method,
+            "color": color,
+            "start_time": "",  # set when status changes to InProgress
+            "end_time": "",  # set when status changes to Completed
+            "notes": notes,
+            "created": datetime.now().isoformat(),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions
@@ -1041,19 +1055,24 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(circle_geom)
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            name,
-            center_wgs84.y(),  # latitude
-            center_wgs84.x(),  # longitude
-            radius_m,
-            label,
-            color,
-            lpb_category,
-            percentile,
-            datetime.now().isoformat(),
-            None  # display_order (set after addFeature)
-        ])
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "center_lat": float(center_wgs84.y()),
+            "center_lon": float(center_wgs84.x()),
+            "radius_m": float(radius_m),
+            "label": label,
+            "color": color,
+            "lpb_category": lpb_category,
+            "percentile": int(percentile) if percentile is not None else None,
+            "created": datetime.now().isoformat(),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions
@@ -1203,18 +1222,23 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(line_geom)
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            name,
-            origin_wgs84.y(),
-            origin_wgs84.x(),
-            bearing,
-            distance_m,
-            label,
-            color,
-            datetime.now().isoformat(),
-            None  # display_order (set after addFeature)
-        ])
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "origin_lat": float(origin_wgs84.y()),
+            "origin_lon": float(origin_wgs84.x()),
+            "bearing": float(bearing),
+            "distance_m": float(distance_m),
+            "label": label,
+            "color": color,
+            "created": datetime.now().isoformat(),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions
@@ -1410,21 +1434,27 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(sector_geom)
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            name,
-            center_wgs84.y(),
-            center_wgs84.x(),
-            start_bearing,
-            end_bearing,
-            radius_m,
-            arc_length_deg,  # BUG-034 fix: store calculated arc length
-            area_sqkm,
-            priority,
-            color,
-            datetime.now().isoformat(),
-            None  # display_order (set after addFeature)
-        ])
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "center_lat": float(center_wgs84.y()),
+            "center_lon": float(center_wgs84.x()),
+            "start_bearing": float(start_bearing),
+            "end_bearing": float(end_bearing),
+            "radius_m": float(radius_m),
+            # BUG-034 fix: store calculated arc length when schema supports it.
+            "arc_length_deg": float(arc_length_deg),
+            "area_sqkm": float(area_sqkm),
+            "priority": priority,
+            "color": color,
+            "created": datetime.now().isoformat(),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions
@@ -1817,17 +1847,22 @@ class DrawingLayerManager(BaseLayerManager):
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(location_wgs84))
 
-        feature.setAttributes([
-            str(uuid.uuid4()),
-            text,
-            location_wgs84.y(),
-            location_wgs84.x(),
-            font_size,
-            color,
-            rotation,
-            datetime.now().isoformat(),
-            None  # display_order (set after addFeature)
-        ])
+        attr_map = {
+            "id": str(uuid.uuid4()),
+            "text": text,
+            "lat": float(location_wgs84.y()),
+            "lon": float(location_wgs84.x()),
+            "font_size": int(font_size),
+            "color": color,
+            "rotation": float(rotation),
+            "created": datetime.now().isoformat(),
+            "display_order": None,  # set after addFeature
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add to layer with proper resource cleanup
         # CRITICAL: Check for nested transactions

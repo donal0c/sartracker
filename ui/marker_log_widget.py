@@ -14,9 +14,9 @@ from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
     QComboBox, QPushButton, QTreeWidget, QTreeWidgetItem, QTextEdit
 )
-from qgis.PyQt.QtCore import Qt, pyqtSignal
+from qgis.PyQt.QtCore import pyqtSignal
 
-from ..utils.qt_compat import AlignLeft
+from ..utils.qt_compat import AlignLeft, UserRole
 
 
 class MarkerLogWidget(QWidget):
@@ -159,7 +159,7 @@ class MarkerLogWidget(QWidget):
                 record.get("updated_at") or "",
                 coords
             ])
-            item.setData(0, Qt.UserRole, record)
+            item.setData(0, UserRole, record)
             self.table.addTopLevelItem(item)
 
         self.table.resizeColumnToContents(0)
@@ -173,7 +173,7 @@ class MarkerLogWidget(QWidget):
         selected_items = self.table.selectedItems()
         if not selected_items:
             return None
-        return selected_items[0].data(0, Qt.UserRole)
+        return selected_items[0].data(0, UserRole)
 
     def _update_button_state(self):
         """Enable/disable action buttons based on selection."""
@@ -200,7 +200,7 @@ class MarkerLogWidget(QWidget):
             self.detail_text.clear()
 
     def _emit_edit_from_item(self, item: QTreeWidgetItem):
-        record = item.data(0, Qt.UserRole)
+        record = item.data(0, UserRole)
         if record:
             # Ensure str values (signal expects str, str)
             marker_type = record.get("type") or ""

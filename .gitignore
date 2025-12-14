@@ -75,7 +75,9 @@ cleanup.sh
 # Documentation files (keep only README.md under version control)
 archive/
 issues/
-docs/*.md
+docs/**
+!docs/
+!docs/compatibility_and_best_practices.md
 research/*.md
 
 

@@ -10,7 +10,7 @@ the Phase 4 specification while preserving backward compatibility.
 
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
-from qgis.PyQt.QtCore import Qt, QObject, QSettings, pyqtSignal, QTimer
+from qgis.PyQt.QtCore import QObject, QSettings, pyqtSignal, QTimer
 from qgis.PyQt.QtGui import QKeySequence
 from qgis.PyQt.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QToolButton,
@@ -23,6 +23,7 @@ from ..utils.dialog_utils import BaseDialog
 from ..utils.task_manager import TaskManager
 from ..utils.qt_compat import (
     Checked, Unchecked,
+    AlignCenter, CustomContextMenu, UserRole,
     ItemIsUserCheckable, ItemIsEnabled, ItemIsSelectable,
     dialog_exec, DialogAccepted,
     Key_Delete, Key_Backspace,
@@ -217,7 +218,7 @@ class LayerConsoleWidget(QWidget):
         self.tree.setAlternatingRowColors(True)
         self.tree.setSelectionBehavior(self.tree.SelectItems)
         self.tree.setSelectionMode(self.tree.ExtendedSelection)
-        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.setContextMenuPolicy(CustomContextMenu)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self._ui_signal_connections.append((self.tree.itemSelectionChanged, self._on_selection_changed))
         self.tree.itemChanged.connect(self._on_item_changed)
@@ -271,7 +272,7 @@ class LayerConsoleWidget(QWidget):
 
         # Empty state label (shown when no data)
         self._empty_state_label = QLabel("No layers available")
-        self._empty_state_label.setAlignment(Qt.AlignCenter)
+        self._empty_state_label.setAlignment(AlignCenter)
         self._empty_state_label.setVisible(False)
         layout.addWidget(self._empty_state_label)
 
@@ -906,7 +907,7 @@ class LayerConsoleWidget(QWidget):
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
-        item.setData(0, Qt.UserRole, {
+        item.setData(0, UserRole, {
             "type": "group",
             "group_id": group_id,
             "feature_count": total_features
@@ -957,7 +958,7 @@ class LayerConsoleWidget(QWidget):
         ])
         item.setFlags(item.flags() | ItemIsUserCheckable | ItemIsEnabled | ItemIsSelectable)
         item.setCheckState(0, Checked if is_visible else Unchecked)
-        item.setData(0, Qt.UserRole, {
+        item.setData(0, UserRole, {
             "type": "layer",
             "layer_id": layer_id,
             "layer_name": layer_name,
@@ -981,7 +982,7 @@ class LayerConsoleWidget(QWidget):
             missing = feature_count - len(features)
             notice = QTreeWidgetItem([f"  … {missing} more not shown", "", "", ""])
             notice.setFlags(notice.flags() & ~ItemIsSelectable & ~ItemIsEnabled)
-            notice.setData(0, Qt.UserRole, {"type": "notice"})
+            notice.setData(0, UserRole, {"type": "notice"})
             item.addChild(notice)
 
         if features:
@@ -1007,7 +1008,7 @@ class LayerConsoleWidget(QWidget):
             (updated_at or created_at)[:16]
         ])
         item.setFlags(item.flags() | ItemIsSelectable | ItemIsEnabled)
-        item.setData(0, Qt.UserRole, {
+        item.setData(0, UserRole, {
             "type": "feature",
             "layer_id": layer_id,
             "feature_id": feature_id,
@@ -1060,7 +1061,7 @@ class LayerConsoleWidget(QWidget):
         metadata["is_visible"] = new_visible
         metadata["is_favorite"] = layer_data.get("is_favorite", False)
         metadata["layer_alias"] = layer_data.get("display_name")
-        item.setData(0, Qt.UserRole, metadata)
+        item.setData(0, UserRole, metadata)
 
         # Update display name with icon, alias, and favorite star
         base_name = layer_data.get("display_name") or layer_data.get("name", metadata.get("layer_name", "Layer"))
@@ -1088,7 +1089,7 @@ class LayerConsoleWidget(QWidget):
             if notice_item is None:
                 notice_item = QTreeWidgetItem([f"  … {missing} more not shown", "", "", ""])
                 notice_item.setFlags(notice_item.flags() & ~ItemIsSelectable & ~ItemIsEnabled)
-                notice_item.setData(0, Qt.UserRole, {"type": "notice"})
+                notice_item.setData(0, UserRole, {"type": "notice"})
                 item.addChild(notice_item)
             else:
                 notice_item.setText(0, f"  … {missing} more not shown")
@@ -1113,7 +1114,7 @@ class LayerConsoleWidget(QWidget):
             return
         is_visible = item.checkState(0) == Checked
         metadata["is_visible"] = is_visible
-        item.setData(0, Qt.UserRole, metadata)
+        item.setData(0, UserRole, metadata)
         # Emit Phase 4 signal first, then legacy name for compatibility
         self._emit_layer_visibility(layer_id, is_visible)
 
@@ -1739,7 +1740,7 @@ class LayerConsoleWidget(QWidget):
     def _get_item_metadata(self, item: QTreeWidgetItem) -> Optional[Dict[str, Any]]:
         if not item:
             return None
-        metadata = item.data(0, Qt.UserRole)
+        metadata = item.data(0, UserRole)
         if not metadata or not isinstance(metadata, dict):
             return None
         return metadata
@@ -2385,6 +2386,6 @@ class LayerConsoleWidget(QWidget):
             self._set_item_check_state(item, Checked if visible else Unchecked)
             meta = self._get_item_metadata(item) or {}
             meta["is_visible"] = visible
-            item.setData(0, Qt.UserRole, meta)
+            item.setData(0, UserRole, meta)
         self.visibility_toggled.emit(layer_id, visible)
         self.layer_visibility_toggled.emit(layer_id, visible)

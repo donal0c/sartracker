@@ -8,6 +8,8 @@ Supports manual radius entry or LPB (Lost Person Behavior) statistics.
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 """
 
+import logging
+
 from qgis.core import QgsPointXY, QgsGeometry, QgsWkbTypes
 from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtGui import QColor
@@ -24,6 +26,8 @@ from ..utils.lpb_statistics import LPBStatistics
 from ..utils.exceptions import DrawingError
 
 from .base_drawing_tool import BaseDrawingTool
+
+logger = logging.getLogger(__name__)
 
 
 class RangeRingDialog(BaseDialog):

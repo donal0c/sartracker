@@ -303,16 +303,23 @@ def update_helicopter_position(
             point = QgsPointXY(lon, lat)
             feature.setGeometry(QgsGeometry.fromPointXY(point))
 
-            # Set attributes
-            feature.setAttributes([
-                call_sign,
-                hex_id,
-                timestamp,
-                speed,
-                heading,
-                altitude,
-                timestamp
-            ])
+            # Set attributes by field name (not positional list) to avoid
+            # "wrong field count" failures when provider-managed fields vary
+            # across QGIS versions/platforms (e.g. GeoPackage fid).
+            attr_map = {
+                "call_sign": call_sign,
+                "hex_id": hex_id,
+                "last_update": timestamp,
+                "speed": speed,
+                "heading": heading,
+                "altitude": altitude,
+                "timestamp": timestamp,
+            }
+            fields = layer.fields()
+            for field_name, value in attr_map.items():
+                idx = fields.indexFromName(field_name)
+                if idx != -1:
+                    feature.setAttribute(idx, value)
 
             # Add feature
             if not layer.addFeature(feature):

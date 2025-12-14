@@ -205,10 +205,17 @@ class DiagnosticsPanel(BaseDialog):
             # Fallback if no status available
             if not vendor_info:
                 import requests
-                import sartracker
-                plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+                # Do not rely on `import sartracker` here: users often install the
+                # GitHub source ZIP which extracts to `sartracker-main/` or
+                # `sartracker-master/`, and that folder name is not importable as
+                # a Python package. Derive the plugin root from this file path.
+                plugin_dir = os.path.dirname(os.path.dirname(__file__))
                 vendor_dir = os.path.join(plugin_dir, 'vendor')
-                if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                try:
+                    common = os.path.commonpath([requests.__file__, vendor_dir])
+                except Exception:
+                    common = ""
+                if common == vendor_dir:
                     vendor_text = "✅ Active (Bundled)"
                     vendor_style = "color: green;"
                     doctor_text = "Vendor detected via import path"
@@ -217,6 +224,19 @@ class DiagnosticsPanel(BaseDialog):
                     vendor_style = "color: black;"
                     doctor_text = "System requests detected via import path"
                     cert_text = getattr(requests, "__file__", None)
+
+                # Install doctor: detect common GitHub ZIP install mistake.
+                try:
+                    folder_name = os.path.basename(plugin_dir)
+                    if folder_name and folder_name != "sartracker":
+                        folder_msg = (
+                            f"⚠️ Plugin folder is '{folder_name}' (expected 'sartracker'). "
+                            "If installed from a GitHub source ZIP, rename the extracted folder to "
+                            "'sartracker' (or install from a SAR Tracker release ZIP)."
+                        )
+                        doctor_text = f"{folder_msg}\n{doctor_text}" if doctor_text else folder_msg
+                except Exception:
+                    pass
 
         except Exception:
             vendor_text = "❓ Unknown"
@@ -608,10 +628,15 @@ class DiagnosticsPanel(BaseDialog):
                     lines.append(f"  Cert Store:        {vendor_info.get('certifi_path')}")
             else:
                 import requests
-                import sartracker
-                plugin_dir = os.path.dirname(os.path.dirname(sartracker.__file__))
+                # Derive plugin root from this file path; avoids failures when the
+                # plugin folder name is `sartracker-main/` or `sartracker-master/`.
+                plugin_dir = os.path.dirname(os.path.dirname(__file__))
                 vendor_dir = os.path.join(plugin_dir, 'vendor')
-                if os.path.commonpath([requests.__file__, vendor_dir]) == vendor_dir:
+                try:
+                    common = os.path.commonpath([requests.__file__, vendor_dir])
+                except Exception:
+                    common = ""
+                if common == vendor_dir:
                     lines.append("  Dependency Bundle: Active (Bundled)")
                 else:
                     lines.append(f"  Dependency Bundle: System ({requests.__file__})")

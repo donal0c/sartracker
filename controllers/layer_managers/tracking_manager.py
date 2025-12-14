@@ -585,14 +585,23 @@ class TrackingLayerManager(BaseLayerManager):
                 for pos in valid_positions:
                     feature = QgsFeature(edit_layer.fields())
                     feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
-                    feature.setAttributes([
-                        pos['device_id'],
-                        pos['name'],
-                        pos['ts'],
-                        pos.get('altitude'),
-                        pos.get('speed'),
-                        pos.get('battery')
-                    ])
+                    # IMPORTANT: Set attributes by field name (not positional list).
+                    # Persistent (GeoPackage/OGR) layers may include provider-managed
+                    # fields (e.g. fid) that vary by QGIS version/platform, and
+                    # positional setAttributes() will fail with "wrong field count".
+                    attr_map = {
+                        "device_id": pos.get("device_id"),
+                        "name": pos.get("name"),
+                        "timestamp": pos.get("ts"),
+                        "altitude": pos.get("altitude"),
+                        "speed": pos.get("speed"),
+                        "battery": pos.get("battery"),
+                    }
+                    fields = edit_layer.fields()
+                    for field_name, value in attr_map.items():
+                        idx = fields.indexFromName(field_name)
+                        if idx != -1:
+                            feature.setAttribute(idx, value)
                     if not edit_layer.addFeature(feature):
                         raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
 

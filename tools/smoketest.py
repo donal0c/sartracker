@@ -312,9 +312,9 @@ def _test_basedialog_rendering():
 
         # Test that methods are callable (don't actually execute, that would block)
         if not callable(dialog.exec):
-            return "FAIL: BaseDialog.exec() is not callable"
+            return "FAIL: BaseDialog exec method is not callable"
         if not callable(dialog.exec_):
-            return "FAIL: BaseDialog.exec_() is not callable"
+            return "FAIL: BaseDialog exec_ method is not callable"
 
         # Verify the methods would call the correct parent method by checking
         # that they don't raise AttributeError when accessing super() methods
