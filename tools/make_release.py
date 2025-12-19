@@ -110,6 +110,7 @@ EXCLUDED_DIRS = {
     ".idea",
     ".vscode",
     ".claude",
+    ".beads",
     "dist",
     "build",
     "archive",
