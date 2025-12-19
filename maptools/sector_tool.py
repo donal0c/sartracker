@@ -317,15 +317,25 @@ class SearchSectorTool(BaseDrawingTool):
         area_sqkm = area_sqm / 1000000
 
         # Create feature
-        feature = QgsFeature()
+        feature = QgsFeature(layer.fields())
         feature.setGeometry(geometry)
-        feature.setAttributes([
-            self.radius,
-            self.start_angle,
-            self.end_angle,
-            arc_length,
-            area_sqkm
-        ])
+
+        # IMPORTANT: Set attributes by field name (not positional list).
+        # Persistent (GeoPackage/OGR) layers may include provider-managed fields
+        # (e.g. fid) that vary by QGIS version/platform, and positional
+        # setAttributes() will fail with "wrong field count".
+        attr_map = {
+            "radius_m": self.radius,
+            "start_angle": self.start_angle,
+            "end_angle": self.end_angle,
+            "arc_length": arc_length,
+            "area_sqkm": area_sqkm,
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
 
         # Add feature
         provider.addFeatures([feature])

@@ -139,6 +139,17 @@ class SETTINGS_KEYS:
     # (e.g., SARTRACKER_ENABLE_TRACCAR_HTTP=1)
 
     # ========================================================================
+    # DEBUG / LOGGING CONFIGURATION
+    # ========================================================================
+    DEBUG_LOGGING_ENABLED = "SARTracker/Debug/logging_enabled"
+
+    # Defaults
+    DEBUG_LOGGING_ENABLED_DEFAULT = False
+
+    # Note: Debug logging can also be enabled via environment variable:
+    # SARTRACKER_DEBUG=1
+
+    # ========================================================================
     # VALIDATION RULES
     # ========================================================================
 
@@ -382,3 +393,17 @@ class ConfigStore:
             SETTINGS_KEYS.PROVIDER_AUTO_CONNECT_DEFAULT,
             bool
         )
+
+    @staticmethod
+    def get_debug_logging_enabled() -> bool:
+        """Get debug logging enabled setting."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.DEBUG_LOGGING_ENABLED,
+            SETTINGS_KEYS.DEBUG_LOGGING_ENABLED_DEFAULT,
+            bool
+        )
+
+    @staticmethod
+    def set_debug_logging_enabled(enabled: bool):
+        """Set debug logging enabled setting."""
+        ConfigStore.set(SETTINGS_KEYS.DEBUG_LOGGING_ENABLED, enabled)

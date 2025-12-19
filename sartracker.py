@@ -948,6 +948,18 @@ class sartracker:
 
     def initGui(self):
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
+        # Configure logging early - routes Python logging to QGIS Log Messages panel
+        try:
+            from utils.logging_config import configure_logging, get_logger
+            configure_logging()
+            self._logger = get_logger("sartracker")
+            self._logger.info("initGui() starting... (v0.3.1)")
+            self._logger.debug("Plugin dir: %s", self.plugin_dir)
+        except Exception as e:
+            # Fallback to print if logging setup fails
+            print(f"[SARTRACKER] Logging setup failed: {e}")
+            self._logger = None
+
         print("[SARTRACKER] initGui() starting... (v0.3.1-debug)")
         print(f"[SARTRACKER] Plugin dir: {self.plugin_dir}")
 

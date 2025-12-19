@@ -1255,7 +1255,16 @@ class TrackingLayerManager(BaseLayerManager):
                 continue
             new_feature = QgsFeature(export_layer.fields())
             new_feature.setGeometry(feature.geometry())
-            new_feature.setAttributes([feature.attribute(i) for i in range(len(layer.fields()))])
+            # IMPORTANT: Copy attributes by field name (not positional list).
+            # Source layers may have provider-managed fields (e.g. fid) that
+            # don't exist in the memory export layer, causing field count mismatch.
+            source_fields = layer.fields()
+            dest_fields = export_layer.fields()
+            for i in range(source_fields.count()):
+                field_name = source_fields.at(i).name()
+                dest_idx = dest_fields.indexFromName(field_name)
+                if dest_idx != -1:
+                    new_feature.setAttribute(dest_idx, feature.attribute(i))
             if not export_layer.dataProvider().addFeature(new_feature):
                 raise RuntimeError(f"Failed to copy feature {feature.id()} for export")
 

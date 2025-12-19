@@ -17,7 +17,7 @@ import os
 
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QPushButton, QTextEdit, QApplication, QFormLayout
+    QPushButton, QTextEdit, QApplication, QFormLayout, QCheckBox
 )
 
 from ..utils import capabilities
@@ -69,6 +69,10 @@ class DiagnosticsPanel(BaseDialog):
         # Configuration Section
         config_group = self._create_configuration_section()
         layout.addWidget(config_group)
+
+        # Debug Logging Section
+        debug_group = self._create_debug_section()
+        layout.addWidget(debug_group)
 
         # Full Details (collapsible text area)
         details_label = QLabel("<b>Full Details (for bug reports):</b>")
@@ -600,6 +604,65 @@ class DiagnosticsPanel(BaseDialog):
 
         group.setLayout(form)
         return group
+
+    def _create_debug_section(self):
+        """Create debug logging configuration section."""
+        group = QGroupBox("Debug Logging")
+        layout = QVBoxLayout()
+
+        # Current state
+        debug_enabled = False
+        env_override = False
+        try:
+            from ..config.keys import ConfigStore
+            from ..utils.logging_config import DEBUG_ENV_VAR, _is_debug_enabled
+            debug_enabled = _is_debug_enabled()
+            env_val = os.environ.get(DEBUG_ENV_VAR, "").lower()
+            env_override = env_val in ("1", "true", "yes", "on")
+        except Exception:
+            pass
+
+        # Info label
+        info_label = QLabel(
+            "Debug logging outputs detailed trace information to the QGIS Log Messages panel "
+            "(View > Panels > Log Messages) under the 'SAR Tracker' category."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        # Checkbox to toggle
+        self.debug_checkbox = QCheckBox("Enable debug logging")
+        self.debug_checkbox.setChecked(debug_enabled)
+        self.debug_checkbox.stateChanged.connect(self._on_debug_toggle)
+
+        if env_override:
+            self.debug_checkbox.setEnabled(False)
+            self.debug_checkbox.setToolTip(
+                f"Debug logging is enabled via environment variable ({DEBUG_ENV_VAR}=1). "
+                "Unset the variable to control via settings."
+            )
+            env_note = QLabel(f"<i>Enabled via {DEBUG_ENV_VAR} environment variable</i>")
+            layout.addWidget(env_note)
+        else:
+            self.debug_checkbox.setToolTip(
+                "When enabled, detailed debug messages appear in QGIS Log Messages panel. "
+                "Changes take effect immediately."
+            )
+
+        layout.addWidget(self.debug_checkbox)
+
+        group.setLayout(layout)
+        return group
+
+    def _on_debug_toggle(self, state):
+        """Handle debug logging toggle."""
+        try:
+            from ..utils.logging_config import set_debug_enabled
+            from ..utils.qt_compat import Checked
+            enabled = (state == Checked)
+            set_debug_enabled(enabled)
+        except Exception as e:
+            print(f"[DIAGNOSTICS] Error toggling debug logging: {e}")
 
     def _get_plugin_version(self):
         """
