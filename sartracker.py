@@ -5094,6 +5094,24 @@ class sartracker:
 
     # ============================================================================
 
+    def _get_available_provider_names(self) -> List[str]:
+        """
+        Get list of available provider display names.
+
+        Phase 0: Startup resilience - shows which providers are available
+        after graceful degradation (e.g., traccar_http may be missing if
+        SSL/requests failed to load).
+
+        Returns:
+            List of provider display names, or empty list if registry unavailable.
+        """
+        try:
+            if provider_registry:
+                return [p.display_name for p in provider_registry.list_providers()]
+        except Exception:
+            pass
+        return []
+
     def get_plugin_status(self, debug_hook=None) -> dict:
         """
         Get current plugin status for diagnostics.
@@ -5136,7 +5154,9 @@ class sartracker:
             'drawing_tools_available': False,
             'charset_guard': get_charset_guard_status(),
             # Vendor diagnostics
-            'vendor': dict(_vendor_info) if _vendor_info else {}
+            'vendor': dict(_vendor_info) if _vendor_info else {},
+            # Phase 0: Available providers for startup resilience diagnostics
+            'available_providers': self._get_available_provider_names(),
         }
 
         try:

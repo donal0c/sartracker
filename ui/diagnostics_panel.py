@@ -286,8 +286,59 @@ class DiagnosticsPanel(BaseDialog):
         guard_label.setStyleSheet(guard_style)
         form.addRow("<b>Charset Guard:</b>", guard_label)
 
+        # SSL/Network dependency state (Phase 0 - Startup resilience)
+        ssl_info = self._get_ssl_info()
+        ssl_label = QLabel(ssl_info['display'])
+        ssl_label.setStyleSheet(ssl_info['style'])
+        ssl_label.setToolTip(ssl_info.get('tooltip', ''))
+        form.addRow("<b>SSL/TLS:</b>", ssl_label)
+
+        # Available providers
+        providers_text = self._get_providers_info()
+        providers_label = QLabel(providers_text)
+        providers_label.setWordWrap(True)
+        form.addRow("<b>Data Providers:</b>", providers_label)
+
         group.setLayout(form)
         return group
+
+    def _get_ssl_info(self) -> dict:
+        """Get SSL/TLS dependency information."""
+        try:
+            import ssl
+            openssl_version = ssl.OPENSSL_VERSION
+            return {
+                'display': f"✅ {openssl_version}",
+                'style': "color: green;",
+                'tooltip': f"OpenSSL available for HTTPS connections"
+            }
+        except Exception as e:
+            return {
+                'display': f"❌ SSL unavailable: {e}",
+                'style': "color: red;",
+                'tooltip': "HTTPS connections will fail"
+            }
+
+    def _get_providers_info(self) -> str:
+        """Get available data providers from registry."""
+        try:
+            from qgis.utils import plugins
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+                    providers = status.get('available_providers', [])
+                    if providers:
+                        return f"✅ {', '.join(providers)}"
+                    return "⚠️ No providers available"
+            # Fallback: try direct registry access
+            from ..providers.registry import registry
+            providers = [p.display_name for p in registry.list_providers()]
+            if providers:
+                return f"✅ {', '.join(providers)}"
+            return "⚠️ No providers registered"
+        except Exception as e:
+            return f"❓ Unable to detect ({e})"
 
     def _create_compatibility_section(self):
         """Create compatibility paths section."""
@@ -660,6 +711,13 @@ class DiagnosticsPanel(BaseDialog):
         else:
             guard_line = "  Charset Guard:     Not invoked"
         lines.append(guard_line)
+
+        # SSL/TLS info (Phase 0 - Startup resilience)
+        ssl_info = self._get_ssl_info()
+        lines.append(f"  SSL/TLS:           {ssl_info['display']}")
+
+        # Available providers
+        lines.append(f"  Data Providers:    {self._get_providers_info()}")
         lines.append("")
 
         # Compatibility
