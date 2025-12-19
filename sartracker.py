@@ -2973,7 +2973,10 @@ class sartracker:
                 self.sar_panel.set_loading_state(True)
 
             # Create provider-specific background task
-            task = self.provider.create_refresh_task("Refreshing tracking data")
+            # Pass mission start time so breadcrumbs are filtered from mission start
+            # (instead of arbitrary last 3 hours)
+            since_iso = self._get_mission_start_iso()
+            task = self.provider.create_refresh_task("Refreshing tracking data", since_iso=since_iso)
 
             # Start task with managed lifecycle (Issue #6 fix)
             # TaskManager handles:
@@ -3508,7 +3511,9 @@ class sartracker:
                 return
 
             # Create provider-specific background task for initial data load
-            data_task = self.provider.create_refresh_task("Loading tracking data")
+            # Pass mission start time so breadcrumbs are filtered from mission start
+            since_iso = self._get_mission_start_iso()
+            data_task = self.provider.create_refresh_task("Loading tracking data", since_iso=since_iso)
 
             # Start data load task with managed lifecycle
             task_id = self.task_manager.start_task(
@@ -5146,6 +5151,31 @@ class sartracker:
         except Exception:
             pass
         return []
+
+    def _get_mission_start_iso(self) -> Optional[str]:
+        """
+        Get mission start time as ISO8601 string for breadcrumb filtering.
+
+        Returns the mission start time if a mission is active, or None if no
+        mission is running (in which case provider will use default time window).
+
+        Phase 1: SAR-an8 - Default breadcrumbs to mission start time.
+
+        Returns:
+            ISO8601 timestamp string or None if no active mission.
+        """
+        if not self.mission_controller:
+            return None
+
+        try:
+            status = self.mission_controller.status_snapshot()
+            # Only return start time if mission is active (not IDLE)
+            if status.get('state') in ('active', 'paused'):
+                return status.get('started_at')
+        except Exception:
+            pass
+
+        return None
 
     def get_plugin_status(self, debug_hook=None) -> dict:
         """

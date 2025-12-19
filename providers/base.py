@@ -305,7 +305,8 @@ class Provider(ABC):
         pass
 
     @abstractmethod
-    def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
+    def create_refresh_task(self, description: str,
+                            since_iso: Optional[str] = None) -> 'ProviderRefreshTask':
         """
         Create provider-specific refresh task for background data fetching.
 
@@ -323,6 +324,10 @@ class Provider(ABC):
         Args:
             description: Human-readable task description for QGIS task manager
                         display (e.g., "Fetching device positions")
+            since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
+                       If provided (e.g., mission start time), breadcrumbs will
+                       be fetched from this time. Providers may ignore if not
+                       applicable (e.g., CSV provider loads all data).
 
         Returns:
             ProviderRefreshTask subclass instance (inherits QgsTask)

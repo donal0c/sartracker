@@ -677,13 +677,25 @@ class TrackingLayerManager(BaseLayerManager):
         except Exception:
             return
 
-        # Get unique device IDs
+        # Get unique device IDs and build device_id -> name mapping
+        # FR-5: Use device names in renderer legend labels
         try:
-            field_idx = layer.fields().indexFromName("device_id")
-            if field_idx == -1:
+            device_id_idx = layer.fields().indexFromName("device_id")
+            name_idx = layer.fields().indexFromName("name")
+            if device_id_idx == -1:
                 return
-            device_ids_raw = layer.uniqueValues(field_idx)
+            device_ids_raw = layer.uniqueValues(device_id_idx)
             device_ids = sorted({str(value) for value in device_ids_raw if value is not None and str(value) != ""})
+
+            # Build device_id -> name mapping from layer features
+            device_names = {}
+            if name_idx != -1:
+                for feature in layer.getFeatures():
+                    did = feature.attribute(device_id_idx)
+                    dname = feature.attribute(name_idx)
+                    if did is not None and str(did) not in device_names:
+                        # Use name if available, otherwise device_id as fallback
+                        device_names[str(did)] = str(dname) if dname else str(did)
         except Exception as exc:
             # CRITICAL FIX (BUG-024): Log renderer setup failures instead of silent return
             logger.warning("Failed to get device IDs for styling: %s", exc)
@@ -717,7 +729,9 @@ class TrackingLayerManager(BaseLayerManager):
                     'outline_color': 'black',
                     'outline_width': '0.5'
                 })
-                category = QgsRendererCategory(device_id, symbol, str(device_id))
+                # FR-5: Use device name as legend label (fallback to device_id)
+                label = device_names.get(device_id, device_id)
+                category = QgsRendererCategory(device_id, symbol, label)
                 current_renderer.addCategory(category)
 
             layer.triggerRepaint()
@@ -748,7 +762,9 @@ class TrackingLayerManager(BaseLayerManager):
                     'outline_color': 'black',
                     'outline_width': '0.5'
                 })
-                category = QgsRendererCategory(device_id, symbol, str(device_id))
+                # FR-5: Use device name as legend label (fallback to device_id)
+                label = device_names.get(device_id, device_id)
+                category = QgsRendererCategory(device_id, symbol, label)
                 categories.append(category)
 
             renderer = QgsCategorizedSymbolRenderer('device_id', categories)
@@ -988,13 +1004,25 @@ class TrackingLayerManager(BaseLayerManager):
         if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
             return
 
-        # Get unique device IDs from data
+        # Get unique device IDs and build device_id -> name mapping
+        # FR-5: Use device names in renderer legend labels
         try:
-            field_idx = layer.fields().indexFromName("device_id")
-            if field_idx == -1:
+            device_id_idx = layer.fields().indexFromName("device_id")
+            name_idx = layer.fields().indexFromName("name")
+            if device_id_idx == -1:
                 return
-            device_ids_raw = layer.uniqueValues(field_idx)
+            device_ids_raw = layer.uniqueValues(device_id_idx)
             device_ids = sorted({str(value) for value in device_ids_raw if value is not None and str(value) != ""})
+
+            # Build device_id -> name mapping from layer features
+            device_names = {}
+            if name_idx != -1:
+                for feature in layer.getFeatures():
+                    did = feature.attribute(device_id_idx)
+                    dname = feature.attribute(name_idx)
+                    if did is not None and str(did) not in device_names:
+                        # Use name if available, otherwise device_id as fallback
+                        device_names[str(did)] = str(dname) if dname else str(did)
         except Exception as exc:
             # CRITICAL FIX (BUG-024): Log breadcrumb styling failures
             logger.warning("Failed to get device IDs for breadcrumb styling: %s", exc)
@@ -1029,7 +1057,9 @@ class TrackingLayerManager(BaseLayerManager):
                     'joinstyle': 'round',
                     'capstyle': 'round'
                 })
-                category = QgsRendererCategory(device_id, symbol, str(device_id))
+                # FR-5: Use device name as legend label (fallback to device_id)
+                label = device_names.get(device_id, device_id)
+                category = QgsRendererCategory(device_id, symbol, label)
                 current_renderer.addCategory(category)
             
             # Force refresh of the legend/canvas
@@ -1055,7 +1085,9 @@ class TrackingLayerManager(BaseLayerManager):
                     'joinstyle': 'round',
                     'capstyle': 'round'
                 })
-                category = QgsRendererCategory(device_id, symbol, str(device_id))
+                # FR-5: Use device name as legend label (fallback to device_id)
+                label = device_names.get(device_id, device_id)
+                category = QgsRendererCategory(device_id, symbol, label)
                 categories.append(category)
 
             renderer = QgsCategorizedSymbolRenderer('device_id', categories)

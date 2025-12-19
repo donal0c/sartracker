@@ -243,6 +243,27 @@ Status badges directly beneath the controls show Auto Refresh / Auto Save state 
 3. Set interval (default: 5 minutes)
 4. Project saves automatically
 
+### 8. Tracking Data Refresh Behavior
+
+Understanding how tracking data refreshes helps operators know what to expect:
+
+**When a mission is active:**
+- **Breadcrumbs** are filtered from **mission start time** - you see all tracks since you started the mission
+- **Current Positions** always shows the latest position for each device
+
+**When no mission is active:**
+- **Breadcrumbs** default to the **last 3 hours** of data (Traccar provider)
+- This prevents overwhelming the map with historical data
+
+**Data behavior by layer:**
+
+| Layer | Refresh Behavior |
+|-------|------------------|
+| **Current Positions** | Replaced completely on each refresh (shows latest position per device) |
+| **Breadcrumbs** | Cumulative during mission; filtered from mission start or last 3 hours |
+
+**CSV Provider Note:** CSV files always load all data regardless of mission state (time filtering only applies to Traccar HTTP provider).
+
 ---
 
 ## 📂 Understanding the Layers

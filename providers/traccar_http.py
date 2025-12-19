@@ -1444,12 +1444,16 @@ class TraccarHttpProvider(Provider):
         """
         return dict(self._last_connection_status)
 
-    def create_refresh_task(self, description: str) -> 'ProviderRefreshTask':
+    def create_refresh_task(self, description: str,
+                            since_iso: Optional[str] = None) -> 'ProviderRefreshTask':
         """
         Create Traccar-specific refresh task for background data fetching.
 
         Args:
             description: Human-readable task description for QGIS task manager
+            since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
+                       If provided (e.g., mission start time), breadcrumbs will
+                       be fetched from this time instead of the default 3 hours.
 
         Returns:
             TraccarRefreshTask instance (inherits from ProviderRefreshTask)
@@ -1457,7 +1461,7 @@ class TraccarHttpProvider(Provider):
         Qt5/Qt6 Compatible: Returns QgsTask subclass.
         """
         from .tasks import TraccarRefreshTask
-        return TraccarRefreshTask(self, description)
+        return TraccarRefreshTask(self, description, since_iso=since_iso)
 
 
 # ============================================================================

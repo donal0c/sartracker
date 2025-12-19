@@ -554,15 +554,20 @@ class TraccarRefreshTask(ProviderRefreshTask):
     Qt5/Qt6 Compatible: Uses QgsTask API.
     """
 
-    def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data"):
+    def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data",
+                 since_iso: Optional[str] = None):
         """
         Initialize Traccar refresh task.
 
         Args:
             provider: TraccarHttpProvider instance (thread-safe)
             description: Task description for progress display
+            since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
+                       If provided (e.g., mission start time), breadcrumbs will
+                       be fetched from this time instead of the default 3 hours.
         """
         super().__init__(provider, description)
+        self.since_iso = since_iso
 
     def run(self) -> bool:
         """
@@ -677,6 +682,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
             try:
                 breadcrumbs = self.provider.get_breadcrumbs(
+                    since_iso=self.since_iso,
                     session=session,
                     cancel_check=self.isCanceled,
                     progress_callback=_breadcrumb_progress

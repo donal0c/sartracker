@@ -1522,11 +1522,13 @@ class SARPanel(QDockWidget):
                     continue
 
                 device_id = device.get('device_id') or device.get('id') or 'Unknown'
+                # FR-5: Show device name with device_id fallback
+                device_name = device.get('name') or device_id
                 status = device.get('status', 'unknown')
                 last_update = device.get('last_update', 'Never')
-                
-                # Format display text
-                text = f"{device_id}"
+
+                # Format display text - show name prominently
+                text = f"{device_name}"
                 if status == 'online':
                     text = f"🟢 {text}"
                 elif status == 'offline':
