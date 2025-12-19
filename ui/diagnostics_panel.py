@@ -25,6 +25,7 @@ from ..utils.qt_compat import dialog_exec, TextSelectableByMouse
 from ..utils.dialog_utils import BaseDialog
 from ..utils.dependency_guard import get_charset_guard_status
 from ..utils.secure_store import SecureStore
+from ..utils.install_doctor import run_diagnostics, format_report_text
 
 
 class DiagnosticsPanel(BaseDialog):
@@ -157,11 +158,10 @@ class DiagnosticsPanel(BaseDialog):
         backend_label.setStyleSheet(backend_style)
         form.addRow("<b>Credential Storage:</b>", backend_label)
 
-        # Vendor Bundle Status + Install Doctor (uses plugin status if available)
+        # Vendor Bundle Status (uses plugin status if available)
         vendor_text = "❓ Unknown"
         vendor_style = "color: gray;"
         cert_text = None
-        doctor_text = None
         try:
             from qgis.utils import plugins
             status = {}
@@ -179,23 +179,18 @@ class DiagnosticsPanel(BaseDialog):
             if error_msg:
                 vendor_text = f"❌ Vendor error: {error_msg}"
                 vendor_style = "color: red;"
-                doctor_text = vendor_text
             elif missing:
                 vendor_text = f"❌ Missing vendor assets ({len(missing)})"
                 vendor_style = "color: red;"
-                doctor_text = "\n".join(missing)
             elif using_vendor:
                 vendor_text = f"✅ Active (Bundled)"
                 vendor_style = "color: green;"
-                doctor_text = "All vendor assets present"
             elif requests_path:
                 vendor_text = f"ℹ️ System ({requests_path})"
                 vendor_style = "color: black;"
-                doctor_text = "Using system requests"
             else:
                 vendor_text = "❓ Unknown"
                 vendor_style = "color: gray;"
-                doctor_text = "Unable to detect"
 
             if cert_path:
                 cert_text = cert_path
@@ -218,30 +213,14 @@ class DiagnosticsPanel(BaseDialog):
                 if common == vendor_dir:
                     vendor_text = "✅ Active (Bundled)"
                     vendor_style = "color: green;"
-                    doctor_text = "Vendor detected via import path"
                 else:
                     vendor_text = f"ℹ️ System ({requests.__file__})"
                     vendor_style = "color: black;"
-                    doctor_text = "System requests detected via import path"
                     cert_text = getattr(requests, "__file__", None)
-
-                # Install doctor: detect common GitHub ZIP install mistake.
-                try:
-                    folder_name = os.path.basename(plugin_dir)
-                    if folder_name and folder_name != "sartracker":
-                        folder_msg = (
-                            f"⚠️ Plugin folder is '{folder_name}' (expected 'sartracker'). "
-                            "If installed from a GitHub source ZIP, rename the extracted folder to "
-                            "'sartracker' (or install from a SAR Tracker release ZIP)."
-                        )
-                        doctor_text = f"{folder_msg}\n{doctor_text}" if doctor_text else folder_msg
-                except Exception:
-                    pass
 
         except Exception:
             vendor_text = "❓ Unknown"
             vendor_style = "color: gray;"
-            doctor_text = "Vendor detection failed"
 
         try:
             vendor_label = QLabel(vendor_text)
@@ -253,13 +232,42 @@ class DiagnosticsPanel(BaseDialog):
                 cert_label.setWordWrap(True)
                 cert_label.setTextInteractionFlags(TextSelectableByMouse)
                 form.addRow("<b>Cert Store:</b>", cert_label)
-            if doctor_text:
-                doctor_label = QLabel(doctor_text)
-                doctor_label.setWordWrap(True)
-                doctor_label.setTextInteractionFlags(TextSelectableByMouse)
-                form.addRow("<b>Install Doctor:</b>", doctor_label)
         except Exception:
             pass
+
+        # Install Doctor - comprehensive installation health checks
+        try:
+            doctor_report = run_diagnostics()
+            if doctor_report.is_healthy:
+                doctor_text = "✅ All checks passed"
+                doctor_style = "color: green;"
+            elif doctor_report.has_errors:
+                doctor_text = f"❌ {len([i for i in doctor_report.issues if i.severity == 'error'])} error(s) found"
+                doctor_style = "color: red;"
+            elif doctor_report.has_warnings:
+                doctor_text = f"⚠️ {len([i for i in doctor_report.issues if i.severity == 'warning'])} warning(s)"
+                doctor_style = "color: orange;"
+            else:
+                doctor_text = "ℹ️ Info available"
+                doctor_style = "color: gray;"
+
+            doctor_label = QLabel(doctor_text)
+            doctor_label.setStyleSheet(doctor_style)
+            doctor_label.setToolTip("Click 'Show Details' below for full report")
+            form.addRow("<b>Install Doctor:</b>", doctor_label)
+
+            # Show detailed issues if any problems found
+            if not doctor_report.is_healthy:
+                details_text = format_report_text(doctor_report)
+                details_label = QLabel(details_text)
+                details_label.setWordWrap(True)
+                details_label.setTextInteractionFlags(TextSelectableByMouse)
+                details_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+                form.addRow("", details_label)
+        except Exception as e:
+            doctor_label = QLabel(f"❓ Check failed: {e}")
+            doctor_label.setStyleSheet("color: gray;")
+            form.addRow("<b>Install Doctor:</b>", doctor_label)
 
         # Charset Guard Status (moved from Plugin section)
         guard_status = get_charset_guard_status()
