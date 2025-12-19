@@ -77,7 +77,7 @@ class ProviderRefreshTask(QgsTask):
         """
         if self.isCanceled():
             if context and not self._cancellation_cleanup_done:
-                print(f"[TASK] Cancellation detected at: {context}")
+                logger.debug("Cancellation detected at: %s", context)
             return True
         return False
 
@@ -500,7 +500,7 @@ class BreadcrumbProcessingTask(QgsTask):
             try:
                 return bool(self.cancel_check())
             except Exception as cancel_err:
-                print(f"[BREADCRUMB_TASK] Warning: cancel_check raised error: {cancel_err}")
+                logger.warning("Breadcrumb task cancel_check raised error: %s", cancel_err)
         return False
 
     @classmethod
@@ -618,7 +618,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 if fallback_features is None and getattr(self.provider, 'enable_last_good_cache', False):
                     fallback_features = self.provider._load_last_good_cache()
                 if fallback_features:
-                    print(f"[TRACCAR_TASK] Using cached devices due to {e.__class__.__name__}: {e}")
+                    logger.info("Using cached devices due to %s: %s", e.__class__.__name__, e)
                     devices = _devices_from_features(fallback_features)
                 else:
                     self.error_message = f"Failed to fetch devices: {str(e)}"
@@ -644,7 +644,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 if fallback_features is None and getattr(self.provider, 'enable_last_good_cache', False):
                     fallback_features = self.provider._load_last_good_cache()
                 if fallback_features:
-                    print(f"[TRACCAR_TASK] Using cached positions due to {e.__class__.__name__}: {e}")
+                    logger.info("Using cached positions due to %s: %s", e.__class__.__name__, e)
                     current = fallback_features
                 else:
                     self.error_message = f"Failed to fetch current positions: {str(e)}"
@@ -653,7 +653,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 self.error_message = f"Failed to fetch current positions: {str(e)}"
                 return False
             except Exception as e:
-                print(f"[TRACCAR_TASK] Error fetching current positions: {e}")
+                logger.error("Error fetching current positions: %s", e)
                 self.error_message = f"Failed to fetch current positions: {str(e)}"
                 return False
 
@@ -682,16 +682,16 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     progress_callback=_breadcrumb_progress
                 )
             except (ProviderNetworkError, ProviderDataError) as e:
-                print(f"[TRACCAR_TASK] {e.__class__.__name__} fetching breadcrumbs: {e}")
+                logger.info("%s fetching breadcrumbs: %s", e.__class__.__name__, e)
                 breadcrumbs = self.provider._load_last_good_breadcrumbs() if getattr(self.provider, 'enable_last_good_cache', False) else []
                 if breadcrumbs:
-                    print(f"[TRACCAR_TASK] Using cached breadcrumbs ({len(breadcrumbs)} points)")
+                    logger.info("Using cached breadcrumbs (%d points)", len(breadcrumbs))
                 _breadcrumb_progress(1.0)
             except ProviderAuthError as e:
                 self.error_message = f"Failed to fetch breadcrumbs: {str(e)}"
                 return False
             except Exception as e:
-                print(f"[TRACCAR_TASK] Error fetching breadcrumbs: {e}")
+                logger.error("Error fetching breadcrumbs: %s", e)
                 breadcrumbs = []
                 _breadcrumb_progress(1.0)
             else:
@@ -736,13 +736,13 @@ class TraccarRefreshTask(ProviderRefreshTask):
             # BUG-050 FIX: Validate results before storing
             # Ensure all lists are actual lists to prevent downstream errors
             if not isinstance(current, list):
-                print(f"[TRACCAR_TASK] BUG-050: Invalid current type {type(current).__name__}, using empty list")
+                logger.warning("BUG-050: Invalid current type %s, using empty list", type(current).__name__)
                 current = []
             if not isinstance(breadcrumbs, list):
-                print(f"[TRACCAR_TASK] BUG-050: Invalid breadcrumbs type {type(breadcrumbs).__name__}, using empty list")
+                logger.warning("BUG-050: Invalid breadcrumbs type %s, using empty list", type(breadcrumbs).__name__)
                 breadcrumbs = []
             if not isinstance(devices, list):
-                print(f"[TRACCAR_TASK] BUG-050: Invalid devices type {type(devices).__name__}, using empty list")
+                logger.warning("BUG-050: Invalid devices type %s, using empty list", type(devices).__name__)
                 devices = []
 
             # Store results for main thread retrieval
@@ -758,7 +758,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 if getattr(self.provider, 'enable_last_good_cache', False):
                     self.provider._save_last_good_cache(current, breadcrumbs)
             except Exception as cache_err:
-                print(f"[TRACCAR_TASK] Warning: Failed to persist last-good cache: {cache_err}")
+                logger.warning("Failed to persist last-good cache: %s", cache_err)
 
             # Update progress to 100%
             self.setProgress(100)
@@ -798,7 +798,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
             # This ensures sessions are ALWAYS closed and resources released.
             was_cancelled = self.isCanceled()
             if was_cancelled:
-                print("[TRACCAR_TASK] Task was cancelled - cleaning up resources")
+                logger.debug("Task was cancelled - cleaning up resources")
                 # Clear any partial results to prevent stale data usage
                 self.results = None
 

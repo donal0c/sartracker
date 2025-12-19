@@ -4352,6 +4352,9 @@ class sartracker:
         Args:
             feature_data: Dict with line info (name, distance_m, points, etc.)
         """
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         success(
             self.iface.messageBar(),
             "SAR Tracker",
@@ -4359,7 +4362,8 @@ class sartracker:
             duration=3
         )
         # Deactivate tool
-        self.tool_registry.deactivate_current()
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
 
     def _on_range_rings_complete(self, feature_data):
         """
@@ -4368,6 +4372,9 @@ class sartracker:
         Args:
             feature_data: Dict with ring info (count, mode, center, etc.)
         """
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         mode_str = "LPB-based" if feature_data['mode'] == 'lpb' else "Manual"
         success(
             self.iface.messageBar(),
@@ -4376,7 +4383,8 @@ class sartracker:
             duration=3
         )
         # Deactivate tool
-        self.tool_registry.deactivate_current()
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
 
     def _on_bearing_complete(self, feature_data):
         """
@@ -4385,6 +4393,9 @@ class sartracker:
         Args:
             feature_data: Dict with bearing line info (name, bearing, distance, etc.)
         """
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         bearing_type = feature_data['bearing_type']
         success(
             self.iface.messageBar(),
@@ -4393,7 +4404,8 @@ class sartracker:
             duration=3
         )
         # Deactivate tool
-        self.tool_registry.deactivate_current()
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
 
     def _on_polygon_complete(self, feature_data):
         """
@@ -4402,6 +4414,9 @@ class sartracker:
         Args:
             feature_data: Dict with search area info (name, team, status, priority, vertices, etc.)
         """
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         success(
             self.iface.messageBar(),
             "SAR Tracker",
@@ -4410,12 +4425,17 @@ class sartracker:
         )
 
         # Deactivate tool via registry (standard pattern, same as other tools)
-        self.tool_registry.deactivate_current()
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
 
     def _on_drawing_cancelled(self):
         """Handle drawing cancellation (ESC pressed or dialog cancelled)."""
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         # Deactivate the current drawing tool
-        self.tool_registry.deactivate_current()
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
         # Silent cancellation - no message needed
 
     def _on_tool_activated(self, tool_name):
@@ -4449,6 +4469,9 @@ class sartracker:
             point1: First point
             point2: Second point
         """
+        # Phase 0: Shutdown guard for drawing callbacks
+        if self._is_unloading or self._app_is_quitting:
+            return
         # Format distance nicely
         if distance_m < 1000:
             distance_str = f"{distance_m:.1f} meters"

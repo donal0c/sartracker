@@ -8,7 +8,10 @@ for SARPanel/LayersController to handle. This file is being aligned with
 the Phase 4 specification while preserving backward compatibility.
 """
 
+import logging
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 from qgis.PyQt.QtCore import QObject, QSettings, pyqtSignal, QTimer
 from qgis.PyQt.QtGui import QKeySequence
@@ -423,9 +426,7 @@ class LayerConsoleWidget(QWidget):
                             return True
                         except Exception as exc:
                             self.error_message = str(exc)
-                            print(f"[FetcherTask] Error: {exc}")
-                            import traceback
-                            traceback.print_exc()
+                            logger.error("FetcherTask error: %s", exc, exc_info=True)
                             return False
 
                 task = FetcherTask(self._catalog_fetcher)
