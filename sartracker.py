@@ -2308,19 +2308,8 @@ class sartracker:
                 finally:
                     self.layer_manager = None
             # ============================================================
-
-            # ============================================================
-            # PHASE 2.5: Clean up Drawing Manager (GPX watch must stop)
-            # ============================================================
-            if hasattr(self, 'drawing_manager') and self.drawing_manager:
-                try:
-                    # Stop GPX folder watching
-                    self.drawing_manager.cleanup()
-                    print("[SARTRACKER] Drawing manager cleaned up (GPX watching stopped)")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during drawing manager cleanup: {e}")
-                finally:
-                    self.drawing_manager = None
+            # Note: Drawing manager cleanup (including GPX watch) is handled
+            # by layers_controller.cleanup() -> drawings.cleanup()
             # ============================================================
 
             # ============================================================
@@ -4840,7 +4829,11 @@ class sartracker:
         Args:
             file_path: Absolute path to GPX file
         """
-        if not self.drawing_manager:
+        # Shutdown guard - prevent operations during plugin unload
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        if not self.layers_controller or not self.layers_controller.drawings:
             error(
                 self.iface.messageBar(),
                 "GPX Import Failed",
@@ -4850,7 +4843,7 @@ class sartracker:
             return
 
         try:
-            layer, error_msg = self.drawing_manager.import_gpx_file(file_path)
+            layer, error_msg = self.layers_controller.drawings.import_gpx_file(file_path)
 
             if layer:
                 success(
@@ -4885,7 +4878,11 @@ class sartracker:
         Args:
             folder_path: Absolute path to folder containing GPX files
         """
-        if not self.drawing_manager:
+        # Shutdown guard - prevent operations during plugin unload
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        if not self.layers_controller or not self.layers_controller.drawings:
             error(
                 self.iface.messageBar(),
                 "GPX Import Failed",
@@ -4895,7 +4892,7 @@ class sartracker:
             return
 
         try:
-            layers, errors = self.drawing_manager.import_gpx_folder(folder_path)
+            layers, errors = self.layers_controller.drawings.import_gpx_folder(folder_path)
 
             if layers:
                 success(
@@ -4943,7 +4940,11 @@ class sartracker:
         Args:
             folder_path: Absolute path to folder to watch
         """
-        if not self.drawing_manager:
+        # Shutdown guard - prevent operations during plugin unload
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        if not self.layers_controller or not self.layers_controller.drawings:
             error(
                 self.iface.messageBar(),
                 "GPX Watch Failed",
@@ -4953,7 +4954,7 @@ class sartracker:
             return
 
         try:
-            success_flag, error_msg = self.drawing_manager.start_gpx_folder_watch(folder_path)
+            success_flag, error_msg = self.layers_controller.drawings.start_gpx_folder_watch(folder_path)
 
             if success_flag:
                 success(
