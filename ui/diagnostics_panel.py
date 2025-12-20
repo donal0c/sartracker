@@ -579,6 +579,26 @@ class DiagnosticsPanel(BaseDialog):
                         provider_details_lines.append(f"Status: {status_message}")
                     cache_stats = detail_status.get('provider_cache_stats') or {}
                     if cache_stats:
+                        # CSV provider cache stats (SAR-1wa)
+                        csv_entries = cache_stats.get('entries')
+                        csv_max = cache_stats.get('max_entries')
+                        if csv_entries is not None:
+                            provider_details_lines.append(f"File Cache: {csv_entries}/{csv_max} files")
+                        csv_positions = cache_stats.get('total_positions')
+                        if csv_positions is not None:
+                            provider_details_lines.append(f"Cached Positions: {csv_positions}")
+                        csv_memory = cache_stats.get('memory_kb')
+                        if csv_memory is not None:
+                            provider_details_lines.append(f"Est. Memory: {csv_memory} KB")
+                        hit_rate = cache_stats.get('hit_rate_percent')
+                        if hit_rate is not None:
+                            provider_details_lines.append(f"Cache Hit Rate: {hit_rate}%")
+                        evict_lru = cache_stats.get('evictions_lru', 0)
+                        evict_ttl = cache_stats.get('evictions_ttl', 0)
+                        if evict_lru or evict_ttl:
+                            provider_details_lines.append(f"Evictions: {evict_lru} LRU, {evict_ttl} TTL")
+
+                        # Traccar HTTP provider cache stats (existing)
                         ttl = cache_stats.get('cache_ttl_s')
                         if ttl is not None:
                             provider_details_lines.append(f"Device Cache TTL: {ttl}s")

@@ -152,6 +152,11 @@ class MissionDetailsWidget(QWidget):
         if info.get("breadcrumb_count"):
             stats_lines.append(f"Breadcrumb Points: {info['breadcrumb_count']}")
 
+        # SAR-31a: Show warning if data may be incomplete
+        if info.get("data_incomplete"):
+            stats_lines.append("")
+            stats_lines.append("⚠ Some statistics may be incomplete")
+
         self.stats_text.setPlainText("\n".join(stats_lines) if stats_lines else "No statistics available")
 
     def _on_refresh(self):

@@ -1665,7 +1665,12 @@ class sartracker:
             print(traceback.format_exc())
 
     def _get_mission_logs_info(self) -> dict:
-        """Get mission information for the Mission Logs window."""
+        """
+        Get mission information for the Mission Logs window.
+
+        SAR-31a: Improved exception handling with logging and diagnostic flag.
+        Returns 'data_incomplete' flag if any section failed to load.
+        """
         info = {
             "name": None,
             "status": "inactive",
@@ -1679,6 +1684,7 @@ class sartracker:
             "marker_count": 0,
             "tracking_devices": 0,
             "breadcrumb_count": 0,
+            "data_incomplete": False,  # SAR-31a: Flag for UI warning
         }
 
         try:
@@ -1708,16 +1714,20 @@ class sartracker:
                         info["layer_count"] = self.layers_controller.get_layer_count()
                     if hasattr(self.layers_controller, "get_feature_count"):
                         info["feature_count"] = self.layers_controller.get_feature_count()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # SAR-31a: Log instead of silent pass
+                    print(f"[SARTRACKER] Warning: Failed to get layer/feature counts: {exc}")
+                    info["data_incomplete"] = True
 
             # Marker count
             if self.layers_controller and hasattr(self.layers_controller, "list_markers"):
                 try:
                     markers = self.layers_controller.list_markers()
                     info["marker_count"] = len(markers) if markers else 0
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # SAR-31a: Log instead of silent pass
+                    print(f"[SARTRACKER] Warning: Failed to get marker count: {exc}")
+                    info["data_incomplete"] = True
 
             # Tracking stats
             if self.layer_manager:
@@ -1726,11 +1736,14 @@ class sartracker:
                         info["tracking_devices"] = self.layer_manager.get_device_count()
                     if hasattr(self.layer_manager, "get_breadcrumb_count"):
                         info["breadcrumb_count"] = self.layer_manager.get_breadcrumb_count()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # SAR-31a: Log instead of silent pass
+                    print(f"[SARTRACKER] Warning: Failed to get tracking stats: {exc}")
+                    info["data_incomplete"] = True
 
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Error getting mission logs info: {exc}")
+            info["data_incomplete"] = True
 
         return info
 
@@ -2600,6 +2613,10 @@ class sartracker:
 
     def _on_mission_state_changed(self, state, context):
         """Handle mission state transitions from MissionController."""
+        # Guard against signals firing during plugin unload
+        if self._is_unloading or self._app_is_quitting:
+            return
+
         mission_name = context.get('mission_name') or "Mission"
         prev_state = self._last_mission_state
         self._last_mission_state = state
@@ -2610,6 +2627,8 @@ class sartracker:
                 self._handle_mission_resume_storage(mission_name)
             else:
                 message = f"Mission '{mission_name}' started"
+                # MEMORY STABILITY: Clear stale caches before new mission
+                self._clear_provider_caches()
                 self._prepare_new_mission_storage(mission_name)
                 self._metadata_collected = False
                 has_coords = bool(self._mission_coordinators_cache or (self.layer_manager and self.layer_manager.get_mission_coordinators()))
@@ -2667,6 +2686,14 @@ class sartracker:
 
     def _handle_mission_finished_cleanup(self):
         """Clear temporary overlays and reset UI badges when mission completes."""
+        # MEMORY STABILITY: Clear provider caches on mission finish
+        # Called first and unconditionally - provider cache clear is independent
+        # of layers_controller state
+        self._clear_provider_caches()
+
+        # Update storage status unconditionally (must happen even if layers_controller is None)
+        self._update_mission_storage_status(active=False)
+
         if not self.layers_controller:
             return
 
@@ -2677,7 +2704,59 @@ class sartracker:
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to clear overlays after mission finish: {exc}")
 
-        self._update_mission_storage_status(active=False)
+    def _clear_provider_caches(self):
+        """
+        Clear provider caches and GPX import tracking for memory recovery.
+
+        Called during mission lifecycle transitions (start/finish) to ensure
+        fresh state and prevent unbounded memory growth across missions.
+
+        MEMORY STABILITY (SAR-ezy): Provider caches persist across mission
+        changes without explicit cleanup. This method clears:
+        - CSV provider file cache (LRUTTLCache)
+        - GPX imported files tracking set
+
+        Safe to call at any time - handles missing components gracefully.
+        """
+        cleared_items = []
+
+        # Clear CSV provider cache if available
+        try:
+            if self.provider and hasattr(self.provider, '_cache'):
+                cache = self.provider._cache
+                if hasattr(cache, 'clear'):
+                    # Get stats before clearing for logging
+                    stats = cache.get_stats() if hasattr(cache, 'get_stats') else {}
+                    cache_size = stats.get('size', len(cache) if hasattr(cache, '__len__') else 0)
+
+                    cache.clear()
+
+                    # Reset statistics for fresh mission
+                    if hasattr(cache, 'reset_stats'):
+                        cache.reset_stats()
+
+                    cleared_items.append(f"CSV cache ({cache_size} files)")
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to clear provider cache: {exc}")
+
+        # Clear GPX imported files set
+        try:
+            if (self.layers_controller and
+                    hasattr(self.layers_controller, 'drawings') and
+                    self.layers_controller.drawings):
+                drawings = self.layers_controller.drawings
+                if hasattr(drawings, '_imported_gpx_files'):
+                    gpx_count = len(drawings._imported_gpx_files)
+                    drawings._imported_gpx_files.clear()
+                    cleared_items.append(f"GPX imports ({gpx_count} files)")
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to clear GPX import set: {exc}")
+
+        # Log what was cleared for debugging
+        if cleared_items:
+            print(f"[SARTRACKER] Mission lifecycle: cleared {', '.join(cleared_items)}")
+        else:
+            print("[SARTRACKER] Mission lifecycle: no caches to clear")
 
     def _on_finalize_mission_requested(self):
         """Handle finalize mission request from SAR Panel."""
@@ -5908,7 +5987,7 @@ class sartracker:
                 status['last_refresh_duration_ms'] = self._last_refresh_duration_ms
 
                 # Provider-specific diagnostics
-                if self.provider_name == 'traccar_http' and hasattr(self.provider, 'get_cache_stats'):
+                if hasattr(self.provider, 'get_cache_stats'):
                     try:
                         status['provider_cache_stats'] = self.provider.get_cache_stats()
                     except Exception as cache_stats_err:
