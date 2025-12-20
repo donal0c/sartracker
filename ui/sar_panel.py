@@ -75,6 +75,9 @@ class SARPanel(QDockWidget):
     marker_zoom_requested = pyqtSignal(float, float)
     attachment_open_requested = pyqtSignal(str)
     unlock_mission_requested = pyqtSignal()
+    gpx_import_file_requested = pyqtSignal(str)  # file_path
+    gpx_import_folder_requested = pyqtSignal(str)  # folder_path
+    gpx_watch_folder_requested = pyqtSignal(str)  # folder_path
     finalize_mission_requested = pyqtSignal()  # Request to finalize and archive mission
 
     # Phase N1: Provider signals removed - configuration moved to Settings Panel
@@ -580,7 +583,7 @@ class SARPanel(QDockWidget):
 
         self.gpx_import_button = QPushButton("Import GPX")
         self.gpx_import_button.setToolTip("Import GPS tracks from GPX files")
-        self.gpx_import_button.setEnabled(False)  # Disabled until implemented
+        self.gpx_import_button.clicked.connect(self._on_gpx_import)
         drawing_grid.addWidget(self.gpx_import_button, 3, 0, 1, 2)  # Full width
 
         drawing_layout.addLayout(drawing_grid)
@@ -1202,6 +1205,61 @@ class SARPanel(QDockWidget):
     def _on_bearing_tool(self):
         """Handle Bearing Tool button click."""
         self.bearing_tool_requested.emit()
+
+    def _on_gpx_import(self):
+        """Handle GPX Import button click - show menu with import options."""
+        from qgis.PyQt.QtWidgets import QMenu
+        from qgis.PyQt.QtCore import QPoint
+
+        menu = QMenu(self)
+
+        # Import GPX File action
+        import_file_action = menu.addAction("Import GPX File...")
+        import_file_action.triggered.connect(self._on_gpx_import_file)
+
+        # Import GPX Folder action
+        import_folder_action = menu.addAction("Import GPX Folder...")
+        import_folder_action.triggered.connect(self._on_gpx_import_folder)
+
+        # Watch GPX Folder action
+        watch_folder_action = menu.addAction("Watch Folder for New GPX...")
+        watch_folder_action.triggered.connect(self._on_gpx_watch_folder)
+
+        # Show menu at button position
+        button_pos = self.gpx_import_button.mapToGlobal(QPoint(0, self.gpx_import_button.height()))
+        menu.exec_(button_pos)
+
+    def _on_gpx_import_file(self):
+        """Handle Import GPX File menu action."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select GPX File",
+            "",
+            "GPX Files (*.gpx);;All Files (*)"
+        )
+
+        if file_path:
+            self.gpx_import_file_requested.emit(file_path)
+
+    def _on_gpx_import_folder(self):
+        """Handle Import GPX Folder menu action."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder Containing GPX Files"
+        )
+
+        if folder_path:
+            self.gpx_import_folder_requested.emit(folder_path)
+
+    def _on_gpx_watch_folder(self):
+        """Handle Watch GPX Folder menu action."""
+        folder_path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Watch for New GPX Files"
+        )
+
+        if folder_path:
+            self.gpx_watch_folder_requested.emit(folder_path)
 
     def set_active_tool(self, tool_name):
         """

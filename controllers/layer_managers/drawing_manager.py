@@ -72,8 +72,13 @@ class DrawingLayerManager(BaseLayerManager):
     MAX_SYNC_FEATURES = 500  # Hint threshold for bulk operations
 
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
-        """Initialize drawing layer manager."""
+        """Initialize drawing layer manager with GPX support."""
         super().__init__(iface, shared_device_colors, layer_manager)
+
+        # Initialize GPX import support
+        self._gpx_watcher = None
+        self._watched_gpx_folder = None
+        self._imported_gpx_files = set()
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -3172,3 +3177,285 @@ class DrawingLayerManager(BaseLayerManager):
                     layer.rollBack()
                 except RuntimeError:
                     pass
+
+    # =========================================================================
+    # GPX IMPORT - File and Folder Import with Optional Folder Watching
+    # =========================================================================
+
+    # GPX layer group name
+    GPX_TRACKS_GROUP_NAME = "GPX Tracks"
+
+    # GPX import limits (defensive)
+    MAX_GPX_FILES_PER_IMPORT = 50
+
+    def _init_gpx_support(self):
+        """Initialize GPX import support. Called from __init__."""
+        # GPX folder watching state
+        self._gpx_watcher = None
+        self._watched_gpx_folder = None
+        self._imported_gpx_files = set()  # Track already-imported files
+
+    def import_gpx_file(self, gpx_path: str):
+        """
+        Import a single GPX file as a layer.
+
+        LIFE-SAFETY CRITICAL: Validates GPX file before import.
+
+        Strategy: One layer per GPX file (all tracks in file consolidated).
+
+        Args:
+            gpx_path: Absolute path to GPX file
+
+        Returns:
+            Tuple of (layer, error_message). Layer is None if import failed.
+
+        Qt5/Qt6 Compatible: Uses QGIS core APIs only.
+        """
+        from ...utils.gpx_utils import import_gpx_track
+
+        # Initialize GPX support if needed
+        if not hasattr(self, '_imported_gpx_files'):
+            self._init_gpx_support()
+
+        # Get or create GPX Tracks group
+        gpx_group = self._get_or_create_gpx_tracks_group()
+
+        # Import the GPX track
+        layer, error = import_gpx_track(gpx_path, parent_group=gpx_group)
+
+        if layer:
+            # Track this file as imported
+            self._imported_gpx_files.add(gpx_path)
+            logger.info(f"Imported GPX file: {gpx_path}")
+        else:
+            logger.warning(f"Failed to import GPX file {gpx_path}: {error}")
+
+        return layer, error
+
+    def import_gpx_folder(self, folder_path: str):
+        """
+        Import all GPX files in a folder.
+
+        LIFE-SAFETY CRITICAL: Limits number of files to prevent overload.
+
+        Args:
+            folder_path: Absolute path to folder containing GPX files
+
+        Returns:
+            Tuple of (imported_layers, error_messages)
+
+        Qt5/Qt6 Compatible: Uses standard library and QGIS core APIs.
+        """
+        import os
+
+        # Initialize GPX support if needed
+        if not hasattr(self, '_imported_gpx_files'):
+            self._init_gpx_support()
+
+        if not os.path.isdir(folder_path):
+            return [], [f"Not a valid directory: {folder_path}"]
+
+        # Find all GPX files
+        try:
+            all_files = os.listdir(folder_path)
+        except OSError as e:
+            return [], [f"Cannot read directory: {e}"]
+
+        gpx_files = [
+            os.path.join(folder_path, f)
+            for f in all_files
+            if f.lower().endswith('.gpx')
+        ]
+
+        # Apply limit (defensive)
+        if len(gpx_files) > self.MAX_GPX_FILES_PER_IMPORT:
+            logger.warning(
+                f"Folder contains {len(gpx_files)} GPX files, "
+                f"limiting to {self.MAX_GPX_FILES_PER_IMPORT}"
+            )
+            gpx_files = gpx_files[:self.MAX_GPX_FILES_PER_IMPORT]
+
+        # Import each file
+        imported_layers = []
+        errors = []
+
+        for gpx_path in gpx_files:
+            # Skip already-imported files
+            if gpx_path in self._imported_gpx_files:
+                logger.debug(f"Skipping already-imported GPX: {gpx_path}")
+                continue
+
+            layer, error = self.import_gpx_file(gpx_path)
+
+            if layer:
+                imported_layers.append(layer)
+            else:
+                errors.append(f"{os.path.basename(gpx_path)}: {error}")
+
+        logger.info(
+            f"Imported {len(imported_layers)} GPX files from folder: {folder_path}"
+        )
+
+        return imported_layers, errors
+
+    def start_gpx_folder_watch(self, folder_path: str):
+        """
+        Start watching a folder for new GPX files.
+
+        Uses Qt's QFileSystemWatcher for native event loop integration.
+        New GPX files will be automatically imported when detected.
+
+        LIFE-SAFETY CRITICAL: File watching is stopped cleanly on plugin unload.
+
+        Args:
+            folder_path: Absolute path to folder to watch
+
+        Returns:
+            Tuple of (success, error_message)
+
+        Qt5/Qt6 Compatible: Uses QFileSystemWatcher from qgis.PyQt.
+        """
+        import os
+        from qgis.PyQt.QtCore import QFileSystemWatcher
+
+        # Initialize GPX support if needed
+        if not hasattr(self, '_imported_gpx_files'):
+            self._init_gpx_support()
+
+        if not os.path.isdir(folder_path):
+            return False, f"Not a valid directory: {folder_path}"
+
+        # Stop any existing watch
+        self.stop_gpx_folder_watch()
+
+        # Create new watcher
+        self._gpx_watcher = QFileSystemWatcher(self)
+        self._watched_gpx_folder = folder_path
+
+        # Watch the directory (not individual files - more efficient)
+        if not self._gpx_watcher.addPath(folder_path):
+            error = f"Failed to watch folder: {folder_path}"
+            logger.error(error)
+            self._gpx_watcher = None
+            self._watched_gpx_folder = None
+            return False, error
+
+        # Connect signal
+        self._gpx_watcher.directoryChanged.connect(self._on_gpx_folder_changed)
+
+        logger.info(f"Started watching GPX folder: {folder_path}")
+        return True, ""
+
+    def stop_gpx_folder_watch(self):
+        """
+        Stop watching for new GPX files.
+
+        Safe to call even if not currently watching.
+
+        LIFE-SAFETY CRITICAL: Must be called during plugin unload.
+        """
+        if hasattr(self, '_gpx_watcher') and self._gpx_watcher:
+            try:
+                self._gpx_watcher.directoryChanged.disconnect(self._on_gpx_folder_changed)
+            except (RuntimeError, TypeError):
+                pass  # Already disconnected
+
+            self._gpx_watcher.deleteLater()
+            self._gpx_watcher = None
+            self._watched_gpx_folder = None
+
+            logger.info("Stopped GPX folder watching")
+
+    def is_watching_gpx_folder(self) -> bool:
+        """Check if currently watching a folder for GPX files."""
+        return (hasattr(self, '_gpx_watcher') and self._gpx_watcher is not None 
+                and hasattr(self, '_watched_gpx_folder') and self._watched_gpx_folder is not None)
+
+    def get_watched_gpx_folder(self):
+        """Get the currently watched folder path, or None if not watching."""
+        return getattr(self, '_watched_gpx_folder', None)
+
+    def _on_gpx_folder_changed(self, path: str):
+        """
+        Handle directory change events - detect and import new GPX files.
+
+        THREAD-SAFETY: This is called on the main thread by Qt's event loop.
+        Safe to call QGIS APIs directly.
+
+        LIFE-SAFETY CRITICAL: Errors are logged but do not crash the plugin.
+        """
+        import os
+
+        if not self._watched_gpx_folder:
+            return
+
+        try:
+            # Find all GPX files in folder
+            current_files = set()
+
+            try:
+                all_files = os.listdir(self._watched_gpx_folder)
+                current_files = set(
+                    os.path.join(self._watched_gpx_folder, f)
+                    for f in all_files
+                    if f.lower().endswith('.gpx')
+                )
+            except OSError as e:
+                logger.error(f"Error scanning watched folder: {e}")
+                return
+
+            # Find new files
+            new_files = current_files - self._imported_gpx_files
+
+            # Import new files
+            for gpx_path in sorted(new_files):  # Sort for predictable order
+                logger.info(f"New GPX file detected: {gpx_path}")
+
+                layer, error = self.import_gpx_file(gpx_path)
+
+                if layer:
+                    # Notify user of successful import
+                    from ...utils.notify import success
+                    success(f"Auto-imported GPX: {os.path.basename(gpx_path)}")
+                else:
+                    # Notify user of failure
+                    from ...utils.notify import warning
+                    warning(f"GPX import failed: {os.path.basename(gpx_path)}")
+
+        except Exception as e:
+            logger.error(f"Error in GPX folder watch handler: {e}", exc_info=True)
+
+    def _get_or_create_gpx_tracks_group(self):
+        """
+        Get or create "GPX Tracks" layer group.
+
+        Returns:
+            QgsLayerTreeGroup for GPX layers
+        """
+        from qgis.core import QgsLayerTreeGroup as TreeGroup
+
+        root = QgsProject.instance().layerTreeRoot()
+
+        # Look for existing group
+        for child in root.children():
+            if isinstance(child, TreeGroup) and child.name() == self.GPX_TRACKS_GROUP_NAME:
+                return child
+
+        # Create new group at top
+        gpx_group = root.insertGroup(0, self.GPX_TRACKS_GROUP_NAME)
+        logger.info(f"Created GPX Tracks layer group")
+
+        return gpx_group
+
+    def cleanup(self):
+        """
+        Clean up resources including GPX folder watching.
+
+        LIFE-SAFETY CRITICAL: Must be called during plugin unload.
+        """
+        # Stop GPX folder watching
+        self.stop_gpx_folder_watch()
+
+        # Clear imported files tracking
+        if hasattr(self, '_imported_gpx_files'):
+            self._imported_gpx_files.clear()

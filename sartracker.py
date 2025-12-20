@@ -1321,6 +1321,9 @@ class sartracker:
         self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
         self.sar_panel.clear_measurements_requested.connect(self._on_clear_measurements_requested)
+        self.sar_panel.gpx_import_file_requested.connect(self._on_gpx_import_file)
+        self.sar_panel.gpx_import_folder_requested.connect(self._on_gpx_import_folder)
+        self.sar_panel.gpx_watch_folder_requested.connect(self._on_gpx_watch_folder)
         self._update_measurement_overlay_indicator()
         self._load_existing_mission_storage_state()
 
@@ -2304,6 +2307,20 @@ class sartracker:
                     print(f"[SARTRACKER] Warning: Error during layer manager cleanup: {e}")
                 finally:
                     self.layer_manager = None
+            # ============================================================
+
+            # ============================================================
+            # PHASE 2.5: Clean up Drawing Manager (GPX watch must stop)
+            # ============================================================
+            if self.drawing_manager:
+                try:
+                    # Stop GPX folder watching
+                    self.drawing_manager.cleanup()
+                    print("[SARTRACKER] Drawing manager cleaned up (GPX watching stopped)")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during drawing manager cleanup: {e}")
+                finally:
+                    self.drawing_manager = None
             # ============================================================
 
             # ============================================================
@@ -4813,6 +4830,154 @@ class sartracker:
             "Bearing Line Tool: Click origin point to configure bearing and distance",
             duration=5
         )
+
+    def _on_gpx_import_file(self, file_path: str):
+        """
+        Handle GPX file import request.
+
+        LIFE-SAFETY CRITICAL: Validates file and provides clear error messages.
+
+        Args:
+            file_path: Absolute path to GPX file
+        """
+        if not self.drawing_manager:
+            error(
+                self.iface.messageBar(),
+                "GPX Import Failed",
+                "Drawing manager not initialized",
+                duration=0
+            )
+            return
+
+        try:
+            layer, error_msg = self.drawing_manager.import_gpx_file(file_path)
+
+            if layer:
+                success(
+                    self.iface.messageBar(),
+                    "GPX Imported",
+                    f"Imported: {layer.name()} ({layer.featureCount()} features)",
+                    duration=5
+                )
+            else:
+                error(
+                    self.iface.messageBar(),
+                    "GPX Import Failed",
+                    error_msg,
+                    duration=0
+                )
+
+        except Exception as e:
+            logger.error(f"GPX import error: {e}", exc_info=True)
+            error(
+                self.iface.messageBar(),
+                "GPX Import Error",
+                f"Unexpected error: {e}",
+                duration=0
+            )
+
+    def _on_gpx_import_folder(self, folder_path: str):
+        """
+        Handle GPX folder import request.
+
+        LIFE-SAFETY CRITICAL: Validates folder and provides summary of results.
+
+        Args:
+            folder_path: Absolute path to folder containing GPX files
+        """
+        if not self.drawing_manager:
+            error(
+                self.iface.messageBar(),
+                "GPX Import Failed",
+                "Drawing manager not initialized",
+                duration=0
+            )
+            return
+
+        try:
+            layers, errors = self.drawing_manager.import_gpx_folder(folder_path)
+
+            if layers:
+                success(
+                    self.iface.messageBar(),
+                    "GPX Folder Imported",
+                    f"Imported {len(layers)} GPX files",
+                    duration=5
+                )
+
+                # Show errors if any
+                if errors:
+                    from .utils.notify import warning
+                    warning(
+                        self.iface.messageBar(),
+                        "Some GPX Files Failed",
+                        f"{len(errors)} files could not be imported. Check QGIS Log Messages for details.",
+                        duration=10
+                    )
+                    for error_msg in errors:
+                        logger.warning(f"GPX import failed: {error_msg}")
+
+            else:
+                error(
+                    self.iface.messageBar(),
+                    "GPX Folder Import Failed",
+                    errors[0] if errors else "No GPX files found in folder",
+                    duration=0
+                )
+
+        except Exception as e:
+            logger.error(f"GPX folder import error: {e}", exc_info=True)
+            error(
+                self.iface.messageBar(),
+                "GPX Import Error",
+                f"Unexpected error: {e}",
+                duration=0
+            )
+
+    def _on_gpx_watch_folder(self, folder_path: str):
+        """
+        Handle GPX folder watch request.
+
+        LIFE-SAFETY CRITICAL: Starts folder watching for auto-import.
+
+        Args:
+            folder_path: Absolute path to folder to watch
+        """
+        if not self.drawing_manager:
+            error(
+                self.iface.messageBar(),
+                "GPX Watch Failed",
+                "Drawing manager not initialized",
+                duration=0
+            )
+            return
+
+        try:
+            success_flag, error_msg = self.drawing_manager.start_gpx_folder_watch(folder_path)
+
+            if success_flag:
+                success(
+                    self.iface.messageBar(),
+                    "Watching GPX Folder",
+                    f"New GPX files in {folder_path} will be imported automatically",
+                    duration=10
+                )
+            else:
+                error(
+                    self.iface.messageBar(),
+                    "GPX Watch Failed",
+                    error_msg,
+                    duration=0
+                )
+
+        except Exception as e:
+            logger.error(f"GPX watch error: {e}", exc_info=True)
+            error(
+                self.iface.messageBar(),
+                "GPX Watch Error",
+                f"Unexpected error: {e}",
+                duration=0
+            )
 
     def _on_line_complete(self, feature_data):
         """
