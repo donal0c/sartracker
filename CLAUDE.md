@@ -35,6 +35,26 @@ Before making **any** change:
 
 If you are unsure about implications of a change: **stop, narrow the scope, and request review.**
 
+8. **GIT COMMIT DISCIPLINE (CRITICAL)** – When committing changes:
+
+   * **ONLY commit files directly related to the current task**
+   * **NEVER use `git add -A` or `git commit -a`**
+   * **ALWAYS explicitly list files to commit**
+   * **ALWAYS ask the user before committing** if there's any uncertainty about what should be included
+   * Untracked files (docs/, FUTURE_WORK/, temp files) should NOT be committed unless explicitly requested
+   * Check `git status` before committing to verify only relevant files are staged
+
+   **Example - CORRECT:**
+   ```bash
+   git add sartracker.py controllers/drawing_manager.py
+   git commit -m "Fix: specific bug description"
+   ```
+
+   **Example - WRONG:**
+   ```bash
+   git add -A && git commit -m "Fix bug"  # ❌ Commits everything including unrelated files
+   ```
+
 ---
 
 ## PROJECT CONTEXT
