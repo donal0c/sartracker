@@ -1989,8 +1989,13 @@ class LayerManager(QObject):
             if current_parent == target_group:
                 return
             if current_parent:
+                # Clone the node before removing - removeChildNode deletes the C++ object
+                cloned_node = layer_node.clone()
                 current_parent.removeChildNode(layer_node)
-            target_group.insertChildNode(position, layer_node)
+                target_group.insertChildNode(position, cloned_node)
+            else:
+                # No parent, just insert
+                target_group.insertChildNode(position, layer_node)
         else:
             # Layer not in tree yet
             self.project.addMapLayer(layer, False)

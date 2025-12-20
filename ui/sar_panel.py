@@ -1227,7 +1227,9 @@ class SARPanel(QDockWidget):
 
         # Show menu at button position
         button_pos = self.gpx_import_button.mapToGlobal(QPoint(0, self.gpx_import_button.height()))
-        menu.exec_(button_pos)
+        exec_fn = getattr(menu, "exec", None) or getattr(menu, "exec_", None)
+        if exec_fn:
+            exec_fn(button_pos)
 
     def _on_gpx_import_file(self):
         """Handle Import GPX File menu action."""
