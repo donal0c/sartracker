@@ -544,9 +544,14 @@ if HAS_QGIS:
         # Older QGIS versions use integer levels directly
         USE_MESSAGE_LEVEL_ENUM = False
 
+    # Valid message levels
+    _VALID_LEVELS = {0, 1, 2, 3}
+
     def push_message(message_bar, title, message, level=0, duration=5):
         """
         Push a message to QGIS message bar in a version-compatible way.
+
+        LIFECYCLE SAFETY: Includes input validation to prevent crashes.
 
         Args:
             message_bar: QgsMessageBar instance (from iface.messageBar())
@@ -555,10 +560,31 @@ if HAS_QGIS:
             level: int - Message level (0=Info, 1=Warning, 2=Critical, 3=Success)
             duration: int - Duration in seconds (0 for indefinite)
 
+        Returns:
+            bool: True if message was pushed, False if suppressed due to invalid input
+
         Example:
             from utils.qt_compat import push_message
             push_message(self.iface.messageBar(), "Title", "Message", level=0)
         """
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        # Validate message_bar
+        if message_bar is None:
+            _logger.debug("[push_message] message_bar is None, suppressing: %s", title)
+            return False
+
+        # Validate message_bar has required method
+        if not hasattr(message_bar, 'pushMessage'):
+            _logger.debug("[push_message] Invalid message_bar type: %s", type(message_bar).__name__)
+            return False
+
+        # Validate and default level
+        if level not in _VALID_LEVELS:
+            _logger.debug("[push_message] Invalid level %s, defaulting to 0 (Info)", level)
+            level = 0
+
         # Map integer levels to Qgis.MessageLevel enum
         level_map = {
             0: Qgis.MessageLevel.Info if USE_MESSAGE_LEVEL_ENUM else Qgis.Info,
@@ -567,13 +593,24 @@ if HAS_QGIS:
             3: Qgis.MessageLevel.Success if USE_MESSAGE_LEVEL_ENUM else Qgis.Success,
         }
 
-        qgis_level = level_map.get(level, level_map[0])
-        message_bar.pushMessage(title, message, qgis_level, duration)
+        qgis_level = level_map[level]
+
+        try:
+            message_bar.pushMessage(title, message, qgis_level, duration)
+            return True
+        except RuntimeError as e:
+            # Common when message_bar is deleted during shutdown
+            _logger.debug("[push_message] RuntimeError: %s", e)
+            return False
+        except Exception as e:
+            _logger.warning("[push_message] Unexpected error: %s", e)
+            return False
 else:
     # Fallback if QGIS is not available (shouldn't happen in a QGIS plugin)
     def push_message(message_bar, title, message, level=0, duration=5):
         """Fallback push_message when QGIS is not available."""
         print(f"[{title}] {message}")
+        return True
 
 
 # =============================================================================

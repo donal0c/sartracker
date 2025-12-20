@@ -8,6 +8,8 @@ All exceptions are testable and can be used in headless environments.
 Qt5/Qt6 Compatible: No Qt dependencies in this module.
 """
 
+import math
+
 
 class SARTrackerError(Exception):
     """
@@ -192,17 +194,25 @@ def validate_latitude(lat):
     """
     Validate latitude value.
 
+    LIFE-SAFETY CRITICAL: Rejects NaN/Inf values that could cause
+    incorrect position calculations during rescue operations.
+
     Args:
         lat: Latitude value to validate
 
     Raises:
-        CoordinateError: If latitude is invalid
+        CoordinateError: If latitude is invalid, NaN, or Inf
 
     Returns:
         float: Validated latitude
     """
     if not isinstance(lat, (int, float)):
         raise CoordinateError('latitude', lat, '-90 to 90 degrees')
+    # CRITICAL: Check for NaN/Inf before range check (NaN comparisons always False)
+    if math.isnan(lat):
+        raise CoordinateError('latitude', 'NaN', 'a valid number (-90 to 90)')
+    if math.isinf(lat):
+        raise CoordinateError('latitude', 'Infinity', 'a valid number (-90 to 90)')
     if not -90 <= lat <= 90:
         raise CoordinateError('latitude', lat, '-90 to 90 degrees')
     return float(lat)
@@ -212,17 +222,25 @@ def validate_longitude(lon):
     """
     Validate longitude value.
 
+    LIFE-SAFETY CRITICAL: Rejects NaN/Inf values that could cause
+    incorrect position calculations during rescue operations.
+
     Args:
         lon: Longitude value to validate
 
     Raises:
-        CoordinateError: If longitude is invalid
+        CoordinateError: If longitude is invalid, NaN, or Inf
 
     Returns:
         float: Validated longitude
     """
     if not isinstance(lon, (int, float)):
         raise CoordinateError('longitude', lon, '-180 to 180 degrees')
+    # CRITICAL: Check for NaN/Inf before range check (NaN comparisons always False)
+    if math.isnan(lon):
+        raise CoordinateError('longitude', 'NaN', 'a valid number (-180 to 180)')
+    if math.isinf(lon):
+        raise CoordinateError('longitude', 'Infinity', 'a valid number (-180 to 180)')
     if not -180 <= lon <= 180:
         raise CoordinateError('longitude', lon, '-180 to 180 degrees')
     return float(lon)

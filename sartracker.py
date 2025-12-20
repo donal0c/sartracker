@@ -545,7 +545,8 @@ class sartracker:
         self._is_unloading = False
 
         # Create centralized error handler (Issue #3)
-        self.error_handler = ErrorHandler(self.iface.messageBar())
+        # LIFECYCLE SAFETY: Pass iface, not messageBar(), to resolve at use time
+        self.error_handler = ErrorHandler(self.iface)
 
         # initialize plugin directory
         self.plugin_dir = os.path.dirname(__file__)
@@ -642,7 +643,9 @@ class sartracker:
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        self.itm = QgsCoordinateReferenceSystem("EPSG:29903")  # Irish Grid
+        # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
+        # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
+        self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -654,8 +657,24 @@ class sartracker:
         return bool(self._skip_layer_ops or self._app_is_quitting or self._is_unloading)
 
     def _notify(self, level: str, title: str, message: str, duration: int = 3):
-        """Centralized notifier wrapper to simplify messaging and future redirection."""
-        bar = self.iface.messageBar() if self.iface else None
+        """
+        Centralized notifier wrapper to simplify messaging and future redirection.
+
+        LIFECYCLE SAFETY: Guards against notifications during plugin unload/shutdown.
+        """
+        # LIFECYCLE SAFETY: Suppress notifications during unload
+        if getattr(self, '_is_unloading', False) or getattr(self, '_app_is_quitting', False):
+            print(f"[SARTRACKER] Notification suppressed during unload ({level}): {title}")
+            return
+
+        # LIFECYCLE SAFETY: Guard messageBar() access - can raise RuntimeError
+        # if underlying C++ object is deleted during QGIS shutdown
+        try:
+            bar = self.iface.messageBar() if self.iface else None
+        except (RuntimeError, AttributeError):
+            print(f"[SARTRACKER] Notification suppressed (messageBar unavailable): {title}")
+            return
+
         try:
             if level == "info":
                 info(bar, title, message, duration=duration)
@@ -2074,6 +2093,10 @@ class sartracker:
             # BUG-019/BUG-021 FIX: Set unloading flag immediately to protect callbacks
             self._is_unloading = True
             self._skip_layer_ops = True
+
+            # LIFECYCLE SAFETY: Notify error handler to suppress notifications during shutdown
+            if hasattr(self, 'error_handler') and self.error_handler:
+                self.error_handler.set_unloading(True)
 
             # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
             # This must happen before any other cleanup to prevent timer callbacks
@@ -4861,7 +4884,7 @@ class sartracker:
                 )
 
         except Exception as e:
-            logger.error(f"GPX import error: {e}", exc_info=True)
+            self._logger.error(f"GPX import error: {e}", exc_info=True)
             error(
                 self.iface.messageBar(),
                 "GPX Import Error",
@@ -4912,7 +4935,7 @@ class sartracker:
                         duration=10
                     )
                     for error_msg in errors:
-                        logger.warning(f"GPX import failed: {error_msg}")
+                        self._logger.warning(f"GPX import failed: {error_msg}")
 
             else:
                 error(
@@ -4923,7 +4946,7 @@ class sartracker:
                 )
 
         except Exception as e:
-            logger.error(f"GPX folder import error: {e}", exc_info=True)
+            self._logger.error(f"GPX folder import error: {e}", exc_info=True)
             error(
                 self.iface.messageBar(),
                 "GPX Import Error",
@@ -4960,7 +4983,7 @@ class sartracker:
                 success(
                     self.iface.messageBar(),
                     "Watching GPX Folder",
-                    f"New GPX files in {folder_path} will be imported automatically",
+                    f"Existing and new GPX files in {folder_path} will be imported",
                     duration=10
                 )
             else:
@@ -4972,7 +4995,7 @@ class sartracker:
                 )
 
         except Exception as e:
-            logger.error(f"GPX watch error: {e}", exc_info=True)
+            self._logger.error(f"GPX watch error: {e}", exc_info=True)
             error(
                 self.iface.messageBar(),
                 "GPX Watch Error",

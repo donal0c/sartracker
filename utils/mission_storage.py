@@ -3,6 +3,10 @@
 Mission storage helpers (filesystem and validation).
 
 This module avoids QGIS/UI dependencies so it can be tested headlessly.
+
+DATA INTEGRITY: This module uses SQLite-native backup mechanisms (VACUUM INTO
+or connection.backup()) to create consistent GeoPackage snapshots, preventing
+data loss during active tracking sessions.
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,10 +14,18 @@ from typing import Optional, Callable
 import shutil
 import re
 import zipfile
+import sqlite3
+import tempfile
+import logging
 from datetime import datetime
 
 
+logger = logging.getLogger(__name__)
+
 WarnFunc = Callable[[str, str, int], None]
+
+# Minimum SQLite version for VACUUM INTO support
+VACUUM_INTO_MIN_VERSION = (3, 27, 0)
 
 
 @dataclass
@@ -25,6 +37,205 @@ class MissionPaths:
     backup_dir: Optional[Path]
     gpkg_path: Path
 
+
+# =============================================================================
+# Safe GeoPackage Backup Functions
+# =============================================================================
+
+def _sqlite_version_tuple() -> tuple:
+    """Return SQLite version as tuple of integers."""
+    return tuple(int(x) for x in sqlite3.sqlite_version.split('.'))
+
+
+def _supports_vacuum_into() -> bool:
+    """Check if SQLite supports VACUUM INTO command (SQLite 3.27+)."""
+    return _sqlite_version_tuple() >= VACUUM_INTO_MIN_VERSION
+
+
+def _backup_with_vacuum_into(source_path: Path, dest_path: Path) -> bool:
+    """
+    Create backup using VACUUM INTO (SQLite 3.27+).
+
+    This creates an optimized, consistent snapshot in a single operation.
+    Works even during active read/write operations.
+
+    Args:
+        source_path: Path to source GeoPackage file
+        dest_path: Path for backup file
+
+    Returns:
+        True if backup succeeded
+
+    Raises:
+        RuntimeError: If backup operation fails
+    """
+    conn = None
+    try:
+        conn = sqlite3.connect(str(source_path))
+        # Use proper escaping for the path
+        dest_str = str(dest_path).replace("'", "''")
+        conn.execute(f"VACUUM INTO '{dest_str}'")
+        logger.info(
+            "Created safe GeoPackage snapshot via VACUUM INTO: %s -> %s",
+            source_path.name, dest_path.name
+        )
+        return True
+    except sqlite3.Error as exc:
+        logger.error(
+            "VACUUM INTO backup failed for %s: %s",
+            source_path, exc
+        )
+        # Clean up partial backup if it exists
+        if dest_path.exists():
+            try:
+                dest_path.unlink()
+            except Exception:
+                pass
+        raise RuntimeError(f"GeoPackage backup failed: {exc}") from exc
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _backup_with_connection_api(source_path: Path, dest_path: Path) -> bool:
+    """
+    Create backup using connection.backup() API (Python 3.7+).
+
+    Fallback for SQLite versions that don't support VACUUM INTO.
+    Uses incremental backup with small page count to minimize lock time.
+
+    Args:
+        source_path: Path to source GeoPackage file
+        dest_path: Path for backup file
+
+    Returns:
+        True if backup succeeded
+
+    Raises:
+        RuntimeError: If backup operation fails
+    """
+    source_conn = None
+    dest_conn = None
+    try:
+        source_conn = sqlite3.connect(str(source_path))
+        dest_conn = sqlite3.connect(str(dest_path))
+
+        # Use incremental backup with small page count to minimize lock time
+        source_conn.backup(dest_conn, pages=100, sleep=0.01)
+
+        logger.info(
+            "Created safe GeoPackage snapshot via backup API: %s -> %s",
+            source_path.name, dest_path.name
+        )
+        return True
+    except sqlite3.Error as exc:
+        logger.error(
+            "Connection backup failed for %s: %s",
+            source_path, exc
+        )
+        # Clean up partial backup
+        if dest_path.exists():
+            try:
+                dest_path.unlink()
+            except Exception:
+                pass
+        raise RuntimeError(f"GeoPackage backup failed: {exc}") from exc
+    finally:
+        for conn in (dest_conn, source_conn):
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+
+def check_uncommitted_edits(project=None) -> list:
+    """
+    Check for layers with uncommitted edits in the current project.
+
+    DATA INTEGRITY: Identifies layers with unsaved changes that may not be
+    included in backups. Call before backup operations to warn users.
+
+    Args:
+        project: QgsProject instance (defaults to QgsProject.instance())
+
+    Returns:
+        List of layer names with uncommitted edits, empty if none found
+        or if QGIS is not available.
+    """
+    try:
+        from qgis.core import QgsProject
+        proj = project or QgsProject.instance()
+        if not proj:
+            return []
+
+        uncommitted = []
+        # THREAD-SAFETY: Create snapshot of layers to avoid dictionary mutation
+        # during iteration if layers are added/removed by another thread
+        layers = list(proj.mapLayers().values())
+        for layer in layers:
+            try:
+                # Check if layer is editable and has uncommitted changes
+                if hasattr(layer, 'isEditable') and hasattr(layer, 'isModified'):
+                    if layer.isEditable() and layer.isModified():
+                        name = layer.name()
+                        if name:  # Guard against None names
+                            uncommitted.append(name)
+            except (RuntimeError, AttributeError):
+                # Layer may be invalid or deleted
+                continue
+
+        return uncommitted
+    except ImportError:
+        # QGIS not available (headless testing)
+        return []
+    except Exception as e:
+        logger.warning(f"Error checking uncommitted edits: {e}")
+        return []
+
+
+def create_safe_snapshot(source_path: Path, dest_path: Path) -> bool:
+    """
+    Create a consistent snapshot of a GeoPackage database.
+
+    DATA INTEGRITY: Uses VACUUM INTO when available (SQLite 3.27+), falls back
+    to connection.backup() API for older SQLite versions. Both methods create
+    transactionally consistent snapshots that work even during active
+    read/write operations.
+
+    Args:
+        source_path: Path to source GeoPackage file
+        dest_path: Path for backup file (must not exist)
+
+    Returns:
+        True if backup succeeded
+
+    Raises:
+        FileNotFoundError: If source file does not exist
+        FileExistsError: If destination file already exists
+        RuntimeError: If backup operation fails
+    """
+    if not source_path.exists():
+        raise FileNotFoundError(f"Source GeoPackage not found: {source_path}")
+
+    if dest_path.exists():
+        raise FileExistsError(f"Backup destination already exists: {dest_path}")
+
+    # Ensure parent directory exists
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if _supports_vacuum_into():
+        return _backup_with_vacuum_into(source_path, dest_path)
+    else:
+        return _backup_with_connection_api(source_path, dest_path)
+
+
+# =============================================================================
+# Mission Storage Helper Class
+# =============================================================================
 
 class MissionStorageHelper:
     """Encapsulates mission storage and backup filesystem operations."""
@@ -190,7 +401,14 @@ class MissionStorageHelper:
             return str(destination)
 
     def sync_backup(self, mission_paths: MissionPaths) -> bool:
-        """Mirror GeoPackage (and attachments if present) to backup root."""
+        """
+        Mirror GeoPackage (and attachments if present) to backup root.
+
+        DATA INTEGRITY: Uses SQLite-native backup mechanism (VACUUM INTO or
+        connection.backup()) to create consistent GeoPackage snapshot, preventing
+        data loss during active tracking sessions. Warns users if layers have
+        uncommitted edits that won't be included in the backup.
+        """
         if not mission_paths or not mission_paths.backup_dir:
             return True  # Backup optional or not configured
 
@@ -199,10 +417,30 @@ class MissionStorageHelper:
         if not gpkg_path.exists():
             return False
 
+        # DATA INTEGRITY: Check for uncommitted edits before backup
+        uncommitted = check_uncommitted_edits()
+        if uncommitted:
+            layer_list = ", ".join(uncommitted[:3])  # Show first 3
+            if len(uncommitted) > 3:
+                layer_list += f" (+{len(uncommitted) - 3} more)"
+            self.warn(
+                "Uncommitted Edits",
+                f"Layers with unsaved changes: {layer_list}. These changes may not be included in backup.",
+                duration=8
+            )
+            logger.warning(f"Backup proceeding with uncommitted edits in: {uncommitted}")
+
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(gpkg_path, backup_dir / gpkg_path.name)
 
+            # Use safe snapshot instead of shutil.copy2
+            backup_gpkg = backup_dir / gpkg_path.name
+            if backup_gpkg.exists():
+                backup_gpkg.unlink()  # Remove old backup before creating new one
+
+            create_safe_snapshot(gpkg_path, backup_gpkg)
+
+            # Copy attachments (regular files, safe to copy directly)
             attachments_src = mission_paths.attachments_dir
             if attachments_src and attachments_src.exists():
                 attachments_dst = backup_dir / "attachments"
@@ -222,6 +460,10 @@ class MissionStorageHelper:
         """
         Create a zip archive of the mission GeoPackage, project, and attachments.
 
+        DATA INTEGRITY: Creates a consistent GeoPackage snapshot using SQLite-native
+        backup before archiving, preventing data loss during active tracking sessions.
+        Warns users if layers have uncommitted edits.
+
         Returns:
             Path to created archive
         Raises:
@@ -233,20 +475,41 @@ class MissionStorageHelper:
         if not mission_paths.gpkg_path.exists():
             raise RuntimeError(f"Mission GeoPackage not found at {mission_paths.gpkg_path}")
 
-        # Determine archive directory
-        if mission_paths.backup_dir and mission_paths.backup_dir.exists():
-            archive_dir = mission_paths.backup_dir
-        else:
-            archive_dir = mission_paths.mission_dir.parent
+        # DATA INTEGRITY: Check for uncommitted edits before archive
+        uncommitted = check_uncommitted_edits()
+        if uncommitted:
+            layer_list = ", ".join(uncommitted[:3])  # Show first 3
+            if len(uncommitted) > 3:
+                layer_list += f" (+{len(uncommitted) - 3} more)"
+            self.warn(
+                "Uncommitted Edits",
+                f"Layers with unsaved changes: {layer_list}. These changes may not be included in archive.",
+                duration=8
+            )
+            logger.warning(f"Archive proceeding with uncommitted edits in: {uncommitted}")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_name = f"{mission_paths.name}_finalized_{timestamp}.zip"
-        archive_path = archive_dir / archive_name
+        # Create temporary snapshot for consistent archive
+        temp_dir = Path(tempfile.mkdtemp(prefix="sartracker_archive_"))
+        snapshot_path = temp_dir / mission_paths.gpkg_path.name
 
         try:
+            # Create safe snapshot first
+            create_safe_snapshot(mission_paths.gpkg_path, snapshot_path)
+
+            # Determine archive directory
+            if mission_paths.backup_dir and mission_paths.backup_dir.exists():
+                archive_dir = mission_paths.backup_dir
+            else:
+                archive_dir = mission_paths.mission_dir.parent
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_name = f"{mission_paths.name}_finalized_{timestamp}.zip"
+            archive_path = archive_dir / archive_name
+
             with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add the consistent snapshot (not the live file)
                 zipf.write(
-                    mission_paths.gpkg_path,
+                    snapshot_path,
                     arcname=f"{mission_paths.name}/{mission_paths.gpkg_path.name}"
                 )
                 if project_path and project_path.exists():
@@ -264,9 +527,13 @@ class MissionStorageHelper:
                             )
             return archive_path
         except Exception as exc:
-            if archive_path.exists():
+            # Clean up partial archive if it exists
+            if 'archive_path' in locals() and archive_path.exists():
                 try:
                     archive_path.unlink()
                 except Exception:
                     pass
             raise RuntimeError(f"Failed to create archive: {exc}") from exc
+        finally:
+            # Clean up temporary snapshot
+            shutil.rmtree(temp_dir, ignore_errors=True)

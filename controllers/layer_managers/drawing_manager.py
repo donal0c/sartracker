@@ -3329,7 +3329,9 @@ class DrawingLayerManager(BaseLayerManager):
         self.stop_gpx_folder_watch()
 
         # Create new watcher
-        self._gpx_watcher = QFileSystemWatcher(self)
+        # Note: Pass None as parent since DrawingLayerManager is not a QObject.
+        # Lifecycle is explicitly managed via stop_gpx_folder_watch() and deleteLater().
+        self._gpx_watcher = QFileSystemWatcher(None)
         self._watched_gpx_folder = folder_path
 
         # Watch the directory (not individual files - more efficient)
@@ -3344,6 +3346,15 @@ class DrawingLayerManager(BaseLayerManager):
         self._gpx_watcher.directoryChanged.connect(self._on_gpx_folder_changed)
 
         logger.info(f"Started watching GPX folder: {folder_path}")
+
+        # Import existing GPX files in the folder (QFileSystemWatcher only triggers on changes)
+        # This ensures files already present when watch starts are also imported.
+        existing_layers, existing_errors = self.import_gpx_folder(folder_path)
+        if existing_layers:
+            logger.info(f"Imported {len(existing_layers)} existing GPX files from watched folder")
+        if existing_errors:
+            logger.warning(f"Some existing GPX files failed to import: {existing_errors}")
+
         return True, ""
 
     def stop_gpx_folder_watch(self):
@@ -3382,9 +3393,16 @@ class DrawingLayerManager(BaseLayerManager):
         THREAD-SAFETY: This is called on the main thread by Qt's event loop.
         Safe to call QGIS APIs directly.
 
+        LIFECYCLE SAFETY: Guards against post-unload callback execution.
         LIFE-SAFETY CRITICAL: Errors are logged but do not crash the plugin.
         """
         import os
+
+        # LIFECYCLE SAFETY: Check for plugin unload before any work
+        layer_manager = getattr(self, 'layer_manager', None)
+        if getattr(layer_manager, '_application_closing', False):
+            logger.debug("GPX folder changed callback during shutdown - ignoring")
+            return
 
         if not self._watched_gpx_folder:
             return
@@ -3409,18 +3427,41 @@ class DrawingLayerManager(BaseLayerManager):
 
             # Import new files
             for gpx_path in sorted(new_files):  # Sort for predictable order
+                # Re-check shutdown state before each import (may be many files)
+                if getattr(layer_manager, '_application_closing', False):
+                    logger.debug("GPX import loop interrupted by shutdown")
+                    return
+
                 logger.info(f"New GPX file detected: {gpx_path}")
 
                 layer, error = self.import_gpx_file(gpx_path)
 
                 if layer:
-                    # Notify user of successful import
-                    from ...utils.notify import success
-                    success(f"Auto-imported GPX: {os.path.basename(gpx_path)}")
+                    # Notify user of successful import using safe_notify
+                    from ...utils.notify import safe_notify, success as notify_success
+                    bar = self.iface.messageBar() if self.iface else None
+                    is_closing = getattr(layer_manager, '_application_closing', False)
+                    safe_notify(
+                        bar, notify_success,
+                        "GPX Import",
+                        f"Auto-imported: {os.path.basename(gpx_path)}",
+                        duration=3,
+                        is_unloading=is_closing,
+                        log_prefix="[GPX-Watch]"
+                    )
                 else:
-                    # Notify user of failure
-                    from ...utils.notify import warning
-                    warning(f"GPX import failed: {os.path.basename(gpx_path)}")
+                    # Notify user of failure using safe_notify
+                    from ...utils.notify import safe_notify, warning as notify_warning
+                    bar = self.iface.messageBar() if self.iface else None
+                    is_closing = getattr(layer_manager, '_application_closing', False)
+                    safe_notify(
+                        bar, notify_warning,
+                        "GPX Import",
+                        f"Failed to import: {os.path.basename(gpx_path)}",
+                        duration=5,
+                        is_unloading=is_closing,
+                        log_prefix="[GPX-Watch]"
+                    )
 
         except Exception as e:
             logger.error(f"Error in GPX folder watch handler: {e}", exc_info=True)

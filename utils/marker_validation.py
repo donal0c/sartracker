@@ -10,6 +10,7 @@ coordinates must be validated before use.
 
 Pure-Python utilities (no QGIS imports) for testability.
 """
+import math
 from typing import Any, Optional, Dict, Tuple
 from .drawing_validation import validate_point, validate_positive_number
 
@@ -28,21 +29,30 @@ def is_number(value: Any) -> bool:
     """
     Check if value is a valid number (int or float).
 
+    LIFE-SAFETY CRITICAL: Rejects NaN and Infinity values that could cause
+    incorrect position calculations during rescue operations.
+
     Args:
         value: Any value to check
 
     Returns:
-        True if value is numeric, False otherwise
+        True if value is a valid finite numeric, False otherwise
     """
     if value is None:
         return False
     if isinstance(value, bool):
         return False
     if isinstance(value, (int, float)):
+        # CRITICAL: Reject NaN and Infinity
+        if math.isnan(value) or math.isinf(value):
+            return False
         return True
     if isinstance(value, str):
         try:
-            float(value)
+            parsed = float(value)
+            # CRITICAL: Reject NaN and Infinity strings like "nan", "inf"
+            if math.isnan(parsed) or math.isinf(parsed):
+                return False
             return True
         except ValueError:
             return False

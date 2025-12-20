@@ -15,10 +15,12 @@ Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
 import os
 import csv
 import glob
+import math
 from typing import List, Dict, Optional, Any, Tuple
 from datetime import datetime
 from .base import Provider, FeatureDict
 from ..utils.exceptions import ProviderDataError
+from ..utils.cache import LRUTTLCache
 
 
 class FileCSVProvider(Provider):
@@ -50,6 +52,17 @@ class FileCSVProvider(Provider):
     Qt5/Qt6 Compatible: Pure Python implementation, no Qt dependencies.
     """
 
+    # Memory estimation constants (measured values from FINDINGS/results_deep_dive_C.md)
+    # Position dict overhead: ~650 bytes per position (was 200, 70% underestimate)
+    # File entry overhead: ~500 bytes per cached file (dict key + mtime + device_name)
+    BYTES_PER_POSITION = 650
+    BYTES_PER_FILE = 500
+
+    # Cache configuration
+    # MEMORY STABILITY: Limit to 50 files with 1 hour TTL to prevent unbounded growth
+    CACHE_MAX_FILES = 50
+    CACHE_TTL_SECONDS = 3600  # 1 hour
+
     def __init__(self, csv_path: str):
         """
         Initialize CSV provider.
@@ -61,11 +74,15 @@ class FileCSVProvider(Provider):
         self.is_folder = os.path.isdir(csv_path)
 
         # Cache: {filepath: (mtime, device_name, positions)}
+        # MEMORY STABILITY: Use LRU+TTL cache to prevent unbounded growth
         # Key is file path, value is tuple of:
         # - mtime: File modification time (float)
         # - device_name: Extracted device name (str)
         # - positions: List of parsed position dicts
-        self._cache: Dict[str, Tuple[float, str, List[FeatureDict]]] = {}
+        self._cache: LRUTTLCache[str, Tuple[float, str, List[FeatureDict]]] = LRUTTLCache(
+            max_size=self.CACHE_MAX_FILES,
+            ttl_seconds=self.CACHE_TTL_SECONDS
+        )
         
     def _parse_attributes(self, attr_string: str) -> Dict[str, Any]:
         """
@@ -118,9 +135,10 @@ class FileCSVProvider(Provider):
             # File deleted/inaccessible since directory listing
             return os.path.basename(filepath).replace('.csv', ''), []
 
-        # Check cache
-        if filepath in self._cache:
-            cached_mtime, cached_name, cached_positions = self._cache[filepath]
+        # Check cache (LRUTTLCache returns None if not found or expired)
+        cached = self._cache.get(filepath)
+        if cached is not None:
+            cached_mtime, cached_name, cached_positions = cached
             if cached_mtime == mtime:
                 # Cache hit - file unchanged since last parse
                 return cached_name, cached_positions
@@ -129,7 +147,7 @@ class FileCSVProvider(Provider):
         device_name, positions = self._parse_csv_file_impl(filepath)
 
         # Update cache
-        self._cache[filepath] = (mtime, device_name, positions)
+        self._cache.set(filepath, (mtime, device_name, positions))
 
         return device_name, positions
 
@@ -271,6 +289,12 @@ class FileCSVProvider(Provider):
                         # Parse and validate coordinates
                         lat = float(row['Latitude'])
                         lon = float(row['Longitude'])
+
+                        # LIFE-SAFETY CRITICAL: Reject NaN/Inf coordinates
+                        # NaN comparisons always return False, so NaN would pass range checks
+                        if math.isnan(lat) or math.isnan(lon) or math.isinf(lat) or math.isinf(lon):
+                            skipped_coord_range += 1
+                            continue  # Invalid NaN/Inf coordinate, skip row
 
                         # Validate coordinate ranges (skip invalid positions)
                         if not (-90 <= lat <= 90):
@@ -676,18 +700,38 @@ class FileCSVProvider(Provider):
         Get cache statistics for debugging and monitoring.
 
         Returns:
-            Dict with cache stats (entries, estimated memory KB)
+            Dict with cache stats (entries, estimated memory KB, LRU stats)
 
         Qt5/Qt6 Compatible: Pure Python implementation.
         """
-        total_positions = sum(len(positions) for _, _, positions in self._cache.values())
-        # Rough estimate: ~200 bytes per position dict
-        memory_kb = (total_positions * 200) / 1024
+        # Get LRU cache internal stats
+        lru_stats = self._cache.get_stats()
+        num_files = lru_stats['size']
+
+        # Count total positions across all cached files
+        # Note: LRUTTLCache.values() returns (timestamp, value) tuples
+        # where value = (mtime, device_name, positions)
+        total_positions = 0
+        for cache_entry in self._cache.values():
+            _timestamp, inner_tuple = cache_entry
+            _mtime, _device_name, positions = inner_tuple
+            total_positions += len(positions)
+
+        # Accurate estimation based on measured values (FINDINGS/results_deep_dive_C.md)
+        memory_bytes = (
+            (total_positions * self.BYTES_PER_POSITION) +
+            (num_files * self.BYTES_PER_FILE)
+        )
+        memory_kb = memory_bytes / 1024
 
         return {
-            'entries': len(self._cache),
+            'entries': num_files,
+            'max_entries': lru_stats['max_size'],
             'total_positions': total_positions,
-            'memory_kb': int(memory_kb)
+            'memory_kb': int(memory_kb),
+            'hit_rate_percent': lru_stats['hit_rate_percent'],
+            'evictions_lru': lru_stats['evictions_lru'],
+            'evictions_ttl': lru_stats['evictions_ttl'],
         }
 
 

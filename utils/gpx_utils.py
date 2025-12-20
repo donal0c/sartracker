@@ -156,12 +156,8 @@ def import_gpx_track(
 
     # Determine layer name
     if not layer_name:
-        # Try to use creator/metadata name, fallback to filename
-        if metadata.get('creator'):
-            layer_name = metadata['creator']
-        else:
-            # Use filename without extension
-            layer_name = os.path.splitext(os.path.basename(gpx_path))[0]
+        # Use filename without extension (team renames files to member initials)
+        layer_name = os.path.splitext(os.path.basename(gpx_path))[0]
 
     # Sanitize layer name (remove problematic characters)
     layer_name = _sanitize_layer_name(layer_name)
