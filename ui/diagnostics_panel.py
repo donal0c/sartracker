@@ -229,7 +229,13 @@ class DiagnosticsPanel(BaseDialog):
         try:
             vendor_label = QLabel(vendor_text)
             vendor_label.setStyleSheet(vendor_style)
-            vendor_label.setToolTip("Ensures plugin works without installing python libraries")
+            vendor_label.setToolTip(
+                "Ensures plugin works without installing python libraries.\n\n"
+                "Note: SAR Tracker modifies Python's import path at startup to ensure\n"
+                "reliable network requests. This may affect other plugins that use the\n"
+                "'requests' library if they load after SAR Tracker. If you experience\n"
+                "issues with other plugins, try loading them before SAR Tracker."
+            )
             form.addRow("<b>Dependency Bundle:</b>", vendor_label)
             if cert_text:
                 cert_label = QLabel(cert_text)

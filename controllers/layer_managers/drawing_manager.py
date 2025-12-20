@@ -16,13 +16,58 @@ that must be preserved EXACTLY for accuracy (<1m error requirement).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
+from collections import OrderedDict
 import uuid
 import logging
 from datetime import datetime
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
+
+
+class BoundedSet:
+    """
+    A bounded set that evicts oldest entries when max_size is exceeded.
+
+    Uses an OrderedDict internally for efficient LRU-style eviction.
+    Thread-safety: NOT thread-safe. Use in main thread only.
+
+    Args:
+        max_size: Maximum number of entries (default: 100)
+    """
+
+    def __init__(self, max_size: int = 100):
+        self._max_size = max(1, max_size)
+        self._data: OrderedDict = OrderedDict()
+
+    def add(self, item) -> None:
+        """Add item, evicting oldest if at capacity."""
+        if item in self._data:
+            # Move to end (most recently used)
+            self._data.move_to_end(item)
+            return
+
+        # Evict oldest entries if at capacity
+        while len(self._data) >= self._max_size:
+            oldest = next(iter(self._data))
+            del self._data[oldest]
+            logger.debug("BoundedSet: Evicted oldest entry: %s", oldest)
+
+        self._data[item] = True
+
+    def __contains__(self, item) -> bool:
+        return item in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def clear(self) -> None:
+        """Remove all entries."""
+        self._data.clear()
+
+    def __iter__(self):
+        return iter(self._data.keys())
 
 from qgis.core import (
     QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
@@ -51,7 +96,7 @@ from ...utils.drawing_validation import (
     validate_width
 )
 from ...utils.exceptions import LayerTransactionError, LayerLockError, GeometryError
-from ...utils.notify import error as notify_error
+from ...utils.notify import error as notify_error, safe_error
 
 
 class DrawingLayerManager(BaseLayerManager):
@@ -71,14 +116,18 @@ class DrawingLayerManager(BaseLayerManager):
     TEXT_LABELS_LAYER_NAME = "Text Labels"
     MAX_SYNC_FEATURES = 500  # Hint threshold for bulk operations
 
+    # Maximum number of GPX file paths to track (prevents unbounded memory growth)
+    MAX_GPX_IMPORT_HISTORY = 100
+
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize drawing layer manager with GPX support."""
         super().__init__(iface, shared_device_colors, layer_manager)
 
         # Initialize GPX import support
+        # Uses BoundedSet to prevent unbounded memory growth from long-running sessions
         self._gpx_watcher = None
         self._watched_gpx_folder = None
-        self._imported_gpx_files = set()
+        self._imported_gpx_files = BoundedSet(max_size=self.MAX_GPX_IMPORT_HISTORY)
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -254,16 +303,12 @@ class DrawingLayerManager(BaseLayerManager):
         )
 
     def _notify_error(self, title: str, message: str):
-        """Show a user-facing error if iface/messageBar is available."""
-        if not getattr(self, "iface", None):
-            return
-        try:
-            bar = self.iface.messageBar() if hasattr(self.iface, "messageBar") else None
-            if bar:
-                notify_error(bar, title, message)
-        except Exception:
-            # Avoid raising from UI notification paths
-            logger.debug("Notification suppressed for %s: %s", title, message)
+        """Show a user-facing error if iface/messageBar is available.
+
+        LIFECYCLE SAFETY: Uses safe_error to guard against deleted Qt objects.
+        """
+        # Use safe_error which handles None iface, deleted objects, and exceptions
+        safe_error(getattr(self, "iface", None), title, message)
 
     def _safe_commit(self, layer: QgsVectorLayer, operation: str, layer_type: str, context: Dict[str, Any]) -> None:
         """
@@ -3193,7 +3238,8 @@ class DrawingLayerManager(BaseLayerManager):
         # GPX folder watching state
         self._gpx_watcher = None
         self._watched_gpx_folder = None
-        self._imported_gpx_files = set()  # Track already-imported files
+        # Track already-imported files with bounded size to prevent memory growth
+        self._imported_gpx_files = BoundedSet(max_size=self.MAX_GPX_IMPORT_HISTORY)
 
     def import_gpx_file(self, gpx_path: str):
         """

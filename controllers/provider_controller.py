@@ -20,7 +20,10 @@ from typing import Optional, Dict, Any
 from ..providers.registry import registry as provider_registry
 from ..providers.base import Provider
 from ..utils.task_manager import TaskManager
-from ..utils.notify import info, warning, error, success
+from ..utils.notify import (
+    info, warning, error, success,
+    safe_error, safe_success, safe_warning
+)
 
 
 class ProviderController(QObject):
@@ -252,8 +255,9 @@ class ProviderController(QObject):
                 print(f"[PROVIDER_CONTROLLER] Connection test FAILED for {self._pending_provider_name}")
                 print(f"[PROVIDER_CONTROLLER] Rolling back to previous provider: {self.provider_name}")
 
-                error(
-                    self.iface.messageBar(),
+                # LIFECYCLE SAFETY: Use safe_error for async callback context
+                safe_error(
+                    self.iface,
                     "Connection Failed",
                     f"Could not connect to {self._pending_provider_name}. "
                     + (f"Your current provider ({self.provider_name}) remains active."
@@ -275,8 +279,9 @@ class ProviderController(QObject):
                 print(f"[PROVIDER_CONTROLLER] NOT committing provider - test-only request")
 
                 # Show success notification but don't commit
-                success(
-                    self.iface.messageBar(),
+                # LIFECYCLE SAFETY: Use safe_success for async callback context
+                safe_success(
+                    self.iface,
                     "Connection Test",
                     f"Connection to {self._pending_provider_name} successful! Click 'Connect' to switch providers.",
                     duration=5
@@ -313,8 +318,9 @@ class ProviderController(QObject):
             print(f"[PROVIDER_CONTROLLER] Provider commit complete: {self.provider_name}")
 
             # Show success notification
-            success(
-                self.iface.messageBar(),
+            # LIFECYCLE SAFETY: Use safe_success for async callback context
+            safe_success(
+                self.iface,
                 "Provider Controller",
                 f"Connected to {self.provider_name} successfully",
                 duration=3
@@ -341,8 +347,9 @@ class ProviderController(QObject):
             self._cleanup_shadow_state()
             self._emit_status('error', f'Unexpected error during provider setup: {str(e)}')
 
-            error(
-                self.iface.messageBar(),
+            # LIFECYCLE SAFETY: Use safe_error for async callback context
+            safe_error(
+                self.iface,
                 "Provider Error",
                 f"Unexpected error: {str(e)}",
                 duration=5
@@ -391,8 +398,9 @@ class ProviderController(QObject):
             )
 
             # Show user-friendly error with rollback context
-            error(
-                self.iface.messageBar(),
+            # LIFECYCLE SAFETY: Use safe_error for async callback context
+            safe_error(
+                self.iface,
                 "Connection Failed",
                 f"{self._pending_provider_name}: {error_msg}. "
                 + (f"Your current provider ({self.provider_name}) remains active."

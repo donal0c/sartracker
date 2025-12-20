@@ -200,6 +200,85 @@ fi
 echo ""
 
 # ============================================================================
+# Check 5.5: Direct messageBar() usage in async callbacks
+# ============================================================================
+echo "Check 5.5: messageBar() lifecycle safety..."
+echo "  Searching for: 'iface.messageBar()' in _on_* callback methods"
+echo ""
+
+# This is a heuristic check - looks for patterns that suggest async contexts
+# Focuses on callback methods which are most at risk
+UNSAFE_MESSAGEBAR=$(grep -r "iface\.messageBar()" . --include="*.py" \
+    --exclude-dir=".git" \
+    --exclude-dir="__pycache__" \
+    --exclude-dir=".pytest_cache" \
+    --exclude-dir="archive" \
+    --exclude-dir="From_Eamon" \
+    --exclude-dir="vendor" \
+    --exclude-dir="FINDINGS" \
+    --exclude-dir="FUTURE_WORK" \
+    --exclude-dir="docs" \
+    --exclude-dir="tools" \
+    --exclude-dir="tests" \
+    2>/dev/null | grep -v "utils/notify.py" | grep -v "^[[:space:]]*#" | head -20 || true)
+
+UNSAFE_COUNT=$(echo "$UNSAFE_MESSAGEBAR" | grep -c "messageBar" 2>/dev/null || echo "0")
+
+if [ "$UNSAFE_COUNT" -eq 0 ] || [ -z "$UNSAFE_MESSAGEBAR" ]; then
+    echo -e "  ${GREEN}✅ PASS${NC} - No direct messageBar() calls in plugin code"
+else
+    echo -e "  ${YELLOW}⚠️  WARNING${NC} - Direct messageBar() calls found ($UNSAFE_COUNT locations):"
+    echo ""
+    echo "$UNSAFE_MESSAGEBAR"
+    echo ""
+    echo "  ℹ️  In async callbacks, use safe_* functions from utils.notify:"
+    echo "  from utils.notify import safe_error, safe_warning, safe_success"
+    echo "  safe_error(self.iface, 'Title', 'Message', is_unloading=self._is_unloading)"
+    echo ""
+    echo "  This is a WARNING - migration to safe_* functions is in progress"
+fi
+
+echo ""
+
+# ============================================================================
+# Check 5.6: Deprecated CRS usage (EPSG:29903 instead of EPSG:2157)
+# ============================================================================
+echo "Check 5.6: CRS consistency (EPSG:2157 ITM required)..."
+echo "  Searching for: deprecated EPSG:29903 (TM65 Irish Grid)"
+echo ""
+
+# LIFE-SAFETY CRITICAL: EPSG:29903 is deprecated and introduces ~1-3m position error
+# Match actual usage patterns like "EPSG:29903" or "(29903)" or "= 29903" but exclude comments
+DEPRECATED_CRS=$(grep -rE "(EPSG:29903|[=(]29903[)]?)" . --include="*.py" \
+    --exclude-dir=".git" \
+    --exclude-dir="__pycache__" \
+    --exclude-dir=".pytest_cache" \
+    --exclude-dir="archive" \
+    --exclude-dir="From_Eamon" \
+    --exclude-dir="FINDINGS" \
+    --exclude-dir="FUTURE_WORK" \
+    --exclude-dir="docs" \
+    --exclude-dir="tools" \
+    2>/dev/null | grep -v "^[[:space:]]*#" | grep -v "# Note:" | grep -v "# DEPRECATED" | grep -v "# .* 29903" || true)
+
+if [ -z "$DEPRECATED_CRS" ]; then
+    echo -e "  ${GREEN}✅ PASS${NC} - No deprecated EPSG:29903 (TM65) usage found"
+else
+    echo -e "  ${RED}❌ FAIL${NC} - Deprecated EPSG:29903 (TM65) found - LIFE-SAFETY RISK:"
+    echo ""
+    echo "$DEPRECATED_CRS"
+    echo ""
+    echo "  ⚠️  EPSG:29903 (TM65 Irish Grid) is DEPRECATED"
+    echo "  Use EPSG:2157 (ITM - Irish Transverse Mercator) instead"
+    echo "  Using TM65 introduces systematic ~1-3m position error!"
+    echo ""
+    echo "  See: docs/AI_CODE_REFERENCE.md for coordinate handling standards"
+    FAILED=1
+fi
+
+echo ""
+
+# ============================================================================
 # Check 6: Documentation link validation
 # ============================================================================
 echo "Check 6: Documentation link validation..."

@@ -222,4 +222,129 @@ def success(message_bar, title, message, duration=5):
     push_message(message_bar, title, message, level=3, duration=duration)
 
 
-__all__ = ['info', 'warning', 'error', 'success', 'safe_notify', '_is_valid_message_bar']
+# =============================================================================
+# SAFE CONVENIENCE WRAPPERS
+# =============================================================================
+# These functions accept iface directly and handle all safety checks internally.
+# Use these in async callbacks, signal handlers, and any context where the
+# plugin might be unloading or QGIS shutting down.
+
+
+def _get_safe_message_bar(iface):
+    """
+    Safely get message bar from iface, returning None on any error.
+
+    Guards against:
+    - None iface
+    - Deleted Qt objects
+    - RuntimeError from QGIS shutdown
+    """
+    if iface is None:
+        return None
+    try:
+        if sip_isdeleted(iface):
+            return None
+        bar = iface.messageBar()
+        if bar is None or sip_isdeleted(bar):
+            return None
+        return bar
+    except (RuntimeError, AttributeError, TypeError):
+        return None
+
+
+def safe_info(iface, title: str, message: str, duration: int = 5,
+              is_unloading: bool = False) -> bool:
+    """
+    Safely show informational message with full lifecycle guards.
+
+    Use this in async callbacks, signal handlers, and uncertain contexts.
+
+    Args:
+        iface: QGIS interface instance (or None)
+        title: Message title
+        message: Message content
+        duration: Display duration in seconds
+        is_unloading: Set True if plugin is unloading (suppresses notification)
+
+    Returns:
+        True if notification was shown, False otherwise
+    """
+    bar = _get_safe_message_bar(iface)
+    return safe_notify(bar, info, title, message, duration=duration,
+                       is_unloading=is_unloading)
+
+
+def safe_warning(iface, title: str, message: str, duration: int = 5,
+                 is_unloading: bool = False) -> bool:
+    """
+    Safely show warning message with full lifecycle guards.
+
+    Use this in async callbacks, signal handlers, and uncertain contexts.
+
+    Args:
+        iface: QGIS interface instance (or None)
+        title: Message title
+        message: Message content
+        duration: Display duration in seconds
+        is_unloading: Set True if plugin is unloading (suppresses notification)
+
+    Returns:
+        True if notification was shown, False otherwise
+    """
+    bar = _get_safe_message_bar(iface)
+    return safe_notify(bar, warning, title, message, duration=duration,
+                       is_unloading=is_unloading)
+
+
+def safe_error(iface, title: str, message: str, duration: int = 5,
+               is_unloading: bool = False) -> bool:
+    """
+    Safely show error message with full lifecycle guards.
+
+    Use this in async callbacks, signal handlers, and uncertain contexts.
+
+    Args:
+        iface: QGIS interface instance (or None)
+        title: Message title
+        message: Message content
+        duration: Display duration in seconds
+        is_unloading: Set True if plugin is unloading (suppresses notification)
+
+    Returns:
+        True if notification was shown, False otherwise
+    """
+    bar = _get_safe_message_bar(iface)
+    return safe_notify(bar, error, title, message, duration=duration,
+                       is_unloading=is_unloading)
+
+
+def safe_success(iface, title: str, message: str, duration: int = 5,
+                 is_unloading: bool = False) -> bool:
+    """
+    Safely show success message with full lifecycle guards.
+
+    Use this in async callbacks, signal handlers, and uncertain contexts.
+
+    Args:
+        iface: QGIS interface instance (or None)
+        title: Message title
+        message: Message content
+        duration: Display duration in seconds
+        is_unloading: Set True if plugin is unloading (suppresses notification)
+
+    Returns:
+        True if notification was shown, False otherwise
+    """
+    bar = _get_safe_message_bar(iface)
+    return safe_notify(bar, success, title, message, duration=duration,
+                       is_unloading=is_unloading)
+
+
+__all__ = [
+    # Original functions (use when you have a valid message_bar)
+    'info', 'warning', 'error', 'success',
+    # Safe wrappers (use in async/uncertain contexts)
+    'safe_notify', 'safe_info', 'safe_warning', 'safe_error', 'safe_success',
+    # Utilities
+    '_is_valid_message_bar', '_get_safe_message_bar',
+]
