@@ -111,7 +111,7 @@ def _is_debug_enabled() -> bool:
 
     # Check QSettings
     try:
-        from config.keys import SETTINGS_KEYS, ConfigStore
+        from ..config.keys import SETTINGS_KEYS, ConfigStore
         return ConfigStore.get(
             SETTINGS_KEYS.DEBUG_LOGGING_ENABLED,
             SETTINGS_KEYS.DEBUG_LOGGING_ENABLED_DEFAULT,
@@ -210,7 +210,7 @@ def set_debug_enabled(enabled: bool):
         enabled: True to enable debug logging
     """
     try:
-        from config.keys import SETTINGS_KEYS, ConfigStore
+        from ..config.keys import SETTINGS_KEYS, ConfigStore
         ConfigStore.set(SETTINGS_KEYS.DEBUG_LOGGING_ENABLED, enabled)
     except Exception:
         pass

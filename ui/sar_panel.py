@@ -42,9 +42,6 @@ from ..utils.qt_compat import (
 from ..utils.notify import info, warning, error, success
 from ..config.keys import ConfigStore, SETTINGS_KEYS
 from ..controllers.mission_controller import MissionState
-from .marker_log_widget import MarkerLogWidget
-from .layer_console_widget import LayerConsoleWidget
-from ..layers import LayerIds
 
 
 class SARPanel(QDockWidget):
@@ -103,38 +100,13 @@ class SARPanel(QDockWidget):
         self._is_finalized = False
         self._is_active = True
         self._audit_warning_logged = False
-        self._layer_console_connections: List[Tuple[Any, Any]] = []
         self._mission_controller_connections: List[Tuple[Any, Callable]] = []
-        self._marker_layer_to_type = {}
-        if self._layers_controller and hasattr(self._layers_controller, "MARKER_TYPE_TO_LAYER_ID"):
-            self._marker_layer_to_type = {
-                layer_id: marker_type
-                for marker_type, layer_id in self._layers_controller.MARKER_TYPE_TO_LAYER_ID.items()
-            }
 
         # Setup UI
         self._setup_ui()
-        self._configure_layer_console()
 
-        # Connect marker_log_widget signals using named methods for proper cleanup
-        # (CRITICAL FIX: BUG-017 - Lambda signals cannot be disconnected)
-        self._marker_log_connections: List[Tuple[Any, Callable]] = []
-        if hasattr(self, "marker_log_widget"):
-            conn1 = (self.marker_log_widget.edit_requested, self._on_marker_edit_requested)
-            conn1[0].connect(conn1[1])
-            self._marker_log_connections.append(conn1)
-
-            conn2 = (self.marker_log_widget.delete_requested, self._on_marker_delete_requested)
-            conn2[0].connect(conn2[1])
-            self._marker_log_connections.append(conn2)
-
-            conn3 = (self.marker_log_widget.zoom_requested, self._on_marker_zoom_requested)
-            conn3[0].connect(conn3[1])
-            self._marker_log_connections.append(conn3)
-
-            conn4 = (self.marker_log_widget.open_attachment_requested, self._on_open_attachment_requested)
-            conn4[0].connect(conn4[1])
-            self._marker_log_connections.append(conn4)
+        # NOTE: Layer Console and Marker Log widgets moved to Mission Logs window
+        # Access via menu: SAR Tracker > Mission Logs...
 
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
@@ -428,22 +400,9 @@ class SARPanel(QDockWidget):
         mission_group.setLayout(mission_layout)
         layout.addWidget(mission_group)
 
-        # Layer Console Section
-        layer_console_group = QGroupBox("Layer Console")
-        layer_console_layout = QVBoxLayout()
-        self.layer_console_widget = LayerConsoleWidget()
-        layer_console_layout.addWidget(self.layer_console_widget)
-        layer_console_group.setLayout(layer_console_layout)
-        layout.addWidget(layer_console_group)
+        # NOTE: Layer Console and Marker Log have been moved to the Mission Logs window
+        # Access via menu: SAR Tracker > Mission Logs...
 
-        # Marker Log Section
-        marker_group = QGroupBox("Marker Log")
-        marker_layout = QVBoxLayout()
-        self.marker_log_widget = MarkerLogWidget()
-        marker_layout.addWidget(self.marker_log_widget)
-        marker_group.setLayout(marker_layout)
-        layout.addWidget(marker_group)
-        
         # Devices Section
         devices_group = QGroupBox("Devices")
         devices_layout = QVBoxLayout()
@@ -940,73 +899,9 @@ class SARPanel(QDockWidget):
         self.pause_button.setStyleSheet(pause_style)
         self.finish_button.setStyleSheet(finish_style)
 
-    def configure_marker_log(self, fetcher: Callable[[], List[Dict[str, object]]]):
-        """Provide data fetcher for marker log widget."""
-        if hasattr(self, "marker_log_widget") and self.marker_log_widget:
-            self.marker_log_widget.set_data_fetcher(fetcher)
-
-    def refresh_marker_log(self):
-        """Refresh marker log widget."""
-        if hasattr(self, "marker_log_widget") and self.marker_log_widget:
-            self.marker_log_widget.refresh()
-        self._set_button_state(self.start_button, "state", "idle")
-        self._set_button_state(self.pause_button, "state", "pause")
-        self._set_button_state(self.pause_button, "flashOn", False)
-        self._set_button_state(self.finish_button, "state", "idle")
-
-    def _configure_layer_console(self):
-        """Wire layer console widget to controllers and catalog."""
-        if not hasattr(self, "layer_console_widget") or not self.layer_console_widget:
-            return
-
-        # Widget signals - track connections for proper cleanup
-        connections = [
-            (self.layer_console_widget.visibility_toggled, self._on_layer_visibility_toggled),
-            (self.layer_console_widget.layer_alias_change_requested, self._on_layer_alias_change_requested),
-            (self.layer_console_widget.layer_favorite_toggled, self._on_layer_favorite_toggled),
-            (self.layer_console_widget.move_to_section_requested, self._on_move_to_section_requested),
-            (self.layer_console_widget.reorder_requested, self._on_reorder_requested),
-            (self.layer_console_widget.feature_delete_requested, self._on_layer_delete_requested),
-            (self.layer_console_widget.feature_zoom_requested, self._on_layer_zoom_requested),
-            (self.layer_console_widget.feature_rename_requested, self._on_layer_rename_requested),
-            (self.layer_console_widget.layer_duplicate_requested, self._on_layer_duplicate_requested),
-            (self.layer_console_widget.layer_export_requested, self._on_layer_export_requested),
-            (self.layer_console_widget.bulk_delete_requested, self._on_bulk_delete_requested),
-            (self.layer_console_widget.bulk_assign_team_requested, self._on_bulk_assign_team_requested),
-            (self.layer_console_widget.bulk_export_requested, self._on_bulk_export_requested),
-            (self.layer_console_widget.refresh_requested, self._on_layer_console_refresh),
-        ]
-
-        # Connect and track each signal
-        for signal, handler in connections:
-            signal.connect(handler)
-            self._layer_console_connections.append((signal, handler))
-
-        if self._layers_controller and getattr(self._layers_controller, "catalog", None):
-            try:
-                self.layer_console_widget.set_catalog(self._layers_controller.catalog)
-            except Exception as exc:
-                print(f"[SARPanel] Warning: failed to set catalog on console: {exc}")
-        elif self._layers_controller:
-            # Fallback to legacy fetcher if catalog not available
-            self.layer_console_widget.set_catalog_fetcher(self._get_layer_console_data)
-            self.layer_console_widget.refresh(full=True)
-
-    # BUG-058 fix: Removed _attach_catalog_signals() and _detach_catalog_signals()
-    # These methods were never called and represented dead code. The _layer_console_connections
-    # list was always empty, making _detach a no-op despite being called in cleanup.
-
-    def _get_layer_console_data(self) -> Dict[str, Any]:
-        """Fetch catalog payload for console widget."""
-        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
-            return {"groups": []}
-        try:
-            return self._layers_controller.catalog.get_console_model(include_features=True, feature_limit=300)
-        except Exception as exc:
-            print(f"[SARPanel] Warning: Failed to build catalog payload: {exc}")
-            import traceback
-            traceback.print_exc()
-            return {"groups": []}
+    # NOTE: configure_marker_log, refresh_marker_log removed
+    # Layer Console and Marker Log are now in the Mission Logs window
+    # Access via menu: SAR Tracker > Mission Logs...
 
     def _apply_focus_mode_style(self):
         """Update focus mode button styling."""
@@ -1132,321 +1027,8 @@ class SARPanel(QDockWidget):
         text = f"Auto Save {status}{(' ' + interval_text) if interval_text else ''} | Last: {last_text}"
         self._set_feature_badge(self.autosave_status_label, text, self.autosave_enabled, color)
 
-    # ------------------------------------------------------------------
-    # Layer Console handlers
-    # ------------------------------------------------------------------
-    def _on_catalog_model_changed(self, *_args):
-        self._refresh_layer_console(full=True)
-
-    def _on_catalog_feature_count_changed(self, *_args):
-        self._refresh_layer_console(full=False)
-
-    def _on_layer_console_refresh(self):
-        """Manual refresh from widget."""
-        if self._layers_controller and getattr(self._layers_controller, "catalog", None):
-            try:
-                self._layers_controller.catalog.rescan_layers()
-            except Exception as exc:
-                print(f"[SARPanel] Warning: Catalog rescan failed: {exc}")
-        self._refresh_layer_console(full=True)
-
-    def _on_layer_alias_change_requested(self, layer_id: str, new_alias: str):
-        """Handle alias changes from console."""
-        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
-            return
-        try:
-            alias_value = new_alias.strip() if new_alias is not None else ""
-            alias_value = alias_value or None
-            self._layers_controller.catalog.set_layer_alias(layer_id, alias_value)
-            self._notify(success, "Alias Updated", f"Alias set for {layer_id}")
-        except ValueError as exc:
-            self._notify(error, "Alias Error", str(exc))
-        except Exception as exc:
-            self._notify(error, "Alias Error", f"Failed to update alias: {exc}")
-
-    def _on_layer_favorite_toggled(self, layer_id: str, is_favorite: bool):
-        """Handle favorite toggle from console."""
-        if not self._layers_controller or not getattr(self._layers_controller, "catalog", None):
-            return
-        try:
-            self._layers_controller.catalog.set_layer_favorite(layer_id, is_favorite)
-            msg = "Marked favorite" if is_favorite else "Favorite cleared"
-            self._notify(success, "Favorite", f"{msg} for {layer_id}")
-        except ValueError as exc:
-            self._notify(error, "Favorite Error", str(exc))
-        except Exception as exc:
-            self._notify(error, "Favorite Error", f"Failed to update favorite: {exc}")
-
-    def _on_move_to_section_requested(self, feature_id: int, section: str):
-        """Handle search area section move requests."""
-        if not self._layers_controller:
-            return
-        try:
-            moved = self._layers_controller.move_search_area_to_section(
-                feature_id=feature_id,
-                target_section=section,
-                updated_by=self._current_user_name()
-            )
-            if moved:
-                self._notify(success, "Search Area Moved", f"Moved to {section.title()}")
-            else:
-                self._notify(warning, "Move Section", "Move did not complete")
-        except ValueError as exc:
-            self._notify(error, "Move Section Error", str(exc))
-        except Exception as exc:
-            self._notify(error, "Move Section Error", f"Failed to move search area: {exc}")
-
-    def _on_reorder_requested(self, layer_id: str, feature_ids_in_order: List):
-        """Handle reorder request from console."""
-        if not self._layers_controller:
-            return
-        try:
-            coerced_ids = []
-            for fid in feature_ids_in_order or []:
-                try:
-                    coerced_ids.append(int(str(fid)))
-                except Exception:
-                    coerced_ids.append(fid)
-            if not coerced_ids:
-                return
-            self._layers_controller.reorder_features(
-                layer_id=layer_id,
-                feature_ids_in_order=coerced_ids,
-                updated_by=self._current_user_name()
-            )
-            self._notify(success, "Reordered", f"Reordered {len(coerced_ids)} feature(s)")
-        except ValueError as exc:
-            self._notify(error, "Reorder Error", str(exc))
-        except Exception as exc:
-            self._notify(error, "Reorder Error", f"Failed to reorder: {exc}")
-
-    def _on_layer_visibility_toggled(self, layer_id: str, visible: bool):
-        if not self._layers_controller:
-            return
-        try:
-            self._layers_controller.set_layer_visibility(layer_id, visible)
-        except Exception as exc:
-            self._notify(error, "Visibility Error", str(exc))
-
-    def _on_layer_delete_requested(self, layer_id: str, feature_id: object):
-        if not self._layers_controller:
-            return
-        try:
-            if layer_id in self._marker_layer_to_type:
-                marker_type = self._marker_layer_to_type[layer_id]
-                self._layers_controller.markers.delete_marker(marker_type, str(feature_id))
-            elif layer_id == LayerIds.SEARCH_AREAS:
-                self._layers_controller.drawings.delete_search_area(self._coerce_int(feature_id))
-            elif layer_id == LayerIds.RANGE_RINGS:
-                self._layers_controller.drawings.delete_range_ring(self._coerce_int(feature_id))
-            elif layer_id == LayerIds.BEARING_LINES:
-                self._layers_controller.drawings.delete_bearing_line(self._coerce_int(feature_id))
-            elif layer_id == LayerIds.LINES:
-                self._layers_controller.drawings.delete_line(self._coerce_int(feature_id))
-            elif layer_id == LayerIds.SEARCH_SECTORS:
-                self._layers_controller.drawings.delete_sector(self._coerce_int(feature_id))
-            elif layer_id == LayerIds.TEXT_LABELS:
-                self._layers_controller.drawings.delete_text_label(self._coerce_int(feature_id))
-            else:
-                # Fallback: attempt direct layer deletion with rollback protection
-                layer = self._layers_controller.layer_manager.get_layer(layer_id) if hasattr(self._layers_controller, "layer_manager") else None
-                if not layer or not layer.isValid():
-                    raise ValueError(f"Unsupported layer: {layer_id}")
-                if not layer.startEditing():
-                    raise RuntimeError("Unable to start edit session for deletion")
-                try:
-                    if not layer.deleteFeature(self._coerce_int(feature_id)):
-                        raise RuntimeError(f"Failed to delete feature {feature_id}")
-                    if not layer.commitChanges():
-                        raise RuntimeError(", ".join(layer.commitErrors()))
-                except Exception:
-                    if layer.isEditable():
-                        try:
-                            layer.rollBack()
-                        except RuntimeError:
-                            pass
-                    raise
-
-            if getattr(self._layers_controller, "catalog", None):
-                try:
-                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
-                except Exception:
-                    pass
-
-            self._refresh_layer_console(layer_id, full=False)
-            self._notify(success, "Deleted", "Feature deleted successfully")
-        except Exception as exc:
-            self._notify(error, "Delete Error", str(exc))
-            print(f"[SARPanel] Delete failed for {layer_id}: {exc}")
-
-    def _on_layer_zoom_requested(self, layer_id: str, feature_id: object):
-        if not self._layers_controller:
-            return
-        # Markers use business_id strings; others use integer feature ids
-        if layer_id in self._marker_layer_to_type:
-            marker_type = self._marker_layer_to_type[layer_id]
-            try:
-                feature = self._layers_controller.markers.get_marker_feature(marker_type, str(feature_id))
-            except Exception as e:
-                # BUG-047 fix: Include actual error details for better diagnostics
-                self._notify(warning, "Zoom", f"Marker unavailable: {str(e)}")
-                return
-        else:
-            layer = self._layers_controller.layer_manager.get_layer(layer_id) if hasattr(self._layers_controller, "layer_manager") else None
-            if not layer or not layer.isValid():
-                self._notify(warning, "Zoom", f"Layer unavailable: {layer_id}")
-                return
-
-            try:
-                fid = self._coerce_int(feature_id)
-            except Exception:
-                self._notify(warning, "Zoom", "Invalid feature id")
-                return
-
-            feature = layer.getFeature(fid)
-
-        if not feature or not feature.isValid() or not feature.hasGeometry():
-            self._notify(warning, "Zoom", "Feature geometry unavailable")
-            return
-
-        geom = feature.geometry()
-        if not geom or geom.isEmpty():
-            self._notify(warning, "Zoom", "Feature has no geometry")
-            return
-
-        canvas = self._layers_controller.iface.mapCanvas() if hasattr(self._layers_controller, "iface") else None
-        if canvas:
-            canvas.setExtent(geom.boundingBox())
-            canvas.refresh()
-
-    def _on_layer_rename_requested(self, layer_id: str, feature_id: object, new_name: str):
-        if not self._layers_controller or not new_name:
-            return
-        try:
-            if layer_id in self._marker_layer_to_type:
-                marker_type = self._marker_layer_to_type[layer_id]
-                self._layers_controller.markers.update_marker(marker_type, str(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.SEARCH_AREAS:
-                self._layers_controller.drawings.update_search_area(self._coerce_int(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.RANGE_RINGS:
-                self._layers_controller.drawings.update_range_ring(self._coerce_int(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.BEARING_LINES:
-                self._layers_controller.drawings.update_bearing_line(self._coerce_int(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.LINES:
-                self._layers_controller.drawings.update_line(self._coerce_int(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.SEARCH_SECTORS:
-                self._layers_controller.drawings.update_sector(self._coerce_int(feature_id), {"name": new_name})
-            elif layer_id == LayerIds.TEXT_LABELS:
-                self._layers_controller.drawings.update_text_label(self._coerce_int(feature_id), {"name": new_name})
-            else:
-                raise ValueError(f"Rename not supported for layer {layer_id}")
-
-            if getattr(self._layers_controller, "catalog", None):
-                try:
-                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
-                except Exception:
-                    pass
-
-            self._refresh_layer_console(layer_id, full=False)
-            self._notify(success, "Renamed", "Feature renamed")
-        except Exception as exc:
-            self._notify(error, "Rename Error", str(exc))
-            print(f"[SARPanel] Rename failed for {layer_id}: {exc}")
-
-    def _on_bulk_delete_requested(self, layer_id: str, feature_ids: List[object]):
-        if not self._layers_controller or not feature_ids:
-            return
-        try:
-            deleted = 0
-            user_name = self._current_user_name()
-
-            if layer_id in self._marker_layer_to_type:
-                marker_type = self._marker_layer_to_type[layer_id]
-                for fid in feature_ids:
-                    if self._layers_controller.markers.delete_marker(marker_type, str(fid)):
-                        deleted += 1
-            else:
-                ids = [self._coerce_int(fid) for fid in feature_ids]
-                deleted = self._layers_controller.bulk_delete_features(
-                    layer_id=layer_id,
-                    feature_ids=ids,
-                    confirmed=True,
-                    updated_by=user_name
-                )
-            if getattr(self._layers_controller, "catalog", None):
-                try:
-                    self._layers_controller.catalog.refresh_layer(layer_id, full=False)
-                except Exception:
-                    pass
-            self._refresh_layer_console(layer_id, full=False)
-
-            # CRITICAL FIX: Issue #1.10 - Log audit trail
-            self._log_audit(
-                operation="bulk_delete",
-                layer_id=layer_id,
-                count=deleted,
-                requested=len(feature_ids),
-                success=(deleted == len(feature_ids))
-            )
-
-            # CRITICAL FIX: Issue #2.9 - Distinguish partial vs full delete success
-            requested_count = len(feature_ids)
-            if deleted < requested_count:
-                # Partial failure - warn user
-                failed = requested_count - deleted
-                self._notify(
-                    warning,
-                    "Partial Delete",
-                    f"Deleted {deleted} of {requested_count} features.\n"
-                    f"{failed} features could not be deleted (may be locked/corrupted)."
-                )
-            elif deleted == requested_count:
-                # Complete success
-                self._notify(success, "Bulk Delete", f"Deleted {deleted} feature(s)")
-            else:
-                # Should never happen - deleted more than requested?
-                self._notify(
-                    error,
-                    "Delete Error",
-                    f"Unexpected: deleted {deleted} but requested {requested_count}"
-                )
-        except Exception as exc:
-            self._notify(error, "Bulk Delete Error", str(exc))
-            print(f"[SARPanel] Bulk delete failed for {layer_id}: {exc}")
-
-    def _on_bulk_assign_team_requested(self, layer_id: str, feature_ids: List[object], team: str):
-        self._notify(warning, "Assign Team", "Team assignment is not yet implemented for this layer")
-        print(f"[SARPanel] Assign team requested for {layer_id} ({len(feature_ids)} features) to {team}")
-
-    def _on_bulk_export_requested(self, layer_id: str, feature_ids: List[object]):
-        self._notify(warning, "Export", "Export from Layer Console not implemented yet")
-        print(f"[SARPanel] Export requested for {layer_id} ({len(feature_ids)} features)")
-
-    def _on_layer_duplicate_requested(self, layer_id: str, feature_id: object):
-        self._notify(warning, "Duplicate", "Duplicate not implemented for this layer")
-        print(f"[SARPanel] Duplicate requested for {layer_id} feature {feature_id}")
-
-    def _on_layer_export_requested(self, layer_id: str, feature_id: object):
-        self._notify(warning, "Export", "Export not implemented for this layer")
-        print(f"[SARPanel] Export requested for {layer_id} feature {feature_id}")
-
-    def _refresh_layer_console(self, layer_id: Optional[str] = None, full: bool = False):
-        if hasattr(self, "layer_console_widget") and self.layer_console_widget:
-            try:
-                self.layer_console_widget.refresh(full=full)
-            except Exception as exc:
-                print(f"[SARPanel] Layer console refresh failed: {exc}")
-
-    def _coerce_int(self, value: object) -> int:
-        if value is None:
-            raise ValueError("Feature id is required")
-        if isinstance(value, bool):
-            raise ValueError("Invalid feature id")
-        # Check for float truncation
-        if isinstance(value, float):
-            if value != int(value):
-                print(f"[SARPanel] Warning: Float feature id {value} truncated to {int(value)}")
-        return int(str(int(value)))
+    # NOTE: Layer Console handlers removed - moved to Mission Logs window
+    # Access via menu: SAR Tracker > Mission Logs...
 
     def _message_bar(self):
         if self._layers_controller and hasattr(self._layers_controller, "iface") and self._layers_controller.iface:
@@ -2002,25 +1584,9 @@ class SARPanel(QDockWidget):
         """
         try:
             self._is_active = False
-            # CRITICAL: Disconnect tracked layer console signals to prevent segfault
-            # Use targeted disconnection - only disconnect our handlers, not all handlers
-            for signal, handler in list(self._layer_console_connections):
-                try:
-                    # CRITICAL FIX: Check if signal parent still exists before disconnect
-                    # Attempting to disconnect from a deleted QObject causes segfault
-                    parent = getattr(signal, '__self__', None)
-                    if parent and isinstance(parent, QObject):
-                        try:
-                            # Try to access a basic property - will fail if object deleted
-                            _ = parent.objectName()
-                        except (RuntimeError, AttributeError):
-                            # Object deleted, skip disconnect
-                            continue
-                    signal.disconnect(handler)
-                except (TypeError, RuntimeError, AttributeError):
-                    # Signal already disconnected or widget destroyed
-                    pass
-            self._layer_console_connections = []
+
+            # NOTE: Layer Console and Marker Log cleanup removed
+            # These widgets are now in the Mission Logs window
 
             # CRITICAL FIX: Disconnect mission controller signals (Issue #1.8)
             if hasattr(self, '_mission_controller_connections'):
@@ -2037,36 +1603,6 @@ class SARPanel(QDockWidget):
                     except (TypeError, RuntimeError, AttributeError):
                         pass
                 self._mission_controller_connections = []
-
-            # CRITICAL FIX: Disconnect marker_log_widget signals (BUG-017)
-            if hasattr(self, '_marker_log_connections'):
-                for signal, handler in list(self._marker_log_connections):
-                    try:
-                        parent = getattr(signal, '__self__', None)
-                        if parent and isinstance(parent, QObject):
-                            try:
-                                _ = parent.objectName()
-                            except (RuntimeError, AttributeError):
-                                continue
-                        signal.disconnect(handler)
-                    except (TypeError, RuntimeError, AttributeError):
-                        pass
-                self._marker_log_connections = []
-
-            # CRITICAL FIX: Clean up marker_log_widget (BUG-019)
-            if hasattr(self, 'marker_log_widget') and self.marker_log_widget:
-                try:
-                    self.marker_log_widget.cleanup()
-                except Exception as exc:
-                    print(f"[SARTRACKER] Warning: Error cleaning up marker log widget: {exc}")
-
-            # BUG-058 fix: Removed _detach_catalog_signals() call (dead code)
-
-            if hasattr(self, 'layer_console_widget') and self.layer_console_widget:
-                try:
-                    self.layer_console_widget.cleanup()
-                except Exception as exc:
-                    print(f"[SARTRACKER] Warning: Error cleaning up layer console: {exc}")
 
             # CRITICAL: Restore hidden panels FIRST (Issue #3 fix)
             # If Focus Mode is active when plugin unloads, we must restore

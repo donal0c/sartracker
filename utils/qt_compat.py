@@ -80,6 +80,9 @@ WindowFlags (7 constants):
 WindowModality (3 constants):
     NonModal, WindowModal, ApplicationModal
 
+WidgetAttribute (1 constant):
+    WA_DeleteOnClose
+
 ToolButtonStyle (5 constants):
     ToolButtonIconOnly, ToolButtonTextOnly, ToolButtonTextBesideIcon,
     ToolButtonTextUnderIcon, ToolButtonFollowStyle
@@ -391,6 +394,15 @@ else:  # Qt5
     NonModal = Qt.NonModal
     WindowModal = Qt.WindowModal
     ApplicationModal = Qt.ApplicationModal
+
+
+# =============================================================================
+# WidgetAttribute enums
+# =============================================================================
+if QT_VERSION == 6:
+    WA_DeleteOnClose = Qt.WidgetAttribute.WA_DeleteOnClose
+else:  # Qt5
+    WA_DeleteOnClose = Qt.WA_DeleteOnClose
 
 
 # =============================================================================

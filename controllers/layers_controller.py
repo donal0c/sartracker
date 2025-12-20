@@ -1231,6 +1231,252 @@ class LayersController:
 
         return False
 
+    def delete_feature(
+        self,
+        layer_id: str,
+        feature_id,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Delete a feature from any supported layer.
+
+        Routes to the appropriate manager based on layer_id.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            feature_id: Feature ID (int for drawings, str for markers)
+            updated_by: Optional user name for audit
+
+        Returns:
+            True on success
+        """
+        self._assert_not_read_only("delete feature")
+        from ..layers import LayerIds
+
+        # Check if it's a marker layer
+        if layer_id in self.MARKER_TYPE_TO_LAYER_ID.values():
+            # Find marker type from layer_id
+            marker_type = None
+            for mt, lid in self.MARKER_TYPE_TO_LAYER_ID.items():
+                if lid == layer_id:
+                    marker_type = mt
+                    break
+            if marker_type and self.markers:
+                return self.markers.delete_marker(marker_type, str(feature_id))
+            return False
+
+        # Handle drawing layers
+        try:
+            if feature_id is None or isinstance(feature_id, bool):
+                raise ValueError("Invalid feature_id for drawing layer")
+            fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid feature_id for drawing layer: {feature_id}")
+
+        if layer_id == LayerIds.SEARCH_AREAS:
+            return self.drawings.delete_search_area(fid, updated_by=updated_by)
+        elif layer_id == LayerIds.RANGE_RINGS:
+            return self.drawings.delete_range_ring(fid, updated_by=updated_by)
+        elif layer_id == LayerIds.BEARING_LINES:
+            return self.drawings.delete_bearing_line(fid, updated_by=updated_by)
+        elif layer_id == LayerIds.LINES:
+            return self.drawings.delete_line(fid, updated_by=updated_by)
+        elif layer_id == LayerIds.SEARCH_SECTORS:
+            return self.drawings.delete_sector(fid, updated_by=updated_by)
+        elif layer_id == LayerIds.TEXT_LABELS:
+            return self.drawings.delete_text_label(fid, updated_by=updated_by)
+        else:
+            # Fallback: attempt direct layer deletion with rollback protection
+            layer = self.layer_manager.get_layer(layer_id)
+            if not layer or not layer.isValid():
+                raise ValueError(f"Unsupported layer: {layer_id}")
+            if not layer.startEditing():
+                raise RuntimeError("Unable to start edit session for deletion")
+            try:
+                if not layer.deleteFeature(fid):
+                    raise RuntimeError(f"Failed to delete feature {feature_id}")
+                if not layer.commitChanges():
+                    raise RuntimeError(", ".join(layer.commitErrors()))
+                self._refresh_catalog_for_layer(layer_id)
+                return True
+            except Exception:
+                if layer.isEditable():
+                    try:
+                        layer.rollBack()
+                    except RuntimeError:
+                        pass
+                raise
+
+    def rename_feature(
+        self,
+        layer_id: str,
+        feature_id,
+        new_name: str,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """
+        Rename a feature in any supported layer.
+
+        Routes to the appropriate manager based on layer_id.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            feature_id: Feature ID (int for drawings, str for markers)
+            new_name: New name for the feature
+            updated_by: Optional user name for audit
+
+        Returns:
+            True on success
+        """
+        self._assert_not_read_only("rename feature")
+        from ..layers import LayerIds
+
+        if not new_name:
+            return False
+
+        # Check if it's a marker layer
+        if layer_id in self.MARKER_TYPE_TO_LAYER_ID.values():
+            marker_type = None
+            for mt, lid in self.MARKER_TYPE_TO_LAYER_ID.items():
+                if lid == layer_id:
+                    marker_type = mt
+                    break
+            if marker_type and self.markers:
+                self.markers.update_marker(
+                    marker_type,
+                    str(feature_id),
+                    {"name": new_name},
+                    updated_by=updated_by
+                )
+                return True
+            return False
+
+        # Handle drawing layers
+        try:
+            if feature_id is None or isinstance(feature_id, bool):
+                raise ValueError("Invalid feature_id for drawing layer")
+            fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid feature_id for drawing layer: {feature_id}")
+
+        # Note: update_* methods return bool, not dict
+        if layer_id == LayerIds.SEARCH_AREAS:
+            return self.drawings.update_search_area(fid, {"name": new_name}, updated_by=updated_by)
+        elif layer_id == LayerIds.RANGE_RINGS:
+            return self.drawings.update_range_ring(fid, {"name": new_name}, updated_by=updated_by)
+        elif layer_id == LayerIds.BEARING_LINES:
+            return self.drawings.update_bearing_line(fid, {"name": new_name}, updated_by=updated_by)
+        elif layer_id == LayerIds.LINES:
+            return self.drawings.update_line(fid, {"name": new_name}, updated_by=updated_by)
+        elif layer_id == LayerIds.SEARCH_SECTORS:
+            return self.drawings.update_sector(fid, {"name": new_name}, updated_by=updated_by)
+        elif layer_id == LayerIds.TEXT_LABELS:
+            # TEXT_LABELS use 'text' field, not 'name'
+            return self.drawings.update_text_label(fid, {"text": new_name}, updated_by=updated_by)
+        else:
+            raise ValueError(f"Rename not supported for layer {layer_id}")
+
+    def zoom_to_feature(
+        self,
+        layer_id: str,
+        feature_id
+    ) -> bool:
+        """
+        Zoom map canvas to a feature in any supported layer.
+
+        Handles CRS transformation and point geometry buffering for proper zoom.
+
+        Args:
+            layer_id: Layer identifier (from LayerIds)
+            feature_id: Feature ID (int for drawings, str for markers)
+
+        Returns:
+            True on success
+        """
+        from qgis.core import QgsCoordinateTransform, QgsGeometry
+
+        layer = None  # Track source layer for CRS
+
+        # Get feature based on layer type
+        if layer_id in self.MARKER_TYPE_TO_LAYER_ID.values():
+            # Find marker type from layer_id
+            marker_type = None
+            for mt, lid in self.MARKER_TYPE_TO_LAYER_ID.items():
+                if lid == layer_id:
+                    marker_type = mt
+                    break
+            if marker_type and self.markers:
+                try:
+                    feature = self.markers.get_marker_feature(marker_type, str(feature_id))
+                    # Get the layer for CRS info
+                    layer = self.layer_manager.get_layer(layer_id)
+                except Exception:
+                    return False
+            else:
+                return False
+        else:
+            layer = self.layer_manager.get_layer(layer_id)
+            if not layer or not layer.isValid():
+                return False
+            try:
+                if feature_id is None or isinstance(feature_id, bool):
+                    return False
+                fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
+            except (ValueError, TypeError):
+                return False
+            feature = layer.getFeature(fid)
+
+        if not feature or not feature.isValid() or not feature.hasGeometry():
+            return False
+
+        geom = feature.geometry()
+        if not geom or geom.isEmpty():
+            return False
+
+        canvas = self.iface.mapCanvas()
+        if not canvas:
+            return False
+
+        # Get bounding box
+        bbox = geom.boundingBox()
+
+        # Handle point geometries (zero width/height) by buffering
+        if bbox.width() <= 0 or bbox.height() <= 0:
+            # Buffer point features so we can zoom to a non-zero extent.
+            #
+            # IMPORTANT: bbox is in the layer's CRS units (not always degrees).
+            # Use a conservative default that behaves reasonably for:
+            # - geographic CRS (degrees): ~0.001° ≈ 100m
+            # - projected CRS (meters/feet): ~100 map units
+            buffer_distance = 0.001
+            try:
+                if layer and layer.isValid() and hasattr(layer, "crs"):
+                    crs = layer.crs()
+                    if crs and hasattr(crs, "isGeographic") and not crs.isGeographic():
+                        buffer_distance = 100.0
+            except Exception:
+                buffer_distance = 0.001
+
+            bbox = bbox.buffered(float(buffer_distance))
+
+        # Transform to canvas CRS if needed
+        if layer and layer.isValid():
+            layer_crs = layer.crs()
+            canvas_crs = canvas.mapSettings().destinationCrs()
+
+            if layer_crs.isValid() and canvas_crs.isValid() and layer_crs != canvas_crs:
+                try:
+                    transform = QgsCoordinateTransform(layer_crs, canvas_crs, self.project)
+                    # Transform the bounding box
+                    bbox = transform.transformBoundingBox(bbox)
+                except Exception as exc:
+                    # If transform fails, proceed with untransformed bbox
+                    print(f"[LayersController] Warning: CRS transform failed: {exc}")
+
+        canvas.setExtent(bbox)
+        canvas.refresh()
+        return True
+
     def get_all_diagnostics(self) -> Dict[str, Any]:
         """
         Aggregate diagnostics from all managers and catalog.

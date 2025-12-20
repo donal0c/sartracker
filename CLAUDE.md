@@ -430,8 +430,86 @@ Every feature you add, every bug you fix, and every refactor you perform has the
 
 ---
 
-**Document Version:** 1.1 (rewritten for Claude Code optimization)
+## WORK TRACKING WITH BEADS
 
-**Last Updated:** 2025‑11‑29
+This project uses **beads** (`bd`) for persistent work tracking across sessions. Beads survives conversation compaction and provides dependency-aware task management.
+
+### When to Use Beads vs TodoWrite
+
+| Use Beads | Use TodoWrite |
+|-----------|---------------|
+| Multi-session work | Single-session tasks |
+| Complex dependencies | Linear step-by-step work |
+| Need to resume after days/weeks | Immediate tactical execution |
+| Work that blocks other work | Simple checklists |
+
+### Session Start Protocol
+
+At the start of every session:
+
+```bash
+bd ready                           # See what's unblocked and workable
+bd list --status in_progress       # Check for work already in progress
+bd show SAR-xxx                    # Read notes on active issues
+```
+
+### Working on Issues
+
+```bash
+bd update SAR-xxx --status in_progress   # Claim work
+bd update SAR-xxx --notes "COMPLETED: ... IN PROGRESS: ... NEXT: ..."   # Checkpoint progress
+bd close SAR-xxx --reason "Implemented X"   # Complete work
+```
+
+### Progress Checkpointing
+
+Update beads notes at these critical points:
+- Before conversation compaction (>70% token usage)
+- After completing significant milestones
+- When hitting blockers
+- Before switching tasks
+
+**Note format for session handoff:**
+```
+COMPLETED: Specific deliverables
+IN PROGRESS: Current state + next step
+BLOCKERS: What's preventing progress
+KEY DECISIONS: Important context
+```
+
+### Landing the Plane (Session Completion)
+
+When ending a work session, complete ALL steps:
+
+1. **Update beads** - Close finished issues, update notes on in-progress work
+2. **File new issues** - Create issues for discovered work or follow-ups
+3. **Run quality gates** (if code changed) - `./tools/check_compatibility.sh`
+4. **Sync and push**:
+   ```bash
+   git pull --rebase
+   bd sync
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+
+**Work is NOT complete until `git push` succeeds.**
+
+### Key Commands Reference
+
+| Command | Purpose |
+|---------|---------|
+| `bd ready` | Show unblocked work |
+| `bd blocked` | Show what's stuck and why |
+| `bd show SAR-xxx` | Full issue details |
+| `bd update SAR-xxx --status X` | Change status |
+| `bd close SAR-xxx` | Mark complete |
+| `bd create "Title"` | New issue |
+| `bd stats` | Project health overview |
+
+---
+
+**Document Version:** 1.2 (added beads integration)
+
+**Last Updated:** 2025‑12‑18
 
 **For Detailed Patterns & Examples:** See `docs/AI_CODE_REFERENCE.md`.

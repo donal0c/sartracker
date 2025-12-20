@@ -17,6 +17,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..utils.qt_compat import AlignLeft, UserRole
+from ..utils.exceptions import validate_coordinate_pair, CoordinateError
 
 
 class MarkerLogWidget(QWidget):
@@ -149,7 +150,11 @@ class MarkerLogWidget(QWidget):
             lat = record.get("lat")
             lon = record.get("lon")
             if lat is not None and lon is not None:
-                coords = f"{lat:.5f}, {lon:.5f}"
+                try:
+                    lat_f, lon_f = validate_coordinate_pair(lat, lon)
+                    coords = f"{lat_f:.5f}, {lon_f:.5f}"
+                except Exception:
+                    coords = ""
 
             item = QTreeWidgetItem([
                 record.get("type", "").title(),
@@ -181,7 +186,14 @@ class MarkerLogWidget(QWidget):
         enabled = record is not None
         self.edit_button.setEnabled(enabled)
         self.delete_button.setEnabled(enabled)
-        self.zoom_button.setEnabled(enabled and record.get("lat") is not None and record.get("lon") is not None)
+        zoom_enabled = False
+        if enabled:
+            try:
+                validate_coordinate_pair(record.get("lat"), record.get("lon"))
+                zoom_enabled = True
+            except Exception:
+                zoom_enabled = False
+        self.zoom_button.setEnabled(zoom_enabled)
         self.open_attachment_button.setEnabled(enabled and bool(record.get("attachment_path")))
 
         if record:
@@ -228,8 +240,17 @@ class MarkerLogWidget(QWidget):
 
     def _emit_zoom(self):
         record = self._selected_record()
-        if record and record.get("lat") is not None and record.get("lon") is not None:
-            self.zoom_requested.emit(record["lat"], record["lon"])
+        if not record:
+            return
+        try:
+            lat, lon = validate_coordinate_pair(record.get("lat"), record.get("lon"))
+        except CoordinateError as exc:
+            print(f"[MarkerLogWidget] Warning: Invalid marker coordinates: {exc}")
+            return
+        except Exception as exc:
+            print(f"[MarkerLogWidget] Warning: Failed to validate marker coordinates: {exc}")
+            return
+        self.zoom_requested.emit(lat, lon)
 
     def _emit_open_attachment(self):
         record = self._selected_record()

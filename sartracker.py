@@ -950,7 +950,7 @@ class sartracker:
         """Create the menu entries and toolbar icons inside the QGIS GUI."""
         # Configure logging early - routes Python logging to QGIS Log Messages panel
         try:
-            from utils.logging_config import configure_logging, get_logger
+            from .utils.logging_config import configure_logging, get_logger
             configure_logging()
             self._logger = get_logger("sartracker")
             self._logger.info("initGui() starting... (v0.3.1)")
@@ -1005,6 +1005,16 @@ class sartracker:
             print("[SARTRACKER] Added Diagnostics menu item")
         except Exception as e:
             print(f"[SARTRACKER] ERROR adding Diagnostics menu: {e}")
+
+        # Add Mission Logs menu item
+        try:
+            self.mission_logs_action = QAction("Mission Logs...", self.iface.mainWindow())
+            self.mission_logs_action.triggered.connect(self._show_mission_logs)
+            self.iface.addPluginToMenu(self.menu, self.mission_logs_action)
+            self.actions.append(self.mission_logs_action)
+            print("[SARTRACKER] Added Mission Logs menu item")
+        except Exception as e:
+            print(f"[SARTRACKER] ERROR adding Mission Logs menu: {e}")
 
         # Add Smoke Test menu item
         try:
@@ -1279,15 +1289,10 @@ class sartracker:
         self.sar_panel.hide()  # Hidden by default
 
         # Note: SAR panel cleanup is handled in unload() directly
-        if self.layers_controller and self.sar_panel:
-            try:
-                self.sar_panel.configure_marker_log(self.layers_controller.list_markers)
-                self.sar_panel.refresh_marker_log()
-            except Exception as log_error:
-                print(f"[SARTRACKER] Warning: Could not initialize marker log: {log_error}")
-        if self.marker_controller and self.sar_panel:
-            # Update marker controller refresh hook now that panel exists
-            self.marker_controller._refresh_log = self.sar_panel.refresh_marker_log
+        # NOTE: Marker log moved to Mission Logs window (SAR Tracker > Mission Logs...)
+        if self.marker_controller:
+            # Update marker controller refresh hook to refresh Mission Logs window
+            self.marker_controller._refresh_log = self._refresh_mission_logs_window
         if self.sar_panel:
             if self.marker_controller:
                 self.sar_panel.marker_edit_requested.connect(self.marker_controller.handle_edit)
@@ -1571,6 +1576,421 @@ class sartracker:
             print(f"ERROR running smoke test: {e}")
             print(traceback.format_exc())
 
+    def _show_mission_logs(self):
+        """Show the Mission Logs window (non-modal) for end-of-mission review."""
+        if self._safe_mode_block("Mission Logs"):
+            return
+
+        try:
+            from .ui.mission_logs_window import MissionLogsWindow
+
+            # Reuse existing window if it exists and is visible
+            if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
+                try:
+                    if self._mission_logs_window.isVisible():
+                        self._mission_logs_window.raise_()
+                        self._mission_logs_window.activateWindow()
+                        return
+                except RuntimeError:
+                    # Window was deleted, create new one
+                    self._mission_logs_window = None
+
+            # Create new window
+            self._mission_logs_window = MissionLogsWindow(self.iface.mainWindow())
+
+            # Configure catalog service from layers controller
+            if self.layers_controller and hasattr(self.layers_controller, "catalog"):
+                self._mission_logs_window.set_catalog_service(self.layers_controller.catalog)
+
+            # Configure marker fetcher
+            if self.layers_controller and hasattr(self.layers_controller, "list_markers"):
+                self._mission_logs_window.set_marker_fetcher(self.layers_controller.list_markers)
+
+            # Configure mission info fetcher
+            self._mission_logs_window.set_mission_info_fetcher(self._get_mission_logs_info)
+
+            # Wire up signals from the window
+            # Marker signals
+            self._mission_logs_window.zoom_requested.connect(self._on_mission_logs_zoom)
+            self._mission_logs_window.edit_marker_requested.connect(self._on_mission_logs_edit_marker)
+            self._mission_logs_window.delete_marker_requested.connect(self._on_mission_logs_delete_marker)
+            self._mission_logs_window.open_attachment_requested.connect(self._on_mission_logs_open_attachment)
+
+            # Layer console signals
+            self._mission_logs_window.feature_zoom_requested.connect(self._on_mission_logs_feature_zoom)
+            self._mission_logs_window.feature_delete_requested.connect(self._on_mission_logs_feature_delete)
+            self._mission_logs_window.feature_rename_requested.connect(self._on_mission_logs_feature_rename)
+            self._mission_logs_window.bulk_delete_requested.connect(self._on_mission_logs_bulk_delete)
+            self._mission_logs_window.visibility_toggled.connect(self._on_mission_logs_visibility_toggled)
+            self._mission_logs_window.layer_alias_change_requested.connect(self._on_mission_logs_alias_change)
+            self._mission_logs_window.layer_favorite_toggled.connect(self._on_mission_logs_favorite_toggled)
+            self._mission_logs_window.move_to_section_requested.connect(self._on_mission_logs_move_to_section)
+            self._mission_logs_window.reorder_requested.connect(self._on_mission_logs_reorder)
+            self._mission_logs_window.layer_console_refresh_requested.connect(self._on_mission_logs_refresh)
+            self._mission_logs_window.closed.connect(self._on_mission_logs_closed)
+
+            # Show non-modal
+            self._mission_logs_window.show()
+
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Failed to open Mission Logs: {e}",
+                duration=5
+            )
+            print(f"ERROR opening Mission Logs: {e}")
+            print(traceback.format_exc())
+
+    def _get_mission_logs_info(self) -> dict:
+        """Get mission information for the Mission Logs window."""
+        info = {
+            "name": None,
+            "status": "inactive",
+            "start_time": None,
+            "end_time": None,
+            "coordinators": "",
+            "primary_store": None,
+            "backup_store": None,
+            "layer_count": 0,
+            "feature_count": 0,
+            "marker_count": 0,
+            "tracking_devices": 0,
+            "breadcrumb_count": 0,
+        }
+
+        try:
+            # Mission name and paths
+            paths = self._current_mission_paths()
+            if paths:
+                info["name"] = paths.mission_name
+                info["status"] = "active"
+                info["primary_store"] = str(paths.gpkg_path) if paths.gpkg_path else None
+                info["backup_store"] = str(paths.backup_directory) if paths.backup_directory else None
+
+            # Coordinators
+            if self.layer_manager:
+                coords = self.layer_manager.get_mission_coordinators()
+                if coords:
+                    info["coordinators"] = coords
+
+            # Start time
+            start_iso = self._get_mission_start_iso()
+            if start_iso:
+                info["start_time"] = start_iso
+
+            # Layer/feature counts
+            if self.layers_controller:
+                try:
+                    if hasattr(self.layers_controller, "get_layer_count"):
+                        info["layer_count"] = self.layers_controller.get_layer_count()
+                    if hasattr(self.layers_controller, "get_feature_count"):
+                        info["feature_count"] = self.layers_controller.get_feature_count()
+                except Exception:
+                    pass
+
+            # Marker count
+            if self.layers_controller and hasattr(self.layers_controller, "list_markers"):
+                try:
+                    markers = self.layers_controller.list_markers()
+                    info["marker_count"] = len(markers) if markers else 0
+                except Exception:
+                    pass
+
+            # Tracking stats
+            if self.layer_manager:
+                try:
+                    if hasattr(self.layer_manager, "get_device_count"):
+                        info["tracking_devices"] = self.layer_manager.get_device_count()
+                    if hasattr(self.layer_manager, "get_breadcrumb_count"):
+                        info["breadcrumb_count"] = self.layer_manager.get_breadcrumb_count()
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Error getting mission logs info: {exc}")
+
+        return info
+
+    def _get_audit_user_name(self) -> str:
+        """Best-effort user name for audit fields."""
+        try:
+            from qgis.PyQt.QtCore import QSettings
+            stored_name = QSettings().value("sartracker/coordinator_name")
+            if stored_name:
+                return str(stored_name)
+        except Exception:
+            pass
+
+        try:
+            from qgis.core import QgsApplication
+            user = QgsApplication.userFullName()
+            if user:
+                return user
+        except Exception:
+            pass
+
+        try:
+            import getpass
+            user = getpass.getuser()
+            if user:
+                return user
+        except Exception:
+            pass
+
+        return "Unknown"
+
+    def _on_mission_logs_feature_zoom(self, layer_id: str, feature_id):
+        """Handle zoom request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.zoom_to_feature(layer_id, feature_id)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to zoom to feature: {exc}")
+
+    def _on_mission_logs_zoom(self, lat: float, lon: float):
+        """Handle coordinate zoom request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        try:
+            from .utils.exceptions import validate_coordinate_pair, CoordinateError
+            from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
+
+            try:
+                lat, lon = validate_coordinate_pair(lat, lon)
+            except CoordinateError as exc:
+                warning(
+                    self.iface.messageBar(),
+                    "SAR Tracker",
+                    f"Invalid coordinates: {exc}",
+                    duration=4
+                )
+                return
+
+            # Convert from WGS84 to project CRS
+            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+            project_crs = QgsProject.instance().crs()
+            transform = QgsCoordinateTransform(wgs84, project_crs, QgsProject.instance())
+
+            point = transform.transform(QgsPointXY(lon, lat))
+
+            # Zoom to point with buffer
+            canvas = self.iface.mapCanvas()
+            current_scale = canvas.scale()
+            canvas.setCenter(point)
+            canvas.zoomScale(min(current_scale, 5000))  # Don't zoom out, only in
+            canvas.refresh()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to zoom to coordinates: {exc}")
+
+    def _on_mission_logs_edit_marker(self, marker_type: str, marker_id: str):
+        """Handle edit marker request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        # Delegate to marker controller if available, else use fallback handler
+        if self.marker_controller:
+            try:
+                self.marker_controller.handle_edit(marker_type, marker_id)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to edit marker: {exc}")
+        else:
+            self._on_marker_edit_requested(marker_type, marker_id)
+
+    def _on_mission_logs_delete_marker(self, marker_type: str, marker_id: str):
+        """Handle delete marker request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        # Delegate to marker controller if available, else use fallback handler
+        if self.marker_controller:
+            try:
+                self.marker_controller.handle_delete(marker_type, marker_id)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to delete marker: {exc}")
+        else:
+            self._on_marker_delete_requested(marker_type, marker_id)
+
+    def _on_mission_logs_open_attachment(self, path: str):
+        """Handle open attachment request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        import os.path
+
+        # Validate path before opening
+        if not path:
+            print("[SARTRACKER] Warning: Empty attachment path")
+            return
+        if not os.path.isfile(path):
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                f"Attachment not found: {path}",
+                duration=4
+            )
+            return
+
+        try:
+            from qgis.PyQt.QtCore import QUrl
+            from qgis.PyQt.QtGui import QDesktopServices
+            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                raise RuntimeError("QDesktopServices.openUrl returned False")
+        except Exception as exc:
+            warning(self.iface.messageBar(), "SAR Tracker", f"Could not open attachment: {exc}", duration=5)
+            print(f"[SARTRACKER] Warning: Failed to open attachment: {exc}")
+
+    def _on_mission_logs_feature_delete(self, layer_id: str, feature_id):
+        """Handle feature delete request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.delete_feature(
+                    layer_id,
+                    feature_id,
+                    updated_by=self._get_audit_user_name()
+                )
+                self._refresh_mission_logs_window()
+            except Exception as exc:
+                warning(self.iface.messageBar(), "SAR Tracker", f"Delete failed: {exc}", duration=4)
+                print(f"[SARTRACKER] Warning: Failed to delete feature: {exc}")
+
+    def _on_mission_logs_feature_rename(self, layer_id: str, feature_id, new_name: str):
+        """Handle feature rename request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.rename_feature(
+                    layer_id,
+                    feature_id,
+                    new_name,
+                    updated_by=self._get_audit_user_name()
+                )
+                self._refresh_mission_logs_window()
+            except Exception as exc:
+                warning(self.iface.messageBar(), "SAR Tracker", f"Rename failed: {exc}", duration=4)
+                print(f"[SARTRACKER] Warning: Failed to rename feature: {exc}")
+
+    def _on_mission_logs_bulk_delete(self, layer_id: str, feature_ids: list):
+        """Handle bulk delete request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                if not feature_ids:
+                    return
+                if len(feature_ids) > 10:
+                    confirm = QMessageBox.question(
+                        self.iface.mainWindow(),
+                        "Bulk Delete",
+                        f"Delete {len(feature_ids)} features?\nThis action cannot be undone.",
+                        MessageBoxYes | MessageBoxNo,
+                        MessageBoxNo
+                    )
+                    if confirm != MessageBoxYes:
+                        return
+                self.layers_controller.bulk_delete_features(
+                    layer_id,
+                    feature_ids,
+                    confirmed=True,
+                    updated_by=self._get_audit_user_name()
+                )
+                self._refresh_mission_logs_window()
+            except Exception as exc:
+                warning(self.iface.messageBar(), "SAR Tracker", f"Bulk delete failed: {exc}", duration=5)
+                print(f"[SARTRACKER] Warning: Failed to bulk delete features: {exc}")
+
+    def _on_mission_logs_visibility_toggled(self, layer_id: str, visible: bool):
+        """Handle layer visibility toggle from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.set_layer_visibility(layer_id, visible)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to toggle layer visibility: {exc}")
+
+    def _on_mission_logs_alias_change(self, layer_id: str, new_alias: str):
+        """Handle layer alias change from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
+            try:
+                alias_value = new_alias.strip() if new_alias else None
+                self.layers_controller.catalog.set_layer_alias(layer_id, alias_value)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to change layer alias: {exc}")
+
+    def _on_mission_logs_favorite_toggled(self, layer_id: str, is_favorite: bool):
+        """Handle layer favorite toggle from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
+            try:
+                self.layers_controller.catalog.set_layer_favorite(layer_id, is_favorite)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to toggle layer favorite: {exc}")
+
+    def _on_mission_logs_move_to_section(self, feature_id: int, section: str):
+        """Handle move to section request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.move_search_area_to_section(
+                    feature_id=feature_id,
+                    target_section=section
+                )
+                self._refresh_mission_logs_window()
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to move to section: {exc}")
+
+    def _on_mission_logs_reorder(self, layer_id: str, feature_ids: list):
+        """Handle feature reorder request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller:
+            try:
+                self.layers_controller.reorder_features(layer_id, feature_ids)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to reorder features: {exc}")
+
+    def _on_mission_logs_refresh(self):
+        """Handle manual refresh request from Mission Logs window."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
+            try:
+                self.layers_controller.catalog.rescan_layers()
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Catalog rescan failed: {exc}")
+        self._refresh_mission_logs_window()
+
+    def _refresh_mission_logs_window(self):
+        """Refresh the Mission Logs window if it's open."""
+        # Guard against refresh during shutdown
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
+            try:
+                # Check if C++ object is still valid
+                if sip_isdeleted(self._mission_logs_window):
+                    self._mission_logs_window = None
+                    return
+                self._mission_logs_window.refresh()
+            except RuntimeError:
+                # Window C++ object deleted
+                self._mission_logs_window = None
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to refresh Mission Logs window: {exc}")
+
+    def _on_mission_logs_closed(self):
+        """Handle Mission Logs window closed signal."""
+        # Just clear the reference, don't try to clean up - window handles its own cleanup
+        self._mission_logs_window = None
+
     def _on_app_about_to_quit(self):
         """
         Handle application exit signal.
@@ -1634,14 +2054,7 @@ class sartracker:
                                 timer.stop()
                         except Exception:
                             pass
-                # Stop Layer Console timers/tasks which may still be active even if
-                # we avoid running full SARPanel.cleanup() during shutdown.
-                layer_console = getattr(self.sar_panel, "layer_console_widget", None)
-                if layer_console and hasattr(layer_console, "cleanup"):
-                    try:
-                        layer_console.cleanup()
-                    except Exception as exc:
-                        print(f"[SARTRACKER] Warning: Failed to clean up layer console on shutdown: {exc}")
+                # NOTE: Layer Console moved to Mission Logs window
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to stop SAR panel timers on shutdown: {exc}")
 
@@ -1944,6 +2357,54 @@ class sartracker:
                     self.provider_controller = None
             # ============================================================
 
+            # ============================================================
+            # Clean up Mission Logs Window
+            # ============================================================
+            if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
+                try:
+                    # Check if C++ object is still valid before accessing
+                    if sip_isdeleted(self._mission_logs_window):
+                        print("[SARTRACKER] Mission Logs window already deleted, skipping cleanup")
+                        self._mission_logs_window = None
+                    else:
+                        print("[SARTRACKER] Cleaning up Mission Logs window...")
+                        # Disconnect all signals (marker signals)
+                        for signal_name, handler in [
+                            ("zoom_requested", self._on_mission_logs_zoom),
+                            ("edit_marker_requested", self._on_mission_logs_edit_marker),
+                            ("delete_marker_requested", self._on_mission_logs_delete_marker),
+                            ("open_attachment_requested", self._on_mission_logs_open_attachment),
+                            # Layer console signals
+                            ("feature_zoom_requested", self._on_mission_logs_feature_zoom),
+                            ("feature_delete_requested", self._on_mission_logs_feature_delete),
+                            ("feature_rename_requested", self._on_mission_logs_feature_rename),
+                            ("bulk_delete_requested", self._on_mission_logs_bulk_delete),
+                            ("visibility_toggled", self._on_mission_logs_visibility_toggled),
+                            ("layer_alias_change_requested", self._on_mission_logs_alias_change),
+                            ("layer_favorite_toggled", self._on_mission_logs_favorite_toggled),
+                            ("move_to_section_requested", self._on_mission_logs_move_to_section),
+                            ("reorder_requested", self._on_mission_logs_reorder),
+                            ("layer_console_refresh_requested", self._on_mission_logs_refresh),
+                            ("closed", self._on_mission_logs_closed),
+                        ]:
+                            try:
+                                signal = getattr(self._mission_logs_window, signal_name, None)
+                                if signal:
+                                    signal.disconnect(handler)
+                            except (TypeError, RuntimeError):
+                                pass
+
+                        # Clean up and close the window
+                        self._mission_logs_window.cleanup()
+                        self._mission_logs_window.close()
+                        self._mission_logs_window.deleteLater()
+                        print("[SARTRACKER] Mission Logs window cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during Mission Logs window cleanup: {e}")
+                finally:
+                    self._mission_logs_window = None
+            # ============================================================
+
             # Disconnect and clean up SAR Panel
             if self.sar_panel:
                 # Stop all timers BEFORE disconnecting signals (Issue #5 fix)
@@ -1954,7 +2415,7 @@ class sartracker:
                     if hasattr(self.sar_panel, 'cleanup') and not self._app_is_quitting:
                         self.sar_panel.cleanup()
                     else:
-                        # Best-effort stop timers + internal widgets without UI restoration
+                        # Best-effort stop timers without UI restoration
                         for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
                             timer = getattr(self.sar_panel, timer_name, None)
                             if timer:
@@ -1963,12 +2424,7 @@ class sartracker:
                                         timer.stop()
                                 except Exception:
                                     pass
-                        layer_console = getattr(self.sar_panel, "layer_console_widget", None)
-                        if layer_console and hasattr(layer_console, "cleanup"):
-                            try:
-                                layer_console.cleanup()
-                            except Exception:
-                                pass
+                        # NOTE: Layer Console moved to Mission Logs window
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
 
@@ -2131,8 +2587,8 @@ class sartracker:
                 if not has_coords:
                     self._collect_mission_metadata(mode="start", allow_resume_time=False)
             success(self.iface.messageBar(), "SAR Tracker", message, duration=3)
+            self._refresh_mission_logs_window()
             if self.sar_panel:
-                self.sar_panel.refresh_marker_log()
                 # Hide finalize button during active mission
                 self.sar_panel.set_finalize_button_visible(visible=False)
         elif state == MissionState.PAUSED:
@@ -2165,8 +2621,7 @@ class sartracker:
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
 
-            if self.sar_panel:
-                self.sar_panel.refresh_marker_log()
+            self._refresh_mission_logs_window()
 
             # Show finalize button after mission ends (if not already finalized)
             if self.sar_panel and self._mission_gpkg_path:
@@ -4023,8 +4478,7 @@ class sartracker:
         # Deactivate marker tool (return to pan/zoom)
         self.iface.mapCanvas().unsetMapTool(self.marker_tool)
         self.current_marker_type = None
-        if self.sar_panel:
-            self.sar_panel.refresh_marker_log()
+        self._refresh_mission_logs_window()
 
     def _on_marker_edit_requested(self, marker_type: str, marker_id: str):
         """Handle marker edit requests originating from the Marker Log."""
@@ -4057,8 +4511,7 @@ class sartracker:
                         "Markers",
                         f"{marker_data['name']} updated successfully",
                         duration=3)
-                if self.sar_panel:
-                    self.sar_panel.refresh_marker_log()
+                self._refresh_mission_logs_window()
         except Exception as exc:
             error(self.iface.messageBar(),
                   "Markers",
@@ -4086,8 +4539,7 @@ class sartracker:
                     "Markers",
                     "Marker deleted.",
                     duration=2)
-            if self.sar_panel:
-                self.sar_panel.refresh_marker_log()
+            self._refresh_mission_logs_window()
         except Exception as exc:
             error(self.iface.messageBar(),
                   "Markers",

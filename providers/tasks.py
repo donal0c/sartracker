@@ -122,6 +122,10 @@ class CSVRefreshTask(ProviderRefreshTask):
     block the UI or crash during active rescue missions.
     """
 
+    def __init__(self, provider: 'Provider', description: str = "Refreshing data", since_iso: Optional[str] = None):
+        super().__init__(provider, description)
+        self.since_iso = since_iso
+
     def run(self) -> bool:
         """
         Run CSV parsing in background thread.
@@ -143,7 +147,7 @@ class CSVRefreshTask(ProviderRefreshTask):
                 return False
 
             # Parse breadcrumbs (historical trail)
-            breadcrumbs = self.provider.get_breadcrumbs()
+            breadcrumbs = self.provider.get_breadcrumbs(since_iso=self.since_iso)
 
             if self.check_cancellation("CSV after get_breadcrumbs"):
                 return False

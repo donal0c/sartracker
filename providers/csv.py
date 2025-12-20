@@ -637,23 +637,25 @@ class FileCSVProvider(Provider):
             logger.error(f"Connection test failed for CSV provider: {str(e)}")
             return False
 
-    def create_refresh_task(self, description: str,
-                            since_iso: Optional[str] = None) -> 'ProviderRefreshTask':
+    def create_refresh_task(
+        self,
+        description: str,
+        since_iso: Optional[str] = None
+    ) -> 'ProviderRefreshTask':
         """
         Create CSV-specific refresh task.
 
         Args:
             description: Task description for progress display
-            since_iso: Ignored for CSV provider (loads all data from files)
+            since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
 
         Returns:
             CSVRefreshTask instance for background parsing
 
         Qt5/Qt6 Compatible: Returns QgsTask subclass.
         """
-        # CSV provider loads all data from files, since_iso is ignored
         from .tasks import CSVRefreshTask
-        return CSVRefreshTask(self, description)
+        return CSVRefreshTask(self, description, since_iso=since_iso)
 
     def invalidate_cache(self, filepath: Optional[str] = None):
         """
