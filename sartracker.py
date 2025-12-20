@@ -2312,7 +2312,7 @@ class sartracker:
             # ============================================================
             # PHASE 2.5: Clean up Drawing Manager (GPX watch must stop)
             # ============================================================
-            if self.drawing_manager:
+            if hasattr(self, 'drawing_manager') and self.drawing_manager:
                 try:
                     # Stop GPX folder watching
                     self.drawing_manager.cleanup()
