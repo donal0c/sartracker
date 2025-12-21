@@ -40,6 +40,7 @@ from .tracking_segments import (
 from ...layers import LayerIds
 from ...layers.schema import (
     DEVICE_POSITION_FIELDS,
+    DEVICE_TRAIL_FIELDS,
     GroupNames,
     get_per_device_group_path,
 )
@@ -96,7 +97,7 @@ class TrackingLayerManager(BaseLayerManager):
     # Set to True to enable per-device architecture, False for shared layers.
 
     USE_PER_DEVICE_POSITIONS = True   # Phase 1: Per-device current position layers
-    USE_PER_DEVICE_TRAILS = False     # Phase 2: Per-device trail layers (future)
+    USE_PER_DEVICE_TRAILS = True      # Phase 2: Per-device trail layers
 
     # Custom property keys for per-device layer identification
     DEVICE_ID_PROP = "sartracker:device_id"
@@ -123,6 +124,10 @@ class TrackingLayerManager(BaseLayerManager):
         # Per-device factory instance (created on first use when mission store exists)
         self._per_device_factory: Optional[PerItemLayerFactory] = None
 
+        # Phase SAR-nj0: Per-device generation tracking for async safety
+        # Each device has its own generation counter to detect stale async data
+        self._device_generations: Dict[str, int] = {}
+
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
         return [self.CURRENT_LAYER_NAME, self.BREADCRUMBS_LAYER_NAME]
@@ -141,6 +146,8 @@ class TrackingLayerManager(BaseLayerManager):
         self._device_position_layers.clear()
         self._device_trail_layers.clear()
         self._per_device_factory = None
+        # Phase SAR-nj0: Clear per-device generations
+        self._device_generations.clear()
 
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
@@ -1467,6 +1474,322 @@ class TrackingLayerManager(BaseLayerManager):
         )
 
     # =========================================================================
+    # Phase SAR-nj0: Per-Device Trail Layers
+    # =========================================================================
+
+    def _get_device_generation(self, device_id: str) -> int:
+        """
+        Get the current generation counter for a device.
+
+        Used for async safety - stale callbacks can detect outdated data.
+
+        Args:
+            device_id: Device identifier
+
+        Returns:
+            Current generation number (0 if device not seen before)
+        """
+        return self._device_generations.get(device_id, 0)
+
+    def _increment_device_generation(self, device_id: str) -> int:
+        """
+        Increment and return the generation counter for a device.
+
+        Called when starting a new async operation for this device.
+
+        Args:
+            device_id: Device identifier
+
+        Returns:
+            New generation number
+        """
+        current = self._device_generations.get(device_id, 0)
+        new_gen = current + 1
+        self._device_generations[device_id] = new_gen
+        return new_gen
+
+    def _ensure_device_trail_layer(
+        self,
+        device_id: str,
+        sample_position: Dict
+    ) -> Optional[QgsVectorLayer]:
+        """
+        Create or retrieve trail layer for a device.
+
+        Each device gets its own trail layer under:
+            SAR Tracker / Tracking / {DeviceName} / Trail
+
+        Trail layers contain LineString segments for that device's breadcrumbs.
+
+        Args:
+            device_id: Stable device identifier from Traccar
+            sample_position: Position dict with 'name' for display name
+
+        Returns:
+            QgsVectorLayer for the device trail, or None on failure
+        """
+        # Check cache first
+        if device_id in self._device_trail_layers:
+            layer = self._device_trail_layers[device_id]
+            if layer and layer.isValid():
+                return layer
+            # Stale cache entry
+            del self._device_trail_layers[device_id]
+
+        # Search by custom property (handles plugin reload)
+        existing = self._get_device_layers_by_property(device_id)
+        if existing['trail'] and existing['trail'].isValid():
+            self._device_trail_layers[device_id] = existing['trail']
+            return existing['trail']
+
+        # Create new layer via factory
+        factory = self._get_per_device_factory()
+        if not factory:
+            logger.warning(
+                "Cannot create per-device trail layer: no factory available. "
+                "Falling back to shared layer."
+            )
+            return None
+
+        # Get device name for display
+        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
+
+        # Ensure device group exists (same group as position layer)
+        device_group = self._ensure_device_group(device_name)
+        if not device_group:
+            logger.warning("Failed to create device group for %s", device_name)
+            return None
+
+        try:
+            # Create the layer via PerItemLayerFactory
+            item_info = factory.create_item_layer(
+                item_type=ItemType.DEVICE_TRAIL,
+                display_name="Trail",
+                item_id=f"trail_{device_id}",
+                fields=DEVICE_TRAIL_FIELDS,
+                add_to_project=True,
+                target_group=device_group
+            )
+
+            layer = item_info.layer
+            if not layer or not layer.isValid():
+                logger.error("Failed to create trail layer for device %s", device_id)
+                return None
+
+            # Set device identification properties (survives rename)
+            layer.setCustomProperty(self.DEVICE_ID_PROP, device_id)
+            layer.setCustomProperty(self.DEVICE_NAME_PROP, device_name)
+
+            # Apply device-specific styling
+            color = self._get_device_color(device_id)
+            layer.setCustomProperty(self.DEVICE_COLOR_PROP, color.name())
+            self._apply_device_trail_style(layer, color)
+
+            # Cache and return
+            self._device_trail_layers[device_id] = layer
+            logger.info(
+                "Created per-device trail layer for %s (device_id=%s)",
+                device_name, device_id
+            )
+            return layer
+
+        except Exception as e:
+            logger.error("Failed to create per-device trail layer: %s", e)
+            return None
+
+    def _apply_device_trail_style(self, layer: QgsVectorLayer, color: QColor):
+        """
+        Apply simple line styling to a per-device trail layer.
+
+        Unlike shared layers which use QgsCategorizedSymbolRenderer,
+        per-device layers use a simple single-symbol renderer since
+        each layer contains only one device.
+
+        Args:
+            layer: The trail layer to style
+            color: Device color for the line
+        """
+        symbol = QgsLineSymbol.createSimple({
+            'color': color.name(),
+            'width': '2',
+            'line_style': 'solid',
+            'joinstyle': 'round',
+            'capstyle': 'round'
+        })
+        layer.renderer().setSymbol(symbol)
+
+    def _update_device_trail(
+        self,
+        layer: QgsVectorLayer,
+        segments: List[Dict[str, Any]],
+        device_id: str
+    ):
+        """
+        Replace trail segments in a per-device trail layer.
+
+        Each per-device trail layer contains multiple LineString features
+        representing trail segments for that device only.
+
+        Args:
+            layer: The device's trail layer
+            segments: List of segment dicts with 'points', 'device_id', 'name'
+            device_id: Device identifier for logging
+        """
+        import uuid
+
+        with self._layer_transaction(layer, f"Trail ({device_id})", "update device trail") as edit_layer:
+            # Clear existing features
+            self._clear_layer_features(edit_layer, f"Trail ({device_id})")
+
+            # Add new segment features
+            for idx, segment in enumerate(segments):
+                qgs_points = []
+                for point in segment.get('points', []):
+                    try:
+                        lon = float(point.get('lon'))
+                        lat = float(point.get('lat'))
+                    except (TypeError, ValueError):
+                        qgs_points = []
+                        break
+
+                    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                        qgs_points = []
+                        break
+
+                    qgs_points.append(QgsPointXY(lon, lat))
+
+                if len(qgs_points) < 2:
+                    continue
+
+                geom = QgsGeometry.fromPolylineXY(qgs_points)
+                feature = QgsFeature(edit_layer.fields())
+                feature.setGeometry(geom)
+
+                # Extract timestamps from segment points
+                points_payload = segment.get('points', [])
+                start_time = ""
+                end_time = ""
+                if points_payload:
+                    first_ts = points_payload[0].get('ts')
+                    last_ts = points_payload[-1].get('ts')
+                    if isinstance(first_ts, str):
+                        start_time = first_ts
+                    if isinstance(last_ts, str):
+                        end_time = last_ts
+
+                # Calculate segment distance (approximate)
+                distance_m = 0.0
+                if len(qgs_points) >= 2:
+                    try:
+                        distance_m = geom.length() * 111000  # Rough degrees to meters
+                    except Exception:
+                        pass
+
+                attr_map = {
+                    "id": str(uuid.uuid4()),
+                    "device_id": device_id,
+                    "name": segment.get('name') or device_id,
+                    "segment_index": idx,
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "point_count": len(qgs_points),
+                    "distance_m": distance_m,
+                }
+
+                fields = edit_layer.fields()
+                for field_name, value in attr_map.items():
+                    field_idx = fields.indexFromName(field_name)
+                    if field_idx != -1:
+                        feature.setAttribute(field_idx, value)
+
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add trail segment for device {device_id}")
+
+    def _update_breadcrumbs_per_device(
+        self,
+        positions: List[Dict],
+        gap_minutes: float,
+        processed_segments: Optional[Dict[str, Any]] = None
+    ):
+        """
+        Update breadcrumbs using per-device trail layers.
+
+        Main entry point for per-device breadcrumb updates. Groups positions
+        by device and updates each device's trail layer with its segments.
+
+        Uses canvas freeze during batch updates for performance.
+
+        Args:
+            positions: List of validated position dicts
+            gap_minutes: Minutes gap to break trail into segments
+            processed_segments: Optional pre-processed segments (bypasses segmentation)
+        """
+        if not positions and not processed_segments:
+            return
+
+        # Group positions by device
+        from collections import defaultdict
+        by_device: Dict[str, List[Dict]] = defaultdict(list)
+
+        for pos in positions:
+            device_id = pos.get('device_id')
+            if device_id:
+                by_device[device_id].append(pos)
+
+        if not by_device and not processed_segments:
+            return
+
+        # If we have pre-processed segments, group them by device
+        segments_by_device: Dict[str, List[Dict]] = defaultdict(list)
+        if processed_segments and isinstance(processed_segments, dict):
+            all_segments = processed_segments.get('segments', [])
+            for seg in all_segments:
+                seg_device_id = seg.get('device_id')
+                if seg_device_id:
+                    segments_by_device[seg_device_id].append(seg)
+        else:
+            # Build segments per device from positions
+            for device_id, device_positions in by_device.items():
+                device_segments = build_segments_from_positions(device_positions, gap_minutes)
+                segments_by_device[device_id] = device_segments
+
+        if not segments_by_device:
+            return
+
+        # Freeze canvas during batch update for performance
+        canvas = self.iface.mapCanvas()
+        canvas.freeze(True)
+
+        # Also block layer tree signals during batch layer creation
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        root.blockSignals(True)
+
+        try:
+            for device_id, device_segments in segments_by_device.items():
+                # Get sample position for device name
+                sample_pos = by_device.get(device_id, [{}])[0] if by_device else {}
+                if not sample_pos and device_segments:
+                    # Extract name from segment if no positions
+                    sample_pos = {'name': device_segments[0].get('name', device_id)}
+
+                layer = self._ensure_device_trail_layer(device_id, sample_pos)
+                if layer:
+                    self._update_device_trail(layer, device_segments, device_id)
+                else:
+                    # Per-device layer creation failed - logged in _ensure_device_trail_layer
+                    pass
+        finally:
+            root.blockSignals(False)
+            canvas.freeze(False)
+            canvas.refresh()
+
+        logger.debug(
+            "SAR-nj0: Updated per-device trails for %d devices",
+            len(segments_by_device)
+        )
+
+    # =========================================================================
     # Breadcrumbs Layer
     # =========================================================================
 
@@ -1551,6 +1874,43 @@ class TrackingLayerManager(BaseLayerManager):
             raise ValueError(f"time_gap_minutes must be a positive number, got: {time_gap_minutes}")
 
         gap_minutes = float(time_gap_minutes)
+
+        # Phase SAR-nj0: Route to per-device or shared layer implementation
+        if self.USE_PER_DEVICE_TRAILS:
+            # Try per-device architecture first
+            factory = self._get_per_device_factory()
+            if factory:
+                try:
+                    # Sanitize positions first
+                    if positions:
+                        sanitized = sanitize_breadcrumb_positions(positions)
+                        valid_positions = sanitized.valid
+                    else:
+                        valid_positions = []
+
+                    self._update_breadcrumbs_per_device(
+                        valid_positions,
+                        gap_minutes,
+                        processed_segments
+                    )
+
+                    self._log_tracking_event(
+                        None,  # No single layer
+                        "BREADCRUMBS_PER_DEVICE",
+                        "update",
+                        payload_items=len(positions) if positions else 0,
+                        device_count=len(set(p.get('device_id') for p in (positions or []) if p.get('device_id')))
+                    )
+                    return  # Successfully updated via per-device layers
+                except Exception as e:
+                    logger.warning(
+                        "SAR-nj0: Per-device breadcrumb update failed, falling back to shared layer: %s", e
+                    )
+                    # Fall through to shared layer implementation
+            else:
+                logger.debug("SAR-nj0: No factory available, using shared breadcrumbs layer")
+
+        # Shared layer implementation (legacy or fallback)
         layer = self._get_or_create_breadcrumbs_layer()
 
         total_inputs = len(positions) if isinstance(positions, list) else 0
