@@ -23,7 +23,7 @@ from qgis.core import (
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
     QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext,
-    QgsTask
+    QgsTask, QgsProject, QgsLayerTreeGroup
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QVariant, QTimer
@@ -38,8 +38,14 @@ from .tracking_segments import (
     validate_processed_segments,
 )
 from ...layers import LayerIds
+from ...layers.schema import (
+    DEVICE_POSITION_FIELDS,
+    GroupNames,
+    get_per_device_group_path,
+)
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 from ...utils.notify import warning as notify_warning
+from ..per_item_layer_factory import ItemType, PerItemLayerFactory
 
 
 logger = logging.getLogger(__name__)
@@ -69,11 +75,33 @@ class TrackingLayerManager(BaseLayerManager):
 
     ASYNC_SEGMENT_THRESHOLD = 1500  # Minimum breadcrumb points before offloading
 
-    # BUG-032 FIX: Memory cap for breadcrumb trail accumulation
-    # Limits the maximum number of breadcrumb segments to prevent memory exhaustion
-    # during long missions. Value chosen to balance history retention vs memory usage.
-    # At ~500 bytes per segment (geometry + attributes), 10000 segments ≈ 5MB
-    MAX_BREADCRUMB_SEGMENTS = 10000
+    # SAR-7i4 FIX: Increased memory caps for 24-hour multi-device missions
+    # Previous limits (10000 segments, 50000 positions) were insufficient for
+    # 30 devices over 24 hours (~43,200 positions at 1/minute update rate).
+    #
+    # New limits support extended missions:
+    # - 20,000 segments ≈ 10MB (supports ~48 hours with 30 devices)
+    # - 100,000 positions ≈ 40MB (supports ~55 hours with 30 devices at 1/min)
+    #
+    # User notification added when truncation occurs (see _notify_truncation_warning)
+    MAX_BREADCRUMB_SEGMENTS = 20000  # Was 10000 (SAR-7i4)
+
+    # Track if truncation warning has been shown this session
+    _truncation_warned = False
+
+    # =========================================================================
+    # Phase SAR-nh9: Per-Device Tracking Feature Flags
+    # =========================================================================
+    # These flags enable gradual rollout and easy rollback of per-device layers.
+    # Set to True to enable per-device architecture, False for shared layers.
+
+    USE_PER_DEVICE_POSITIONS = True   # Phase 1: Per-device current position layers
+    USE_PER_DEVICE_TRAILS = False     # Phase 2: Per-device trail layers (future)
+
+    # Custom property keys for per-device layer identification
+    DEVICE_ID_PROP = "sartracker:device_id"
+    DEVICE_NAME_PROP = "sartracker:device_name"
+    DEVICE_COLOR_PROP = "sartracker:device_color"
 
     def __init__(self, iface, shared_device_colors=None, layer_manager=None, task_manager=None):
         """Initialize tracking layer manager."""
@@ -87,6 +115,14 @@ class TrackingLayerManager(BaseLayerManager):
         self._temp_export_dirs: List[str] = []
         self._cleanup_old_temp_dirs()
 
+        # Phase SAR-nh9: Per-device tracking layer caches
+        # device_id -> QgsVectorLayer for O(1) lookups
+        self._device_position_layers: Dict[str, QgsVectorLayer] = {}
+        self._device_trail_layers: Dict[str, QgsVectorLayer] = {}
+
+        # Per-device factory instance (created on first use when mission store exists)
+        self._per_device_factory: Optional[PerItemLayerFactory] = None
+
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
         return [self.CURRENT_LAYER_NAME, self.BREADCRUMBS_LAYER_NAME]
@@ -98,6 +134,13 @@ class TrackingLayerManager(BaseLayerManager):
         self._cancel_breadcrumb_task()
         # BUG-BC-001 fix: Increment generation to invalidate in-flight async tasks
         self._mission_generation += 1
+        # SAR-7i4: Reset truncation warning for new mission
+        TrackingLayerManager._truncation_warned = False
+
+        # Phase SAR-nh9: Clear per-device layer caches
+        self._device_position_layers.clear()
+        self._device_trail_layers.clear()
+        self._per_device_factory = None
 
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
@@ -136,6 +179,32 @@ class TrackingLayerManager(BaseLayerManager):
 
         logger.warning("%s", msg)
         self._notify_warning(f"{data_label} Data", msg)
+
+    def _notify_truncation_warning(self, data_type: str, discarded: int, kept: int, limit: int):
+        """
+        SAR-7i4 FIX: Notify coordinator when historical data is truncated.
+
+        This is a LIFE-SAFETY notification - coordinators must know when
+        early mission data is being discarded to manage memory.
+
+        Args:
+            data_type: Type of data being truncated ("breadcrumbs" or "positions")
+            discarded: Number of records discarded
+            kept: Number of records retained
+            limit: The memory limit that triggered truncation
+        """
+        # Only warn once per session to avoid notification spam
+        if TrackingLayerManager._truncation_warned:
+            return
+        TrackingLayerManager._truncation_warned = True
+
+        msg = (
+            f"Memory limit reached: {discarded:,} oldest {data_type} discarded, "
+            f"{kept:,} most recent retained. "
+            f"For missions >24 hours, consider periodic data export."
+        )
+        logger.warning("SAR-7i4: %s", msg)
+        self._notify_warning("Long Mission Data", msg, duration=10)
 
     @contextmanager
     def _layer_transaction(self, layer: QgsVectorLayer, layer_name: str, operation: str):
@@ -300,9 +369,10 @@ class TrackingLayerManager(BaseLayerManager):
             return False
         return self._start_breadcrumb_task(positions, gap_minutes, total_inputs)
 
-    # BUG-042 FIX: Maximum positions for background task to prevent memory exhaustion
-    # Limits task memory to a safe level. Larger datasets should be chunked.
-    MAX_TASK_POSITIONS = 50000
+    # SAR-7i4 FIX: Increased maximum positions for extended 24-hour missions
+    # Previous limit (50000) was insufficient for 30 devices over 24 hours.
+    # New limit supports ~55 hours with 30 devices at 1 position/minute.
+    MAX_TASK_POSITIONS = 100000  # Was 50000 (SAR-7i4)
 
     def _start_breadcrumb_task(self, positions: List[Dict], gap_minutes: float, total_inputs: int) -> bool:
         """
@@ -319,15 +389,20 @@ class TrackingLayerManager(BaseLayerManager):
         if not create_task:
             return False
 
-        # BUG-042 FIX: Memory guard for background task
+        # SAR-7i4 FIX: Memory guard for background task
         # Truncate positions to prevent excessive memory usage in background task
         if len(positions) > self.MAX_TASK_POSITIONS:
+            discarded = len(positions) - self.MAX_TASK_POSITIONS
             logger.warning(
-                "BUG-042: Task memory guard - truncating %d positions to %d for background processing",
+                "SAR-7i4: Task memory guard - truncating %d positions to %d for background processing",
                 len(positions), self.MAX_TASK_POSITIONS
             )
             positions = positions[-self.MAX_TASK_POSITIONS:]
             total_inputs = self.MAX_TASK_POSITIONS
+            # SAR-7i4: Notify coordinator of data truncation
+            self._notify_truncation_warning(
+                "position records", discarded, self.MAX_TASK_POSITIONS, self.MAX_TASK_POSITIONS
+            )
 
         try:
             positions_snapshot = [dict(pos) for pos in positions]
@@ -562,8 +637,8 @@ class TrackingLayerManager(BaseLayerManager):
         """
         Update current positions layer.
 
-        Clears existing features and adds new position for each device.
-        Uses efficient truncate() method for clearing when available.
+        SAR-lc6 FIX: Uses delta/incremental update pattern instead of clear-all + add-all.
+        This reduces map flicker and improves performance with many devices.
 
         BUG-027 FIX: Uses global layer edit lock to prevent race conditions
         during concurrent position updates from multiple sources.
@@ -593,6 +668,42 @@ class TrackingLayerManager(BaseLayerManager):
             sanitized.last_error
         )
 
+        # Phase SAR-nh9: Route to per-device or shared layer implementation
+        if self.USE_PER_DEVICE_POSITIONS:
+            # Try per-device architecture first
+            factory = self._get_per_device_factory()
+            if factory:
+                try:
+                    self._update_positions_per_device(valid_positions)
+
+                    # Zoom to extent ONLY on first load
+                    if self.first_load and valid_positions:
+                        # Find a device layer to get extent from
+                        for device_id in self._device_position_layers:
+                            layer = self._device_position_layers[device_id]
+                            if layer and layer.isValid() and layer.featureCount() > 0:
+                                self.iface.mapCanvas().setExtent(layer.extent())
+                                self.iface.mapCanvas().refresh()
+                                self.first_load = False
+                                break
+
+                    self._log_tracking_event(
+                        None,  # No single layer
+                        "CURRENT_PER_DEVICE",
+                        "update",
+                        payload_items=len(valid_positions),
+                        device_count=len(set(p.get('device_id') for p in valid_positions if p.get('device_id')))
+                    )
+                    return  # Successfully updated via per-device layers
+                except Exception as e:
+                    logger.warning(
+                        "SAR-nh9: Per-device update failed, falling back to shared layer: %s", e
+                    )
+                    # Fall through to shared layer implementation
+            else:
+                logger.debug("SAR-nh9: No factory available, using shared layer")
+
+        # Shared layer implementation (legacy or fallback)
         # Get or create layer
         layer = self._get_or_create_current_layer()
 
@@ -633,31 +744,11 @@ class TrackingLayerManager(BaseLayerManager):
             )
 
         try:
-            with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "update current positions") as edit_layer:
-                self._clear_layer_features(edit_layer, self.CURRENT_LAYER_NAME)
-
-                for pos in valid_positions:
-                    feature = QgsFeature(edit_layer.fields())
-                    feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
-                    # IMPORTANT: Set attributes by field name (not positional list).
-                    # Persistent (GeoPackage/OGR) layers may include provider-managed
-                    # fields (e.g. fid) that vary by QGIS version/platform, and
-                    # positional setAttributes() will fail with "wrong field count".
-                    attr_map = {
-                        "device_id": pos.get("device_id"),
-                        "name": pos.get("name"),
-                        "timestamp": pos.get("ts"),
-                        "altitude": pos.get("altitude"),
-                        "speed": pos.get("speed"),
-                        "battery": pos.get("battery"),
-                    }
-                    fields = edit_layer.fields()
-                    for field_name, value in attr_map.items():
-                        idx = fields.indexFromName(field_name)
-                        if idx != -1:
-                            feature.setAttribute(idx, value)
-                    if not edit_layer.addFeature(feature):
-                        raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
+            # SAR-lc6 FIX: Delta update pattern - update in place, add new, remove stale
+            # This significantly reduces map flicker and renderer recalculation
+            updated_count, added_count, removed_count = self._delta_update_current_positions(
+                layer, valid_positions
+            )
 
             # Apply styling (outside transaction - failures here don't affect data)
             # Defer by 1 event loop tick to reduce re-entrancy with layer-tree UI edits.
@@ -704,6 +795,179 @@ class TrackingLayerManager(BaseLayerManager):
         finally:
             # BUG-027 FIX: Always release lock, even on error
             self.release_layer_edit_lock()
+
+    def _delta_update_current_positions(
+        self,
+        layer: QgsVectorLayer,
+        new_positions: List[Dict]
+    ) -> tuple:
+        """
+        SAR-lc6 FIX: Delta/incremental update for current positions.
+
+        Instead of clear-all + add-all, this method:
+        1. Updates existing features in-place if position changed
+        2. Adds features for new devices
+        3. Removes features for devices no longer present
+
+        This reduces map flicker and renderer recalculation overhead.
+
+        Args:
+            layer: The current positions layer
+            new_positions: List of validated position dicts
+
+        Returns:
+            Tuple of (updated_count, added_count, removed_count)
+        """
+        # Build lookup of new positions by device_id
+        new_by_device = {pos['device_id']: pos for pos in new_positions}
+        new_device_ids = set(new_by_device.keys())
+
+        # Get field indices
+        fields = layer.fields()
+        device_id_idx = fields.indexFromName('device_id')
+        if device_id_idx == -1:
+            # No device_id field - fall back to full rebuild
+            logger.warning("SAR-lc6: device_id field not found, using full rebuild")
+            return self._full_rebuild_current_positions(layer, new_positions)
+
+        # Build lookup of existing features by device_id
+        existing_features = {}  # device_id -> (feature_id, feature)
+        for feature in layer.getFeatures(QgsFeatureRequest()):
+            did = feature.attribute(device_id_idx)
+            if did is not None:
+                existing_features[str(did)] = (feature.id(), feature)
+
+        existing_device_ids = set(existing_features.keys())
+
+        # Determine what needs to change
+        devices_to_update = new_device_ids & existing_device_ids
+        devices_to_add = new_device_ids - existing_device_ids
+        devices_to_remove = existing_device_ids - new_device_ids
+
+        updated_count = 0
+        added_count = 0
+        removed_count = 0
+
+        # Perform updates in a single transaction
+        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "delta update positions") as edit_layer:
+            # 1. Update existing features (geometry and attributes)
+            for device_id in devices_to_update:
+                pos = new_by_device[device_id]
+                fid, old_feature = existing_features[device_id]
+
+                # Check if geometry actually changed (avoid unnecessary updates)
+                old_geom = old_feature.geometry()
+                new_point = QgsPointXY(pos['lon'], pos['lat'])
+                new_geom = QgsGeometry.fromPointXY(new_point)
+
+                geometry_changed = True
+                if old_geom and not old_geom.isNull():
+                    old_point = old_geom.asPoint()
+                    # Use small epsilon for floating point comparison
+                    if abs(old_point.x() - new_point.x()) < 1e-8 and abs(old_point.y() - new_point.y()) < 1e-8:
+                        geometry_changed = False
+
+                if geometry_changed:
+                    if not edit_layer.changeGeometry(fid, new_geom):
+                        logger.warning("SAR-lc6: Failed to update geometry for device %s", device_id)
+                        continue
+
+                # Update attributes
+                attr_map = {
+                    "name": pos.get("name"),
+                    "timestamp": pos.get("ts"),
+                    "altitude": pos.get("altitude"),
+                    "speed": pos.get("speed"),
+                    "battery": pos.get("battery"),
+                }
+                for field_name, value in attr_map.items():
+                    idx = fields.indexFromName(field_name)
+                    if idx != -1:
+                        edit_layer.changeAttributeValue(fid, idx, value)
+
+                updated_count += 1
+
+            # 2. Add new devices
+            for device_id in devices_to_add:
+                pos = new_by_device[device_id]
+                feature = QgsFeature(edit_layer.fields())
+                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
+
+                attr_map = {
+                    "device_id": pos.get("device_id"),
+                    "name": pos.get("name"),
+                    "timestamp": pos.get("ts"),
+                    "altitude": pos.get("altitude"),
+                    "speed": pos.get("speed"),
+                    "battery": pos.get("battery"),
+                }
+                for field_name, value in attr_map.items():
+                    idx = fields.indexFromName(field_name)
+                    if idx != -1:
+                        feature.setAttribute(idx, value)
+
+                if not edit_layer.addFeature(feature):
+                    logger.warning("SAR-lc6: Failed to add feature for device %s", device_id)
+                    continue
+                added_count += 1
+
+            # 3. Remove stale devices
+            if devices_to_remove:
+                fids_to_remove = [existing_features[did][0] for did in devices_to_remove]
+                if not edit_layer.deleteFeatures(fids_to_remove):
+                    logger.warning("SAR-lc6: Failed to remove %d stale features", len(fids_to_remove))
+                else:
+                    removed_count = len(fids_to_remove)
+
+        # Log delta stats if there were changes
+        if updated_count or added_count or removed_count:
+            logger.debug(
+                "SAR-lc6: Delta update - updated: %d, added: %d, removed: %d (total: %d devices)",
+                updated_count, added_count, removed_count, len(new_positions)
+            )
+
+        return (updated_count, added_count, removed_count)
+
+    def _full_rebuild_current_positions(
+        self,
+        layer: QgsVectorLayer,
+        positions: List[Dict]
+    ) -> tuple:
+        """
+        Full rebuild fallback for current positions (original clear-all + add-all pattern).
+
+        Used when delta update is not possible (e.g., missing device_id field).
+
+        Args:
+            layer: The current positions layer
+            positions: List of validated position dicts
+
+        Returns:
+            Tuple of (0, added_count, 0) - no updates/removals in full rebuild
+        """
+        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "rebuild positions") as edit_layer:
+            self._clear_layer_features(edit_layer, self.CURRENT_LAYER_NAME)
+
+            for pos in positions:
+                feature = QgsFeature(edit_layer.fields())
+                feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(pos['lon'], pos['lat'])))
+                attr_map = {
+                    "device_id": pos.get("device_id"),
+                    "name": pos.get("name"),
+                    "timestamp": pos.get("ts"),
+                    "altitude": pos.get("altitude"),
+                    "speed": pos.get("speed"),
+                    "battery": pos.get("battery"),
+                }
+                fields = edit_layer.fields()
+                for field_name, value in attr_map.items():
+                    idx = fields.indexFromName(field_name)
+                    if idx != -1:
+                        feature.setAttribute(idx, value)
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature for device {pos['device_id']}")
+
+        return (0, len(positions), 0)
 
     def _apply_current_positions_style(self, layer: QgsVectorLayer):
         """
@@ -860,6 +1124,349 @@ class TrackingLayerManager(BaseLayerManager):
             layer.setLabelsEnabled(True)
 
     # =========================================================================
+    # Phase SAR-nh9: Per-Device Position Layers
+    # =========================================================================
+
+    def _get_per_device_factory(self) -> Optional[PerItemLayerFactory]:
+        """
+        Get the per-device layer factory, creating if necessary.
+
+        Returns:
+            PerItemLayerFactory or None if mission store not available
+        """
+        if self._per_device_factory is not None:
+            return self._per_device_factory
+
+        # Try to get the mission GeoPackage path from layer_manager
+        layer_manager = getattr(self, 'layer_manager', None)
+        if not layer_manager:
+            logger.debug("Per-device factory: no layer_manager available")
+            return None
+
+        # Use get_mission_store() method (same pattern as marker_manager)
+        gpkg_path = layer_manager.get_mission_store()
+        if not gpkg_path:
+            logger.debug("Per-device factory: no mission store configured")
+            return None
+
+        from pathlib import Path
+        self._per_device_factory = PerItemLayerFactory(Path(gpkg_path))
+        logger.info("SAR-nh9: PerItemLayerFactory initialized for per-device tracking: %s", gpkg_path)
+        return self._per_device_factory
+
+    def _ensure_tracking_group(self) -> Optional[QgsLayerTreeGroup]:
+        """
+        Ensure the Tracking group exists under SAR Tracker.
+
+        Returns:
+            QgsLayerTreeGroup for Tracking, or None on failure
+        """
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+
+        # Find or create SAR Tracker root
+        sar_root = root.findGroup(GroupNames.ROOT)
+        if not sar_root:
+            sar_root = root.insertGroup(0, GroupNames.ROOT)
+
+        # Find or create Tracking group
+        tracking_group = sar_root.findGroup(GroupNames.TRACKING)
+        if not tracking_group:
+            tracking_group = sar_root.insertGroup(0, GroupNames.TRACKING)
+
+        return tracking_group
+
+    def _ensure_device_group(self, device_name: str) -> Optional[QgsLayerTreeGroup]:
+        """
+        Ensure a device group exists under Tracking.
+
+        Structure: SAR Tracker / Tracking / {DeviceName}
+
+        Args:
+            device_name: Display name for the device
+
+        Returns:
+            QgsLayerTreeGroup for the device, or None on failure
+        """
+        tracking_group = self._ensure_tracking_group()
+        if not tracking_group:
+            return None
+
+        # Find or create device group
+        device_group = tracking_group.findGroup(device_name)
+        if not device_group:
+            device_group = tracking_group.addGroup(device_name)
+
+        return device_group
+
+    def _get_device_layers_by_property(self, device_id: str) -> Dict[str, Optional[QgsVectorLayer]]:
+        """
+        Find position and trail layers by stable device_id custom property.
+
+        This is the primary lookup method for per-device layers.
+        Uses custom property sartracker:device_id for identification,
+        which survives layer rename.
+
+        Args:
+            device_id: Stable device identifier
+
+        Returns:
+            Dict with 'position' and 'trail' layer references (may be None)
+        """
+        result = {'position': None, 'trail': None}
+
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+
+            layer_device_id = layer.customProperty(self.DEVICE_ID_PROP)
+            if layer_device_id != device_id:
+                continue
+
+            item_type = layer.customProperty("sartracker:item_type")
+            if item_type == ItemType.DEVICE_POSITION:
+                result['position'] = layer
+            elif item_type == ItemType.DEVICE_TRAIL:
+                result['trail'] = layer
+
+        return result
+
+    def _ensure_device_position_layer(
+        self,
+        device_id: str,
+        sample_position: Dict
+    ) -> Optional[QgsVectorLayer]:
+        """
+        Create or retrieve position layer for a device.
+
+        Each device gets its own position layer under:
+            SAR Tracker / Tracking / {DeviceName} / Position
+
+        Args:
+            device_id: Stable device identifier from Traccar
+            sample_position: Position dict with 'name' for display name
+
+        Returns:
+            QgsVectorLayer for the device position, or None on failure
+        """
+        # Check cache first
+        if device_id in self._device_position_layers:
+            layer = self._device_position_layers[device_id]
+            if layer and layer.isValid():
+                return layer
+            # Stale cache entry
+            del self._device_position_layers[device_id]
+
+        # Search by custom property (handles plugin reload)
+        existing = self._get_device_layers_by_property(device_id)
+        if existing['position'] and existing['position'].isValid():
+            self._device_position_layers[device_id] = existing['position']
+            return existing['position']
+
+        # Create new layer via factory
+        factory = self._get_per_device_factory()
+        if not factory:
+            logger.warning(
+                "Cannot create per-device position layer: no factory available. "
+                "Falling back to shared layer."
+            )
+            return None
+
+        # Get device name for display
+        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
+
+        # Ensure device group exists
+        device_group = self._ensure_device_group(device_name)
+        if not device_group:
+            logger.warning("Failed to create device group for %s", device_name)
+            return None
+
+        try:
+            # Create the layer via PerItemLayerFactory
+            item_info = factory.create_item_layer(
+                item_type=ItemType.DEVICE_POSITION,
+                display_name="Position",
+                item_id=f"pos_{device_id}",
+                fields=DEVICE_POSITION_FIELDS,
+                add_to_project=True,
+                target_group=device_group
+            )
+
+            layer = item_info.layer
+            if not layer or not layer.isValid():
+                logger.error("Failed to create position layer for device %s", device_id)
+                return None
+
+            # Set device identification properties (survives rename)
+            layer.setCustomProperty(self.DEVICE_ID_PROP, device_id)
+            layer.setCustomProperty(self.DEVICE_NAME_PROP, device_name)
+
+            # Apply device-specific styling
+            color = self._get_device_color(device_id)
+            layer.setCustomProperty(self.DEVICE_COLOR_PROP, color.name())
+            self._apply_device_position_style(layer, color)
+
+            # Cache and return
+            self._device_position_layers[device_id] = layer
+            logger.info(
+                "Created per-device position layer for %s (device_id=%s)",
+                device_name, device_id
+            )
+            return layer
+
+        except Exception as e:
+            logger.error("Failed to create per-device position layer: %s", e)
+            return None
+
+    def _apply_device_position_style(self, layer: QgsVectorLayer, color: QColor):
+        """
+        Apply simple marker styling to a per-device position layer.
+
+        Unlike shared layers which use QgsCategorizedSymbolRenderer,
+        per-device layers use a simple single-symbol renderer since
+        each layer contains only one device.
+
+        Args:
+            layer: The position layer to style
+            color: Device color for the marker
+        """
+        symbol = QgsMarkerSymbol.createSimple({
+            'name': 'circle',
+            'color': color.name(),
+            'size': '5',
+            'outline_color': 'black',
+            'outline_width': '0.5'
+        })
+        layer.renderer().setSymbol(symbol)
+
+        # Apply labels
+        label_settings = QgsPalLayerSettings()
+        label_settings.fieldName = 'name'
+        label_settings.enabled = True
+
+        try:
+            label_settings.placement = QgsPalLayerSettings.Placement.OverPoint
+        except AttributeError:
+            label_settings.placement = QgsPalLayerSettings.OverPoint
+
+        text_format = QgsTextFormat()
+        text_format.setSize(10)
+        text_format.setColor(QColor('black'))
+
+        buffer = QgsTextBufferSettings()
+        buffer.setEnabled(True)
+        buffer.setColor(QColor('white'))
+        buffer.setSize(1)
+        text_format.setBuffer(buffer)
+
+        label_settings.setFormat(text_format)
+
+        labeling = QgsVectorLayerSimpleLabeling(label_settings)
+        layer.setLabeling(labeling)
+        layer.setLabelsEnabled(True)
+
+    def _update_device_position(self, layer: QgsVectorLayer, position: Dict):
+        """
+        Update the single feature in a per-device position layer.
+
+        Each per-device position layer contains exactly one feature
+        representing the latest known position. This method replaces
+        that feature with the new position data.
+
+        Args:
+            layer: The device's position layer
+            position: Position dict with lat, lon, name, ts, etc.
+        """
+        device_id = position.get('device_id', '')
+
+        with self._layer_transaction(layer, f"Position ({device_id})", "update device position") as edit_layer:
+            # Clear existing feature(s)
+            self._clear_layer_features(edit_layer, f"Position ({device_id})")
+
+            # Create new feature with latest position
+            feature = QgsFeature(edit_layer.fields())
+            feature.setGeometry(
+                QgsGeometry.fromPointXY(QgsPointXY(position['lon'], position['lat']))
+            )
+
+            # Set attributes
+            import uuid
+            attr_map = {
+                "id": str(uuid.uuid4()),
+                "device_id": device_id,
+                "name": position.get("name"),
+                "timestamp": position.get("ts"),
+                "altitude": position.get("altitude"),
+                "speed": position.get("speed"),
+                "battery": position.get("battery"),
+                "accuracy": position.get("accuracy"),
+                "source": position.get("source", "traccar"),
+            }
+
+            fields = edit_layer.fields()
+            for field_name, value in attr_map.items():
+                idx = fields.indexFromName(field_name)
+                if idx != -1:
+                    feature.setAttribute(idx, value)
+
+            if not edit_layer.addFeature(feature):
+                raise RuntimeError(f"Failed to add position feature for device {device_id}")
+
+    def _update_positions_per_device(self, positions: List[Dict]):
+        """
+        Update positions using per-device layers.
+
+        Main entry point for per-device position updates. Groups positions
+        by device and updates each device's layer with its latest position.
+
+        Uses canvas freeze during batch updates for performance.
+
+        Args:
+            positions: List of validated position dicts
+        """
+        if not positions:
+            return
+
+        # Group by device - we only need the latest position per device
+        from collections import defaultdict
+        by_device: Dict[str, Dict] = {}
+        for pos in positions:
+            device_id = pos.get('device_id')
+            if device_id:
+                by_device[device_id] = pos  # Keep overwriting with latest
+
+        if not by_device:
+            return
+
+        # Freeze canvas during batch update for performance
+        canvas = self.iface.mapCanvas()
+        canvas.freeze(True)
+
+        # Also block layer tree signals during batch layer creation
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        root.blockSignals(True)
+
+        try:
+            for device_id, latest_pos in by_device.items():
+                layer = self._ensure_device_position_layer(device_id, latest_pos)
+                if layer:
+                    self._update_device_position(layer, latest_pos)
+                else:
+                    # Per-device layer creation failed - this is logged in _ensure_device_position_layer
+                    # The fallback to shared layer happens at the routing level
+                    pass
+        finally:
+            root.blockSignals(False)
+            canvas.freeze(False)
+            canvas.refresh()
+
+        logger.debug(
+            "SAR-nh9: Updated per-device positions for %d devices",
+            len(by_device)
+        )
+
+    # =========================================================================
     # Breadcrumbs Layer
     # =========================================================================
 
@@ -977,15 +1584,19 @@ class TrackingLayerManager(BaseLayerManager):
         """
         segments = segments or []
 
-        # BUG-032 FIX: Enforce memory cap on breadcrumb segments
+        # SAR-7i4 FIX: Enforce memory cap on breadcrumb segments
         # Keep the most recent segments (end of list) if over limit
         if len(segments) > self.MAX_BREADCRUMB_SEGMENTS:
             discarded_count = len(segments) - self.MAX_BREADCRUMB_SEGMENTS
             segments = segments[-self.MAX_BREADCRUMB_SEGMENTS:]
             logger.warning(
-                "BUG-032: Breadcrumb memory cap enforced - discarded %d oldest segments, "
+                "SAR-7i4: Breadcrumb memory cap enforced - discarded %d oldest segments, "
                 "keeping %d most recent (limit: %d)",
                 discarded_count, len(segments), self.MAX_BREADCRUMB_SEGMENTS
+            )
+            # SAR-7i4: Notify coordinator of data truncation
+            self._notify_truncation_warning(
+                "breadcrumb segments", discarded_count, len(segments), self.MAX_BREADCRUMB_SEGMENTS
             )
 
         with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "update breadcrumbs") as edit_layer:

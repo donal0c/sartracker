@@ -60,6 +60,9 @@ class ItemType:
     BEARING_LINE = "bearing_line"
     LINE = "line"
     TEXT_LABEL = "text_label"
+    # Phase SAR-nh9: Per-device tracking layers
+    DEVICE_POSITION = "device_position"
+    DEVICE_TRAIL = "device_trail"
 
 
 # Geometry types per item type
@@ -73,6 +76,9 @@ ITEM_GEOMETRY_TYPES = {
     ItemType.BEARING_LINE: "LineString",
     ItemType.LINE: "LineString",
     ItemType.TEXT_LABEL: "Point",
+    # Phase SAR-nh9: Per-device tracking layers
+    ItemType.DEVICE_POSITION: "Point",
+    ItemType.DEVICE_TRAIL: "LineString",
 }
 
 
@@ -622,6 +628,9 @@ class PerformanceMode:
         ItemType.RANGE_RING: 250000,
         ItemType.BEARING_LINE: 100000,
         ItemType.LINE: 100000,
+        # Phase SAR-nh9: Device tracking always visible (critical for SAR)
+        ItemType.DEVICE_POSITION: 0,      # Always visible (life-safety critical)
+        ItemType.DEVICE_TRAIL: 0,         # Always visible (life-safety critical)
     }
 
     @staticmethod

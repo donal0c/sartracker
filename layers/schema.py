@@ -406,6 +406,35 @@ BREADCRUMB_FIELDS = [
 ]
 
 # ---------------------------------------------------------------------------
+# Per-device tracking layer field definitions (Phase SAR-nh9)
+# ---------------------------------------------------------------------------
+
+# Fields for per-device position layers (single feature per layer - latest position)
+DEVICE_POSITION_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},           # Feature UUID
+    {"name": "device_id", "type": "String", "length": 50},    # Stable device ID from Traccar
+    {"name": "name", "type": "String", "length": 100},        # Display name
+    {"name": "timestamp", "type": "String", "length": 40},    # ISO8601 timestamp
+    {"name": "altitude", "type": "Double"},                   # Meters
+    {"name": "speed", "type": "Double"},                      # km/h
+    {"name": "battery", "type": "Double"},                    # Percentage
+    {"name": "accuracy", "type": "Double"},                   # GPS accuracy (m)
+    {"name": "source", "type": "String", "length": 50},       # Data source
+]
+
+# Fields for per-device trail layers (LineString segments for that device only)
+DEVICE_TRAIL_FIELDS = [
+    {"name": "id", "type": "String", "length": 36},           # Segment UUID
+    {"name": "device_id", "type": "String", "length": 50},    # Stable device ID
+    {"name": "name", "type": "String", "length": 100},        # Display name
+    {"name": "segment_index", "type": "Int"},                 # Segment order
+    {"name": "start_time", "type": "String", "length": 40},   # First point time
+    {"name": "end_time", "type": "String", "length": 40},     # Last point time
+    {"name": "point_count", "type": "Int"},                   # Points in segment
+    {"name": "distance_m", "type": "Double"},                 # Segment length
+]
+
+# ---------------------------------------------------------------------------
 # Drawing / overlay layer field definitions
 # ---------------------------------------------------------------------------
 
@@ -838,6 +867,26 @@ def get_per_item_group_path(item_type: str) -> List[str]:
     # Fallback to Map Tools root if unknown type
     logger.warning("Unknown item type for per-item grouping: %s", item_type)
     return [GroupNames.ROOT, GroupNames.MAP_TOOLS]
+
+
+def get_per_device_group_path(device_name: str) -> List[str]:
+    """
+    Get the group path for a device's tracking layers.
+
+    Phase SAR-nh9: Per-device tracking layers are organized as:
+        SAR Tracker / Tracking / {DeviceName} / [Position, Trail]
+
+    This device-centric grouping matches coordinator mental model
+    ("show me Alpha Team") and enables one-click device visibility toggle.
+
+    Args:
+        device_name: Display name of the device (e.g., "Alpha Team")
+
+    Returns:
+        List of group names forming the path
+        e.g., ["SAR Tracker", "Tracking", "Alpha Team"]
+    """
+    return [GroupNames.ROOT, GroupNames.TRACKING, device_name]
 
 
 # Mapping of canonical layer names to LayerIds for metadata tagging

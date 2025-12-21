@@ -83,7 +83,7 @@ class TraccarHttpProvider(Provider):
         cache_ttl: int = 300,
         enable_last_good_cache: bool = True,
         breadcrumb_workers: int = 10,
-        enable_bulk_breadcrumbs: bool = False
+        enable_bulk_breadcrumbs: bool = True
     ):
         """
         Initialize Traccar HTTP provider.
@@ -98,7 +98,7 @@ class TraccarHttpProvider(Provider):
             cache_ttl: Device cache TTL in seconds (default: 300 = 5 minutes)
             enable_last_good_cache: Whether to enable last-good payload caching (default: True)
             breadcrumb_workers: Max parallel workers for breadcrumb fetch (default: 10)
-            enable_bulk_breadcrumbs: Try bulk /api/positions?from=&to= for breadcrumbs before per-device (default: False)
+            enable_bulk_breadcrumbs: Try bulk /api/positions?from=&to= for breadcrumbs before per-device (default: True)
 
         Raises:
             ValueError: If inputs invalid or auth credentials missing
@@ -677,16 +677,20 @@ class TraccarHttpProvider(Provider):
 
                 logger.debug("Breadcrumb time window: %s -> %s", from_iso, to_iso)
 
-                # Optional bulk fetch (single request) to reduce API load
+                # SAR-63m: Bulk fetch (single request) to reduce API load
+                # Default enabled - significantly reduces server load with 15+ devices
+                # Falls back to per-device if bulk endpoint unavailable (older Traccar versions)
                 if self.enable_bulk_breadcrumbs:
                     try:
                         bulk_params = {'from': from_iso, 'to': to_iso}
+                        bulk_start = time.monotonic()
                         bulk_data = self.http_client.get(
                             "/api/positions",
                             session=session,
                             params=bulk_params,
                             expect_json=True
                         )
+                        bulk_duration = time.monotonic() - bulk_start
                         if isinstance(bulk_data, list):
                             bulk_positions = []
                             for pos in bulk_data:
@@ -696,19 +700,31 @@ class TraccarHttpProvider(Provider):
                                 except Exception as e:
                                     logger.warning("Failed to normalize bulk breadcrumb record: %s", e)
                             bulk_positions.sort(key=lambda x: (x['device_id'], x['ts']))
-                            logger.info("Bulk breadcrumbs fetched: %s positions", len(bulk_positions))
+                            # SAR-63m: Log performance comparison
+                            logger.info(
+                                "SAR-63m: Bulk breadcrumbs fetched: %d positions for %d devices in %.2fs "
+                                "(vs ~%.1fs estimated for per-device with %d workers)",
+                                len(bulk_positions),
+                                device_count,
+                                bulk_duration,
+                                (device_count / self.breadcrumb_workers) * 2.0,  # Estimate ~2s per batch
+                                self.breadcrumb_workers
+                            )
                             annotated_bulk = self._annotate_origin(bulk_positions, origin='live')
                             _report_progress(1, 1)
                             return annotated_bulk
                         else:
                             logger.warning(
-                                "Bulk breadcrumb response invalid (type=%s); falling back to per-device",
+                                "SAR-63m: Bulk breadcrumb response invalid (type=%s); falling back to per-device",
                                 type(bulk_data).__name__
                             )
                     except Exception as bulk_err:
-                        logger.warning(
-                            "Bulk breadcrumb fetch failed: %s; falling back to per-device",
-                            bulk_err
+                        # SAR-63m: Log but continue with per-device fallback
+                        # Some Traccar versions don't support bulk time-range queries
+                        logger.info(
+                            "SAR-63m: Bulk breadcrumb endpoint unavailable (%s); using per-device queries. "
+                            "This is normal for older Traccar versions.",
+                            type(bulk_err).__name__
                         )
 
                 # Fetch breadcrumbs for each device in parallel
@@ -1660,7 +1676,7 @@ def _create_traccar_http_provider(config: Dict) -> TraccarHttpProvider:
             recoverable=False
         )
 
-    enable_bulk_breadcrumbs = config.get('enable_bulk_breadcrumbs', False)
+    enable_bulk_breadcrumbs = config.get('enable_bulk_breadcrumbs', True)
     if not isinstance(enable_bulk_breadcrumbs, bool):
         raise ProviderDataError(
             f"Traccar HTTP provider 'enable_bulk_breadcrumbs' must be boolean, got: {enable_bulk_breadcrumbs}",
@@ -1745,9 +1761,9 @@ registry.register(
             },
             'enable_bulk_breadcrumbs': {
                 'type': 'boolean',
-                'description': 'Attempt bulk /api/positions for breadcrumbs before per-device',
+                'description': 'Attempt bulk /api/positions for breadcrumbs before per-device (recommended for 15+ devices)',
                 'required': False,
-                'default': False
+                'default': True
             }
         },
         # Phase 4 capabilities
