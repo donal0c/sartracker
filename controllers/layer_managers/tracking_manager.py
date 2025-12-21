@@ -1846,19 +1846,25 @@ class TrackingLayerManager(BaseLayerManager):
         SAR-0uy: This migration is non-destructive - shared layers are archived
         (renamed) not deleted. Migration is idempotent - safe to run multiple times.
 
+        SAFETY FIXES:
+        - Acquires global edit lock to prevent concurrent tracking updates
+        - Tracks failed devices and reports them
+        - Only archives if at least some devices migrated successfully
+
         Migration Flow:
         1. Check if migration is needed (shared layers exist)
-        2. Extract device list from shared layer features
-        3. Create per-device layers for each device
-        4. Copy features from shared to per-device layers
-        5. Archive shared layers (rename, hide)
+        2. Acquire global edit lock
+        3. Extract device list from shared layer features
+        4. Create per-device layers for each device
+        5. Copy features from shared to per-device layers
+        6. Archive shared layers (rename, hide)
+        7. Release lock
 
         Returns:
             True if migration completed successfully (or was not needed)
             False if migration failed
         """
         from ...layers.schema import (
-            MigrationTracker,
             MigrationStatus,
             migration_tracker,
         )
@@ -1887,39 +1893,47 @@ class TrackingLayerManager(BaseLayerManager):
             logger.info("SAR-0uy: Archived layers exist, migration already completed")
             return True
 
-        # Start migration tracking
-        affected_layers = []
-        if shared_current:
-            affected_layers.append(shared_current.name())
-        if shared_breadcrumbs:
-            affected_layers.append(shared_breadcrumbs.name())
-
-        migration_record = migration_tracker.start_migration(
-            self.MIGRATION_ID,
-            from_version=3,
-            to_version=4,
-            affected_layers=affected_layers
-        )
-
-        if migration_record.status == MigrationStatus.COMPLETED:
-            logger.info("SAR-0uy: Migration already completed")
-            return True
-
-        logger.info(
-            "SAR-0uy: Starting migration to per-device layers (current: %s, breadcrumbs: %s)",
-            shared_current.name() if shared_current else "none",
-            shared_breadcrumbs.name() if shared_breadcrumbs else "none"
-        )
+        # SAFETY FIX: Acquire global edit lock to prevent concurrent tracking updates
+        lock_acquired = self.acquire_layer_edit_lock(timeout=30.0)
+        if not lock_acquired:
+            logger.error("SAR-0uy: Cannot migrate - layer edit lock unavailable (concurrent operation in progress)")
+            return False
 
         try:
+            # Start migration tracking
+            affected_layers = []
+            if shared_current:
+                affected_layers.append(shared_current.name())
+            if shared_breadcrumbs:
+                affected_layers.append(shared_breadcrumbs.name())
+
+            migration_record = migration_tracker.start_migration(
+                self.MIGRATION_ID,
+                from_version=3,
+                to_version=4,
+                affected_layers=affected_layers
+            )
+
+            if migration_record.status == MigrationStatus.COMPLETED:
+                logger.info("SAR-0uy: Migration already completed")
+                return True
+
+            logger.info(
+                "SAR-0uy: Starting migration to per-device layers (current: %s, breadcrumbs: %s)",
+                shared_current.name() if shared_current else "none",
+                shared_breadcrumbs.name() if shared_breadcrumbs else "none"
+            )
+
             # Extract devices from shared layers
             devices = self._extract_devices_from_shared(shared_current, shared_breadcrumbs)
 
             if not devices:
                 logger.info("SAR-0uy: No devices found in shared layers, archiving empty layers")
 
-            # Migrate each device
+            # SAFETY FIX: Track failed devices for proper reporting
             migrated_count = 0
+            failed_devices = []
+
             for device_id, device_info in devices.items():
                 try:
                     self._migrate_device_to_per_device(
@@ -1934,24 +1948,45 @@ class TrackingLayerManager(BaseLayerManager):
                         "SAR-0uy: Failed to migrate device %s: %s",
                         device_id, e
                     )
-                    # Continue with other devices
+                    failed_devices.append((device_id, str(e)))
 
-            # Archive shared layers
-            self._archive_shared_tracking_layers(shared_current, shared_breadcrumbs)
+            # SAFETY FIX: Report failed devices prominently
+            if failed_devices:
+                logger.warning(
+                    "SAR-0uy: Migration incomplete - %d/%d devices failed: %s",
+                    len(failed_devices),
+                    len(devices),
+                    ", ".join(d[0] for d in failed_devices[:5])  # Show first 5
+                )
 
-            # Complete migration
-            migration_tracker.complete_migration(self.MIGRATION_ID, rollback_available=True)
+            # Archive shared layers (only if at least some devices migrated or no devices existed)
+            if migrated_count > 0 or not devices:
+                self._archive_shared_tracking_layers(shared_current, shared_breadcrumbs)
 
-            logger.info(
-                "SAR-0uy: Migration completed successfully - %d devices migrated",
-                migrated_count
-            )
-            return True
+                # Complete migration
+                migration_tracker.complete_migration(self.MIGRATION_ID, rollback_available=True)
+
+                logger.info(
+                    "SAR-0uy: Migration completed - %d devices migrated, %d failed",
+                    migrated_count, len(failed_devices)
+                )
+                return len(failed_devices) == 0  # True only if all succeeded
+            else:
+                # All devices failed - don't archive, mark as failed
+                migration_tracker.fail_migration(
+                    self.MIGRATION_ID,
+                    f"All {len(devices)} devices failed to migrate"
+                )
+                return False
 
         except Exception as e:
             logger.error("SAR-0uy: Migration failed: %s", e)
             migration_tracker.fail_migration(self.MIGRATION_ID, str(e))
             return False
+
+        finally:
+            # SAFETY FIX: Always release the lock
+            self.release_layer_edit_lock()
 
     def _find_shared_current_layer(self) -> Optional[QgsVectorLayer]:
         """
@@ -2067,8 +2102,10 @@ class TrackingLayerManager(BaseLayerManager):
             Dict mapping device_id to device info dict with 'name' key
         """
         devices: Dict[str, Dict] = {}
+        skipped_invalid = 0
 
         def extract_from_layer(layer: QgsVectorLayer):
+            nonlocal skipped_invalid
             if not layer or not layer.isValid():
                 return
 
@@ -2080,20 +2117,42 @@ class TrackingLayerManager(BaseLayerManager):
 
             for feature in layer.getFeatures():
                 device_id = feature.attribute(device_id_idx)
+
+                # SAFETY FIX: Validate device_id before use
                 if not device_id:
+                    skipped_invalid += 1
+                    continue
+
+                # Validate device_id is a string and reasonable length
+                if not isinstance(device_id, str):
+                    device_id = str(device_id)
+
+                if len(device_id) > 256:
+                    logger.warning(
+                        "SAR-0uy: Skipping device with excessively long ID: %s...",
+                        device_id[:50]
+                    )
+                    skipped_invalid += 1
                     continue
 
                 if device_id not in devices:
                     name = None
                     if name_idx != -1:
                         name = feature.attribute(name_idx)
+                    # Use full device_id for fallback name, not truncated
                     devices[device_id] = {
-                        'name': name or f"Device {device_id[:8]}",
+                        'name': name or f"Device {device_id}",
                         'device_id': device_id
                     }
 
         extract_from_layer(current_layer)
         extract_from_layer(breadcrumbs_layer)
+
+        if skipped_invalid > 0:
+            logger.warning(
+                "SAR-0uy: Skipped %d features with invalid/empty device_id",
+                skipped_invalid
+            )
 
         logger.info(
             "SAR-0uy: Extracted %d devices from shared layers",
@@ -2158,11 +2217,15 @@ class TrackingLayerManager(BaseLayerManager):
         For positions, we only keep the latest position (per-device layers
         store single features representing current position).
 
+        SAFETY FIX: Validates geometry before copy to prevent invalid coordinates.
+
         Args:
             source_layer: Shared current positions layer
             target_layer: Per-device position layer
             device_id: Device to filter by
         """
+        import uuid
+
         device_id_idx = source_layer.fields().indexFromName("device_id")
         if device_id_idx == -1:
             return
@@ -2176,6 +2239,15 @@ class TrackingLayerManager(BaseLayerManager):
             if feature.attribute(device_id_idx) != device_id:
                 continue
 
+            # SAFETY FIX: Skip features with invalid geometry
+            geom = feature.geometry()
+            if geom.isNull() or geom.isEmpty():
+                logger.warning(
+                    "SAR-0uy: Skipping position with null/empty geometry for device %s",
+                    device_id
+                )
+                continue
+
             if ts_idx != -1:
                 feature_ts = feature.attribute(ts_idx)
                 if latest_ts is None or (feature_ts and feature_ts > latest_ts):
@@ -2185,31 +2257,45 @@ class TrackingLayerManager(BaseLayerManager):
                 latest_feature = feature  # Just take the last one
 
         if not latest_feature:
+            logger.debug("SAR-0uy: No valid position found for device %s", device_id)
             return
 
-        # Copy to target layer
+        # SAFETY FIX: Final geometry validation before copy
+        src_geom = latest_feature.geometry()
+        if src_geom.isNull() or src_geom.isEmpty():
+            logger.warning(
+                "SAR-0uy: Cannot copy position for device %s - invalid geometry",
+                device_id
+            )
+            return
+
+        # Build the new feature FIRST, then clear and add in transaction
+        # This ensures we have valid data before modifying target
+        new_feature = QgsFeature(target_layer.fields())
+        new_feature.setGeometry(src_geom)
+
+        source_fields = source_layer.fields()
+        target_fields = target_layer.fields()
+
+        # Copy common attributes
+        for field_name in ['device_id', 'name', 'timestamp', 'altitude', 'speed', 'battery']:
+            src_idx = source_fields.indexFromName(field_name)
+            tgt_idx = target_fields.indexFromName(field_name)
+            if src_idx != -1 and tgt_idx != -1:
+                new_feature.setAttribute(tgt_idx, latest_feature.attribute(src_idx))
+
+        # Add UUID if target has id field
+        id_idx = target_fields.indexFromName("id")
+        if id_idx != -1:
+            new_feature.setAttribute(id_idx, str(uuid.uuid4()))
+
+        # Copy to target layer - clear and add in single transaction
         with self._layer_transaction(target_layer, f"Position ({device_id})", "migrate position") as edit_layer:
-            self._clear_layer_features(edit_layer, f"Position ({device_id})")
-
-            new_feature = QgsFeature(edit_layer.fields())
-            new_feature.setGeometry(latest_feature.geometry())
-
-            # Map attributes from source to target
-            import uuid
-            source_fields = source_layer.fields()
-            target_fields = edit_layer.fields()
-
-            # Copy common attributes
-            for field_name in ['device_id', 'name', 'timestamp', 'altitude', 'speed', 'battery']:
-                src_idx = source_fields.indexFromName(field_name)
-                tgt_idx = target_fields.indexFromName(field_name)
-                if src_idx != -1 and tgt_idx != -1:
-                    new_feature.setAttribute(tgt_idx, latest_feature.attribute(src_idx))
-
-            # Add UUID if target has id field
-            id_idx = target_fields.indexFromName("id")
-            if id_idx != -1:
-                new_feature.setAttribute(id_idx, str(uuid.uuid4()))
+            # Use deleteFeatures instead of truncate to work with transaction rollback
+            existing_ids = [f.id() for f in edit_layer.getFeatures()]
+            if existing_ids:
+                if not edit_layer.deleteFeatures(existing_ids):
+                    raise RuntimeError(f"Failed to clear existing features for device {device_id}")
 
             if not edit_layer.addFeature(new_feature):
                 raise RuntimeError(f"Failed to copy position for device {device_id}")
@@ -2225,56 +2311,91 @@ class TrackingLayerManager(BaseLayerManager):
         """
         Copy trail features for a device from shared to per-device layer.
 
+        SAFETY FIX: Validates geometry and uses transaction-safe deletion.
+
         Args:
             source_layer: Shared breadcrumbs layer
             target_layer: Per-device trail layer
             device_id: Device to filter by
         """
+        import uuid
+
         device_id_idx = source_layer.fields().indexFromName("device_id")
         if device_id_idx == -1:
             return
 
-        # Collect features for this device
+        # Collect valid features for this device (with geometry validation)
         device_features = []
+        skipped_count = 0
         for feature in source_layer.getFeatures():
-            if feature.attribute(device_id_idx) == device_id:
-                device_features.append(feature)
+            if feature.attribute(device_id_idx) != device_id:
+                continue
+
+            # SAFETY FIX: Skip features with invalid geometry
+            geom = feature.geometry()
+            if geom.isNull() or geom.isEmpty():
+                skipped_count += 1
+                continue
+
+            device_features.append(feature)
+
+        if skipped_count > 0:
+            logger.warning(
+                "SAR-0uy: Skipped %d trail segments with invalid geometry for device %s",
+                skipped_count, device_id
+            )
 
         if not device_features:
+            logger.debug("SAR-0uy: No valid trail segments found for device %s", device_id)
             return
 
-        # Copy to target layer
+        # Build all new features FIRST before modifying target
+        source_fields = source_layer.fields()
+        target_fields = target_layer.fields()
+        new_features = []
+
+        for idx, feature in enumerate(device_features):
+            new_feature = QgsFeature(target_fields)
+            new_feature.setGeometry(feature.geometry())
+
+            # Copy common attributes
+            for field_name in ['device_id', 'name', 'timestamp']:
+                src_idx = source_fields.indexFromName(field_name)
+                tgt_idx = target_fields.indexFromName(field_name)
+                if src_idx != -1 and tgt_idx != -1:
+                    new_feature.setAttribute(tgt_idx, feature.attribute(src_idx))
+
+            # Set per-device trail specific fields
+            id_idx = target_fields.indexFromName("id")
+            if id_idx != -1:
+                new_feature.setAttribute(id_idx, str(uuid.uuid4()))
+
+            seg_idx = target_fields.indexFromName("segment_index")
+            if seg_idx != -1:
+                new_feature.setAttribute(seg_idx, idx)
+
+            new_features.append(new_feature)
+
+        # Copy to target layer - clear and add in single transaction
         with self._layer_transaction(target_layer, f"Trail ({device_id})", "migrate trails") as edit_layer:
-            self._clear_layer_features(edit_layer, f"Trail ({device_id})")
+            # Use deleteFeatures instead of truncate to work with transaction rollback
+            existing_ids = [f.id() for f in edit_layer.getFeatures()]
+            if existing_ids:
+                if not edit_layer.deleteFeatures(existing_ids):
+                    raise RuntimeError(f"Failed to clear existing trail features for device {device_id}")
 
-            source_fields = source_layer.fields()
-            target_fields = edit_layer.fields()
-            import uuid
-
-            for idx, feature in enumerate(device_features):
-                new_feature = QgsFeature(target_fields)
-                new_feature.setGeometry(feature.geometry())
-
-                # Copy common attributes
-                for field_name in ['device_id', 'name', 'timestamp']:
-                    src_idx = source_fields.indexFromName(field_name)
-                    tgt_idx = target_fields.indexFromName(field_name)
-                    if src_idx != -1 and tgt_idx != -1:
-                        new_feature.setAttribute(tgt_idx, feature.attribute(src_idx))
-
-                # Set per-device trail specific fields
-                id_idx = target_fields.indexFromName("id")
-                if id_idx != -1:
-                    new_feature.setAttribute(id_idx, str(uuid.uuid4()))
-
-                seg_idx = target_fields.indexFromName("segment_index")
-                if seg_idx != -1:
-                    new_feature.setAttribute(seg_idx, idx)
-
+            # Add all features
+            failed_count = 0
+            for new_feature in new_features:
                 if not edit_layer.addFeature(new_feature):
-                    logger.warning("SAR-0uy: Failed to copy trail segment %d for device %s", idx, device_id)
+                    failed_count += 1
 
-        logger.debug("SAR-0uy: Copied %d trail segments for device %s", len(device_features), device_id)
+            if failed_count > 0:
+                raise RuntimeError(
+                    f"Failed to copy {failed_count}/{len(new_features)} trail segments for device {device_id}"
+                )
+
+        logger.debug("SAR-0uy: Copied %d trail segments for device %s", len(new_features), device_id)
 
     def _archive_shared_tracking_layers(
         self,
@@ -2287,6 +2408,8 @@ class TrackingLayerManager(BaseLayerManager):
         Non-destructive: Layers are renamed with suffix and hidden,
         not deleted. This allows rollback if needed.
 
+        SAFETY FIX: Stores original name in custom property for proper rollback.
+
         Args:
             current_layer: Shared current positions layer
             breadcrumbs_layer: Shared breadcrumbs layer
@@ -2295,11 +2418,27 @@ class TrackingLayerManager(BaseLayerManager):
             if not layer or not layer.isValid():
                 return
 
+            # SAFETY FIX: Check layer is not being edited
+            if layer.isEditable():
+                logger.warning(
+                    "SAR-0uy: Cannot archive layer %s - currently being edited",
+                    layer.name()
+                )
+                return
+
             old_name = layer.name()
             new_name = f"{old_name}{self.ARCHIVE_SUFFIX}"
 
+            # SAFETY FIX: Store original name for proper rollback
+            layer.setCustomProperty("sartracker:original_name", old_name)
+
             # Rename the layer
             layer.setName(new_name)
+
+            # Verify rename worked
+            if layer.name() != new_name:
+                logger.error("SAR-0uy: Failed to rename layer %s -> %s", old_name, new_name)
+                return
 
             # Mark as archived
             layer.setCustomProperty("sartracker:archived", True)
@@ -2322,7 +2461,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         This method:
         1. Finds archived shared layers
-        2. Restores their original names
+        2. Restores their original names (from stored custom property)
         3. Makes them visible again
         4. Optionally removes per-device layers
 
@@ -2352,13 +2491,17 @@ class TrackingLayerManager(BaseLayerManager):
             logger.warning("SAR-0uy: No archived layers found for rollback")
             return False
 
-        def restore_layer(layer: QgsVectorLayer, original_name: str):
+        def restore_layer(layer: QgsVectorLayer, fallback_name: str):
             if not layer:
                 return
+
+            # SAFETY FIX: Get original name from stored property, with fallback
+            original_name = layer.customProperty("sartracker:original_name") or fallback_name
 
             layer.setName(original_name)
             layer.removeCustomProperty("sartracker:archived")
             layer.removeCustomProperty("sartracker:archived_at")
+            layer.removeCustomProperty("sartracker:original_name")
 
             root = QgsProject.instance().layerTreeRoot()
             tree_layer = root.findLayer(layer.id())

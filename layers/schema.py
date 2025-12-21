@@ -11,7 +11,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all Qt imports.
 
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 import logging
 import threading
@@ -130,7 +130,7 @@ class MigrationTracker:
                 from_version=from_version,
                 to_version=to_version,
                 status=MigrationStatus.IN_PROGRESS,
-                started_at=datetime.utcnow().isoformat(),
+                started_at=datetime.now(timezone.utc).isoformat(),
                 affected_layers=affected_layers or []
             )
             self._migrations[migration_id] = record
@@ -156,7 +156,7 @@ class MigrationTracker:
 
             record = self._migrations[migration_id]
             record.status = MigrationStatus.COMPLETED
-            record.completed_at = datetime.utcnow().isoformat()
+            record.completed_at = datetime.now(timezone.utc).isoformat()
             record.rollback_available = rollback_available
             logger.info(
                 "Completed migration %s (rollback %s)",
@@ -179,7 +179,7 @@ class MigrationTracker:
 
             record = self._migrations[migration_id]
             record.status = MigrationStatus.FAILED
-            record.completed_at = datetime.utcnow().isoformat()
+            record.completed_at = datetime.now(timezone.utc).isoformat()
             record.error_message = error_message
             logger.error(
                 "Migration %s FAILED: %s",
