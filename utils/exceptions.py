@@ -250,18 +250,31 @@ def validate_coordinate_pair(lat, lon):
     """
     Validate latitude/longitude pair.
 
+    LIFE-SAFETY CRITICAL: Also rejects "Null Island" (0,0) which is a
+    common GPS failure indicator, not a valid SAR position.
+
     Args:
         lat: Latitude value to validate
         lon: Longitude value to validate
 
     Raises:
-        CoordinateError: If either coordinate is invalid
+        CoordinateError: If either coordinate is invalid or represents Null Island
 
     Returns:
         tuple: Validated (latitude, longitude) as floats
     """
     validated_lat = validate_latitude(lat)
     validated_lon = validate_longitude(lon)
+
+    # SAR-1lt FIX: Reject Null Island (0,0) - common GPS failure indicator
+    # Uses small epsilon to catch floating-point near-zero values
+    if abs(validated_lat) < 0.0001 and abs(validated_lon) < 0.0001:
+        raise CoordinateError(
+            'coordinate pair',
+            f'({validated_lat}, {validated_lon})',
+            'a valid position (0,0 is rejected as likely GPS failure)'
+        )
+
     return (validated_lat, validated_lon)
 
 

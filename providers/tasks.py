@@ -645,7 +645,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     self.error_message = f"Failed to fetch devices: {str(e)}"
                     return False
             except ProviderAuthError as e:
-                self.error_message = f"Failed to fetch devices: {str(e)}"
+                # SAR-5vu FIX: Add recovery guidance
+                self.error_message = f"Failed to fetch devices: {str(e)} - Check Provider Settings to re-authenticate."
                 return False
             except Exception as e:
                 self.error_message = f"Unexpected error fetching devices: {str(e)}"
@@ -671,7 +672,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     self.error_message = f"Failed to fetch current positions: {str(e)}"
                     return False
             except ProviderAuthError as e:
-                self.error_message = f"Failed to fetch current positions: {str(e)}"
+                # SAR-5vu FIX: Add recovery guidance
+                self.error_message = f"Failed to fetch current positions: {str(e)} - Check Provider Settings to re-authenticate."
                 return False
             except Exception as e:
                 logger.error("Error fetching current positions: %s", e)
@@ -710,7 +712,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     logger.info("Using cached breadcrumbs (%d points)", len(breadcrumbs))
                 _breadcrumb_progress(1.0)
             except ProviderAuthError as e:
-                self.error_message = f"Failed to fetch breadcrumbs: {str(e)}"
+                # SAR-5vu FIX: Add recovery guidance
+                self.error_message = f"Failed to fetch breadcrumbs: {str(e)} - Check Provider Settings to re-authenticate."
                 return False
             except Exception as e:
                 logger.error("Error fetching breadcrumbs: %s", e)
@@ -767,12 +770,21 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 logger.warning("BUG-050: Invalid devices type %s, using empty list", type(devices).__name__)
                 devices = []
 
+            # SAR-nzf FIX: Include breadcrumb failures for UI notification
+            breadcrumb_failures = []
+            try:
+                with self.provider._cache_lock:
+                    breadcrumb_failures = list(self.provider._last_breadcrumb_failures)
+            except Exception:
+                pass  # Silently ignore if provider doesn't have this field
+
             # Store results for main thread retrieval
             self.results = {
                 'current': current,
                 'breadcrumbs': breadcrumbs,
                 'devices': devices,
-                'breadcrumb_processing': breadcrumb_processing
+                'breadcrumb_processing': breadcrumb_processing,
+                'breadcrumb_failures': breadcrumb_failures  # SAR-nzf: Surface partial failures
             }
 
             # Persist last-good payload (positions + breadcrumbs) for offline resilience
@@ -789,7 +801,11 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
         except ProviderAuthError as e:
             # BUG-079 FIX: Specific handling for authentication errors
-            self.error_message = f"[AUTH_ERROR] {str(e)}"
+            # SAR-5vu FIX: Add recovery guidance for mid-mission auth failures
+            self.error_message = (
+                f"[AUTH_ERROR] {str(e)} - "
+                "Check Provider Settings to verify credentials and re-test connection."
+            )
             self.error_type = "auth"
             return False
         except ProviderNetworkError as e:

@@ -17,10 +17,12 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 import sys
+import time
 import concurrent.futures
 import queue
 from pathlib import Path
 import logging
+import threading
 from threading import RLock
 import contextlib
 
@@ -171,6 +173,10 @@ class TraccarHttpProvider(Provider):
         self._cache_lock: RLock = RLock()
         # BUG-075 FIX: Maximum devices to cache (safety limit)
         self.MAX_DEVICE_CACHE_SIZE = 10000  # Reasonable limit for rescue operations
+        # SAR-l07 FIX: Longer cache expiration for extended SAR operations
+        # 4 hours allows for extended connectivity issues in remote mountain areas
+        # Stale data with warnings is preferable to no data in life-safety scenarios
+        self.LAST_GOOD_CACHE_MAX_AGE_S = 14400  # 4 hours (was 1 hour)
         self._last_breadcrumb_failures: List[str] = []
         self._last_connection_status: Dict[str, Any] = {
             'success': None,
@@ -484,6 +490,22 @@ class TraccarHttpProvider(Provider):
                 # Sort by timestamp (most recent first)
                 features.sort(key=lambda x: x['ts'], reverse=True)
 
+                # SAR-e5h FIX: Deduplicate by device_id, keeping most recent position
+                # Traccar API can return multiple positions per device in rapid update scenarios
+                seen_devices = set()
+                unique_features = []
+                for feature in features:
+                    device_id = feature['device_id']
+                    if device_id not in seen_devices:
+                        seen_devices.add(device_id)
+                        unique_features.append(feature)
+                if len(unique_features) < len(features):
+                    logger.debug(
+                        "SAR-e5h: Deduplicated %d -> %d positions (removed %d duplicates)",
+                        len(features), len(unique_features), len(features) - len(unique_features)
+                    )
+                features = unique_features
+
                 logger.info("Fetched %s current positions", len(features))
 
                 annotated_features = self._annotate_origin(features, origin='live')
@@ -537,9 +559,22 @@ class TraccarHttpProvider(Provider):
 
                     # Annotate with both origin and cache age for UI to use
                     annotated = self._annotate_origin(cached, origin='cache')
+
+                    # SAR-1zb FIX: Also mark if device cache is stale
+                    # This warns coordinators that team roster may have changed
+                    with self._cache_lock:
+                        device_cache_is_stale = self._device_cache_stale
+
                     for record in annotated:
                         record['cache_age_seconds'] = age_seconds
                         record['cache_timestamp'] = format_iso(cache_timestamp)
+                        record['device_cache_stale'] = device_cache_is_stale
+
+                    if device_cache_is_stale:
+                        logger.warning(
+                            "SAR-1zb: Device cache also stale - team roster may have changed"
+                        )
+
                     return annotated
 
             raise
@@ -609,6 +644,8 @@ class TraccarHttpProvider(Provider):
 
         session_pool = None
         executor = None
+        all_sessions = []  # SAR-vk6: Track all sessions for guaranteed cleanup
+        all_sessions_lock = threading.Lock()
         try:
             # Create session if not provided
             if session is None:
@@ -685,14 +722,22 @@ class TraccarHttpProvider(Provider):
 
                 pool_size = max(1, min(self.breadcrumb_workers, device_count))
                 for _ in range(pool_size):
-                    session_pool.put(self._create_session())
+                    s = self._create_session()
+                    with all_sessions_lock:
+                        all_sessions.append(s)
+                    session_pool.put(s)
 
                 cancel_requested = False
                 processed_devices = 0
                 executor = concurrent.futures.ThreadPoolExecutor(max_workers=pool_size)
 
+                # SAR-anf: Track slow devices to identify timeout cascade sources
+                slow_device_threshold_s = 5.0  # Log if device takes longer than 5 seconds
+
                 # Helper function for parallel execution
                 def fetch_device_breadcrumbs(device_id_str, device_name):
+                    # SAR-anf: Time the fetch to detect slow devices
+                    fetch_start = time.monotonic()
                     try:
                         if _should_cancel():
                             return []
@@ -709,7 +754,10 @@ class TraccarHttpProvider(Provider):
                             worker_session = session_pool.get_nowait()
                             from_pool = True
                         except queue.Empty:
+                            # SAR-vk6: Track ad-hoc sessions for guaranteed cleanup
                             worker_session = self._create_session()
+                            with all_sessions_lock:
+                                all_sessions.append(worker_session)
                             from_pool = False
 
                         try:
@@ -727,13 +775,10 @@ class TraccarHttpProvider(Provider):
                             logger.warning("Failed HTTP breadcrumb fetch for %s: %s", device_name, http_err)
                             return []
                         finally:
+                            # SAR-vk6: Return pooled sessions; ad-hoc sessions are cleaned up
+                            # at shutdown via all_sessions list (no early close needed)
                             if from_pool:
                                 session_pool.put(worker_session)
-                            else:
-                                try:
-                                    worker_session.close()
-                                except Exception:
-                                    pass
 
                         # Validate response type
                         if not isinstance(data, list):
@@ -763,6 +808,16 @@ class TraccarHttpProvider(Provider):
                                         f"{device_name}: invalid position payload ({e})"
                                     )
                                 continue
+
+                        # SAR-anf: Log slow devices that may cause timeout cascades
+                        fetch_duration = time.monotonic() - fetch_start
+                        if fetch_duration > slow_device_threshold_s:
+                            logger.warning(
+                                "SAR-anf: Slow breadcrumb fetch for '%s' took %.1fs (threshold: %.1fs) - "
+                                "may cause timeout cascade",
+                                device_name, fetch_duration, slow_device_threshold_s
+                            )
+
                         return device_positions
 
                     except Exception as e:
@@ -810,11 +865,15 @@ class TraccarHttpProvider(Provider):
                             cancel_requested = True
                             break
                 finally:
+                    # SAR-vk6: ALWAYS wait for workers to finish before cleanup
+                    # to prevent session pool exhaustion. Use cancel_futures to
+                    # prevent queued work from starting, but still wait for in-flight.
                     # Python 3.8 compatibility: cancel_futures was added in 3.9.
                     try:
-                        executor.shutdown(wait=not cancel_requested, cancel_futures=cancel_requested)
+                        executor.shutdown(wait=True, cancel_futures=cancel_requested)
                     except TypeError:
-                        executor.shutdown(wait=not cancel_requested)
+                        # Python 3.8: no cancel_futures, just wait for completion
+                        executor.shutdown(wait=True)
 
                 # Sort by (device_id, timestamp)
                 all_positions.sort(key=lambda x: (x['device_id'], x['ts']))
@@ -840,12 +899,13 @@ class TraccarHttpProvider(Provider):
                 return annotated_positions
 
             finally:
-                # Close pooled sessions
-                if session_pool:
-                    while not session_pool.empty():
-                        pooled = session_pool.get_nowait()
+                # SAR-vk6: Close ALL tracked sessions (both pooled and ad-hoc).
+                # This runs AFTER executor.shutdown(wait=True), so all workers
+                # have finished and returned their sessions.
+                if all_sessions:
+                    for tracked_session in all_sessions:
                         try:
-                            pooled.close()
+                            tracked_session.close()
                         except Exception:
                             pass
 
@@ -991,7 +1051,18 @@ class TraccarHttpProvider(Provider):
         device_id_str = str(device_id)
 
         # EXTRACT device name from cache
-        name = device_map.get(device_id_str, f"Device {device_id_str}")
+        # SAR-5h1 FIX: Track when fallback name is used so UI can indicate unknown devices
+        name_from_cache = device_map.get(device_id_str)
+        if name_from_cache:
+            name = name_from_cache
+            name_unresolved = False
+        else:
+            name = f"Device {device_id_str}"
+            name_unresolved = True
+            logger.warning(
+                "SAR-5h1: Unknown device %s - using fallback name '%s' (device may be new or cache stale)",
+                device_id_str, name
+            )
 
         # EXTRACT coordinates
         lat = raw_pos.get('latitude')
@@ -1024,6 +1095,7 @@ class TraccarHttpProvider(Provider):
         return {
             'device_id': device_id_str,
             'name': name,
+            'name_unresolved': name_unresolved,  # SAR-5h1: Flag for UI to indicate unknown devices
             'lat': lat,
             'lon': lon,
             'ts': timestamp,
@@ -1158,16 +1230,19 @@ class TraccarHttpProvider(Provider):
             except Exception as exc:
                 logger.warning("Failed to remove corrupt cache after %s: %s", reason, exc)
 
-    def _load_last_good_cache(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
+    def _load_last_good_cache(self, max_age_s: Optional[int] = None) -> Optional[List[FeatureDict]]:
         """
         Load last-good positions from cache file.
 
         Args:
-            max_age_s: Maximum age of cache in seconds (default: 3600 = 1 hour)
+            max_age_s: Maximum age of cache in seconds (default: LAST_GOOD_CACHE_MAX_AGE_S)
 
         Returns:
             List of feature dicts from cache, or None if cache unavailable or expired
         """
+        # SAR-l07 FIX: Use configurable instance variable for default
+        if max_age_s is None:
+            max_age_s = self.LAST_GOOD_CACHE_MAX_AGE_S
         cache = self._read_last_good_cache(max_age_s=max_age_s)
         if cache:
             logger.info(
@@ -1178,16 +1253,19 @@ class TraccarHttpProvider(Provider):
             return cache.get('features')
         return None
 
-    def _load_last_good_cache_with_metadata(self, max_age_s: int = 3600):
+    def _load_last_good_cache_with_metadata(self, max_age_s: Optional[int] = None):
         """
         Load last-good positions from cache file with timestamp metadata.
 
         Args:
-            max_age_s: Maximum age of cache in seconds (default: 3600 = 1 hour)
+            max_age_s: Maximum age of cache in seconds (default: LAST_GOOD_CACHE_MAX_AGE_S)
 
         Returns:
             Tuple of (features list, cache datetime), or None if cache unavailable or expired
         """
+        # SAR-l07 FIX: Use configurable instance variable for default
+        if max_age_s is None:
+            max_age_s = self.LAST_GOOD_CACHE_MAX_AGE_S
         cache = self._read_last_good_cache(max_age_s=max_age_s)
         if cache:
             features = cache.get('features')
@@ -1200,16 +1278,19 @@ class TraccarHttpProvider(Provider):
                 return None
         return None
 
-    def _load_last_good_breadcrumbs(self, max_age_s: int = 3600) -> Optional[List[FeatureDict]]:
+    def _load_last_good_breadcrumbs(self, max_age_s: Optional[int] = None) -> Optional[List[FeatureDict]]:
         """
         Load last-good breadcrumbs from cache file (if saved).
 
         Args:
-            max_age_s: Maximum age of cache in seconds
+            max_age_s: Maximum age of cache in seconds (default: LAST_GOOD_CACHE_MAX_AGE_S)
 
         Returns:
             List of breadcrumb feature dicts, or None if unavailable/expired.
         """
+        # SAR-l07 FIX: Use configurable instance variable for default
+        if max_age_s is None:
+            max_age_s = self.LAST_GOOD_CACHE_MAX_AGE_S
         cache = self._read_last_good_cache(max_age_s=max_age_s)
         if cache and cache.get('breadcrumbs'):
             logger.info(
@@ -1220,10 +1301,16 @@ class TraccarHttpProvider(Provider):
             return cache.get('breadcrumbs')
         return None
 
-    def _read_last_good_cache(self, max_age_s: Optional[int] = 3600) -> Optional[Dict[str, Any]]:
+    def _read_last_good_cache(self, max_age_s: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """
         Internal helper to read cache file and enforce age limits.
+
+        Args:
+            max_age_s: Maximum age of cache in seconds (default: LAST_GOOD_CACHE_MAX_AGE_S)
         """
+        # SAR-l07 FIX: Use configurable instance variable for default
+        if max_age_s is None:
+            max_age_s = self.LAST_GOOD_CACHE_MAX_AGE_S
         if not self.enable_last_good_cache:
             return None
 

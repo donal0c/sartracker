@@ -9,6 +9,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
 import logging
+import time
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
 from datetime import datetime, timedelta, timezone
@@ -407,12 +408,14 @@ class TrackingLayerManager(BaseLayerManager):
             if not layer or not layer.isValid():
                 logger.warning("Breadcrumb task complete but layer unavailable")
                 return
+            # SAR-hi3 FIX: Pass expected generation to close race window
             self._apply_breadcrumb_results(
                 layer,
                 segments,
                 total_inputs,
                 invalid_count,
-                last_error
+                last_error,
+                expected_generation=task_generation
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Breadcrumb task completion failed: %s", exc)
@@ -460,12 +463,14 @@ class TrackingLayerManager(BaseLayerManager):
                 if not layer or not layer.isValid():
                     logger.warning("Breadcrumb fallback: layer unavailable")
                     return
+                # SAR-hi3 FIX: Pass expected generation to close race window
                 self._apply_breadcrumb_results(
                     layer,
                     segments,
                     len(payload),
                     sanitized_positions.invalid_count,
-                    sanitized_positions.last_error
+                    sanitized_positions.last_error,
+                    expected_generation=task_generation
                 )
                 return
             except Exception as exc:
@@ -482,9 +487,30 @@ class TrackingLayerManager(BaseLayerManager):
         segments: List[Dict[str, Any]],
         total_inputs: int,
         invalid_count: int,
-        last_error: Optional[str]
+        last_error: Optional[str],
+        expected_generation: Optional[int] = None
     ):
-        """Common render/apply routine for both sync and async breadcrumb updates."""
+        """Common render/apply routine for both sync and async breadcrumb updates.
+
+        Args:
+            layer: The breadcrumbs layer to update
+            segments: List of segment dicts with 'points', 'device_id', 'name'
+            total_inputs: Total number of input positions
+            invalid_count: Number of invalid positions filtered
+            last_error: Last error message if any
+            expected_generation: If provided, re-check mission generation atomically
+                before writing to layer (SAR-hi3 fix for race condition)
+        """
+        # SAR-hi3 FIX: Re-check mission generation immediately before layer write
+        # This closes the race window between initial check and actual update
+        if expected_generation is not None and expected_generation != self._mission_generation:
+            logger.info(
+                "SAR-hi3: Mission generation changed before layer write (%s -> %s) - discarding stale data",
+                expected_generation,
+                self._mission_generation
+            )
+            return
+
         self._report_validation_warning(
             "Breadcrumbs",
             total_inputs,
@@ -571,11 +597,39 @@ class TrackingLayerManager(BaseLayerManager):
         layer = self._get_or_create_current_layer()
 
         # BUG-027 FIX: Acquire global lock to prevent concurrent position updates
-        # This prevents race conditions when multiple refresh operations occur simultaneously
-        if not self.acquire_layer_edit_lock(timeout=10.0):
+        # SAR-z4t FIX: Retry with exponential backoff to prevent dropped updates
+        max_retries = 3
+        base_timeout = 5.0
+        lock_acquired = False
+        total_wait_time = 0.0
+
+        for attempt in range(max_retries):
+            # Scale timeout based on data size: more positions = longer timeout
+            position_factor = 1.0 + (len(valid_positions) / 50.0)  # +1s per 50 positions
+            timeout = min(base_timeout * (2 ** attempt) * position_factor, 30.0)  # Cap at 30s
+
+            lock_start = time.monotonic()
+            lock_acquired = self.acquire_layer_edit_lock(timeout=timeout)
+            lock_duration = time.monotonic() - lock_start
+            total_wait_time += lock_duration
+
+            if lock_acquired:
+                if attempt > 0 or lock_duration > 1.0:
+                    logger.info(
+                        "SAR-z4t: Layer lock acquired after %.2fs (attempt %d/%d, %d positions)",
+                        total_wait_time, attempt + 1, max_retries, len(valid_positions)
+                    )
+                break
+
+            logger.warning(
+                "SAR-z4t: Lock attempt %d/%d failed after %.1fs, retrying...",
+                attempt + 1, max_retries, lock_duration
+            )
+
+        if not lock_acquired:
             raise LayerLockError(
-                f"{self.CURRENT_LAYER_NAME} - concurrent update in progress. "
-                "Please wait for the current operation to complete."
+                f"{self.CURRENT_LAYER_NAME} - concurrent update in progress after {max_retries} attempts "
+                f"({total_wait_time:.1f}s total). Please wait for the current operation to complete."
             )
 
         try:

@@ -641,6 +641,10 @@ class sartracker:
         self._last_refresh_time = None  # ISO timestamp of last successful refresh
         self._last_refresh_duration_ms = None  # Duration of last refresh in ms
 
+        # SAR-la0: Track network failures for recovery notification
+        self._consecutive_refresh_failures = 0
+        self._first_failure_time = None  # When the outage started
+
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
         # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
@@ -3611,6 +3615,15 @@ class sartracker:
             self._refresh_in_progress = False
             self._current_refresh_task = None
 
+            # SAR-la0: Detect network recovery after failures
+            was_in_outage = self._consecutive_refresh_failures > 0
+            outage_duration = None
+            if was_in_outage and self._first_failure_time:
+                outage_duration = (datetime.now() - self._first_failure_time).total_seconds()
+            # Reset failure tracking on success
+            self._consecutive_refresh_failures = 0
+            self._first_failure_time = None
+
             # Hide loading state (check again before accessing)
             self._clear_loading_state()
 
@@ -3629,6 +3642,8 @@ class sartracker:
             breadcrumbs = sanitized.get('breadcrumbs', [])
             devices = sanitized.get('devices', [])
             breadcrumb_processing = sanitized.get('breadcrumb_processing')
+            # SAR-nzf: Get breadcrumb failures for notification
+            breadcrumb_failures = task.results.get('breadcrumb_failures', []) if task.results else []
 
             print(
                 "[SARTRACKER] Refresh payload -> "
@@ -3659,6 +3674,30 @@ class sartracker:
                 except Exception:
                     pass
                 self._notify("warning", "SAR Tracker", f"Ignored {dropped_total} invalid tracking records (see log for details).", duration=4)
+
+            # SAR-nzf FIX: Surface partial breadcrumb failures prominently
+            if breadcrumb_failures:
+                # Extract device names from failure messages (format: "DeviceName: error message")
+                failed_devices = []
+                for failure in breadcrumb_failures[:5]:  # Limit to first 5 to avoid long messages
+                    if ':' in failure:
+                        device_name = failure.split(':')[0].strip()
+                        failed_devices.append(device_name)
+                    else:
+                        failed_devices.append(failure[:20])  # Truncate if no device name
+
+                if len(breadcrumb_failures) > 5:
+                    devices_display = ", ".join(failed_devices) + f" (+{len(breadcrumb_failures) - 5} more)"
+                else:
+                    devices_display = ", ".join(failed_devices)
+
+                self._notify(
+                    "warning",
+                    "Trail Data Incomplete",
+                    f"Failed to fetch trails for: {devices_display}",
+                    duration=6
+                )
+                print(f"[SARTRACKER] SAR-nzf: Breadcrumb failures for {len(breadcrumb_failures)} devices: {failed_devices}")
 
             # Update layers (main thread operation) with instrumentation
             try:
@@ -3705,10 +3744,58 @@ class sartracker:
                 "[SARTRACKER] Refresh complete -> "
                 f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
             )
-            if current or breadcrumbs:
-                self._notify("success", "SAR Tracker", f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points", duration=2)
-            else:
-                self._notify("info", "SAR Tracker", "Refresh completed but no tracking data was returned; layers cleared.", duration=3)
+
+            # SAR-fhd FIX: Detect and prominently warn about cached data
+            cache_warning_shown = False
+            if current:
+                # Check if any position is from cache
+                cache_positions = [p for p in current if p.get('data_origin') == 'cache']
+                if cache_positions:
+                    # Get max cache age for prominent display
+                    max_cache_age = max(p.get('cache_age_seconds', 0) for p in cache_positions)
+                    age_minutes = max_cache_age / 60
+
+                    if age_minutes >= 60:
+                        age_display = f"{age_minutes / 60:.1f} hours"
+                    else:
+                        age_display = f"{age_minutes:.0f} minutes"
+
+                    # SAR-1zb FIX: Check if device cache is also stale
+                    device_cache_stale = any(p.get('device_cache_stale') for p in cache_positions)
+                    roster_warning = " Team roster may have changed!" if device_cache_stale else ""
+
+                    # CRITICAL: Show prominent, long-duration warning
+                    self._notify(
+                        "error",  # Use error level for maximum visibility
+                        "OFFLINE MODE",
+                        f"Showing CACHED positions ({age_display} old) - Network unavailable!{roster_warning}",
+                        duration=10  # 10 seconds - much longer than normal
+                    )
+                    cache_warning_shown = True
+                    print(f"[SARTRACKER] SAR-fhd: Serving {len(cache_positions)} cached positions ({age_display} old, device_cache_stale={device_cache_stale})")
+
+            if not cache_warning_shown:
+                # SAR-la0: Show connection restored notification after outage
+                if was_in_outage and outage_duration is not None:
+                    outage_minutes = outage_duration / 60
+                    if outage_minutes >= 60:
+                        outage_display = f"{outage_minutes / 60:.1f} hours"
+                    elif outage_minutes >= 1:
+                        outage_display = f"{outage_minutes:.0f} minutes"
+                    else:
+                        outage_display = f"{outage_duration:.0f} seconds"
+
+                    self._notify(
+                        "success",
+                        "CONNECTION RESTORED",
+                        f"Network recovered after {outage_display} offline. Positions now live.",
+                        duration=8  # Long duration to ensure coordinator sees it
+                    )
+                    print(f"[SARTRACKER] SAR-la0: Connection restored after {outage_display}")
+                elif current or breadcrumbs:
+                    self._notify("success", "SAR Tracker", f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points", duration=2)
+                else:
+                    self._notify("info", "SAR Tracker", "Refresh completed but no tracking data was returned; layers cleared.", duration=3)
 
         except Exception as e:
             # Reset state on processing error
@@ -3740,6 +3827,12 @@ class sartracker:
             self._current_refresh_task = None
             self._refresh_started_at = None
             self._last_refresh_duration_ms = None
+
+            # SAR-la0: Track consecutive failures for recovery notification
+            self._consecutive_refresh_failures += 1
+            if self._first_failure_time is None:
+                self._first_failure_time = datetime.now()
+                print(f"[SARTRACKER] SAR-la0: Network outage started at {self._first_failure_time.isoformat()}")
 
             # Hide loading state
             self._clear_loading_state()

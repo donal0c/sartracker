@@ -155,6 +155,10 @@ def _coerce_coordinates(lat_value: Any, lon_value: Any, index: int) -> (float, f
     if not (-180 <= lon <= 180):
         raise ValueError(f"Position {index} has invalid longitude: {lon} (must be -180 to 180)")
 
+    # SAR-1lt FIX: Reject Null Island (0,0) - common GPS failure indicator
+    if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+        raise ValueError(f"Position {index} rejected: (0,0) is likely GPS failure, not valid position")
+
     return lat, lon
 
 
