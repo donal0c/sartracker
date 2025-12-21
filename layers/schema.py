@@ -20,7 +20,10 @@ logger = logging.getLogger(__name__)
 
 
 # Schema version - increment when structure changes
-SAR_LAYER_SCHEMA_VERSION = 3
+# Version 4: Per-device tracking layers (SAR-nh9/SAR-0uy)
+#   - Each device gets its own Position and Trail layers under Tracking/{DeviceName}/
+#   - Migration from shared Current Positions/Breadcrumbs layers
+SAR_LAYER_SCHEMA_VERSION = 4
 
 
 # =============================================================================

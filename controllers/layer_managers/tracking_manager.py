@@ -1832,6 +1832,551 @@ class TrackingLayerManager(BaseLayerManager):
         )
 
     # =========================================================================
+    # Phase SAR-0uy: Migration from Shared to Per-Device Layers
+    # =========================================================================
+
+    # Migration constants
+    MIGRATION_ID = "tracking_v3_to_v4"
+    ARCHIVE_SUFFIX = "_archive_v3"
+
+    def migrate_to_per_device_layers(self) -> bool:
+        """
+        Migrate existing shared tracking layers to per-device architecture.
+
+        SAR-0uy: This migration is non-destructive - shared layers are archived
+        (renamed) not deleted. Migration is idempotent - safe to run multiple times.
+
+        Migration Flow:
+        1. Check if migration is needed (shared layers exist)
+        2. Extract device list from shared layer features
+        3. Create per-device layers for each device
+        4. Copy features from shared to per-device layers
+        5. Archive shared layers (rename, hide)
+
+        Returns:
+            True if migration completed successfully (or was not needed)
+            False if migration failed
+        """
+        from ...layers.schema import (
+            MigrationTracker,
+            MigrationStatus,
+            migration_tracker,
+        )
+
+        # Check if per-device mode is enabled
+        if not self.USE_PER_DEVICE_POSITIONS and not self.USE_PER_DEVICE_TRAILS:
+            logger.info("SAR-0uy: Per-device mode disabled, skipping migration")
+            return True
+
+        # Check if factory is available (requires mission store)
+        factory = self._get_per_device_factory()
+        if not factory:
+            logger.debug("SAR-0uy: No factory available, skipping migration")
+            return True
+
+        # Find shared layers
+        shared_current = self._find_shared_current_layer()
+        shared_breadcrumbs = self._find_shared_breadcrumbs_layer()
+
+        if not shared_current and not shared_breadcrumbs:
+            logger.info("SAR-0uy: No shared tracking layers found, migration not needed")
+            return True
+
+        # Check for existing archived layers (migration already done)
+        if self._has_archived_tracking_layers():
+            logger.info("SAR-0uy: Archived layers exist, migration already completed")
+            return True
+
+        # Start migration tracking
+        affected_layers = []
+        if shared_current:
+            affected_layers.append(shared_current.name())
+        if shared_breadcrumbs:
+            affected_layers.append(shared_breadcrumbs.name())
+
+        migration_record = migration_tracker.start_migration(
+            self.MIGRATION_ID,
+            from_version=3,
+            to_version=4,
+            affected_layers=affected_layers
+        )
+
+        if migration_record.status == MigrationStatus.COMPLETED:
+            logger.info("SAR-0uy: Migration already completed")
+            return True
+
+        logger.info(
+            "SAR-0uy: Starting migration to per-device layers (current: %s, breadcrumbs: %s)",
+            shared_current.name() if shared_current else "none",
+            shared_breadcrumbs.name() if shared_breadcrumbs else "none"
+        )
+
+        try:
+            # Extract devices from shared layers
+            devices = self._extract_devices_from_shared(shared_current, shared_breadcrumbs)
+
+            if not devices:
+                logger.info("SAR-0uy: No devices found in shared layers, archiving empty layers")
+
+            # Migrate each device
+            migrated_count = 0
+            for device_id, device_info in devices.items():
+                try:
+                    self._migrate_device_to_per_device(
+                        device_id,
+                        device_info,
+                        shared_current,
+                        shared_breadcrumbs
+                    )
+                    migrated_count += 1
+                except Exception as e:
+                    logger.error(
+                        "SAR-0uy: Failed to migrate device %s: %s",
+                        device_id, e
+                    )
+                    # Continue with other devices
+
+            # Archive shared layers
+            self._archive_shared_tracking_layers(shared_current, shared_breadcrumbs)
+
+            # Complete migration
+            migration_tracker.complete_migration(self.MIGRATION_ID, rollback_available=True)
+
+            logger.info(
+                "SAR-0uy: Migration completed successfully - %d devices migrated",
+                migrated_count
+            )
+            return True
+
+        except Exception as e:
+            logger.error("SAR-0uy: Migration failed: %s", e)
+            migration_tracker.fail_migration(self.MIGRATION_ID, str(e))
+            return False
+
+    def _find_shared_current_layer(self) -> Optional[QgsVectorLayer]:
+        """
+        Find the shared Current Positions layer if it exists.
+
+        Looks for layer by:
+        1. Custom property sartracker:type = current_position
+        2. Layer ID sar_current_positions_active
+        3. Layer name "Current – Active" or "Current Positions"
+
+        Returns:
+            QgsVectorLayer if found, None otherwise
+        """
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+
+            # Skip per-device layers
+            if layer.customProperty(self.DEVICE_ID_PROP):
+                continue
+
+            # Skip archived layers
+            if self.ARCHIVE_SUFFIX in layer.name():
+                continue
+
+            # Check by custom property
+            layer_type = layer.customProperty("sartracker:type")
+            if layer_type == "current_position":
+                return layer
+
+            # Check by layer ID
+            layer_id_prop = layer.customProperty("sartracker:layer_id")
+            if layer_id_prop == LayerIds.CURRENT_ACTIVE:
+                return layer
+
+            # Check by name
+            if layer.name() in ("Current – Active", "Current Positions"):
+                # Verify it has expected fields
+                fields = layer.fields()
+                if fields.indexFromName("device_id") != -1:
+                    return layer
+
+        return None
+
+    def _find_shared_breadcrumbs_layer(self) -> Optional[QgsVectorLayer]:
+        """
+        Find the shared Breadcrumbs layer if it exists.
+
+        Returns:
+            QgsVectorLayer if found, None otherwise
+        """
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+
+            # Skip per-device layers
+            if layer.customProperty(self.DEVICE_ID_PROP):
+                continue
+
+            # Skip archived layers
+            if self.ARCHIVE_SUFFIX in layer.name():
+                continue
+
+            # Check by custom property
+            layer_type = layer.customProperty("sartracker:type")
+            if layer_type == "breadcrumb":
+                return layer
+
+            # Check by layer ID
+            layer_id_prop = layer.customProperty("sartracker:layer_id")
+            if layer_id_prop == LayerIds.BREADCRUMBS:
+                return layer
+
+            # Check by name
+            if layer.name() == "Breadcrumbs":
+                # Verify it has expected fields
+                fields = layer.fields()
+                if fields.indexFromName("device_id") != -1:
+                    return layer
+
+        return None
+
+    def _has_archived_tracking_layers(self) -> bool:
+        """
+        Check if archived tracking layers exist from a previous migration.
+
+        Returns:
+            True if archived layers exist
+        """
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            if self.ARCHIVE_SUFFIX in layer.name():
+                return True
+        return False
+
+    def _extract_devices_from_shared(
+        self,
+        current_layer: Optional[QgsVectorLayer],
+        breadcrumbs_layer: Optional[QgsVectorLayer]
+    ) -> Dict[str, Dict]:
+        """
+        Extract device information from shared layers.
+
+        Collects unique device_id values and associated names from both
+        Current Positions and Breadcrumbs layers.
+
+        Args:
+            current_layer: Shared current positions layer (may be None)
+            breadcrumbs_layer: Shared breadcrumbs layer (may be None)
+
+        Returns:
+            Dict mapping device_id to device info dict with 'name' key
+        """
+        devices: Dict[str, Dict] = {}
+
+        def extract_from_layer(layer: QgsVectorLayer):
+            if not layer or not layer.isValid():
+                return
+
+            device_id_idx = layer.fields().indexFromName("device_id")
+            name_idx = layer.fields().indexFromName("name")
+
+            if device_id_idx == -1:
+                return
+
+            for feature in layer.getFeatures():
+                device_id = feature.attribute(device_id_idx)
+                if not device_id:
+                    continue
+
+                if device_id not in devices:
+                    name = None
+                    if name_idx != -1:
+                        name = feature.attribute(name_idx)
+                    devices[device_id] = {
+                        'name': name or f"Device {device_id[:8]}",
+                        'device_id': device_id
+                    }
+
+        extract_from_layer(current_layer)
+        extract_from_layer(breadcrumbs_layer)
+
+        logger.info(
+            "SAR-0uy: Extracted %d devices from shared layers",
+            len(devices)
+        )
+        return devices
+
+    def _migrate_device_to_per_device(
+        self,
+        device_id: str,
+        device_info: Dict,
+        shared_current: Optional[QgsVectorLayer],
+        shared_breadcrumbs: Optional[QgsVectorLayer]
+    ):
+        """
+        Migrate a single device from shared layers to per-device layers.
+
+        Creates per-device position and trail layers, then copies
+        features from the shared layers.
+
+        Args:
+            device_id: Device identifier
+            device_info: Dict with 'name' and other device metadata
+            shared_current: Source shared current positions layer
+            shared_breadcrumbs: Source shared breadcrumbs layer
+        """
+        logger.debug("SAR-0uy: Migrating device %s (%s)", device_id, device_info.get('name'))
+
+        # Create per-device position layer if we have position data
+        if shared_current and self.USE_PER_DEVICE_POSITIONS:
+            try:
+                pos_layer = self._ensure_device_position_layer(device_id, device_info)
+                if pos_layer:
+                    self._copy_device_positions(shared_current, pos_layer, device_id)
+            except Exception as e:
+                logger.warning(
+                    "SAR-0uy: Failed to migrate positions for device %s: %s",
+                    device_id, e
+                )
+
+        # Create per-device trail layer if we have trail data
+        if shared_breadcrumbs and self.USE_PER_DEVICE_TRAILS:
+            try:
+                trail_layer = self._ensure_device_trail_layer(device_id, device_info)
+                if trail_layer:
+                    self._copy_device_trails(shared_breadcrumbs, trail_layer, device_id)
+            except Exception as e:
+                logger.warning(
+                    "SAR-0uy: Failed to migrate trails for device %s: %s",
+                    device_id, e
+                )
+
+    def _copy_device_positions(
+        self,
+        source_layer: QgsVectorLayer,
+        target_layer: QgsVectorLayer,
+        device_id: str
+    ):
+        """
+        Copy position features for a device from shared to per-device layer.
+
+        For positions, we only keep the latest position (per-device layers
+        store single features representing current position).
+
+        Args:
+            source_layer: Shared current positions layer
+            target_layer: Per-device position layer
+            device_id: Device to filter by
+        """
+        device_id_idx = source_layer.fields().indexFromName("device_id")
+        if device_id_idx == -1:
+            return
+
+        # Find features for this device, keep the latest one
+        latest_feature = None
+        latest_ts = None
+        ts_idx = source_layer.fields().indexFromName("timestamp")
+
+        for feature in source_layer.getFeatures():
+            if feature.attribute(device_id_idx) != device_id:
+                continue
+
+            if ts_idx != -1:
+                feature_ts = feature.attribute(ts_idx)
+                if latest_ts is None or (feature_ts and feature_ts > latest_ts):
+                    latest_feature = feature
+                    latest_ts = feature_ts
+            else:
+                latest_feature = feature  # Just take the last one
+
+        if not latest_feature:
+            return
+
+        # Copy to target layer
+        with self._layer_transaction(target_layer, f"Position ({device_id})", "migrate position") as edit_layer:
+            self._clear_layer_features(edit_layer, f"Position ({device_id})")
+
+            new_feature = QgsFeature(edit_layer.fields())
+            new_feature.setGeometry(latest_feature.geometry())
+
+            # Map attributes from source to target
+            import uuid
+            source_fields = source_layer.fields()
+            target_fields = edit_layer.fields()
+
+            # Copy common attributes
+            for field_name in ['device_id', 'name', 'timestamp', 'altitude', 'speed', 'battery']:
+                src_idx = source_fields.indexFromName(field_name)
+                tgt_idx = target_fields.indexFromName(field_name)
+                if src_idx != -1 and tgt_idx != -1:
+                    new_feature.setAttribute(tgt_idx, latest_feature.attribute(src_idx))
+
+            # Add UUID if target has id field
+            id_idx = target_fields.indexFromName("id")
+            if id_idx != -1:
+                new_feature.setAttribute(id_idx, str(uuid.uuid4()))
+
+            if not edit_layer.addFeature(new_feature):
+                raise RuntimeError(f"Failed to copy position for device {device_id}")
+
+        logger.debug("SAR-0uy: Copied position for device %s", device_id)
+
+    def _copy_device_trails(
+        self,
+        source_layer: QgsVectorLayer,
+        target_layer: QgsVectorLayer,
+        device_id: str
+    ):
+        """
+        Copy trail features for a device from shared to per-device layer.
+
+        Args:
+            source_layer: Shared breadcrumbs layer
+            target_layer: Per-device trail layer
+            device_id: Device to filter by
+        """
+        device_id_idx = source_layer.fields().indexFromName("device_id")
+        if device_id_idx == -1:
+            return
+
+        # Collect features for this device
+        device_features = []
+        for feature in source_layer.getFeatures():
+            if feature.attribute(device_id_idx) == device_id:
+                device_features.append(feature)
+
+        if not device_features:
+            return
+
+        # Copy to target layer
+        with self._layer_transaction(target_layer, f"Trail ({device_id})", "migrate trails") as edit_layer:
+            self._clear_layer_features(edit_layer, f"Trail ({device_id})")
+
+            source_fields = source_layer.fields()
+            target_fields = edit_layer.fields()
+            import uuid
+
+            for idx, feature in enumerate(device_features):
+                new_feature = QgsFeature(target_fields)
+                new_feature.setGeometry(feature.geometry())
+
+                # Copy common attributes
+                for field_name in ['device_id', 'name', 'timestamp']:
+                    src_idx = source_fields.indexFromName(field_name)
+                    tgt_idx = target_fields.indexFromName(field_name)
+                    if src_idx != -1 and tgt_idx != -1:
+                        new_feature.setAttribute(tgt_idx, feature.attribute(src_idx))
+
+                # Set per-device trail specific fields
+                id_idx = target_fields.indexFromName("id")
+                if id_idx != -1:
+                    new_feature.setAttribute(id_idx, str(uuid.uuid4()))
+
+                seg_idx = target_fields.indexFromName("segment_index")
+                if seg_idx != -1:
+                    new_feature.setAttribute(seg_idx, idx)
+
+                if not edit_layer.addFeature(new_feature):
+                    logger.warning("SAR-0uy: Failed to copy trail segment %d for device %s", idx, device_id)
+
+        logger.debug("SAR-0uy: Copied %d trail segments for device %s", len(device_features), device_id)
+
+    def _archive_shared_tracking_layers(
+        self,
+        current_layer: Optional[QgsVectorLayer],
+        breadcrumbs_layer: Optional[QgsVectorLayer]
+    ):
+        """
+        Archive (rename and hide) shared tracking layers.
+
+        Non-destructive: Layers are renamed with suffix and hidden,
+        not deleted. This allows rollback if needed.
+
+        Args:
+            current_layer: Shared current positions layer
+            breadcrumbs_layer: Shared breadcrumbs layer
+        """
+        def archive_layer(layer: QgsVectorLayer):
+            if not layer or not layer.isValid():
+                return
+
+            old_name = layer.name()
+            new_name = f"{old_name}{self.ARCHIVE_SUFFIX}"
+
+            # Rename the layer
+            layer.setName(new_name)
+
+            # Mark as archived
+            layer.setCustomProperty("sartracker:archived", True)
+            layer.setCustomProperty("sartracker:archived_at", datetime.now(timezone.utc).isoformat())
+
+            # Hide in layer tree
+            root = QgsProject.instance().layerTreeRoot()
+            tree_layer = root.findLayer(layer.id())
+            if tree_layer:
+                tree_layer.setItemVisibilityChecked(False)
+
+            logger.info("SAR-0uy: Archived layer %s -> %s", old_name, new_name)
+
+        archive_layer(current_layer)
+        archive_layer(breadcrumbs_layer)
+
+    def rollback_per_device_migration(self) -> bool:
+        """
+        Rollback per-device migration by restoring archived shared layers.
+
+        This method:
+        1. Finds archived shared layers
+        2. Restores their original names
+        3. Makes them visible again
+        4. Optionally removes per-device layers
+
+        Note: Does NOT delete per-device layers by default for safety.
+
+        Returns:
+            True if rollback successful, False otherwise
+        """
+        logger.info("SAR-0uy: Starting migration rollback")
+
+        archived_current = None
+        archived_breadcrumbs = None
+
+        # Find archived layers
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+
+            if layer.customProperty("sartracker:archived") and self.ARCHIVE_SUFFIX in layer.name():
+                layer_type = layer.customProperty("sartracker:type")
+                if layer_type == "current_position":
+                    archived_current = layer
+                elif layer_type == "breadcrumb":
+                    archived_breadcrumbs = layer
+
+        if not archived_current and not archived_breadcrumbs:
+            logger.warning("SAR-0uy: No archived layers found for rollback")
+            return False
+
+        def restore_layer(layer: QgsVectorLayer, original_name: str):
+            if not layer:
+                return
+
+            layer.setName(original_name)
+            layer.removeCustomProperty("sartracker:archived")
+            layer.removeCustomProperty("sartracker:archived_at")
+
+            root = QgsProject.instance().layerTreeRoot()
+            tree_layer = root.findLayer(layer.id())
+            if tree_layer:
+                tree_layer.setItemVisibilityChecked(True)
+
+            logger.info("SAR-0uy: Restored layer %s", original_name)
+
+        if archived_current:
+            restore_layer(archived_current, "Current – Active")
+
+        if archived_breadcrumbs:
+            restore_layer(archived_breadcrumbs, "Breadcrumbs")
+
+        logger.info("SAR-0uy: Migration rollback completed")
+        return True
+
+    # =========================================================================
     # Breadcrumbs Layer
     # =========================================================================
 

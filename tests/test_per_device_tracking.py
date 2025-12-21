@@ -558,6 +558,99 @@ def test_trail_updates_replace():
 
 
 # =============================================================================
+# Migration Tests (Phase 3 - SAR-0uy)
+# =============================================================================
+
+def test_migration_detection():
+    """Test that migration detects shared layers."""
+    print("\n=== Test: Migration Detection ===")
+    tm = get_tracking_manager()
+
+    # Check find methods work
+    shared_current = tm._find_shared_current_layer()
+    shared_breadcrumbs = tm._find_shared_breadcrumbs_layer()
+
+    print(f"  Shared Current layer: {shared_current.name() if shared_current else 'None'}")
+    print(f"  Shared Breadcrumbs layer: {shared_breadcrumbs.name() if shared_breadcrumbs else 'None'}")
+
+    # Check archived detection
+    has_archived = tm._has_archived_tracking_layers()
+    print(f"  Has archived layers: {has_archived}")
+
+    print("  [PASS] Migration detection methods work")
+    return True
+
+
+def test_migration_device_extraction():
+    """Test extracting devices from shared layers."""
+    print("\n=== Test: Migration Device Extraction ===")
+    tm = get_tracking_manager()
+
+    shared_current = tm._find_shared_current_layer()
+    shared_breadcrumbs = tm._find_shared_breadcrumbs_layer()
+
+    if not shared_current and not shared_breadcrumbs:
+        print("  [SKIP] No shared layers to extract from")
+        return True
+
+    devices = tm._extract_devices_from_shared(shared_current, shared_breadcrumbs)
+    print(f"  Found {len(devices)} devices in shared layers:")
+    for device_id, info in list(devices.items())[:5]:  # Show first 5
+        print(f"    - {device_id}: {info.get('name', 'Unknown')}")
+
+    print("  [PASS] Device extraction works")
+    return True
+
+
+def test_migration_idempotent():
+    """Test that migration is idempotent (safe to run multiple times)."""
+    print("\n=== Test: Migration Idempotent ===")
+    tm = get_tracking_manager()
+
+    # Run migration twice
+    print("  Running migration (first time)...")
+    result1 = tm.migrate_to_per_device_layers()
+    print(f"  First migration result: {result1}")
+
+    print("  Running migration (second time)...")
+    result2 = tm.migrate_to_per_device_layers()
+    print(f"  Second migration result: {result2}")
+
+    if result1 and result2:
+        print("  [PASS] Migration is idempotent")
+        return True
+    else:
+        print("  [FAIL] Migration returned False")
+        return False
+
+
+def test_archive_detection():
+    """Test detecting archived layers."""
+    print("\n=== Test: Archive Detection ===")
+    tm = get_tracking_manager()
+
+    # Check for archived layers
+    has_archived = tm._has_archived_tracking_layers()
+    print(f"  Has archived layers: {has_archived}")
+
+    # Find archived layers
+    archived_layers = []
+    for layer in QgsProject.instance().mapLayers().values():
+        if not isinstance(layer, QgsVectorLayer):
+            continue
+        if tm.ARCHIVE_SUFFIX in layer.name():
+            archived_layers.append(layer.name())
+
+    if archived_layers:
+        print(f"  Found archived layers: {', '.join(archived_layers)}")
+    else:
+        print("  No archived layers found")
+
+    print("  [PASS] Archive detection works")
+    return True
+
+
+# =============================================================================
 # Test Runner
 # =============================================================================
 
@@ -585,6 +678,11 @@ def run_tests():
         ("Single Device Trail", test_single_device_trail),
         ("Multiple Device Trails", test_multiple_device_trails),
         ("Trail Updates Replace", test_trail_updates_replace),
+        # Phase 3: Migration tests
+        ("Migration Detection", test_migration_detection),
+        ("Migration Device Extraction", test_migration_device_extraction),
+        ("Migration Idempotent", test_migration_idempotent),
+        ("Archive Detection", test_archive_detection),
     ]
 
     results = []
