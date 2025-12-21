@@ -8,6 +8,7 @@ Qt5/Qt6 Compatible: Uses QgsTask API.
 """
 
 import logging
+import math
 from typing import Dict, List, Optional, Any, Callable
 from collections import defaultdict
 from datetime import datetime
@@ -300,11 +301,22 @@ def _normalize_iso_timestamp(ts: Any) -> datetime:
 
 
 def _validate_coordinate(value: Any, min_val: float, max_val: float, field_name: str) -> float:
-    """Convert coordinate to float and ensure it lies within bounds."""
+    """Convert coordinate to float and ensure it lies within bounds.
+
+    LIFE-SAFETY CRITICAL: Validates coordinates from Traccar HTTP provider.
+    Invalid coordinates could lead rescue teams to wrong locations.
+    """
     try:
         numeric = float(value)
     except (TypeError, ValueError):
         raise ValueError(f"{field_name} must be a float-compatible value") from None
+
+    # CRITICAL: Check NaN/Inf BEFORE range check (NaN comparisons always return False)
+    # This matches validation pattern in utils/exceptions.py and providers/csv.py
+    if math.isnan(numeric):
+        raise ValueError(f"{field_name} is NaN")
+    if math.isinf(numeric):
+        raise ValueError(f"{field_name} is Infinite")
 
     if not (min_val <= numeric <= max_val):
         raise ValueError(f"{field_name} must be between {min_val} and {max_val}, got {numeric}")
