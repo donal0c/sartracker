@@ -2124,6 +2124,32 @@ class sartracker:
                     print(f"[SARTRACKER] Warning: Could not set layer manager shutdown flag: {exc}")
 
             # ============================================================
+            # CRASH FIX: Cancel all background tasks IMMEDIATELY
+            # This MUST happen before ANY component cleanup to prevent
+            # race conditions where background threads try to access
+            # components being destroyed.
+            #
+            # LIFE-SAFETY CRITICAL: This prevents segmentation faults
+            # during plugin unload that occur when QGIS task manager
+            # threads try to access destroyed Qt objects.
+            # ============================================================
+            if self.task_manager:
+                try:
+                    active_count = self.task_manager.get_active_count()
+                    if active_count > 0:
+                        print(f"[SARTRACKER] EARLY CLEANUP: Cancelling {active_count} active task(s) and waiting...")
+                        # This now waits synchronously for tasks to finish (5 second timeout)
+                        self.task_manager.cancel_all(wait_timeout_ms=5000)
+                        print("[SARTRACKER] All tasks cancelled and threads stopped")
+                    else:
+                        print("[SARTRACKER] No active tasks to cancel")
+                except Exception as e:
+                    print(f"[SARTRACKER] ERROR: TaskManager early cleanup failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+            # ============================================================
+
+            # ============================================================
             # Phase 1 Refactor: Use lifecycle manager for coordinated cleanup
             # Lifecycle cleanup handles:
             # - Signal disconnection (in reverse order of connection)
@@ -2196,22 +2222,10 @@ class sartracker:
                 self.mission_controller.cleanup()
                 self.mission_controller = None
 
-            # Cancel all background tasks (Issue #6 fix)
-            # TaskManager handles:
-            # - Signal disconnection BEFORE cancellation
-            # - Task cancellation
-            # - Cleanup of all active tasks
+            # CRASH FIX: TaskManager cleanup moved to EARLY CLEANUP section above
+            # (before any component cleanup). This section now just nullifies the reference.
             if self.task_manager:
-                try:
-                    active_count = self.task_manager.get_active_count()
-                    if active_count > 0:
-                        print(f"[SARTRACKER] Cancelling {active_count} active task(s)...")
-                        self.task_manager.cancel_all()
-                        print("[SARTRACKER] All tasks cancelled successfully")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: TaskManager cleanup error: {e}")
-                finally:
-                    self.task_manager = None
+                self.task_manager = None
 
             # Legacy cleanup (for backwards compatibility if TaskManager not initialized)
             if self._current_refresh_task:

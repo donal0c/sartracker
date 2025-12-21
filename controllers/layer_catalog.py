@@ -25,11 +25,26 @@ from qgis.core import (
 
 from ..layers import LayerManager, LayerIds, GroupNames, get_layer_by_id
 from ..layers.schema import get_expected_structure, LAYER_NAME_TO_ID
+from .per_item_layer_factory import PerItemLayerFactory, ItemType, SAR_ITEM_TYPE
 from ..utils.notify import info as notify_info, warning as notify_warning, error as notify_error
 from ..utils.task_manager import TaskManager
 
 
 logger = logging.getLogger(__name__)
+
+# Canonical layer_id -> per-item ItemType mapping
+PER_ITEM_LAYER_TYPES = {
+    LayerIds.MARKERS_CLUES: ItemType.MARKER_CLUE,
+    LayerIds.MARKERS_IPP_LKP: ItemType.MARKER_IPP_LKP,
+    LayerIds.MARKERS_HAZARDS: ItemType.MARKER_HAZARD,
+    LayerIds.MARKERS_CASUALTIES: ItemType.MARKER_CASUALTY,
+    LayerIds.LINES: ItemType.LINE,
+    LayerIds.SEARCH_AREAS: ItemType.SEARCH_AREA,
+    LayerIds.RANGE_RINGS: ItemType.RANGE_RING,
+    LayerIds.BEARING_LINES: ItemType.BEARING_LINE,
+}
+
+PER_ITEM_TYPE_TO_LAYER_ID = {value: key for key, value in PER_ITEM_LAYER_TYPES.items()}
 
 
 # ============================================================================
@@ -498,6 +513,8 @@ class LayerCatalogService(QObject):
         self._task_manager = task_manager or TaskManager()
         self._owned_task_manager = task_manager is None
         self._message_bar = self._resolve_message_bar()
+        self._per_item_factory: Optional[PerItemLayerFactory] = None
+        self._per_item_factory_path: Optional[str] = None
 
         if not self.project:
             raise RuntimeError("QgsProject instance not available")
@@ -505,6 +522,7 @@ class LayerCatalogService(QObject):
         # Cache dictionaries (keyed by ID)
         self._groups: Dict[str, LayerGroupInfo] = {}
         self._layers: Dict[str, LayerInfo] = {}
+        self._per_item_layer_ids: Dict[str, str] = {}
 
         # Refresh management
         self._refresh_pending = False
@@ -715,6 +733,163 @@ class LayerCatalogService(QObject):
         """
         return self._layers.get(layer_id)
 
+    def _get_per_item_factory(self) -> Optional[PerItemLayerFactory]:
+        """Return cached per-item factory if mission store is configured."""
+        gpkg_path = self.layer_manager.get_mission_store()
+        if not gpkg_path:
+            self._per_item_factory = None
+            self._per_item_factory_path = None
+            return None
+
+        if self._per_item_factory and self._per_item_factory_path == gpkg_path:
+            return self._per_item_factory
+
+        try:
+            self._per_item_factory = PerItemLayerFactory(
+                Path(gpkg_path),
+                auto_wal=True,
+                auto_registry=True
+            )
+            self._per_item_factory_path = gpkg_path
+            return self._per_item_factory
+        except Exception as exc:
+            logger.warning("Failed to initialize per-item factory for catalog: %s", exc)
+            self._per_item_factory = None
+            self._per_item_factory_path = None
+            return None
+
+    def _get_per_item_type_for_layer(self, layer_id: str) -> Optional[str]:
+        """Map canonical layer_id to per-item ItemType."""
+        return PER_ITEM_LAYER_TYPES.get(layer_id)
+
+    def _get_per_item_layers_for_layer(self, layer_id: str) -> List[QgsVectorLayer]:
+        """Return loaded per-item layers for a canonical layer_id."""
+        item_type = self._get_per_item_type_for_layer(layer_id)
+        if not item_type:
+            return []
+
+        factory = self._get_per_item_factory()
+        if not factory:
+            return []
+
+        try:
+            items = factory.get_all_item_layers(item_type=item_type)
+        except Exception as exc:
+            logger.warning("Failed to fetch per-item layers for %s: %s", layer_id, exc)
+            return []
+
+        layers: List[QgsVectorLayer] = []
+        for info in items:
+            layer = info.layer
+            if not layer or not layer.isValid():
+                continue
+            layers.append(layer)
+            self._per_item_layer_ids[layer.id()] = layer_id
+        return layers
+
+    def _get_per_item_layer_count(self, layer_id: str) -> int:
+        """Return count of loaded per-item layers for a canonical layer_id."""
+        try:
+            return len(self._get_per_item_layers_for_layer(layer_id))
+        except Exception:
+            return 0
+
+    def _build_feature_summary(
+        self,
+        layer_id: str,
+        layer: QgsVectorLayer,
+        feature
+    ) -> Optional[FeatureSummary]:
+        """Build a FeatureSummary for a given feature."""
+        try:
+            name = ''
+            name_idx = feature.fieldNameIndex('name')
+            if name_idx >= 0:
+                name_val = feature.attribute('name')
+                if name_val is not None:
+                    name = str(name_val)
+
+            type_field = ''
+            type_idx = feature.fieldNameIndex('type')
+            if type_idx >= 0:
+                type_val = feature.attribute('type')
+                if type_val is not None:
+                    type_field = str(type_val)
+
+            business_id = None
+            business_idx = feature.fieldNameIndex('id')
+            if business_idx >= 0:
+                business_val = feature.attribute('id')
+                if business_val is not None and str(business_val) != '':
+                    business_id = str(business_val)
+
+            created_at_val = None
+            created_idx = feature.fieldNameIndex('created_at')
+            if created_idx >= 0:
+                created_raw = feature.attribute('created_at')
+                if created_raw not in (None, ''):
+                    created_at_val = str(created_raw)
+
+            updated_at_val = None
+            updated_idx = feature.fieldNameIndex('updated_at')
+            if updated_idx >= 0:
+                updated_raw = feature.attribute('updated_at')
+                if updated_raw not in (None, ''):
+                    updated_at_val = str(updated_raw)
+
+            display_order_val = 0
+            order_idx = feature.fieldNameIndex('display_order')
+            if order_idx >= 0:
+                order_raw = feature.attribute('display_order')
+                try:
+                    display_order_val = max(0, int(order_raw))
+                except (TypeError, ValueError):
+                    display_order_val = 0
+
+            geometry_wkt = ''
+            if feature.hasGeometry():
+                try:
+                    geom = feature.geometry()
+                    if geom and not geom.isNull():
+                        geometry_wkt = geom.asWkt()
+                except Exception as exc:
+                    logger.warning(
+                        "Could not extract geometry for feature %s in layer %s: %s",
+                        feature.id(),
+                        layer_id,
+                        exc,
+                        exc_info=True
+                    )
+
+            attributes: Dict[str, Any] = {
+                'feature_id': feature.id()
+            }
+            if business_id is not None:
+                attributes['business_id'] = business_id
+            if type_field:
+                attributes['type'] = type_field
+            attributes['display_order'] = display_order_val
+            if created_at_val:
+                attributes['created_at'] = created_at_val
+            if updated_at_val:
+                attributes['updated_at'] = updated_at_val
+
+            summary_id = business_id if business_id is not None else str(feature.id())
+
+            return FeatureSummary(
+                id=str(summary_id),
+                name=name or str(summary_id),
+                type=type_field or layer_id,
+                geometry_wkt=geometry_wkt,
+                created_at=created_at_val,
+                updated_at=updated_at_val,
+                display_order=display_order_val,
+                attributes=attributes
+            )
+        except Exception as exc:
+            logger.warning("Failed to build feature summary for %s: %s", layer_id, exc, exc_info=True)
+            return None
+
     def list_features(
         self,
         layer_id: str,
@@ -773,103 +948,37 @@ class LayerCatalogService(QObject):
 
         # TODO: Apply filters if provided (not yet implemented)
 
-        summaries = []
+        summaries: List[FeatureSummary] = []
         try:
             for feature in layer.getFeatures(request):
-                # Extract key attributes safely
-                name = ''
-                name_idx = feature.fieldNameIndex('name')
-                if name_idx >= 0:
-                    name_val = feature.attribute('name')
-                    if name_val is not None:
-                        name = str(name_val)
-
-                type_field = ''
-                type_idx = feature.fieldNameIndex('type')
-                if type_idx >= 0:
-                    type_val = feature.attribute('type')
-                    if type_val is not None:
-                        type_field = str(type_val)
-
-                # Business identifier (if present)
-                business_id = None
-                business_idx = feature.fieldNameIndex('id')
-                if business_idx >= 0:
-                    business_val = feature.attribute('id')
-                    if business_val is not None and str(business_val) != '':
-                        business_id = str(business_val)
-
-                # Created / updated timestamps (lightweight string capture)
-                created_at_val = None
-                created_idx = feature.fieldNameIndex('created_at')
-                if created_idx >= 0:
-                    created_raw = feature.attribute('created_at')
-                    if created_raw not in (None, ''):
-                        created_at_val = str(created_raw)
-
-                updated_at_val = None
-                updated_idx = feature.fieldNameIndex('updated_at')
-                if updated_idx >= 0:
-                    updated_raw = feature.attribute('updated_at')
-                    if updated_raw not in (None, ''):
-                        updated_at_val = str(updated_raw)
-
-                # Display order (optional)
-                display_order_val = 0
-                order_idx = feature.fieldNameIndex('display_order')
-                if order_idx >= 0:
-                    order_raw = feature.attribute('display_order')
-                    try:
-                        display_order_val = max(0, int(order_raw))
-                    except (TypeError, ValueError):
-                        display_order_val = 0
-
-                # Extract geometry safely
-                geometry_wkt = ''
-                if feature.hasGeometry():
-                    try:
-                        geom = feature.geometry()
-                        if geom and not geom.isNull():
-                            geometry_wkt = geom.asWkt()
-                    except Exception as e:
-                        logger.warning(
-                            "Could not extract geometry for feature %s in layer %s: %s",
-                            feature.id(),
-                            layer_id,
-                            e,
-                            exc_info=True
-                        )
-
-                # Build attributes payload for UI consumers
-                attributes: Dict[str, Any] = {
-                    'feature_id': feature.id()
-                }
-                if business_id is not None:
-                    attributes['business_id'] = business_id
-                if type_field:
-                    attributes['type'] = type_field
-                attributes['display_order'] = display_order_val
-                if created_at_val:
-                    attributes['created_at'] = created_at_val
-                if updated_at_val:
-                    attributes['updated_at'] = updated_at_val
-
-                summary_id = business_id if business_id is not None else str(feature.id())
-
-                summary = FeatureSummary(
-                    id=str(summary_id),
-                    name=name or str(summary_id),
-                    type=type_field or layer_id,
-                    geometry_wkt=geometry_wkt,
-                    created_at=created_at_val,
-                    updated_at=updated_at_val,
-                    display_order=display_order_val,
-                    attributes=attributes
-                )
-                summaries.append(summary)
+                summary = self._build_feature_summary(layer_id, layer, feature)
+                if summary:
+                    summaries.append(summary)
+                if limit and len(summaries) >= limit:
+                    break
         except Exception as e:
             logger.exception("Error enumerating features for layer %s", layer_id)
             self._notify_warning("Layer Data Unavailable", f"Could not list features for {layer_info.display_name}: {e}")
+
+        # Include per-item layers for this canonical layer_id
+        per_item_layers = self._get_per_item_layers_for_layer(layer_id)
+        if per_item_layers:
+            for per_layer in per_item_layers:
+                if limit and len(summaries) >= limit:
+                    break
+                try:
+                    for feature in per_layer.getFeatures():
+                        summary = self._build_feature_summary(layer_id, per_layer, feature)
+                        if summary:
+                            summaries.append(summary)
+                        break  # per-item layers store a single feature
+                except Exception as e:
+                    logger.warning(
+                        "Error enumerating per-item features for layer %s: %s",
+                        layer_id,
+                        e,
+                        exc_info=True
+                    )
 
         try:
             summaries.sort(key=lambda s: (s.display_order if s.display_order is not None else 0, str(s.id)))
@@ -1159,6 +1268,13 @@ class LayerCatalogService(QObject):
     # CACHE MANAGEMENT
     # ========================================================================
 
+    def _augment_per_item_feature_counts(self) -> None:
+        """Add per-item layer counts to cached feature counts."""
+        for layer_id, layer_info in self._layers.items():
+            per_item_count = self._get_per_item_layer_count(layer_id)
+            if per_item_count:
+                layer_info.feature_count += per_item_count
+
     def _build_cache(self) -> None:
         """
         Build full catalog cache from LayerManager.
@@ -1192,6 +1308,9 @@ class LayerCatalogService(QObject):
 
         self._layers.clear()
         self._layers.update(result.layers)
+        self._per_item_layer_ids.clear()
+
+        self._augment_per_item_feature_counts()
 
         # Rewire per-layer signals now that cache is rebuilt
         for layer_id, layer in result.layer_refs.items():
@@ -1297,6 +1416,9 @@ class LayerCatalogService(QObject):
                         group_id=group_id,
                         logger_instance=logger
                     )
+                    per_item_count = self._get_per_item_layer_count(layer_id)
+                    if per_item_count:
+                        layer_info.feature_count += per_item_count
                     self._layers[layer_id] = layer_info
                     self._wire_layer_signals(layer_id, layer)
                     logger.info("Full refresh completed for %s", layer_id)
@@ -1307,7 +1429,8 @@ class LayerCatalogService(QObject):
                 # Quick update (feature count only)
                 try:
                     old_count = self._layers[layer_id].feature_count
-                    new_count = layer.featureCount()
+                    per_item_count = self._get_per_item_layer_count(layer_id)
+                    new_count = layer.featureCount() + per_item_count
 
                     if old_count != new_count:
                         self._layers[layer_id].feature_count = new_count
@@ -1396,6 +1519,14 @@ class LayerCatalogService(QObject):
                 layer_id = layer.customProperty('sartracker:layer_id')
                 if layer_id:
                     managed_layers.append((layer_id, layer))
+                    continue
+
+                item_type = layer.customProperty(SAR_ITEM_TYPE)
+                if item_type:
+                    per_item_layer_id = PER_ITEM_TYPE_TO_LAYER_ID.get(item_type)
+                    if per_item_layer_id:
+                        self._per_item_layer_ids[layer.id()] = per_item_layer_id
+                        managed_layers.append((per_item_layer_id, layer))
 
             if not managed_layers:
                 return
@@ -1424,6 +1555,7 @@ class LayerCatalogService(QObject):
 
         try:
             removed_count = 0
+            per_item_refresh: Set[str] = set()
             # Remove from cache
             for qgis_layer_id in layer_ids:
                 # Find catalog layer_id by qgis_layer_id
@@ -1434,10 +1566,17 @@ class LayerCatalogService(QObject):
                         removed_count += 1
                         logger.info("Removed %s from catalog cache", catalog_id)
                         self.layer_updated.emit(catalog_id)
+                        break
+
+                if qgis_layer_id in self._per_item_layer_ids:
+                    per_item_refresh.add(self._per_item_layer_ids.pop(qgis_layer_id))
 
             if removed_count > 0:
                 logger.info("Removed %s managed layer(s) from catalog", removed_count)
                 logger.debug("If layers are recreated, call rescan_layers() to refresh cache")
+
+            if per_item_refresh:
+                self._schedule_refresh([(layer_id, None) for layer_id in per_item_refresh])
 
         except Exception as e:
             logger.exception("layersWillBeRemoved handler failed")
@@ -1902,6 +2041,9 @@ class LayerCatalogService(QObject):
         # Clear tracking
         self._signal_connections = []
         self._disconnect_all_layer_signals()
+        self._per_item_layer_ids.clear()
+        self._per_item_factory = None
+        self._per_item_factory_path = None
 
         # Disconnect timer signal (if connected)
         if self._refresh_timer:

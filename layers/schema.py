@@ -275,14 +275,25 @@ class LayerIds:
 class GroupNames:
     """Names for all layer tree groups."""
     ROOT = ROOT_GROUP_NAME
+    # Tracking groups
     CURRENT_POSITIONS = "Current Positions"
     BREADCRUMBS = "Breadcrumbs"
-    LINES = "Lines"
-    RINGS = "Rings"
-    MARKERS = "Markers"
-    CLUES = "Clues"
+    TRACKING = "Tracking"  # For future per-device tracking layers
+    # Helicopters
     HELICOPTERS = "Helicopters"
+    # Mission Overlays (legacy - for sectors, text labels)
     MISSION_OVERLAYS = "Mission Overlays"
+    # Map Tools - main group for all drawing/marker items (FR-3)
+    MAP_TOOLS = "Map Tools"
+    # Map Tools subgroups (per-item layers go here)
+    MAP_TOOLS_IPP_LKP = "IPP-LKP"
+    MAP_TOOLS_CLUES = "Clues"
+    MAP_TOOLS_HAZARDS = "Hazards"
+    MAP_TOOLS_CASUALTIES = "Casualties"
+    MAP_TOOLS_SEARCH_AREAS = "Search Areas"
+    MAP_TOOLS_RANGE_RINGS = "Range Rings"
+    MAP_TOOLS_BEARING_LINES = "Bearing Lines"
+    MAP_TOOLS_LINES = "Lines"
 
 
 @dataclass
@@ -307,6 +318,7 @@ class GroupDefinition:
     subgroups: Optional[List['GroupDefinition']] = None
     metadata: Optional[Dict[str, str]] = None
     position: int = 0  # Position within parent
+    auto_create: bool = True  # Whether to auto-create the group during structure ensure
 
 
 # ---------------------------------------------------------------------------
@@ -541,103 +553,11 @@ def get_expected_structure() -> GroupDefinition:
                 ]
             ),
 
-            # Lines group
-            GroupDefinition(
-                name=GroupNames.LINES,
-                parent_path=[GroupNames.ROOT],
-                position=2,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.LINES,
-                        name="Lines",
-                        geometry_type="LineString",
-                        fields=LINES_FIELDS,
-                        metadata={"sartracker:type": "line"},
-                        auto_create=True
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.BEARING_LINES,
-                        name="Bearing Lines",
-                        geometry_type="LineString",
-                        fields=BEARING_LINE_FIELDS,
-                        metadata={"sartracker:type": "bearing_line"},
-                        auto_create=True
-                    )
-                ]
-            ),
-
-            # Rings group
-            GroupDefinition(
-                name=GroupNames.RINGS,
-                parent_path=[GroupNames.ROOT],
-                position=3,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.RANGE_RINGS,
-                        name="Range Rings",
-                        geometry_type="Polygon",
-                        fields=RANGE_RING_FIELDS,
-                        metadata={"sartracker:type": "range_ring"},
-                        auto_create=True
-                    )
-                ]
-            ),
-
-            # Markers group
-            GroupDefinition(
-                name=GroupNames.MARKERS,
-                parent_path=[GroupNames.ROOT],
-                position=4,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_IPP_LKP,
-                        name="IPP/LKP",
-                        geometry_type="Point",
-                        fields=IPP_LKP_FIELDS,
-                        metadata={"sartracker:type": "marker_ipp_lkp"},
-                        auto_create=True
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_HAZARDS,
-                        name="Hazards",
-                        geometry_type="Point",
-                        fields=HAZARD_FIELDS,
-                        metadata={"sartracker:type": "marker_hazard"},
-                        auto_create=True
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_CASUALTIES,
-                        name="Casualties",
-                        geometry_type="Point",
-                        fields=CASUALTY_FIELDS,
-                        metadata={"sartracker:type": "marker_casualty"},
-                        auto_create=True
-                    )
-                ]
-            ),
-
-            # Clues group
-            GroupDefinition(
-                name=GroupNames.CLUES,
-                parent_path=[GroupNames.ROOT],
-                position=5,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_CLUES,
-                        name="Clues",
-                        geometry_type="Point",
-                        fields=CLUE_FIELDS,
-                        metadata={"sartracker:type": "marker_clue"},
-                        auto_create=True
-                    )
-                ]
-            ),
-
             # Helicopters group
             GroupDefinition(
                 name=GroupNames.HELICOPTERS,
                 parent_path=[GroupNames.ROOT],
-                position=6,
+                position=2,
                 layers=[
                     LayerDefinition(
                         layer_id=LayerIds.HELICOPTER_1,
@@ -678,7 +598,7 @@ def get_expected_structure() -> GroupDefinition:
             GroupDefinition(
                 name=GroupNames.MISSION_OVERLAYS,
                 parent_path=[GroupNames.ROOT],
-                position=7,
+                position=3,
                 layers=[
                     LayerDefinition(
                         layer_id=LayerIds.SEARCH_AREAS,
@@ -686,7 +606,7 @@ def get_expected_structure() -> GroupDefinition:
                         geometry_type="Polygon",
                         fields=SEARCH_AREA_FIELDS,
                         metadata={"sartracker:type": "search_area"},
-                        auto_create=True
+                        auto_create=False  # Phase 4: Search Areas now use per-item layers under Map Tools/Search Areas
                     ),
                     LayerDefinition(
                         layer_id=LayerIds.SEARCH_SECTORS,
@@ -703,6 +623,68 @@ def get_expected_structure() -> GroupDefinition:
                         fields=TEXT_LABEL_FIELDS,
                         metadata={"sartracker:type": "text_label"},
                         auto_create=True
+                    ),
+                    # Phase 4: Drawing layers kept for fallback compatibility
+                    # These are used when per-item factory is not available (no mission store)
+                    # auto_create=False since Phase 4 prefers per-item layers
+                    LayerDefinition(
+                        layer_id=LayerIds.LINES,
+                        name="Lines",
+                        geometry_type="LineString",
+                        fields=LINES_FIELDS,
+                        metadata={"sartracker:type": "line"},
+                        auto_create=False
+                    ),
+                    LayerDefinition(
+                        layer_id=LayerIds.RANGE_RINGS,
+                        name="Range Rings",
+                        geometry_type="Polygon",
+                        fields=RANGE_RING_FIELDS,
+                        metadata={"sartracker:type": "range_ring"},
+                        auto_create=False
+                    ),
+                    LayerDefinition(
+                        layer_id=LayerIds.BEARING_LINES,
+                        name="Bearing Lines",
+                        geometry_type="LineString",
+                        fields=BEARING_LINE_FIELDS,
+                        metadata={"sartracker:type": "bearing_line"},
+                        auto_create=False
+                    ),
+                    # Phase 4: Marker layers kept for fallback compatibility
+                    # These are used when per-item factory is not available (no mission store)
+                    # auto_create=False since Phase 4 prefers per-item layers
+                    LayerDefinition(
+                        layer_id=LayerIds.MARKERS_IPP_LKP,
+                        name="IPP/LKP",
+                        geometry_type="Point",
+                        fields=IPP_LKP_FIELDS,
+                        metadata={"sartracker:type": "marker_ipp_lkp"},
+                        auto_create=False
+                    ),
+                    LayerDefinition(
+                        layer_id=LayerIds.MARKERS_CLUES,
+                        name="Clues",
+                        geometry_type="Point",
+                        fields=CLUE_FIELDS,
+                        metadata={"sartracker:type": "marker_clue"},
+                        auto_create=False
+                    ),
+                    LayerDefinition(
+                        layer_id=LayerIds.MARKERS_HAZARDS,
+                        name="Hazards",
+                        geometry_type="Point",
+                        fields=HAZARD_FIELDS,
+                        metadata={"sartracker:type": "marker_hazard"},
+                        auto_create=False
+                    ),
+                    LayerDefinition(
+                        layer_id=LayerIds.MARKERS_CASUALTIES,
+                        name="Casualties",
+                        geometry_type="Point",
+                        fields=CASUALTY_FIELDS,
+                        metadata={"sartracker:type": "marker_casualty"},
+                        auto_create=False
                     )
                 ]
             )
@@ -794,25 +776,68 @@ LEGACY_LAYER_NAMES = {
 
 
 # Layer tree placement mapping (used during migrations and when inserting layers)
+# Phase 4: All drawing/marker items now use Map Tools hierarchy
 LAYER_GROUP_PATHS = {
+    # Tracking layers (not yet per-item)
     "Current Positions": [GroupNames.ROOT, GroupNames.CURRENT_POSITIONS],
     "Breadcrumbs": [GroupNames.ROOT, GroupNames.BREADCRUMBS],
-    "Lines": [GroupNames.ROOT, GroupNames.LINES],
-    "Bearing Lines": [GroupNames.ROOT, GroupNames.LINES],
-    "Range Rings": [GroupNames.ROOT, GroupNames.RINGS],
-    "IPP/LKP": [GroupNames.ROOT, GroupNames.MARKERS],
-    "IPP / LKP": [GroupNames.ROOT, GroupNames.MARKERS],
-    "Clues": [GroupNames.ROOT, GroupNames.CLUES],
-    "Hazards": [GroupNames.ROOT, GroupNames.MARKERS],
-    "Casualties": [GroupNames.ROOT, GroupNames.MARKERS],
-    "Search Areas": [GroupNames.ROOT, GroupNames.MISSION_OVERLAYS],
+    # Map Tools - Drawing items (per-item layers)
+    "Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_LINES],
+    "Bearing Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_BEARING_LINES],
+    "Range Rings": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_RANGE_RINGS],
+    "Search Areas": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_SEARCH_AREAS],
+    # Map Tools - Marker items (per-item layers)
+    "IPP/LKP": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_IPP_LKP],
+    "IPP / LKP": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_IPP_LKP],
+    "Clues": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_CLUES],
+    "Hazards": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_HAZARDS],
+    "Casualties": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_CASUALTIES],
+    # Mission Overlays - legacy items (sectors, text labels still use shared layers)
     "Search Sectors": [GroupNames.ROOT, GroupNames.MISSION_OVERLAYS],
     "Text Labels": [GroupNames.ROOT, GroupNames.MISSION_OVERLAYS],
+    # Helicopters
     "Helicopter 1": [GroupNames.ROOT, GroupNames.HELICOPTERS],
     "Helicopter 2": [GroupNames.ROOT, GroupNames.HELICOPTERS],
     "Helicopter 3": [GroupNames.ROOT, GroupNames.HELICOPTERS],
     "Helicopter 4": [GroupNames.ROOT, GroupNames.HELICOPTERS],
 }
+
+
+# =============================================================================
+# Phase 4: Per-Item Layer Group Paths (FR-2/FR-3)
+# =============================================================================
+# These paths are used by PerItemLayerFactory for placing per-item layers
+# in the new "Map Tools" hierarchy.
+
+def get_per_item_group_path(item_type: str) -> List[str]:
+    """
+    Get the group path for a per-item layer based on its type.
+
+    Args:
+        item_type: Item type from PerItemLayerFactory.ItemType
+
+    Returns:
+        List of group names forming the path (e.g., ["SAR Tracker", "Map Tools", "Clues"])
+    """
+    # Map item types to their subgroups under Map Tools
+    PER_ITEM_GROUP_MAP = {
+        "marker_clue": GroupNames.MAP_TOOLS_CLUES,
+        "marker_ipp_lkp": GroupNames.MAP_TOOLS_IPP_LKP,
+        "marker_hazard": GroupNames.MAP_TOOLS_HAZARDS,
+        "marker_casualty": GroupNames.MAP_TOOLS_CASUALTIES,
+        "search_area": GroupNames.MAP_TOOLS_SEARCH_AREAS,
+        "range_ring": GroupNames.MAP_TOOLS_RANGE_RINGS,
+        "bearing_line": GroupNames.MAP_TOOLS_BEARING_LINES,
+        "line": GroupNames.MAP_TOOLS_LINES,
+    }
+
+    subgroup = PER_ITEM_GROUP_MAP.get(item_type)
+    if subgroup:
+        return [GroupNames.ROOT, GroupNames.MAP_TOOLS, subgroup]
+
+    # Fallback to Map Tools root if unknown type
+    logger.warning("Unknown item type for per-item grouping: %s", item_type)
+    return [GroupNames.ROOT, GroupNames.MAP_TOOLS]
 
 
 # Mapping of canonical layer names to LayerIds for metadata tagging

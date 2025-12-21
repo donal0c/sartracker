@@ -868,10 +868,17 @@ class PerItemLayerFactory:
             item_id = str(uuid.uuid4())
 
         # Create table name from item_id (stable, not based on display name)
-        # Format: {type_prefix}_{uuid_short} e.g., "clue_a1b2c3d4"
+        # Format: {type_prefix}_{uuid_hex} e.g., "clue_a1b2c3d4e5f6..."
         prefix = item_type.replace("marker_", "").replace("_", "")
-        uuid_short = item_id.replace("-", "")[:8]
-        table_name = f"{prefix}_{uuid_short}"
+        uuid_hex = item_id.replace("-", "")
+        table_name = f"{prefix}_{uuid_hex}"
+
+        if self.gpkg_path.exists():
+            existing_tables = set(get_gpkg_tables(self.gpkg_path))
+            if table_name in existing_tables:
+                raise RuntimeError(
+                    f"Table name collision for item {item_id}: {table_name} already exists"
+                )
 
         geometry_type = ITEM_GEOMETRY_TYPES[item_type]
         created_at = datetime.now(timezone.utc).isoformat()
@@ -2142,8 +2149,9 @@ class PerItemLayerFactory:
             Table name, or empty string if not a GeoPackage layer
         """
         source = layer.source()
-        if "|layername=" in source:
-            return source.split("|layername=")[-1]
+        for part in source.split("|"):
+            if part.startswith("layername="):
+                return part.split("=", 1)[1]
         return ""
 
     def _drop_gpkg_table(self, table_name: str) -> bool:
@@ -2175,7 +2183,12 @@ class PerItemLayerFactory:
             conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
 
             # Drop spatial index if exists
-            conn.execute(f'DROP TABLE IF EXISTS "rtree_{table_name}_geom"')
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?",
+                (f"rtree_{table_name}_%",)
+            )
+            for row in cursor.fetchall():
+                conn.execute(f'DROP TABLE IF EXISTS "{row[0]}"')
 
             conn.commit()
             conn.close()

@@ -15,7 +15,7 @@ Qt5/Qt6 Compatible: Uses QGIS QgsTask API.
 from functools import partial
 from typing import Optional, Callable, Dict, Set, Any
 from qgis.core import QgsTask, QgsApplication
-from qgis.PyQt.QtCore import QObject
+from qgis.PyQt.QtCore import QObject, QEventLoop, QTimer
 import logging
 import time
 import traceback
@@ -283,15 +283,25 @@ class TaskManager(QObject):
         self._active_tasks.pop(task_id, None)
         return True
 
-    def cancel_all(self):
+    def cancel_all(self, wait_timeout_ms: int = 5000):
         """
         Cancel all active tasks (call during shutdown).
 
         BUG-015 FIX: Sets shutdown flag to prevent callbacks during teardown.
+        CRASH FIX: Now waits synchronously for tasks to finish to prevent
+        race conditions during plugin unload.
+
+        Args:
+            wait_timeout_ms: Maximum time to wait for tasks to finish (milliseconds)
 
         Note:
             This is the primary method called during plugin unload().
             It ensures NO task handlers will fire after unload completes.
+
+            LIFE-SAFETY CRITICAL: This method now includes a synchronous wait
+            to ensure all background threads have fully stopped before returning.
+            This prevents segmentation faults when QGIS tries to clean up the
+            task manager while threads are still accessing Qt objects.
         """
         # BUG-015 FIX: Set shutdown flag to prevent callbacks from firing
         self._shutting_down = True
@@ -299,11 +309,69 @@ class TaskManager(QObject):
         # Get list of task IDs (avoid modifying dict during iteration)
         task_ids = list(self._active_tasks.keys())
 
+        if not task_ids:
+            logger.debug("No active tasks to cancel")
+            self._task_errors.clear()
+            return
+
+        logger.info("Cancelling %d active task(s) and waiting for completion...", len(task_ids))
+
         for task_id in task_ids:
             self.cancel_task(task_id)
 
+        # CRASH FIX: Wait synchronously for QGIS task manager to finish all tasks
+        # This prevents the race condition where threads are still running when
+        # the plugin is destroyed
+        self._wait_for_tasks_to_finish(wait_timeout_ms)
+
         # BUG-015 FIX: Clear error tracking on shutdown
         self._task_errors.clear()
+
+        logger.info("All tasks cancelled and cleanup complete")
+
+    def _wait_for_tasks_to_finish(self, timeout_ms: int):
+        """
+        Wait for QGIS task manager to finish processing all tasks.
+
+        CRASH FIX: This method provides a synchronization barrier to ensure
+        background threads have fully stopped before plugin unload continues.
+
+        Args:
+            timeout_ms: Maximum time to wait in milliseconds
+
+        Note:
+            Uses an event loop to process Qt events while waiting, allowing
+            tasks to complete their cleanup. If timeout is reached, logs a
+            warning but continues (to prevent hanging indefinitely).
+        """
+        task_manager = QgsApplication.taskManager()
+        start_time = time.monotonic()
+        timeout_seconds = timeout_ms / 1000.0
+
+        # Poll until all tasks are done or timeout
+        while True:
+            # Check if QGIS task manager has any active tasks
+            active_count = task_manager.countActiveTasks()
+
+            if active_count == 0:
+                elapsed = time.monotonic() - start_time
+                logger.debug("All tasks finished in %.2f seconds", elapsed)
+                return
+
+            # Check timeout
+            elapsed = time.monotonic() - start_time
+            if elapsed >= timeout_seconds:
+                logger.warning(
+                    "Timeout waiting for tasks to finish after %.2f seconds. "
+                    "%d task(s) still active. Continuing anyway to prevent hang.",
+                    elapsed, active_count
+                )
+                return
+
+            # Process events to allow tasks to complete
+            # Use a short wait to avoid busy-waiting
+            QEventLoop().processEvents()
+            time.sleep(0.05)  # 50ms between checks
 
     def get_active_count(self) -> int:
         """

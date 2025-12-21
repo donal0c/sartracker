@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import logging
 import math
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
@@ -22,13 +22,19 @@ from qgis.core import (
     QgsPointXY, QgsMarkerSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
     QgsFeatureRequest, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsProject
+    QgsProject, QgsLayerTreeGroup
 )
 from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
-from ...layers import LayerIds
+from ...layers import LayerIds, GroupNames, get_per_item_group_path
 from ...utils.exceptions import LayerTransactionError, LayerLockError, LayerError
+
+# Phase 4 imports for per-item layers
+from pathlib import Path
+from ..per_item_layer_factory import (
+    PerItemLayerFactory, ItemType, ItemLayerInfo, SAR_ITEM_ID, SAR_ITEM_TYPE
+)
 
 
 class MarkerLayerManager(BaseLayerManager):
@@ -73,10 +79,22 @@ class MarkerLayerManager(BaseLayerManager):
         }
     }
 
+    # Phase 4: Enable per-item layers for specific marker types
+    # When True, new markers of these types create individual layers
+    # When False, use legacy shared layers (backward compatibility)
+    USE_PER_ITEM_LAYERS = {
+        "clue": True,       # Phase 4 Step 1: Clues use per-item layers
+        "ipp_lkp": True,    # Phase 4 Step 2: IPP/LKP use per-item layers
+        "hazard": True,     # Phase 4 Step 2: Hazards use per-item layers
+        "casualty": True,   # Phase 4 Step 2: Casualties use per-item layers
+    }
+
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize marker layer manager."""
         super().__init__(iface, shared_device_colors, layer_manager)
         self._invalid_layer_warnings = set()
+        # Phase 4: Per-item layer factory (lazy initialized)
+        self._per_item_factory: Optional[PerItemLayerFactory] = None
 
     def _validate_irish_grid_consistency(self, lat: float, lon: float,
                                          irish_grid_e: Optional[float],
@@ -161,6 +179,114 @@ class MarkerLayerManager(BaseLayerManager):
             self.HAZARDS_LAYER_NAME,
             self.CASUALTIES_LAYER_NAME
         ]
+
+    # =========================================================================
+    # Phase 4: Per-Item Layer Support
+    # =========================================================================
+
+    def _get_per_item_factory(self) -> Optional[PerItemLayerFactory]:
+        """
+        Get or create the PerItemLayerFactory for per-item layers.
+
+        Returns None if no mission store is configured (layers will be memory-only).
+
+        Returns:
+            PerItemLayerFactory or None
+        """
+        # Return cached factory if available
+        if self._per_item_factory is not None:
+            return self._per_item_factory
+
+        # Get mission store path from layer manager
+        layer_manager = self._require_layer_manager()
+        gpkg_path = layer_manager.get_mission_store()
+
+        if not gpkg_path:
+            logger.warning(
+                "Phase 4: No mission store configured - per-item layers will not persist. "
+                "Configure a mission store to enable persistent per-item layers."
+            )
+            return None
+
+        # Create factory
+        self._per_item_factory = PerItemLayerFactory(
+            gpkg_path=Path(gpkg_path),
+            auto_wal=True,
+            auto_registry=True
+        )
+        logger.info("Phase 4: PerItemLayerFactory initialized with mission store: %s", gpkg_path)
+        return self._per_item_factory
+
+    def _ensure_per_item_group(self, item_type: str) -> QgsLayerTreeGroup:
+        """
+        Ensure the group path exists for a per-item layer type.
+
+        Creates the "Map Tools / <subgroup>" structure if needed.
+
+        Args:
+            item_type: ItemType value (e.g., ItemType.MARKER_CLUE)
+
+        Returns:
+            QgsLayerTreeGroup for placing the per-item layer
+        """
+        group_path = get_per_item_group_path(item_type)
+        return self._ensure_group_path(group_path)
+
+    def _uses_per_item_layers(self, marker_type: str) -> bool:
+        """
+        Check if a marker type uses per-item layers.
+
+        Args:
+            marker_type: Type key (e.g., "clue", "ipp_lkp")
+
+        Returns:
+            True if this marker type uses per-item layers
+        """
+        return self.USE_PER_ITEM_LAYERS.get(marker_type, False)
+
+    def _get_item_type_for_marker(self, marker_type: str) -> str:
+        """
+        Map marker type to ItemType constant.
+
+        Args:
+            marker_type: Internal marker type key
+
+        Returns:
+            ItemType constant for PerItemLayerFactory
+        """
+        mapping = {
+            "clue": ItemType.MARKER_CLUE,
+            "ipp_lkp": ItemType.MARKER_IPP_LKP,
+            "hazard": ItemType.MARKER_HAZARD,
+            "casualty": ItemType.MARKER_CASUALTY,
+        }
+        return mapping.get(marker_type, ItemType.MARKER_CLUE)
+
+    def _cleanup_failed_per_item_layer(
+        self,
+        factory: PerItemLayerFactory,
+        item_id: str,
+        context: str
+    ) -> None:
+        """Remove per-item layer/table after a failed create."""
+        try:
+            factory.delete_item_layer(
+                item_id=item_id,
+                remove_table=True,
+                hard_delete=True
+            )
+            logger.warning(
+                "Phase 4: Cleaned up failed per-item %s layer %s",
+                context,
+                item_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Phase 4: Failed to clean up per-item %s layer %s: %s",
+                context,
+                item_id,
+                exc
+            )
 
     # ---------------------------------------------------------------------
     # Internal helpers
@@ -526,7 +652,7 @@ class MarkerLayerManager(BaseLayerManager):
                     irish_grid_e: float = None, irish_grid_n: float = None,
                     coordinator_ids: Optional[str] = None,
                     updated_by: Optional[str] = None,
-                    attachment_path: Optional[str] = None) -> str:
+                    attachment_path: Optional[str] = None) -> Union[int, str]:
         """
         Add an IPP/LKP marker to the map.
 
@@ -540,7 +666,7 @@ class MarkerLayerManager(BaseLayerManager):
             irish_grid_n: Irish Grid (ITM) Northing (optional)
 
         Returns:
-            str: UUID of added marker
+            Union[int, str]: Feature ID (int for shared layer) or item_id (str for per-item layer)
         """
         # Validate name (required)
         if not name or not name.strip():
@@ -575,6 +701,33 @@ class MarkerLayerManager(BaseLayerManager):
         # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
         self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("ipp_lkp"):
+            return self._add_ipp_lkp_per_item(
+                name=name, lat=lat, lon=lon,
+                subject_category=subject_category, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Legacy path: shared layer
+        return self._add_ipp_lkp_shared_layer(
+            name=name, lat=lat, lon=lon,
+            subject_category=subject_category, description=description,
+            irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+            coordinator_ids=coordinator_ids, updated_by=updated_by,
+            attachment_path=attachment_path
+        )
+
+    def _add_ipp_lkp_shared_layer(
+        self, name: str, lat: float, lon: float,
+        subject_category: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """Legacy implementation: Add IPP/LKP to shared layer."""
         layer = self._get_or_create_ipp_lkp_layer()
 
         # Create feature
@@ -584,7 +737,7 @@ class MarkerLayerManager(BaseLayerManager):
         # Generate UUID
         marker_id = str(uuid.uuid4())
 
-        created_ts = datetime.now().isoformat()
+        created_ts = self._current_timestamp()
         attributes = {
             "id": marker_id,
             "name": name,
@@ -612,6 +765,117 @@ class MarkerLayerManager(BaseLayerManager):
         self._log_marker_event(layer, self._marker_log_label("ipp_lkp"), "add", marker_id=marker_id, name=name)
         return marker_id
 
+    def _add_ipp_lkp_per_item(
+        self, name: str, lat: float, lon: float,
+        subject_category: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """
+        Phase 4: Add IPP/LKP as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this IPP/LKP marker,
+        placed under "SAR Tracker / Map Tools / IPP-LKP /".
+
+        Returns:
+            str: item_id (which serves as the marker_id)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for IPP/LKP")
+            return self._add_ipp_lkp_shared_layer(
+                name=name, lat=lat, lon=lon,
+                subject_category=subject_category, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.MARKER_IPP_LKP)
+
+        # Define fields for the IPP/LKP layer (matching schema)
+        ipp_lkp_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "subject_category", "type": "String", "length": 100},
+            {"name": "description", "type": "String", "length": 1000},
+            {"name": "lat", "type": "Double"},
+            {"name": "lon", "type": "Double"},
+            {"name": "irish_grid_e", "type": "Double"},
+            {"name": "irish_grid_n", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "created_at", "type": "String", "length": 50},
+            {"name": "updated_at", "type": "String", "length": 50},
+            {"name": "updated_by", "type": "String", "length": 255},
+            {"name": "coordinator_ids", "type": "String", "length": 500},
+            {"name": "attachment_path", "type": "String", "length": 500},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.MARKER_IPP_LKP,
+                display_name=name,
+                fields=ipp_lkp_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for IPP/LKP '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item IPP/LKP layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for IPP/LKP '{name}'")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attributes = {
+            "id": item_id,  # Use item_id as the marker id
+            "name": name,
+            "subject_category": subject_category,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
+
+        # Add feature to layer
+        try:
+            with self._layer_transaction(layer, name, "add IPP/LKP feature") as edit_layer:
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature to per-item IPP/LKP layer '{name}'")
+        except Exception:
+            self._cleanup_failed_per_item_layer(factory, item_id, "IPP/LKP")
+            raise
+
+        # Apply styling
+        self._style_ipp_lkp_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item IPP/LKP layer '%s' (item_id=%s) under Map Tools/IPP-LKP",
+            name, item_id
+        )
+        return item_id
+
     # =========================================================================
     # Clues Layer (Evidence found during search)
     # =========================================================================
@@ -636,9 +900,12 @@ class MarkerLayerManager(BaseLayerManager):
                  irish_grid_e: float = None, irish_grid_n: float = None,
                  coordinator_ids: Optional[str] = None,
                  updated_by: Optional[str] = None,
-                 attachment_path: Optional[str] = None) -> str:
+                 attachment_path: Optional[str] = None) -> Union[int, str]:
         """
         Add a clue marker to the map.
+
+        Phase 4: When USE_PER_ITEM_LAYERS["clue"] is True, creates an individual
+        layer for this clue under "SAR Tracker / Map Tools / Clues /".
 
         Args:
             name: Clue name/identifier
@@ -651,7 +918,7 @@ class MarkerLayerManager(BaseLayerManager):
             irish_grid_n: Irish Grid (ITM) Northing (optional)
 
         Returns:
-            str: UUID of added clue
+            Union[int, str]: Feature ID (int for shared layer) or item_id (str for per-item layer)
         """
         # Validate name (required)
         if not name or not name.strip():
@@ -686,13 +953,40 @@ class MarkerLayerManager(BaseLayerManager):
         # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
         self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("clue"):
+            return self._add_clue_per_item(
+                name=name, lat=lat, lon=lon,
+                clue_type=clue_type, confidence=confidence, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Legacy path: shared layer
+        return self._add_clue_shared_layer(
+            name=name, lat=lat, lon=lon,
+            clue_type=clue_type, confidence=confidence, description=description,
+            irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+            coordinator_ids=coordinator_ids, updated_by=updated_by,
+            attachment_path=attachment_path
+        )
+
+    def _add_clue_shared_layer(
+        self, name: str, lat: float, lon: float,
+        clue_type: str, confidence: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """Legacy implementation: Add clue to shared Clues layer."""
         layer = self._get_or_create_clues_layer()
 
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
         marker_id = str(uuid.uuid4())
-        created_ts = datetime.now().isoformat()
+        created_ts = self._current_timestamp()
         attributes = {
             "id": marker_id,
             "name": name,
@@ -721,6 +1015,119 @@ class MarkerLayerManager(BaseLayerManager):
         self._log_marker_event(layer, self._marker_log_label("clue"), "add", marker_id=marker_id, name=name)
         return marker_id
 
+    def _add_clue_per_item(
+        self, name: str, lat: float, lon: float,
+        clue_type: str, confidence: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """
+        Phase 4: Add clue as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this clue,
+        placed under "SAR Tracker / Map Tools / Clues /".
+
+        Returns:
+            str: item_id (which serves as the marker_id)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for clue")
+            return self._add_clue_shared_layer(
+                name=name, lat=lat, lon=lon,
+                clue_type=clue_type, confidence=confidence, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.MARKER_CLUE)
+
+        # Define fields for the clue layer (matching schema for Clues)
+        clue_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "clue_type", "type": "String", "length": 100},
+            {"name": "confidence", "type": "String", "length": 50},
+            {"name": "description", "type": "String", "length": 1000},
+            {"name": "lat", "type": "Double"},
+            {"name": "lon", "type": "Double"},
+            {"name": "irish_grid_e", "type": "Double"},
+            {"name": "irish_grid_n", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "created_at", "type": "String", "length": 50},
+            {"name": "updated_at", "type": "String", "length": 50},
+            {"name": "updated_by", "type": "String", "length": 255},
+            {"name": "coordinator_ids", "type": "String", "length": 500},
+            {"name": "attachment_path", "type": "String", "length": 500},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.MARKER_CLUE,
+                display_name=name,
+                fields=clue_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for clue '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item clue layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for clue '{name}'")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attributes = {
+            "id": item_id,  # Use item_id as the marker id
+            "name": name,
+            "clue_type": clue_type,
+            "confidence": confidence,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
+
+        # Add feature to layer
+        try:
+            with self._layer_transaction(layer, name, "add clue feature") as edit_layer:
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature to per-item clue layer '{name}'")
+        except Exception:
+            self._cleanup_failed_per_item_layer(factory, item_id, "clue")
+            raise
+
+        # Apply styling
+        self._style_clues_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item clue layer '%s' (item_id=%s) under Map Tools/Clues",
+            name, item_id
+        )
+        return item_id
+
     # =========================================================================
     # Hazards Layer (Safety warnings)
     # =========================================================================
@@ -745,7 +1152,7 @@ class MarkerLayerManager(BaseLayerManager):
                    irish_grid_e: float = None, irish_grid_n: float = None,
                    coordinator_ids: Optional[str] = None,
                    updated_by: Optional[str] = None,
-                   attachment_path: Optional[str] = None) -> str:
+                   attachment_path: Optional[str] = None) -> Union[int, str]:
         """
         Add a hazard marker to the map.
 
@@ -795,13 +1202,40 @@ class MarkerLayerManager(BaseLayerManager):
         # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
         self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("hazard"):
+            return self._add_hazard_per_item(
+                name=name, lat=lat, lon=lon,
+                hazard_type=hazard_type, severity=severity, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Legacy path: shared layer
+        return self._add_hazard_shared_layer(
+            name=name, lat=lat, lon=lon,
+            hazard_type=hazard_type, severity=severity, description=description,
+            irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+            coordinator_ids=coordinator_ids, updated_by=updated_by,
+            attachment_path=attachment_path
+        )
+
+    def _add_hazard_shared_layer(
+        self, name: str, lat: float, lon: float,
+        hazard_type: str, severity: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """Legacy implementation: Add hazard to shared layer."""
         layer = self._get_or_create_hazards_layer()
 
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
         marker_id = str(uuid.uuid4())
-        created_ts = datetime.now().isoformat()
+        created_ts = self._current_timestamp()
         attributes = {
             "id": marker_id,
             "name": name,
@@ -830,6 +1264,119 @@ class MarkerLayerManager(BaseLayerManager):
         self._log_marker_event(layer, self._marker_log_label("hazard"), "add", marker_id=marker_id, name=name)
         return marker_id
 
+    def _add_hazard_per_item(
+        self, name: str, lat: float, lon: float,
+        hazard_type: str, severity: str, description: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """
+        Phase 4: Add hazard as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this hazard marker,
+        placed under "SAR Tracker / Map Tools / Hazards /".
+
+        Returns:
+            str: item_id (which serves as the marker_id)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for hazard")
+            return self._add_hazard_shared_layer(
+                name=name, lat=lat, lon=lon,
+                hazard_type=hazard_type, severity=severity, description=description,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.MARKER_HAZARD)
+
+        # Define fields for the hazard layer (matching schema)
+        hazard_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "hazard_type", "type": "String", "length": 100},
+            {"name": "severity", "type": "String", "length": 50},
+            {"name": "description", "type": "String", "length": 1000},
+            {"name": "lat", "type": "Double"},
+            {"name": "lon", "type": "Double"},
+            {"name": "irish_grid_e", "type": "Double"},
+            {"name": "irish_grid_n", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "created_at", "type": "String", "length": 50},
+            {"name": "updated_at", "type": "String", "length": 50},
+            {"name": "updated_by", "type": "String", "length": 255},
+            {"name": "coordinator_ids", "type": "String", "length": 500},
+            {"name": "attachment_path", "type": "String", "length": 500},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.MARKER_HAZARD,
+                display_name=name,
+                fields=hazard_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for hazard '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item hazard layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for hazard '{name}'")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attributes = {
+            "id": item_id,  # Use item_id as the marker id
+            "name": name,
+            "hazard_type": hazard_type,
+            "severity": severity,
+            "description": description,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
+
+        # Add feature to layer
+        try:
+            with self._layer_transaction(layer, name, "add hazard feature") as edit_layer:
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature to per-item hazard layer '{name}'")
+        except Exception:
+            self._cleanup_failed_per_item_layer(factory, item_id, "hazard")
+            raise
+
+        # Apply styling
+        self._style_hazards_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item hazard layer '%s' (item_id=%s) under Map Tools/Hazards",
+            name, item_id
+        )
+        return item_id
+
     # =========================================================================
     # Casualties Layer (Found injured or deceased persons)
     # =========================================================================
@@ -856,7 +1403,7 @@ class MarkerLayerManager(BaseLayerManager):
                      irish_grid_e: float = None, irish_grid_n: float = None,
                      coordinator_ids: Optional[str] = None,
                      updated_by: Optional[str] = None,
-                     attachment_path: Optional[str] = None) -> str:
+                     attachment_path: Optional[str] = None) -> Union[int, str]:
         """
         Add a casualty marker to the map.
 
@@ -919,13 +1466,45 @@ class MarkerLayerManager(BaseLayerManager):
         # BUG-072 FIX: Cross-validate WGS84 and Irish Grid coordinates
         self._validate_irish_grid_consistency(lat, lon, irish_grid_e, irish_grid_n)
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("casualty"):
+            return self._add_casualty_per_item(
+                name=name, lat=lat, lon=lon,
+                condition=condition, treatment=treatment,
+                evacuation_priority=evacuation_priority,
+                description=description, found_by=found_by,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Legacy path: shared layer
+        return self._add_casualty_shared_layer(
+            name=name, lat=lat, lon=lon,
+            condition=condition, treatment=treatment,
+            evacuation_priority=evacuation_priority,
+            description=description, found_by=found_by,
+            irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+            coordinator_ids=coordinator_ids, updated_by=updated_by,
+            attachment_path=attachment_path
+        )
+
+    def _add_casualty_shared_layer(
+        self, name: str, lat: float, lon: float,
+        condition: str, treatment: str, evacuation_priority: str,
+        description: str, found_by: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """Legacy implementation: Add casualty to shared layer."""
         layer = self._get_or_create_casualties_layer()
 
         feature = QgsFeature(layer.fields())
         feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
 
         marker_id = str(uuid.uuid4())
-        created_ts = datetime.now().isoformat()
+        created_ts = self._current_timestamp()
         attributes = {
             "id": marker_id,
             "name": name,
@@ -964,6 +1543,133 @@ class MarkerLayerManager(BaseLayerManager):
             evacuation_priority=evacuation_priority
         )
         return marker_id
+
+    def _add_casualty_per_item(
+        self, name: str, lat: float, lon: float,
+        condition: str, treatment: str, evacuation_priority: str,
+        description: str, found_by: str,
+        irish_grid_e: Optional[float], irish_grid_n: Optional[float],
+        coordinator_ids: Optional[str], updated_by: Optional[str],
+        attachment_path: Optional[str]
+    ) -> str:
+        """
+        Phase 4: Add casualty as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this casualty marker,
+        placed under "SAR Tracker / Map Tools / Casualties /".
+
+        CRITICAL: Casualties are found injured or deceased persons.
+        This is distinct from clues (evidence). Casualties trigger:
+        - Medical response and evacuation
+        - Legal/coroner documentation
+        - Family notifications
+        - Mission reporting requirements
+
+        Returns:
+            str: item_id (which serves as the marker_id)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for casualty")
+            return self._add_casualty_shared_layer(
+                name=name, lat=lat, lon=lon,
+                condition=condition, treatment=treatment,
+                evacuation_priority=evacuation_priority,
+                description=description, found_by=found_by,
+                irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
+                coordinator_ids=coordinator_ids, updated_by=updated_by,
+                attachment_path=attachment_path
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.MARKER_CASUALTY)
+
+        # Define fields for the casualty layer (matching schema)
+        casualty_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "condition", "type": "String", "length": 100},
+            {"name": "treatment", "type": "String", "length": 255},
+            {"name": "evacuation_priority", "type": "String", "length": 50},
+            {"name": "description", "type": "String", "length": 1000},
+            {"name": "found_by", "type": "String", "length": 255},
+            {"name": "lat", "type": "Double"},
+            {"name": "lon", "type": "Double"},
+            {"name": "irish_grid_e", "type": "Double"},
+            {"name": "irish_grid_n", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "created_at", "type": "String", "length": 50},
+            {"name": "updated_at", "type": "String", "length": 50},
+            {"name": "updated_by", "type": "String", "length": 255},
+            {"name": "coordinator_ids", "type": "String", "length": 500},
+            {"name": "attachment_path", "type": "String", "length": 500},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.MARKER_CASUALTY,
+                display_name=name,
+                fields=casualty_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for casualty '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item casualty layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for casualty '{name}'")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attributes = {
+            "id": item_id,  # Use item_id as the marker id
+            "name": name,
+            "condition": condition,
+            "treatment": treatment,
+            "evacuation_priority": evacuation_priority,
+            "description": description,
+            "found_by": found_by,
+            "lat": lat,
+            "lon": lon,
+            "irish_grid_e": irish_grid_e,
+            "irish_grid_n": irish_grid_n,
+            "created": created_ts
+        }
+        attributes.update(self._build_audit_attributes(
+            include_created=True,
+            updated_by=updated_by,
+            coordinator_ids=coordinator_ids,
+            attachment_path=attachment_path
+        ))
+        self._apply_feature_attributes(layer, feature, attributes)
+
+        # Add feature to layer
+        try:
+            with self._layer_transaction(layer, name, "add casualty feature") as edit_layer:
+                if not edit_layer.addFeature(feature):
+                    raise RuntimeError(f"Failed to add feature to per-item casualty layer '{name}'")
+        except Exception:
+            self._cleanup_failed_per_item_layer(factory, item_id, "casualty")
+            raise
+
+        # Apply styling
+        self._style_casualties_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item casualty layer '%s' (item_id=%s) under Map Tools/Casualties",
+            name, item_id
+        )
+        return item_id
 
     # =========================================================================
     # Marker listing / CRUD helpers
@@ -1051,24 +1757,171 @@ class MarkerLayerManager(BaseLayerManager):
         return record
 
     def list_markers(self) -> List[Dict[str, object]]:
-        """Return all markers across managed layers."""
+        """
+        Return all markers across managed layers.
+
+        Phase 4: For marker types using per-item layers, queries the factory
+        registry instead of the shared layer.
+        """
         records: List[Dict[str, object]] = []
         for marker_type in self.MARKER_TYPE_MAP.keys():
-            layer = self._get_marker_layer(marker_type)
+            # Phase 4: Check if this marker type uses per-item layers
+            if self._uses_per_item_layers(marker_type):
+                try:
+                    per_item_records = self._list_markers_per_item(marker_type)
+                    records.extend(per_item_records)
+                except Exception as exc:
+                    # Don't let one marker type failure break the entire list
+                    logger.warning("Could not list per-item markers for type %s: %s", marker_type, exc)
+            else:
+                # Legacy: get from shared layer
+                try:
+                    layer = self._get_marker_layer(marker_type)
+                    for feature in layer.getFeatures():
+                        try:
+                            records.append(self._feature_to_record(marker_type, layer, feature))
+                        except Exception as exc:
+                            print(f"[MarkerLayerManager] Warning: Failed to serialize marker {feature['id']}: {exc}")
+                except Exception as exc:
+                    # Layer might not exist yet
+                    logger.debug("Could not list markers for type %s: %s", marker_type, exc)
+        return records
+
+    def _list_markers_per_item(self, marker_type: str) -> List[Dict[str, object]]:
+        """
+        Phase 4: List all markers of a type from per-item layers.
+
+        Queries the factory registry to find all per-item layers of the given type,
+        then extracts the feature from each.
+        """
+        records: List[Dict[str, object]] = []
+        factory = self._get_per_item_factory()
+        if not factory:
+            # No factory, try shared layer as fallback
+            try:
+                layer = self._get_marker_layer(marker_type)
+                for feature in layer.getFeatures():
+                    try:
+                        records.append(self._feature_to_record(marker_type, layer, feature))
+                    except Exception as exc:
+                        print(f"[MarkerLayerManager] Warning: Failed to serialize marker {feature['id']}: {exc}")
+            except Exception:
+                pass
+            return records
+
+        # Get the ItemType for this marker type
+        item_type = self._get_item_type_for_marker(marker_type)
+
+        # Get all items of this type from the registry - with error handling
+        try:
+            from ..per_item_layer_factory import registry_get_all_items
+            items = registry_get_all_items(factory.gpkg_path, include_deleted=False, item_type=item_type)
+        except Exception as e:
+            logger.error(
+                "Phase 4: Failed to query registry for marker type '%s': %s. "
+                "Falling back to shared layer if available.",
+                marker_type, e
+            )
+            # Fallback to shared layer
+            try:
+                layer = self._get_marker_layer(marker_type)
+                for feature in layer.getFeatures():
+                    try:
+                        records.append(self._feature_to_record(marker_type, layer, feature))
+                    except Exception as exc:
+                        feature_id = feature.attribute('id') if feature else 'unknown'
+                        logger.warning("Failed to serialize marker %s: %s", feature_id, exc)
+            except Exception:
+                pass
+            return records
+
+        for item_info in items:
+            # Get the layer for this item
+            layer = factory.get_layer_by_item_id(item_info.item_id)
+            if not layer or not layer.isValid():
+                logger.debug("Phase 4: Skipping orphaned item %s (layer not found)", item_info.item_id)
+                continue
+
+            # Per-item layers have exactly one feature
             for feature in layer.getFeatures():
                 try:
                     records.append(self._feature_to_record(marker_type, layer, feature))
                 except Exception as exc:
-                    print(f"[MarkerLayerManager] Warning: Failed to serialize marker {feature['id']}: {exc}")
+                    print(f"[MarkerLayerManager] Warning: Failed to serialize per-item marker {item_info.item_id}: {exc}")
+
         return records
 
     def get_marker_feature(self, marker_type: str, marker_id: str) -> Optional[QgsFeature]:
-        """Return feature for marker id."""
+        """
+        Return feature for marker id.
+
+        Phase 4: For per-item layers, looks up the layer by item_id and returns
+        its single feature.
+        """
+        # Phase 4: Check if this marker type uses per-item layers
+        if self._uses_per_item_layers(marker_type):
+            return self._get_marker_feature_per_item(marker_type, marker_id)
+
+        # Legacy path: get from shared layer
         layer = self._get_marker_layer(marker_type)
         return self._get_feature_by_id(layer, marker_id)
 
+    def _get_marker_feature_per_item(self, marker_type: str, marker_id: str) -> Optional[QgsFeature]:
+        """
+        Phase 4: Get feature from a per-item layer.
+
+        Per-item layers have exactly one feature, identified by the item_id.
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer
+            layer = self._get_marker_layer(marker_type)
+            return self._get_feature_by_id(layer, marker_id)
+
+        layer = factory.get_layer_by_item_id(marker_id)
+        if not layer:
+            # Not found as per-item layer, try shared layer as fallback
+            logger.debug("Phase 4: Marker %s not found as per-item layer, trying shared layer", marker_id)
+            try:
+                shared_layer = self._get_marker_layer(marker_type)
+                return self._get_feature_by_id(shared_layer, marker_id)
+            except Exception:
+                return None
+
+        # Per-item layers have exactly one feature
+        features = list(layer.getFeatures())
+        if features:
+            return features[0]
+        return None
+
     def update_marker(self, marker_type: str, marker_id: str, updates: Dict[str, object], updated_by: Optional[str] = None) -> bool:
-        """Update marker attributes."""
+        """
+        Update marker attributes.
+
+        Phase 4: For per-item layers, updates the feature in the per-item layer.
+        Also optionally updates the layer display name if 'name' is in updates.
+
+        Args:
+            marker_type: Type of marker
+            marker_id: UUID/item_id of the marker
+            updates: Dictionary of field names to new values
+            updated_by: Optional user identifier for audit trail
+
+        Returns:
+            True if update successful
+        """
+        # Phase 4: Check if this marker type uses per-item layers
+        if self._uses_per_item_layers(marker_type):
+            return self._update_marker_per_item(marker_type, marker_id, updates, updated_by)
+
+        # Legacy path: update feature in shared layer
+        return self._update_marker_shared_layer(marker_type, marker_id, updates, updated_by)
+
+    def _update_marker_shared_layer(
+        self, marker_type: str, marker_id: str,
+        updates: Dict[str, object], updated_by: Optional[str]
+    ) -> bool:
+        """Legacy implementation: Update feature in shared layer."""
         layer = self._get_marker_layer(marker_type)
         feature = self._get_feature_by_id(layer, marker_id)
         if not feature:
@@ -1095,8 +1948,103 @@ class MarkerLayerManager(BaseLayerManager):
         self._log_marker_event(layer, self._marker_log_label(marker_type), "update", marker_id=marker_id)
         return True
 
+    def _update_marker_per_item(
+        self, marker_type: str, marker_id: str,
+        updates: Dict[str, object], updated_by: Optional[str]
+    ) -> bool:
+        """
+        Phase 4: Update a per-item marker layer.
+
+        Updates the feature in the per-item layer. Also updates the layer
+        display name if 'name' field is being updated.
+
+        Args:
+            marker_type: Type of marker
+            marker_id: item_id of the per-item layer
+            updates: Dictionary of field names to new values
+            updated_by: Optional user identifier for audit trail
+
+        Returns:
+            True if update successful
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer
+            logger.warning("Phase 4: No factory available, trying shared layer update for marker %s", marker_id)
+            return self._update_marker_shared_layer(marker_type, marker_id, updates, updated_by)
+
+        # Find the per-item layer
+        layer = factory.get_layer_by_item_id(marker_id)
+        if not layer:
+            # Layer not found via factory - try shared layer as fallback
+            logger.info(
+                "Phase 4: Marker %s not found as per-item layer, trying shared layer",
+                marker_id
+            )
+            return self._update_marker_shared_layer(marker_type, marker_id, updates, updated_by)
+
+        # Per-item layers have exactly one feature - get it
+        features = list(layer.getFeatures())
+        if not features:
+            raise ValueError(f"Per-item layer for marker '{marker_id}' has no features")
+        feature = features[0]
+
+        # Build update payload with audit attributes
+        audit_attrs = self._build_audit_attributes(
+            include_created=False,
+            updated_by=updated_by or updates.get("updated_by"),
+            coordinator_ids=updates.get("coordinator_ids"),
+            attachment_path=updates.get("attachment_path")
+        )
+        all_updates = {**(updates or {}), **audit_attrs}
+
+        # Update the feature
+        with self._layer_transaction(layer, layer.name(), "update per-item marker") as edit_layer:
+            fields = edit_layer.fields()
+            for field_name, value in all_updates.items():
+                field_index = fields.indexOf(field_name)
+                if field_index == -1:
+                    continue
+                if not edit_layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update per-item marker '{marker_id}' field '{field_name}'")
+
+        # If name was updated, also update the layer display name
+        if "name" in updates and updates["name"]:
+            new_name = str(updates["name"])
+            factory.rename_item_layer(marker_id, new_name)
+            logger.info("Phase 4: Renamed per-item layer to '%s' (item_id=%s)", new_name, marker_id)
+
+        layer.triggerRepaint()
+        logger.info("Phase 4: Updated per-item marker (type=%s, item_id=%s)", marker_type, marker_id)
+        return True
+
     def delete_marker(self, marker_type: str, marker_id: str) -> bool:
-        """Delete marker by id."""
+        """
+        Delete marker by id.
+
+        Phase 4: For marker types using per-item layers, this deletes the entire
+        layer (not just a feature from a shared layer).
+
+        Args:
+            marker_type: Type of marker ('clue', 'ipp_lkp', 'hazard', 'casualty')
+            marker_id: UUID of the marker to delete
+
+        Returns:
+            True if deletion successful
+
+        Raises:
+            ValueError: If marker not found
+            RuntimeError: If deletion fails
+        """
+        # Phase 4: Check if this marker type uses per-item layers
+        if self._uses_per_item_layers(marker_type):
+            return self._delete_marker_per_item(marker_type, marker_id)
+
+        # Legacy path: delete feature from shared layer
+        return self._delete_marker_shared_layer(marker_type, marker_id)
+
+    def _delete_marker_shared_layer(self, marker_type: str, marker_id: str) -> bool:
+        """Legacy implementation: Delete feature from shared layer."""
         layer = self._get_marker_layer(marker_type)
         feature = self._get_feature_by_id(layer, marker_id)
         if not feature:
@@ -1108,6 +2056,53 @@ class MarkerLayerManager(BaseLayerManager):
 
         layer.triggerRepaint()
         self._log_marker_event(layer, self._marker_log_label(marker_type), "delete", marker_id=marker_id)
+        return True
+
+    def _delete_marker_per_item(self, marker_type: str, marker_id: str) -> bool:
+        """
+        Phase 4: Delete a per-item marker layer.
+
+        The marker_id is the item_id, which identifies the entire layer.
+        This removes the layer from the project and optionally the GeoPackage table.
+
+        Args:
+            marker_type: Type of marker
+            marker_id: item_id of the per-item layer
+
+        Returns:
+            True if deletion successful
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # If no factory, try the shared layer approach
+            logger.warning("Phase 4: No factory available, trying shared layer delete for marker %s", marker_id)
+            return self._delete_marker_shared_layer(marker_type, marker_id)
+
+        # Try to find and delete the per-item layer
+        layer = factory.get_layer_by_item_id(marker_id)
+        if not layer:
+            # Layer not found via factory - could be a legacy marker in shared layer
+            # Try the shared layer approach as fallback
+            logger.info(
+                "Phase 4: Marker %s not found as per-item layer, trying shared layer",
+                marker_id
+            )
+            return self._delete_marker_shared_layer(marker_type, marker_id)
+
+        # Delete the per-item layer (removes layer + GeoPackage table + registry entry)
+        success = factory.delete_item_layer(
+            item_id=marker_id,
+            remove_table=False,
+            hard_delete=False  # Soft delete for potential recovery
+        )
+
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item marker layer '{marker_id}'")
+
+        logger.info(
+            "Phase 4: Deleted per-item marker layer (type=%s, item_id=%s)",
+            marker_type, marker_id
+        )
         return True
 
     # =========================================================================
@@ -1153,3 +2148,27 @@ class MarkerLayerManager(BaseLayerManager):
         labeling = QgsVectorLayerSimpleLabeling(label_settings)
         layer.setLabeling(labeling)
         layer.setLabelsEnabled(True)
+
+    def cleanup(self):
+        """
+        Clean up marker layer manager resources.
+
+        CRASH FIX: Added to ensure proper resource cleanup during plugin unload.
+        Matches the cleanup pattern used by other layer managers.
+
+        Note:
+            This method is called by layers_controller.cleanup() during
+            plugin shutdown to ensure all resources are properly released.
+        """
+        try:
+            # Clear any cached references in the per-item layer factory
+            if hasattr(self, '_per_item_factory') and self._per_item_factory:
+                # The factory doesn't currently maintain state that needs cleanup,
+                # but we nullify the reference for consistency
+                self._per_item_factory = None
+                logger.debug("Marker layer manager cleaned up")
+
+            # IMPORTANT: Call parent cleanup to release base resources
+            super().cleanup()
+        except Exception as e:
+            logger.error("Error during marker layer manager cleanup: %s", e)

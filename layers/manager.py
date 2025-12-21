@@ -625,6 +625,13 @@ class LayerManager(QObject):
             group_def: Group definition to create
             parent: Parent group (None = root)
         """
+        # Phase 4: Skip groups with auto_create=False (legacy groups)
+        # These groups are kept in schema for backward compatibility but should
+        # not be created for new missions. They will only exist if migrated data
+        # is present.
+        if not getattr(group_def, 'auto_create', True):
+            return
+
         # Create the group
         group = self.ensure_group(get_group_path(group_def.name), position=group_def.position)
 

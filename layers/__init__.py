@@ -18,6 +18,7 @@ from .schema import (
     get_expected_structure,
     get_group_path,
     get_layer_by_id,
+    get_per_item_group_path,  # Phase 4: Per-item layer placement
     ARTIFACT_LAYER_MAP,
     LEGACY_LAYER_NAMES,
     LAYER_GROUP_PATHS,
@@ -58,6 +59,7 @@ __all__ = [
     'get_expected_structure',
     'get_group_path',
     'get_layer_by_id',
+    'get_per_item_group_path',  # Phase 4: Per-item layer placement
     'ARTIFACT_LAYER_MAP',
     'LEGACY_LAYER_NAMES',
     'LAYER_GROUP_PATHS',

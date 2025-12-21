@@ -16,11 +16,12 @@ that must be preserved EXACTLY for accuracy (<1m error requirement).
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Optional, Dict, Any, Set
+from typing import List, Optional, Dict, Any, Set, Union, Tuple
 from collections import OrderedDict
+from pathlib import Path
 import uuid
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ from qgis.PyQt.QtGui import QColor
 
 from .base_manager import BaseLayerManager
 from ...layers import LayerIds
+from ..per_item_layer_factory import ItemType, PerItemLayerFactory, SAR_ITEM_TYPE
 from ...utils.drawing_math import (
     geodesic_bearing_endpoint,
     geodesic_circle_points,
@@ -119,6 +121,18 @@ class DrawingLayerManager(BaseLayerManager):
     # Maximum number of GPX file paths to track (prevents unbounded memory growth)
     MAX_GPX_IMPORT_HISTORY = 100
 
+    # Phase 4: Enable per-item layers for specific drawing types
+    # When True, new drawings of these types create individual layers
+    # When False, use legacy shared layers (backward compatibility)
+    USE_PER_ITEM_LAYERS = {
+        "search_area": True,    # Phase 4 Step 3: Search Areas use per-item layers
+        "range_ring": True,     # Phase 4 Step 3: Range Rings use per-item layers
+        "bearing_line": True,   # Phase 4 Step 3: Bearing Lines use per-item layers
+        "line": True,           # Phase 4 Step 3: Lines use per-item layers
+        "sector": False,        # Keep legacy for now
+        "text_label": False,    # Keep legacy for now
+    }
+
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
         """Initialize drawing layer manager with GPX support."""
         super().__init__(iface, shared_device_colors, layer_manager)
@@ -128,6 +142,9 @@ class DrawingLayerManager(BaseLayerManager):
         self._gpx_watcher = None
         self._watched_gpx_folder = None
         self._imported_gpx_files = BoundedSet(max_size=self.MAX_GPX_IMPORT_HISTORY)
+
+        # Phase 4: Per-item layer factory (lazy initialized)
+        self._per_item_factory: Optional[PerItemLayerFactory] = None
 
     def get_managed_layer_names(self):
         """Return list of layer names this manager handles."""
@@ -139,6 +156,241 @@ class DrawingLayerManager(BaseLayerManager):
             self.SECTORS_LAYER_NAME,
             self.TEXT_LABELS_LAYER_NAME
         ]
+
+    # =========================================================================
+    # Phase 4: Per-Item Layer Helpers
+    # =========================================================================
+
+    def _uses_per_item_layers(self, drawing_type: str) -> bool:
+        """
+        Check if the given drawing type should use per-item layers.
+
+        Args:
+            drawing_type: One of "search_area", "range_ring", "bearing_line", "line",
+                         "sector", "text_label"
+
+        Returns:
+            True if per-item layers should be used, False for legacy shared layers
+        """
+        return self.USE_PER_ITEM_LAYERS.get(drawing_type, False)
+
+    def _is_uuid(self, value: object) -> bool:
+        """Return True if value looks like a UUID string."""
+        if not isinstance(value, str):
+            return False
+        try:
+            uuid.UUID(value)
+            return True
+        except (ValueError, AttributeError, TypeError):
+            return False
+
+    def _get_per_item_layer(self, item_type: str, item_id: str) -> Optional[QgsVectorLayer]:
+        """
+        Return per-item layer for item_id if it matches the expected type.
+        """
+        if not item_id or not isinstance(item_id, str):
+            return None
+
+        factory = self._get_per_item_factory()
+        if not factory:
+            return None
+
+        layer = factory.get_layer_by_item_id(item_id)
+        if not layer or not layer.isValid():
+            return None
+
+        layer_item_type = layer.customProperty(SAR_ITEM_TYPE)
+        if layer_item_type and layer_item_type != item_type:
+            logger.warning(
+                "Phase 4: Per-item layer type mismatch for %s: expected %s, got %s",
+                item_id, item_type, layer_item_type
+            )
+            return None
+
+        return layer
+
+    def _get_single_feature(self, layer: QgsVectorLayer) -> Optional[QgsFeature]:
+        """Return the first feature in a layer (per-item layers store one feature)."""
+        for feature in layer.getFeatures():
+            return feature
+        return None
+
+    def _list_per_item_records(self, item_type: str) -> List[Dict[str, Any]]:
+        """Return records for all loaded per-item layers of the given type."""
+        records: List[Dict[str, Any]] = []
+        factory = self._get_per_item_factory()
+        if not factory:
+            return records
+
+        try:
+            items = factory.get_all_item_layers(item_type=item_type)
+        except Exception as exc:
+            logger.warning("Phase 4: Failed to enumerate per-item layers for %s: %s", item_type, exc)
+            return records
+
+        for item_info in items:
+            layer = item_info.layer
+            if not layer or not layer.isValid():
+                continue
+            for feature in layer.getFeatures():
+                try:
+                    record = self._feature_to_record(feature, layer)
+                    if record:
+                        records.append(record)
+                except Exception as exc:
+                    logger.warning(
+                        "Phase 4: Failed to serialize per-item %s %s: %s",
+                        item_type, item_info.item_id, exc
+                    )
+        return records
+
+    def get_per_item_feature_for_layer_id(
+        self,
+        layer_id: str,
+        item_id: str
+    ) -> Optional[Tuple[QgsVectorLayer, QgsFeature]]:
+        """
+        Return (layer, feature) for a per-item drawing layer.
+        """
+        layer_map = {
+            LayerIds.LINES: ("line", ItemType.LINE),
+            LayerIds.SEARCH_AREAS: ("search_area", ItemType.SEARCH_AREA),
+            LayerIds.RANGE_RINGS: ("range_ring", ItemType.RANGE_RING),
+            LayerIds.BEARING_LINES: ("bearing_line", ItemType.BEARING_LINE),
+        }
+        mapping = layer_map.get(layer_id)
+        if not mapping:
+            return None
+
+        drawing_type, item_type = mapping
+        if not self._uses_per_item_layers(drawing_type):
+            return None
+
+        layer = self._get_per_item_layer(item_type, item_id)
+        if not layer:
+            return None
+
+        feature = self._get_single_feature(layer)
+        if not feature:
+            return None
+
+        return (layer, feature)
+
+    def _cleanup_failed_per_item_layer(
+        self,
+        factory: PerItemLayerFactory,
+        item_id: str,
+        context: str
+    ) -> None:
+        """Remove per-item layer/table after a failed create."""
+        try:
+            factory.delete_item_layer(
+                item_id=item_id,
+                remove_table=True,
+                hard_delete=True
+            )
+            logger.warning(
+                "Phase 4: Cleaned up failed per-item %s layer %s",
+                context,
+                item_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Phase 4: Failed to clean up per-item %s layer %s: %s",
+                context,
+                item_id,
+                exc
+            )
+
+    def _get_per_item_factory(self) -> Optional[PerItemLayerFactory]:
+        """
+        Get or create the PerItemLayerFactory for per-item layers.
+
+        Returns None if no mission store is configured (layers will be memory-only).
+
+        Returns:
+            PerItemLayerFactory or None
+        """
+        # Return cached factory if available
+        if self._per_item_factory is not None:
+            return self._per_item_factory
+
+        # Get mission store path from layer manager
+        if not self.layer_manager:
+            return None
+
+        layer_manager = self._require_layer_manager()
+        gpkg_path = layer_manager.get_mission_store()
+
+        if not gpkg_path:
+            logger.warning(
+                "Phase 4: No mission store configured - per-item layers will not persist. "
+                "Configure a mission store to enable persistent per-item layers."
+            )
+            return None
+
+        # Create factory
+        self._per_item_factory = PerItemLayerFactory(
+            gpkg_path=Path(gpkg_path),
+            auto_wal=True,
+            auto_registry=True
+        )
+        logger.info("Phase 4: PerItemLayerFactory initialized with mission store: %s", gpkg_path)
+        return self._per_item_factory
+
+    def _ensure_per_item_group(self, item_type: str) -> Optional[Any]:
+        """
+        Ensure the target group exists for per-item layers.
+
+        Args:
+            item_type: ItemType string value (e.g., ItemType.SEARCH_AREA which is "search_area")
+                       Note: ItemType is a class with string constants, NOT an enum.
+
+        Returns:
+            QgsLayerTreeGroup or None if not available
+        """
+        from ...layers import get_per_item_group_path
+
+        # ItemType values are strings (e.g., ItemType.LINE = "line"), not enums
+        # Do NOT call .value on them
+        group_path = get_per_item_group_path(item_type)
+        if not group_path:
+            logger.warning("Phase 4: No group path defined for item type: %s", item_type)
+            return None
+
+        # Get or create the group
+        root = QgsProject.instance().layerTreeRoot()
+        return self._get_or_create_nested_group(root, group_path)
+
+    def _get_or_create_nested_group(self, parent, path_parts: List[str]):
+        """
+        Get or create a nested group structure.
+
+        Args:
+            parent: Parent QgsLayerTreeGroup
+            path_parts: List of group names to create/find
+
+        Returns:
+            The deepest group in the path
+        """
+        from qgis.core import QgsLayerTreeGroup
+
+        current = parent
+        for part in path_parts:
+            found = None
+            for child in current.children():
+                if isinstance(child, QgsLayerTreeGroup) and child.name() == part:
+                    found = child
+                    break
+            if found:
+                current = found
+            else:
+                current = current.addGroup(part)
+        return current
+
+    def _current_timestamp(self) -> str:
+        """Return ISO timestamp for audit fields (timezone-aware UTC)."""
+        return datetime.now(timezone.utc).isoformat()
 
     def _style_lines_layer(self, layer: QgsVectorLayer):
         symbol = QgsLineSymbol.createSimple({'color': 'red', 'width': '2'})
@@ -436,7 +688,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def add_line(self, name: str, points_wgs84: List[QgsPointXY],
                  description: str = "", color: str = "#FF0000", width: int = 2,
-                 temporary_measure: bool = False) -> int:
+                 temporary_measure: bool = False) -> Union[int, str]:
         """
         Add a line feature to the Lines layer.
 
@@ -459,6 +711,24 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Line Failed", str(exc))
             raise
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("line"):
+            return self._add_line_per_item(
+                name=name, points_wgs84=points_wgs84, description=description,
+                color=color, width=width, temporary_measure=temporary_measure
+            )
+
+        # Legacy path: shared layer
+        return self._add_line_shared_layer(
+            name=name, points_wgs84=points_wgs84, description=description,
+            color=color, width=width, temporary_measure=temporary_measure
+        )
+
+    def _add_line_shared_layer(
+        self, name: str, points_wgs84: List[QgsPointXY], description: str,
+        color: str, width: int, temporary_measure: bool
+    ) -> int:
+        """Legacy implementation: Add line to shared layer."""
         layer = self._get_or_create_lines_layer()
         self._ensure_lines_layer_schema(layer)
 
@@ -492,7 +762,7 @@ class DrawingLayerManager(BaseLayerManager):
             "color": color,
             "width": int(width),
             "distance_m": float(total_distance),
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "temporary_measure": bool(temporary_measure),
             "display_order": None,  # set after addFeature
         }
@@ -538,6 +808,133 @@ class DrawingLayerManager(BaseLayerManager):
             temporary=temporary_measure
         )
         return feature.id()
+
+    def _add_line_per_item(
+        self, name: str, points_wgs84: List[QgsPointXY], description: str,
+        color: str, width: int, temporary_measure: bool
+    ) -> str:
+        """
+        Phase 4: Add line as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this line,
+        placed under "SAR Tracker / Map Tools / Lines /".
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for line")
+            return self._add_line_shared_layer(
+                name=name, points_wgs84=points_wgs84, description=description,
+                color=color, width=width, temporary_measure=temporary_measure
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.LINE)
+
+        # Define fields for the line layer (matching schema)
+        line_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "description", "type": "String", "length": 1000},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "width", "type": "Int"},
+            {"name": "distance_m", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "temporary_measure", "type": "Int"},  # Boolean stored as 0/1
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.LINE,
+                display_name=name,
+                fields=line_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for line '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item line layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for line '{name}'")
+
+        # Calculate total distance using WGS84 ellipsoid
+        distance_calc = QgsDistanceArea()
+        distance_calc.setSourceCrs(
+            layer.crs(),
+            QgsProject.instance().transformContext()
+        )
+        distance_calc.setEllipsoid('WGS84')
+
+        total_distance = 0
+        for i in range(len(points_wgs84) - 1):
+            dist = distance_calc.measureLine(points_wgs84[i], points_wgs84[i + 1])
+            total_distance += dist
+
+        logger.debug(f"Line '{name}' (per-item): {len(points_wgs84)} points, total distance={total_distance:.2f}m")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPolylineXY(points_wgs84))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,  # Use item_id as the feature id
+            "name": name,
+            "description": description,
+            "color": color,
+            "width": int(width),
+            "distance_m": float(total_distance),
+            "created": created_ts,
+            "temporary_measure": 1 if temporary_measure else 0,
+        }
+
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        # Add feature to layer
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item line layer '{name}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "LINES", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "line")
+            raise LayerTransactionError(
+                name,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling
+        self._style_lines_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item line layer '%s' (item_id=%s) under Map Tools/Lines",
+            name, item_id
+        )
+        return item_id
 
     def add_measurement_overlay(self, name: str, points_wgs84: List[QgsPointXY],
                                 description: str, color: str = "#FFD447",
@@ -632,24 +1029,41 @@ class DrawingLayerManager(BaseLayerManager):
 
     def list_lines(self, filters: Optional[Dict] = None) -> List[Dict]:
         """List all line features."""
+        records: List[Dict[str, Any]] = []
+
         layer = self._get_or_create_lines_layer()
-        if not layer or not layer.isValid():
-            return []
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
+            try:
+                for feature in layer.getFeatures(request):
+                    rec = self._feature_to_record(feature, layer)
+                    if rec:
+                        records.append(rec)
+            except Exception as exc:
+                logger.error("Error listing lines: %s", exc, exc_info=True)
 
-        request = self._build_filter_request(layer, filters)
+        if self._uses_per_item_layers("line"):
+            records.extend(self._list_per_item_records(ItemType.LINE))
 
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                rec = self._feature_to_record(feature, layer)
-                if rec:
-                    records.append(rec)
-        except Exception as exc:
-            logger.error("Error listing lines: %s", exc, exc_info=True)
         return self._sort_records_by_display_order(records)
 
-    def get_line(self, feature_id: int) -> Optional[Dict]:
+    def get_line(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """Get a single line by feature id."""
+        if isinstance(feature_id, str) and self._uses_per_item_layers("line") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.LINE, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
         layer = self._get_or_create_lines_layer()
         if not layer or not layer.isValid():
             return None
@@ -658,9 +1072,18 @@ class DrawingLayerManager(BaseLayerManager):
             return None
         return self._feature_to_record(feature, layer)
 
-    def update_line(self, feature_id: int, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
+    def update_line(self, feature_id: Union[int, str], updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
         """Update attributes of a line feature."""
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("line") and self._is_uuid(feature_id):
+            return self._update_line_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
         if not isinstance(updates, dict) or not updates:
             raise ValueError("updates must be a non-empty dictionary")
@@ -719,9 +1142,86 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
-    def delete_line(self, feature_id: int, updated_by: Optional[str] = None) -> bool:
+    def _update_line_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item line."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.LINE, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item line '{item_id}' not found")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(layer_name=layer.name(), operation="start editing", details="startEditing() returned False")
+
+        try:
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                raise ValueError(f"Per-item line '{item_id}' has no feature")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'width' in updates:
+                validate_width(updates['width'], "width")
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            self._safe_commit(layer, "update", "LINES", {"item_id": item_id, "feature_id": feature.id()})
+
+            if "name" in updates and updates["name"]:
+                factory = self._get_per_item_factory()
+                if factory:
+                    factory.rename_item_layer(item_id, str(updates["name"]))
+
+            layer.triggerRepaint()
+            return True
+
+        except Exception as exc:
+            layer.rollBack()
+            if isinstance(exc, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(exc)
+            ) from exc
+        finally:
+            if layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def delete_line(self, feature_id: Union[int, str], updated_by: Optional[str] = None) -> bool:
         """Delete a single line feature."""
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("line") and self._is_uuid(feature_id):
+            return self._delete_line_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         layer = self._get_or_create_lines_layer()
@@ -754,6 +1254,26 @@ class DrawingLayerManager(BaseLayerManager):
                     layer.rollBack()
                 except RuntimeError:
                     pass
+
+    def _delete_line_per_item(self, item_id: str, updated_by: Optional[str] = None) -> bool:
+        """Delete a per-item line layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for line deletion")
+
+        layer = self._get_per_item_layer(ItemType.LINE, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item line '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item line '{item_id}'")
+
+        return True
 
     def delete_lines(self, feature_ids: List[int], updated_by: Optional[str] = None) -> int:
         """Bulk delete lines."""
@@ -891,7 +1411,7 @@ class DrawingLayerManager(BaseLayerManager):
                         team: str = "Unassigned", status: str = "Planned",
                         priority: str = "Medium", POA: float = 50.0,
                         terrain: str = "", search_method: str = "",
-                        color: str = "#0064FF", notes: str = "") -> int:
+                        color: str = "#0064FF", notes: str = "") -> Union[int, str]:
         """
         Add a search area polygon with status tracking.
 
@@ -908,7 +1428,7 @@ class DrawingLayerManager(BaseLayerManager):
             notes: Additional notes
 
         Returns:
-            int: Feature ID of added search area
+            int: Feature ID of added search area (or item_id as string for per-item layers)
         """
         try:
             polygon_wgs84 = list(polygon_wgs84)
@@ -918,6 +1438,29 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Search Area Failed", str(exc))
             raise
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("search_area"):
+            return self._add_search_area_per_item(
+                name=name, polygon_wgs84=polygon_wgs84,
+                team=team, status=status, priority=priority, POA=POA,
+                terrain=terrain, search_method=search_method,
+                color=color, notes=notes
+            )
+
+        # Legacy path: shared layer
+        return self._add_search_area_shared_layer(
+            name=name, polygon_wgs84=polygon_wgs84,
+            team=team, status=status, priority=priority, POA=POA,
+            terrain=terrain, search_method=search_method,
+            color=color, notes=notes
+        )
+
+    def _add_search_area_shared_layer(
+        self, name: str, polygon_wgs84: List[QgsPointXY],
+        team: str, status: str, priority: str, POA: float,
+        terrain: str, search_method: str, color: str, notes: str
+    ) -> int:
+        """Legacy implementation: Add search area to shared layer."""
         layer = self._get_or_create_search_areas_layer()
 
         # Calculate area in square kilometers using WGS84 ellipsoid
@@ -954,7 +1497,7 @@ class DrawingLayerManager(BaseLayerManager):
             "start_time": "",  # set when status changes to InProgress
             "end_time": "",  # set when status changes to Completed
             "notes": notes,
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "display_order": None,  # set after addFeature
         }
         fields = layer.fields()
@@ -999,6 +1542,150 @@ class DrawingLayerManager(BaseLayerManager):
             status=status
         )
         return feature.id()
+
+    def _add_search_area_per_item(
+        self, name: str, polygon_wgs84: List[QgsPointXY],
+        team: str, status: str, priority: str, POA: float,
+        terrain: str, search_method: str, color: str, notes: str
+    ) -> str:
+        """
+        Phase 4: Add search area as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this search area,
+        placed under "SAR Tracker / Map Tools / Search Areas /".
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for search area")
+            return self._add_search_area_shared_layer(
+                name=name, polygon_wgs84=polygon_wgs84,
+                team=team, status=status, priority=priority, POA=POA,
+                terrain=terrain, search_method=search_method,
+                color=color, notes=notes
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.SEARCH_AREA)
+
+        # Define fields for the search area layer (matching schema)
+        search_area_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "team", "type": "String", "length": 255},
+            {"name": "status", "type": "String", "length": 50},
+            {"name": "priority", "type": "String", "length": 50},
+            {"name": "area_sqkm", "type": "Double"},
+            {"name": "POA", "type": "Double"},
+            {"name": "POD", "type": "Double"},
+            {"name": "terrain", "type": "String", "length": 255},
+            {"name": "search_method", "type": "String", "length": 255},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "start_time", "type": "String", "length": 50},
+            {"name": "end_time", "type": "String", "length": 50},
+            {"name": "notes", "type": "String", "length": 1000},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.SEARCH_AREA,
+                display_name=name,
+                fields=search_area_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for search area '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item search area layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for search area '{name}'")
+
+        # Calculate area in square kilometers using WGS84 ellipsoid
+        distance_calc = QgsDistanceArea()
+        distance_calc.setSourceCrs(
+            layer.crs(),
+            QgsProject.instance().transformContext()
+        )
+        distance_calc.setEllipsoid('WGS84')
+
+        # Create polygon geometry
+        polygon_geom = QgsGeometry.fromPolygonXY([polygon_wgs84])
+        area_sqm = distance_calc.measureArea(polygon_geom)
+        area_sqkm = area_sqm / 1000000.0  # Convert to km²
+
+        logger.debug(f"Search area '{name}' (per-item): {len(polygon_wgs84)} points, area={area_sqkm:.4f}km²")
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(polygon_geom)
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,  # Use item_id as the marker id
+            "name": name,
+            "team": team,
+            "status": status,
+            "priority": priority,
+            "area_sqkm": float(area_sqkm),
+            "POA": float(POA),
+            "POD": 0.0,
+            "terrain": terrain,
+            "search_method": search_method,
+            "color": color,
+            "start_time": "",
+            "end_time": "",
+            "notes": notes,
+            "created": created_ts,
+        }
+
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        # Add feature to layer
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item search area layer '{name}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "SEARCH_AREAS", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "search area")
+            raise LayerTransactionError(
+                name,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling
+        self._style_search_areas_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item search area layer '%s' (item_id=%s) under Map Tools/Search Areas",
+            name, item_id
+        )
+        return item_id
 
     # =========================================================================
     # Range Rings Layer
@@ -1066,7 +1753,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def add_range_ring(self, name: str, center_wgs84: QgsPointXY, radius_m: float,
                        label: str = "", color: str = "#FFA500",
-                       lpb_category: str = "", percentile: int = 0) -> int:
+                       lpb_category: str = "", percentile: int = 0) -> Union[int, str]:
         """
         Add a range ring (circle) feature.
 
@@ -1093,6 +1780,24 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Range Ring Failed", str(exc))
             raise
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("range_ring"):
+            return self._add_range_ring_per_item(
+                name=name, center_wgs84=center_wgs84, radius_m=radius_m,
+                label=label, color=color, lpb_category=lpb_category, percentile=percentile
+            )
+
+        # Legacy path: shared layer
+        return self._add_range_ring_shared_layer(
+            name=name, center_wgs84=center_wgs84, radius_m=radius_m,
+            label=label, color=color, lpb_category=lpb_category, percentile=percentile
+        )
+
+    def _add_range_ring_shared_layer(
+        self, name: str, center_wgs84: QgsPointXY, radius_m: float,
+        label: str, color: str, lpb_category: str, percentile: int
+    ) -> int:
+        """Legacy implementation: Add range ring to shared layer."""
         layer = self._get_or_create_range_rings_layer()
 
         circle_points = geodesic_circle_points(center_wgs84.x(), center_wgs84.y(), radius_m, segments=64)
@@ -1115,7 +1820,7 @@ class DrawingLayerManager(BaseLayerManager):
             "color": color,
             "lpb_category": lpb_category,
             "percentile": int(percentile) if percentile is not None else None,
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "display_order": None,  # set after addFeature
         }
         fields = layer.fields()
@@ -1160,6 +1865,129 @@ class DrawingLayerManager(BaseLayerManager):
             percentile=percentile
         )
         return feature.id()
+
+    def _add_range_ring_per_item(
+        self, name: str, center_wgs84: QgsPointXY, radius_m: float,
+        label: str, color: str, lpb_category: str, percentile: int
+    ) -> str:
+        """
+        Phase 4: Add range ring as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this range ring,
+        placed under "SAR Tracker / Map Tools / Range Rings /".
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for range ring")
+            return self._add_range_ring_shared_layer(
+                name=name, center_wgs84=center_wgs84, radius_m=radius_m,
+                label=label, color=color, lpb_category=lpb_category, percentile=percentile
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.RANGE_RING)
+
+        # Define fields for the range ring layer (matching schema)
+        range_ring_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "center_lat", "type": "Double"},
+            {"name": "center_lon", "type": "Double"},
+            {"name": "radius_m", "type": "Double"},
+            {"name": "label", "type": "String", "length": 100},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "lpb_category", "type": "String", "length": 100},
+            {"name": "percentile", "type": "Int"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.RANGE_RING,
+                display_name=name,
+                fields=range_ring_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for range ring '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item range ring layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for range ring '{name}'")
+
+        # Calculate geodesic circle points
+        circle_points = geodesic_circle_points(center_wgs84.x(), center_wgs84.y(), radius_m, segments=64)
+        points = [QgsPointXY(lon, lat) for lon, lat in circle_points]
+
+        # Create polygon geometry from points
+        circle_geom = QgsGeometry.fromPolygonXY([points])
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(circle_geom)
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,  # Use item_id as the feature id
+            "name": name,
+            "center_lat": float(center_wgs84.y()),
+            "center_lon": float(center_wgs84.x()),
+            "radius_m": float(radius_m),
+            "label": label,
+            "color": color,
+            "lpb_category": lpb_category,
+            "percentile": int(percentile) if percentile is not None else None,
+            "created": created_ts,
+        }
+
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        # Add feature to layer
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item range ring layer '{name}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "RANGE_RINGS", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "range ring")
+            raise LayerTransactionError(
+                name,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling
+        self._style_range_rings_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item range ring layer '%s' (item_id=%s) under Map Tools/Range Rings",
+            name, item_id
+        )
+        return item_id
 
     # =========================================================================
     # Bearing Lines Layer
@@ -1224,7 +2052,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def add_bearing_line(self, name: str, origin_wgs84: QgsPointXY,
                          bearing: float, distance_m: float,
-                         label: str = "", color: str = "#800080") -> int:
+                         label: str = "", color: str = "#800080") -> Union[int, str]:
         """
         Add a bearing line feature.
 
@@ -1251,6 +2079,24 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Bearing Line Failed", str(exc))
             raise
 
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("bearing_line"):
+            return self._add_bearing_line_per_item(
+                name=name, origin_wgs84=origin_wgs84, bearing=bearing,
+                distance_m=distance_m, label=label, color=color
+            )
+
+        # Legacy path: shared layer
+        return self._add_bearing_line_shared_layer(
+            name=name, origin_wgs84=origin_wgs84, bearing=bearing,
+            distance_m=distance_m, label=label, color=color
+        )
+
+    def _add_bearing_line_shared_layer(
+        self, name: str, origin_wgs84: QgsPointXY, bearing: float,
+        distance_m: float, label: str, color: str
+    ) -> int:
+        """Legacy implementation: Add bearing line to shared layer."""
         layer = self._get_or_create_bearing_lines_layer()
 
         # Calculate endpoint using bearing and distance
@@ -1281,7 +2127,7 @@ class DrawingLayerManager(BaseLayerManager):
             "distance_m": float(distance_m),
             "label": label,
             "color": color,
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "display_order": None,  # set after addFeature
         }
         fields = layer.fields()
@@ -1325,6 +2171,138 @@ class DrawingLayerManager(BaseLayerManager):
             distance_m=distance_m
         )
         return feature.id()
+
+    def _add_bearing_line_per_item(
+        self, name: str, origin_wgs84: QgsPointXY, bearing: float,
+        distance_m: float, label: str, color: str
+    ) -> str:
+        """
+        Phase 4: Add bearing line as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this bearing line,
+        placed under "SAR Tracker / Map Tools / Bearing Lines /".
+
+        CRITICAL: Uses WGS84 ellipsoid geodesic calculations for accuracy.
+        DO NOT MODIFY the geodesic math without thorough testing.
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            # Fallback to shared layer if no mission store configured
+            logger.warning("Phase 4: No factory available, falling back to shared layer for bearing line")
+            return self._add_bearing_line_shared_layer(
+                name=name, origin_wgs84=origin_wgs84, bearing=bearing,
+                distance_m=distance_m, label=label, color=color
+            )
+
+        # Ensure the target group exists
+        target_group = self._ensure_per_item_group(ItemType.BEARING_LINE)
+
+        # Define fields for the bearing line layer (matching schema)
+        bearing_line_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "origin_lat", "type": "Double"},
+            {"name": "origin_lon", "type": "Double"},
+            {"name": "bearing", "type": "Double"},
+            {"name": "distance_m", "type": "Double"},
+            {"name": "label", "type": "String", "length": 100},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        # Create the per-item layer
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.BEARING_LINE,
+                display_name=name,
+                fields=bearing_line_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for bearing line '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item bearing line layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for bearing line '{name}'")
+
+        # Calculate endpoint using bearing and distance
+        # CRITICAL: This code was carefully tuned for <1m accuracy
+        # Bug fix from Day 7 audit - DO NOT MODIFY
+
+        endpoint_lon, endpoint_lat = geodesic_bearing_endpoint(
+            origin_wgs84.x(),
+            origin_wgs84.y(),
+            bearing,
+            distance_m
+        )
+        endpoint = QgsPointXY(endpoint_lon, endpoint_lat)
+
+        # Create line geometry
+        line_geom = QgsGeometry.fromPolylineXY([origin_wgs84, endpoint])
+
+        # Create and add the feature to the layer
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(line_geom)
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,  # Use item_id as the feature id
+            "name": name,
+            "origin_lat": float(origin_wgs84.y()),
+            "origin_lon": float(origin_wgs84.x()),
+            "bearing": float(bearing),
+            "distance_m": float(distance_m),
+            "label": label,
+            "color": color,
+            "created": created_ts,
+        }
+
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        # Add feature to layer
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item bearing line layer '{name}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "BEARING_LINES", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "bearing line")
+            raise LayerTransactionError(
+                name,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        # Apply styling
+        self._style_bearing_lines_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item bearing line layer '%s' (item_id=%s) under Map Tools/Bearing Lines",
+            name, item_id
+        )
+        return item_id
 
     # =========================================================================
     # Search Sectors Layer
@@ -1497,7 +2475,7 @@ class DrawingLayerManager(BaseLayerManager):
             "area_sqkm": float(area_sqkm),
             "priority": priority,
             "color": color,
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "display_order": None,  # set after addFeature
         }
         fields = layer.fields()
@@ -1905,7 +2883,7 @@ class DrawingLayerManager(BaseLayerManager):
             "font_size": int(font_size),
             "color": color,
             "rotation": float(rotation),
-            "created": datetime.now().isoformat(),
+            "created": self._current_timestamp(),
             "display_order": None,  # set after addFeature
         }
         fields = layer.fields()
@@ -2044,25 +3022,27 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             List of feature dictionaries ordered by display_order (if field exists)
         """
+        records: List[Dict[str, Any]] = []
+
         layer = self._get_or_create_search_areas_layer()
-        if not layer or not layer.isValid():
-            return []
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
 
-        request = self._build_filter_request(layer, filters)
+            # Fetch and serialize features
+            try:
+                for feature in layer.getFeatures(request):
+                    record = self._feature_to_record(feature, layer)
+                    if record:
+                        records.append(record)
+            except Exception as e:
+                logger.error(f"Error listing search areas: {e}", exc_info=True)
 
-        # Fetch and serialize features
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                record = self._feature_to_record(feature, layer)
-                if record:
-                    records.append(record)
-        except Exception as e:
-            logger.error(f"Error listing search areas: {e}", exc_info=True)
+        if self._uses_per_item_layers("search_area"):
+            records.extend(self._list_per_item_records(ItemType.SEARCH_AREA))
 
         return self._sort_records_by_display_order(records)
 
-    def get_search_area(self, feature_id: int) -> Optional[Dict]:
+    def get_search_area(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """
         Get single search area by feature ID.
 
@@ -2072,6 +3052,21 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             Feature dictionary or None if not found
         """
+        if isinstance(feature_id, str) and self._uses_per_item_layers("search_area") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.SEARCH_AREA, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
         layer = self._get_or_create_search_areas_layer()
         if not layer or not layer.isValid():
             return None
@@ -2084,7 +3079,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def update_search_area(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updates: Dict[str, Any],
         updated_by: Optional[str] = None
     ) -> bool:
@@ -2110,7 +3105,20 @@ class DrawingLayerManager(BaseLayerManager):
         # STEP 1: VALIDATE INPUT (BEFORE touching layer)
         # ========================================================================
 
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("search_area") and self._is_uuid(feature_id):
+            return self._update_search_area_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"Invalid feature ID: {feature_id}. "
+                    "Feature IDs must be positive integers. "
+                    "Verify the ID was correctly retrieved from the search areas layer."
+                )
+
+        if feature_id <= 0:
             raise ValueError(
                 f"Invalid feature ID: {feature_id}. "
                 "Feature IDs must be positive integers. "
@@ -2253,9 +3261,103 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass  # Layer already rolled back or deleted
 
+    def _update_search_area_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item search area."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.SEARCH_AREA, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item search area '{item_id}' not found")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                raise ValueError(f"Per-item search area '{item_id}' has no feature")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name, value in updates.items():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+                if field_name == 'name':
+                    if not isinstance(value, str) or not value.strip():
+                        raise ValueError("name must be a non-empty string")
+                    if len(value) > 128:
+                        raise ValueError("name must be ≤ 128 characters")
+                elif field_name == 'status':
+                    valid_statuses = ['Planned', 'Assigned', 'InProgress', 'Completed', 'Cleared']
+                    if value not in valid_statuses:
+                        raise ValueError(f"status must be one of: {valid_statuses}")
+                elif field_name == 'priority':
+                    valid_priorities = ['High', 'Medium', 'Low']
+                    if value not in valid_priorities:
+                        raise ValueError(f"priority must be one of: {valid_priorities}")
+                elif field_name == 'area_sqkm':
+                    if not isinstance(value, (int, float)) or value <= 0:
+                        raise ValueError("area_sqkm must be a positive number")
+                elif field_name == 'POA':
+                    if not isinstance(value, (int, float)) or not (0 <= value <= 100):
+                        raise ValueError("POA must be between 0 and 100")
+                elif field_name == 'color':
+                    validate_color_hex(value, "color")
+
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name} on feature {feature.id()}")
+
+            self._safe_commit(layer, "update", "SEARCH_AREAS", {"item_id": item_id, "feature_id": feature.id()})
+
+            if "name" in updates and updates["name"]:
+                factory = self._get_per_item_factory()
+                if factory:
+                    factory.rename_item_layer(item_id, str(updates["name"]))
+
+            layer.triggerRepaint()
+            logger.debug("Updated per-item search area %s", item_id)
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
     def delete_search_area(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updated_by: Optional[str] = None
     ) -> bool:
         """
@@ -2272,7 +3374,16 @@ class DrawingLayerManager(BaseLayerManager):
             ValueError: If feature_id invalid
             LayerTransactionError: If deletion fails
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("search_area") and self._is_uuid(feature_id):
+            return self._delete_search_area_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         layer = self._get_or_create_search_areas_layer()
@@ -2320,6 +3431,26 @@ class DrawingLayerManager(BaseLayerManager):
                     layer.rollBack()
                 except RuntimeError:
                     pass
+
+    def _delete_search_area_per_item(self, item_id: str, updated_by: Optional[str] = None) -> bool:
+        """Delete a per-item search area layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for search area deletion")
+
+        layer = self._get_per_item_layer(ItemType.SEARCH_AREA, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item search area '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item search area '{item_id}'")
+
+        return True
 
     def delete_search_areas(
         self,
@@ -2417,24 +3548,26 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             List of feature dictionaries
         """
+        records: List[Dict[str, Any]] = []
+
         layer = self._get_or_create_range_rings_layer()
-        if not layer or not layer.isValid():
-            return []
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
 
-        request = self._build_filter_request(layer, filters)
+            try:
+                for feature in layer.getFeatures(request):
+                    record = self._feature_to_record(feature, layer)
+                    if record:
+                        records.append(record)
+            except Exception as e:
+                logger.error(f"Error listing range rings: {e}", exc_info=True)
 
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                record = self._feature_to_record(feature, layer)
-                if record:
-                    records.append(record)
-        except Exception as e:
-            logger.error(f"Error listing range rings: {e}", exc_info=True)
+        if self._uses_per_item_layers("range_ring"):
+            records.extend(self._list_per_item_records(ItemType.RANGE_RING))
 
         return self._sort_records_by_display_order(records)
 
-    def get_range_ring(self, feature_id: int) -> Optional[Dict]:
+    def get_range_ring(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """
         Get single range ring by feature ID.
 
@@ -2444,6 +3577,21 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             Feature dictionary or None if not found
         """
+        if isinstance(feature_id, str) and self._uses_per_item_layers("range_ring") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.RANGE_RING, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
         layer = self._get_or_create_range_rings_layer()
         if not layer or not layer.isValid():
             return None
@@ -2456,7 +3604,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def update_range_ring(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updates: Dict[str, Any],
         updated_by: Optional[str] = None
     ) -> bool:
@@ -2475,7 +3623,16 @@ class DrawingLayerManager(BaseLayerManager):
             ValueError: If feature_id invalid or updates malformed
             LayerTransactionError: If commit fails
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("range_ring") and self._is_uuid(feature_id):
+            return self._update_range_ring_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         if not isinstance(updates, dict) or not updates:
@@ -2509,21 +3666,7 @@ class DrawingLayerManager(BaseLayerManager):
                 updates['updated_by'] = updated_by
                 updates['updated_at'] = datetime.now().isoformat()
 
-            if 'bearing' in updates:
-                validate_bearing(updates['bearing'], "bearing")
-            if 'distance_m' in updates:
-                validate_positive_number(updates['distance_m'], "distance_m")
-            if 'color' in updates:
-                validate_color_hex(updates['color'], "color")
-            if 'origin_lat' in updates:
-                lat = float(updates['origin_lat'])
-                if not (-90.0 <= lat <= 90.0):
-                    raise ValueError("origin_lat must be between -90 and 90")
-            if 'origin_lon' in updates:
-                lon = float(updates['origin_lon'])
-                if not (-180.0 <= lon <= 180.0):
-                    raise ValueError("origin_lon must be between -180 and 180")
-
+            # Validate range ring-specific fields
             if 'radius_m' in updates:
                 validate_positive_number(updates['radius_m'], "radius_m")
             if 'color' in updates:
@@ -2570,9 +3713,94 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
+    def _update_range_ring_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item range ring."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.RANGE_RING, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item range ring '{item_id}' not found")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                raise ValueError(f"Per-item range ring '{item_id}' has no feature")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            if 'radius_m' in updates:
+                validate_positive_number(updates['radius_m'], "radius_m")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'center_lat' in updates:
+                lat = float(updates['center_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("center_lat must be between -90 and 90")
+            if 'center_lon' in updates:
+                lon = float(updates['center_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("center_lon must be between -180 and 180")
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            self._safe_commit(layer, "update", "RANGE_RINGS", {"item_id": item_id, "feature_id": feature.id()})
+
+            if "name" in updates and updates["name"]:
+                factory = self._get_per_item_factory()
+                if factory:
+                    factory.rename_item_layer(item_id, str(updates["name"]))
+
+            layer.triggerRepaint()
+            logger.debug("Updated per-item range ring %s", item_id)
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
     def delete_range_ring(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updated_by: Optional[str] = None
     ) -> bool:
         """
@@ -2585,7 +3813,16 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             True on success
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("range_ring") and self._is_uuid(feature_id):
+            return self._delete_range_ring_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         layer = self._get_or_create_range_rings_layer()
@@ -2632,6 +3869,26 @@ class DrawingLayerManager(BaseLayerManager):
                     layer.rollBack()
                 except RuntimeError:
                     pass
+
+    def _delete_range_ring_per_item(self, item_id: str, updated_by: Optional[str] = None) -> bool:
+        """Delete a per-item range ring layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for range ring deletion")
+
+        layer = self._get_per_item_layer(ItemType.RANGE_RING, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item range ring '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item range ring '{item_id}'")
+
+        return True
 
     def delete_range_rings(
         self,
@@ -2710,24 +3967,26 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             List of feature dictionaries
         """
+        records: List[Dict[str, Any]] = []
+
         layer = self._get_or_create_bearing_lines_layer()
-        if not layer or not layer.isValid():
-            return []
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
 
-        request = self._build_filter_request(layer, filters)
+            try:
+                for feature in layer.getFeatures(request):
+                    record = self._feature_to_record(feature, layer)
+                    if record:
+                        records.append(record)
+            except Exception as e:
+                logger.error(f"Error listing bearing lines: {e}", exc_info=True)
 
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                record = self._feature_to_record(feature, layer)
-                if record:
-                    records.append(record)
-        except Exception as e:
-            logger.error(f"Error listing bearing lines: {e}", exc_info=True)
+        if self._uses_per_item_layers("bearing_line"):
+            records.extend(self._list_per_item_records(ItemType.BEARING_LINE))
 
         return self._sort_records_by_display_order(records)
 
-    def get_bearing_line(self, feature_id: int) -> Optional[Dict]:
+    def get_bearing_line(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """
         Get single bearing line by feature ID.
 
@@ -2737,6 +3996,21 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             Feature dictionary or None if not found
         """
+        if isinstance(feature_id, str) and self._uses_per_item_layers("bearing_line") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.BEARING_LINE, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
         layer = self._get_or_create_bearing_lines_layer()
         if not layer or not layer.isValid():
             return None
@@ -2749,7 +4023,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def update_bearing_line(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updates: Dict[str, Any],
         updated_by: Optional[str] = None
     ) -> bool:
@@ -2764,7 +4038,16 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             True on success
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("bearing_line") and self._is_uuid(feature_id):
+            return self._update_bearing_line_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         if not isinstance(updates, dict) or not updates:
@@ -2798,10 +4081,21 @@ class DrawingLayerManager(BaseLayerManager):
                 updates['updated_by'] = updated_by
                 updates['updated_at'] = datetime.now().isoformat()
 
-            if 'font_size' in updates:
-                validate_font_size(updates['font_size'], "font_size")
+            # Validate bearing line-specific fields
+            if 'bearing' in updates:
+                validate_bearing(updates['bearing'], "bearing")
+            if 'distance_m' in updates:
+                validate_positive_number(updates['distance_m'], "distance_m")
             if 'color' in updates:
                 validate_color_hex(updates['color'], "color")
+            if 'origin_lat' in updates:
+                lat = float(updates['origin_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("origin_lat must be between -90 and 90")
+            if 'origin_lon' in updates:
+                lon = float(updates['origin_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("origin_lon must be between -180 and 180")
 
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
@@ -2836,9 +4130,96 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
+    def _update_bearing_line_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item bearing line."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.BEARING_LINE, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item bearing line '{item_id}' not found")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                raise ValueError(f"Per-item bearing line '{item_id}' has no feature")
+
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            if updated_by:
+                updates['updated_by'] = updated_by
+                updates['updated_at'] = datetime.now().isoformat()
+
+            if 'bearing' in updates:
+                validate_bearing(updates['bearing'], "bearing")
+            if 'distance_m' in updates:
+                validate_positive_number(updates['distance_m'], "distance_m")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'origin_lat' in updates:
+                lat = float(updates['origin_lat'])
+                if not (-90.0 <= lat <= 90.0):
+                    raise ValueError("origin_lat must be between -90 and 90")
+            if 'origin_lon' in updates:
+                lon = float(updates['origin_lon'])
+                if not (-180.0 <= lon <= 180.0):
+                    raise ValueError("origin_lon must be between -180 and 180")
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            self._safe_commit(layer, "update", "BEARING_LINES", {"item_id": item_id, "feature_id": feature.id()})
+
+            if "name" in updates and updates["name"]:
+                factory = self._get_per_item_factory()
+                if factory:
+                    factory.rename_item_layer(item_id, str(updates["name"]))
+
+            layer.triggerRepaint()
+            logger.debug("Updated per-item bearing line %s", item_id)
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
     def delete_bearing_line(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updated_by: Optional[str] = None
     ) -> bool:
         """
@@ -2851,7 +4232,16 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             True on success
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("bearing_line") and self._is_uuid(feature_id):
+            return self._delete_bearing_line_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         layer = self._get_or_create_bearing_lines_layer()
@@ -2898,6 +4288,26 @@ class DrawingLayerManager(BaseLayerManager):
                     layer.rollBack()
                 except RuntimeError:
                     pass
+
+    def _delete_bearing_line_per_item(self, item_id: str, updated_by: Optional[str] = None) -> bool:
+        """Delete a per-item bearing line layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for bearing line deletion")
+
+        layer = self._get_per_item_layer(ItemType.BEARING_LINE, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item bearing line '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item bearing line '{item_id}'")
+
+        return True
 
     def delete_bearing_lines(
         self,
@@ -3469,7 +4879,8 @@ class DrawingLayerManager(BaseLayerManager):
                 return
 
             # Find new files
-            new_files = current_files - self._imported_gpx_files
+            # BoundedSet doesn't support set subtraction, so convert to regular set first
+            new_files = current_files - set(self._imported_gpx_files)
 
             # Import new files
             for gpx_path in sorted(new_files):  # Sort for predictable order
@@ -3546,3 +4957,10 @@ class DrawingLayerManager(BaseLayerManager):
         # Clear imported files tracking
         if hasattr(self, '_imported_gpx_files'):
             self._imported_gpx_files.clear()
+
+        # Clear cached per-item factory
+        if hasattr(self, '_per_item_factory'):
+            self._per_item_factory = None
+
+        # IMPORTANT: Call parent cleanup to release base resources
+        super().cleanup()

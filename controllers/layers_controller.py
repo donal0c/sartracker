@@ -137,6 +137,20 @@ class LayersController:
         if self.layer_manager and self.layer_manager.is_read_only():
             raise LayerTransactionError("mission data", operation, details="Mission is finalized (read-only)")
 
+    def _coerce_feature_id_for_drawings(self, feature_id):
+        """Normalize drawing feature identifiers (int feature_id or str item_id)."""
+        if feature_id is None or isinstance(feature_id, bool):
+            raise ValueError("Invalid feature_id for drawing layer")
+        if isinstance(feature_id, str):
+            normalized = feature_id.strip()
+            if not normalized:
+                raise ValueError("Invalid feature_id for drawing layer")
+            return normalized
+        try:
+            return int(feature_id)
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid feature_id for drawing layer: {feature_id}")
+
     def _execute_manager_call(self, operation: str, func: Callable, *args, **kwargs):
         """
         Execute a manager call with consistent exception logging.
@@ -1071,7 +1085,7 @@ class LayersController:
 
     def move_search_area_to_section(
         self,
-        feature_id: int,
+        feature_id,
         target_section: str,
         updated_by: Optional[str] = None
     ) -> bool:
@@ -1108,6 +1122,8 @@ class LayersController:
             )
 
         new_status = section_to_status[target_section]
+
+        feature_id = self._coerce_feature_id_for_drawings(feature_id)
 
         # Update status field using DrawingLayerManager
         success = self._execute_manager_call(
@@ -1266,12 +1282,7 @@ class LayersController:
             return False
 
         # Handle drawing layers
-        try:
-            if feature_id is None or isinstance(feature_id, bool):
-                raise ValueError("Invalid feature_id for drawing layer")
-            fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
-        except (ValueError, TypeError):
-            raise ValueError(f"Invalid feature_id for drawing layer: {feature_id}")
+        fid = self._coerce_feature_id_for_drawings(feature_id)
 
         if layer_id == LayerIds.SEARCH_AREAS:
             return self.drawings.delete_search_area(fid, updated_by=updated_by)
@@ -1352,12 +1363,7 @@ class LayersController:
             return False
 
         # Handle drawing layers
-        try:
-            if feature_id is None or isinstance(feature_id, bool):
-                raise ValueError("Invalid feature_id for drawing layer")
-            fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
-        except (ValueError, TypeError):
-            raise ValueError(f"Invalid feature_id for drawing layer: {feature_id}")
+        fid = self._coerce_feature_id_for_drawings(feature_id)
 
         # Note: update_* methods return bool, not dict
         if layer_id == LayerIds.SEARCH_AREAS:
@@ -1415,16 +1421,29 @@ class LayersController:
             else:
                 return False
         else:
-            layer = self.layer_manager.get_layer(layer_id)
-            if not layer or not layer.isValid():
-                return False
             try:
-                if feature_id is None or isinstance(feature_id, bool):
-                    return False
-                fid = int(feature_id) if not isinstance(feature_id, int) else feature_id
-            except (ValueError, TypeError):
+                fid = self._coerce_feature_id_for_drawings(feature_id)
+            except ValueError:
                 return False
-            feature = layer.getFeature(fid)
+
+            if isinstance(fid, str) and self.drawings:
+                per_item = self.drawings.get_per_item_feature_for_layer_id(layer_id, fid)
+                if per_item:
+                    layer, feature = per_item
+                else:
+                    try:
+                        fid_int = int(fid)
+                    except (TypeError, ValueError):
+                        return False
+                    layer = self.layer_manager.get_layer(layer_id)
+                    if not layer or not layer.isValid():
+                        return False
+                    feature = layer.getFeature(fid_int)
+            else:
+                layer = self.layer_manager.get_layer(layer_id)
+                if not layer or not layer.isValid():
+                    return False
+                feature = layer.getFeature(fid)
 
         if not feature or not feature.isValid() or not feature.hasGeometry():
             return False
