@@ -1337,6 +1337,8 @@ class TrackingLayerManager(BaseLayerManager):
             layer: The position layer to style
             color: Device color for the marker
         """
+        from qgis.core import QgsSingleSymbolRenderer
+
         symbol = QgsMarkerSymbol.createSimple({
             'name': 'circle',
             'color': color.name(),
@@ -1344,7 +1346,14 @@ class TrackingLayerManager(BaseLayerManager):
             'outline_color': 'black',
             'outline_width': '0.5'
         })
-        layer.renderer().setSymbol(symbol)
+
+        # CRITICAL FIX: renderer() can return None for newly created layers
+        renderer = layer.renderer()
+        if renderer is None:
+            renderer = QgsSingleSymbolRenderer(symbol)
+            layer.setRenderer(renderer)
+        else:
+            renderer.setSymbol(symbol)
 
         # Apply labels
         label_settings = QgsPalLayerSettings()
@@ -1454,19 +1463,31 @@ class TrackingLayerManager(BaseLayerManager):
         root = project.layerTreeRoot()
         root.blockSignals(True)
 
+        failed_devices = []
         try:
             for device_id, latest_pos in by_device.items():
                 layer = self._ensure_device_position_layer(device_id, latest_pos)
                 if layer:
                     self._update_device_position(layer, latest_pos)
                 else:
-                    # Per-device layer creation failed - this is logged in _ensure_device_position_layer
-                    # The fallback to shared layer happens at the routing level
-                    pass
+                    # CRITICAL FIX: Track failed devices instead of silent loss
+                    failed_devices.append(device_id)
         finally:
             root.blockSignals(False)
             canvas.freeze(False)
             canvas.refresh()
+
+        # CRITICAL FIX: If ANY device failed, raise exception to trigger fallback
+        # This ensures no position data is silently lost
+        if failed_devices:
+            logger.warning(
+                "SAR-nh9: %d device(s) failed per-device layer creation: %s",
+                len(failed_devices), ", ".join(failed_devices[:5])  # Log first 5
+            )
+            raise RuntimeError(
+                f"Per-device layer creation failed for {len(failed_devices)} device(s). "
+                "Falling back to shared layer."
+            )
 
         logger.debug(
             "SAR-nh9: Updated per-device positions for %d devices",
@@ -1609,6 +1630,8 @@ class TrackingLayerManager(BaseLayerManager):
             layer: The trail layer to style
             color: Device color for the line
         """
+        from qgis.core import QgsSingleSymbolRenderer
+
         symbol = QgsLineSymbol.createSimple({
             'color': color.name(),
             'width': '2',
@@ -1616,7 +1639,14 @@ class TrackingLayerManager(BaseLayerManager):
             'joinstyle': 'round',
             'capstyle': 'round'
         })
-        layer.renderer().setSymbol(symbol)
+
+        # CRITICAL FIX: renderer() can return None for newly created layers
+        renderer = layer.renderer()
+        if renderer is None:
+            renderer = QgsSingleSymbolRenderer(symbol)
+            layer.setRenderer(renderer)
+        else:
+            renderer.setSymbol(symbol)
 
     def _update_device_trail(
         self,
@@ -1642,23 +1672,35 @@ class TrackingLayerManager(BaseLayerManager):
             self._clear_layer_features(edit_layer, f"Trail ({device_id})")
 
             # Add new segment features
+            dropped_segments = 0
             for idx, segment in enumerate(segments):
                 qgs_points = []
-                for point in segment.get('points', []):
+                drop_reason = None
+                for pt_idx, point in enumerate(segment.get('points', [])):
                     try:
                         lon = float(point.get('lon'))
                         lat = float(point.get('lat'))
-                    except (TypeError, ValueError):
+                    except (TypeError, ValueError) as e:
+                        # HIGH FIX: Log dropped segments instead of silent loss
+                        drop_reason = f"invalid coordinate at point {pt_idx}: {e}"
                         qgs_points = []
                         break
 
                     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+                        # HIGH FIX: Log dropped segments instead of silent loss
+                        drop_reason = f"out-of-range coordinate at point {pt_idx}: lat={lat}, lon={lon}"
                         qgs_points = []
                         break
 
                     qgs_points.append(QgsPointXY(lon, lat))
 
                 if len(qgs_points) < 2:
+                    if drop_reason:
+                        logger.warning(
+                            "SAR-nj0: Dropping trail segment %d for device %s - %s",
+                            idx, device_id, drop_reason
+                        )
+                    dropped_segments += 1
                     continue
 
                 geom = QgsGeometry.fromPolylineXY(qgs_points)
@@ -1882,11 +1924,25 @@ class TrackingLayerManager(BaseLayerManager):
             if factory:
                 try:
                     # Sanitize positions first
+                    total_inputs = len(positions) if positions else 0
+                    invalid_count = 0
+                    last_error = None
+
                     if positions:
                         sanitized = sanitize_breadcrumb_positions(positions)
                         valid_positions = sanitized.valid
+                        invalid_count = sanitized.invalid_count
+                        last_error = sanitized.last_error
                     else:
                         valid_positions = []
+
+                    # HIGH FIX: Report validation warnings (was missing in per-device path)
+                    self._report_validation_warning(
+                        "Breadcrumbs",
+                        total_inputs,
+                        invalid_count,
+                        last_error
+                    )
 
                     self._update_breadcrumbs_per_device(
                         valid_positions,
@@ -1898,7 +1954,7 @@ class TrackingLayerManager(BaseLayerManager):
                         None,  # No single layer
                         "BREADCRUMBS_PER_DEVICE",
                         "update",
-                        payload_items=len(positions) if positions else 0,
+                        payload_items=total_inputs,
                         device_count=len(set(p.get('device_id') for p in (positions or []) if p.get('device_id')))
                     )
                     return  # Successfully updated via per-device layers
