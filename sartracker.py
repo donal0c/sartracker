@@ -205,6 +205,14 @@ except Exception as e:
         _import_report, 'controllers.mission_logs_controller.MissionLogsController', e
     )
 
+# Import CoordinatesController (Phase 5 - status bar coordinates extraction)
+try:
+    from .controllers.coordinates_controller import CoordinatesController
+except Exception as e:
+    CoordinatesController = track_import_error(
+        _import_report, 'controllers.coordinates_controller.CoordinatesController', e
+    )
+
 # Import SARPanel
 try:
     from .ui.sar_panel import SARPanel
@@ -360,14 +368,17 @@ class sartracker:
         self.mission_storage = None
         self.mission_storage_controller = None  # Phase 6: Archive + backup controller
         self.mission_logs_controller = None  # Phase 4: Mission logs window controller
+        self.coordinates_controller = None  # Phase 5: Status bar coordinates controller
         self.mission_controller = None  # Phase N3: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
-        self.coords_label = None  # Status bar coordinate display
-        self.last_coords_point = None  # Last mouse position (for throttling)
-        self.coords_update_timer = None  # Timer to throttle coordinate updates
-        self._map_canvas_connected = False  # Track xyCoordinates signal connection (Issue #4)
-        self._coords_updates_enabled = False  # Guard for timer callbacks
+        # Phase 5: Coordinate display state moved to CoordinatesController
+        # These are kept as compatibility references pointing to controller state
+        self.coords_label = None  # Status bar coordinate display (ref to controller.coords_label)
+        self.last_coords_point = None  # Last mouse position (ref to controller.last_coords_point)
+        self.coords_update_timer = None  # Timer (ref to controller.coords_update_timer)
+        self._map_canvas_connected = False  # Track xyCoordinates signal (ref to controller)
+        self._coords_updates_enabled = False  # Guard for timer callbacks (ref to controller)
         # BUG-058 FIX: Prevent overlapping timer callbacks and unnecessary updates
         self._coords_update_in_progress = False  # Guard against overlapping callbacks
         self._coords_point_changed = False  # Track if mouse moved since last update
@@ -1329,8 +1340,38 @@ class sartracker:
             self.sar_panel.disable_drawing_tools("Tool Registry failed to load")
             print("[SARTRACKER] Drawing tool buttons disabled due to registry initialization failure")
 
-        # Add coordinate display to status bar
-        self._setup_status_bar_coords()
+        # Phase 5: Initialize coordinate display controller
+        # Creates status bar label, timer, and map canvas signal connection
+        _coords_init_success = False
+        if CoordinatesController:
+            try:
+                self.coordinates_controller = CoordinatesController(
+                    iface=self.iface,
+                    is_unloading=lambda: getattr(self, '_is_unloading', False),
+                    is_app_quitting=lambda: getattr(self, '_app_is_quitting', False),
+                    log_exception=self._log_exception,
+                    parent=self.iface.mainWindow()
+                )
+                if self.coordinates_controller.init():
+                    # Update compatibility references to controller state
+                    self.coords_label = self.coordinates_controller.coords_label
+                    self.coords_update_timer = self.coordinates_controller.coords_update_timer
+                    self._coords_updates_enabled = True
+                    self._map_canvas_connected = True
+                    _coords_init_success = True
+                    print("[SARTRACKER] CoordinatesController initialized successfully")
+                else:
+                    print("[SARTRACKER] CoordinatesController.init() returned False - using fallback")
+                    self.coordinates_controller = None
+            except Exception as exc:
+                self._log_exception("CoordinatesController initialization", exc)
+                self.coordinates_controller = None
+        else:
+            print("[SARTRACKER] CoordinatesController import failed - using fallback")
+
+        # Fallback: Use legacy coordinate setup if controller failed
+        if not _coords_init_success:
+            self._setup_status_bar_coords()
 
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
@@ -1902,9 +1943,14 @@ class sartracker:
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
 
-        # Stop UI timers early to avoid callbacks into deleted C++ objects during teardown
+        # Phase 5: Stop coordinate updates early to avoid callbacks into deleted C++ objects
         try:
-            if self.coords_update_timer or self._coords_updates_enabled:
+            if self.coordinates_controller:
+                self.coordinates_controller.cleanup("application about to quit")
+                self._coords_updates_enabled = False
+                self._map_canvas_connected = False
+            elif self.coords_update_timer or self._coords_updates_enabled:
+                # Fallback for legacy cleanup if controller not available
                 self._disable_coords_updates("application about to quit")
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to disable coord updates on shutdown: {exc}")
@@ -1977,7 +2023,13 @@ class sartracker:
             # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
             # This must happen before any other cleanup to prevent timer callbacks
             # from firing while components are being torn down.
-            if self.coords_update_timer or self._coords_updates_enabled:
+            # Phase 5: Use controller cleanup if available
+            if self.coordinates_controller:
+                self.coordinates_controller.cleanup("plugin unload (early cleanup)")
+                self._coords_updates_enabled = False
+                self._map_canvas_connected = False
+            elif self.coords_update_timer or self._coords_updates_enabled:
+                # Fallback for legacy cleanup
                 self._disable_coords_updates("plugin unload (early cleanup)")
 
             if self.layer_manager:
@@ -2055,24 +2107,28 @@ class sartracker:
             # running while we're in the middle of cleanup
             # ============================================================
 
-            # Disconnect map canvas mouse move signal
-            # BUG-045 FIX: Always attempt disconnection regardless of flag state
-            # Flag may be out of sync due to exceptions during setup
-            try:
-                if self.iface and self.iface.mapCanvas():
-                    self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
-                    print("[SARTRACKER] xyCoordinates signal disconnected successfully")
-            except (TypeError, RuntimeError) as e:
-                # TypeError: Signal not connected (initGui never completed)
-                # RuntimeError: C++ object already deleted
-                if self._map_canvas_connected:
-                    # Only warn if we expected to be connected
-                    print(f"[SARTRACKER] BUG-045: Could not disconnect xyCoordinates: {e}")
-            except Exception as e:
-                # BUG-045 FIX: Catch any other exceptions to ensure cleanup continues
-                print(f"[SARTRACKER] BUG-045: Unexpected error disconnecting xyCoordinates: {e}")
-            finally:
-                self._map_canvas_connected = False
+            # Phase 5: xyCoordinates signal handled by CoordinatesController.cleanup()
+            # (called in early cleanup above). Only do fallback disconnect if controller
+            # was not available or cleanup didn't run for some reason.
+            if not self.coordinates_controller:
+                # Fallback: Disconnect map canvas mouse move signal manually
+                # BUG-045 FIX: Always attempt disconnection regardless of flag state
+                # Flag may be out of sync due to exceptions during setup
+                try:
+                    if self.iface and self.iface.mapCanvas():
+                        self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
+                        print("[SARTRACKER] xyCoordinates signal disconnected successfully (fallback)")
+                except (TypeError, RuntimeError) as e:
+                    # TypeError: Signal not connected (initGui never completed)
+                    # RuntimeError: C++ object already deleted
+                    if self._map_canvas_connected:
+                        # Only warn if we expected to be connected
+                        print(f"[SARTRACKER] BUG-045: Could not disconnect xyCoordinates: {e}")
+                except Exception as e:
+                    # BUG-045 FIX: Catch any other exceptions to ensure cleanup continues
+                    print(f"[SARTRACKER] BUG-045: Unexpected error disconnecting xyCoordinates: {e}")
+                finally:
+                    self._map_canvas_connected = False
 
             if self.mission_controller:
                 # BUG-078 FIX: Enhanced signal disconnection error handling
@@ -2152,18 +2208,27 @@ class sartracker:
                     action)
                 self.iface.removeToolBarIcon(action)
 
-            # Stop coordinate update timer
-            if self.coords_update_timer or self._coords_updates_enabled:
-                self._disable_coords_updates("plugin unload")
+            # Phase 5: Coordinate cleanup handled by controller (if available)
+            # Controller cleanup was called in early cleanup section above.
+            # Only do fallback cleanup if controller was not available.
+            if not self.coordinates_controller:
+                # Fallback: Stop coordinate update timer
+                if self.coords_update_timer or self._coords_updates_enabled:
+                    self._disable_coords_updates("plugin unload")
 
-            # Remove coordinate label from status bar
-            if self.coords_label:
-                try:
-                    self.iface.statusBarIface().removeWidget(self.coords_label)
-                    self.coords_label.deleteLater()
-                except:
-                    pass
+                # Fallback: Remove coordinate label from status bar
+                if self.coords_label:
+                    try:
+                        self.iface.statusBarIface().removeWidget(self.coords_label)
+                        self.coords_label.deleteLater()
+                    except:
+                        pass
+                    self.coords_label = None
+            else:
+                # Controller cleaned up - just clear our reference
                 self.coords_label = None
+                self.coords_update_timer = None
+                self.coordinates_controller = None
 
             # Deactivate and clean up all map tools
             if self.tool_registry:
