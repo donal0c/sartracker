@@ -193,6 +193,82 @@ class LayerManager(QObject):
         # Connect to project signals for cache management
         self._connect_signals()
 
+    def _read_mission_store_path_from_project(self) -> Optional[str]:
+        """Best-effort read of mission store path from project custom variables."""
+        try:
+            value = self.project.customVariables().get(self.MISSION_STORE_VAR)
+            if value:
+                return str(Path(str(value)).expanduser())
+        except Exception as exc:
+            print(f"[LayerManager] Warning: Could not read mission store path: {exc}")
+        return None
+
+    def _refresh_mission_store_path(self, *, emit_signal: bool = True) -> Optional[str]:
+        """
+        Refresh cached mission store path from the current project.
+
+        Keeps LayerManager state correct when users open/close projects during a
+        single QGIS session.
+        """
+        new_path = self._read_mission_store_path_from_project()
+        if new_path == "":
+            new_path = None
+        if new_path != self._mission_store_path:
+            old = self._mission_store_path
+            self._mission_store_path = new_path
+            if emit_signal:
+                try:
+                    self.mission_store_changed.emit(new_path or "")
+                except Exception:
+                    pass
+            self._log("INFO", f"Mission store updated: {old} → {new_path}")
+        return self._mission_store_path
+
+    def on_project_read(self):
+        """
+        Notify LayerManager that the active project has changed or finished loading.
+
+        Clears caches and refreshes project-backed state (mission store path).
+        """
+        with self._cache_lock:
+            self._layer_cache.clear()
+            self._group_cache.clear()
+        self._layer_provider_uris.clear()
+        self._refresh_mission_store_path(emit_signal=True)
+
+    def is_sar_project(self) -> bool:
+        """
+        Return True if the current project appears to be a SAR Tracker project.
+
+        Used to avoid mutating unrelated user projects during startup.
+        """
+        try:
+            custom_vars = self.project.customVariables()
+        except Exception:
+            custom_vars = {}
+
+        try:
+            if custom_vars.get(self.MISSION_STORE_VAR):
+                return True
+        except Exception:
+            pass
+
+        try:
+            if custom_vars.get("sar_layer_schema"):
+                return True
+        except Exception:
+            pass
+
+        try:
+            root = self.project.layerTreeRoot()
+            sar_group = root.findGroup(GroupNames.ROOT) if root else None
+            if sar_group:
+                return True
+        except Exception:
+            pass
+
+        return False
+
     def _log(self, level: str, message: str):
         """Consistent logging helper for LayerManager."""
         try:
@@ -226,9 +302,7 @@ class LayerManager(QObject):
     def _load_mission_store_path(self) -> Optional[str]:
         """Read mission store path from project custom variables."""
         try:
-            value = self.project.customVariables().get(self.MISSION_STORE_VAR)
-            if value:
-                return str(Path(value).expanduser())
+            return self._read_mission_store_path_from_project()
         except Exception as exc:
             print(f"[LayerManager] Warning: Could not load mission store path: {exc}")
         return None
@@ -279,8 +353,8 @@ class LayerManager(QObject):
             self.mission_store_changed.emit(normalized)
 
     def get_mission_store(self) -> Optional[str]:
-        """Return the configured mission store path, if any."""
-        return self._mission_store_path
+        """Return the configured mission store path, if any (refreshing from project)."""
+        return self._refresh_mission_store_path(emit_signal=False)
 
     def clear_mission_store(self):
         """Remove the mission store association from the project."""
@@ -377,7 +451,7 @@ class LayerManager(QObject):
             return ""
 
     def _mission_store_enabled(self) -> bool:
-        return bool(self._mission_store_path)
+        return bool(self._refresh_mission_store_path(emit_signal=False))
 
     def _notify_metadata_warning(self, message: str):
         """Best-effort helper to warn users about metadata issues."""
@@ -480,20 +554,22 @@ class LayerManager(QObject):
 
     def _on_project_cleared(self):
         """
-        Rebuild SAR Tracker layer structure after project is cleared.
+        Handle QGIS project clear events.
 
-        Prevents SAR layers from remaining absent in the QGIS Layers panel
-        after the user declines to save and QGIS resets the project.
+        QGIS clears projects during startup and when opening different projects.
+        The plugin must not rebuild/create SAR layers here, because doing so can
+        mark a transient project dirty and trigger QGIS' "Do you want to save
+        the current project?" prompt unexpectedly.
         """
         if self._application_closing:
-            self._log("INFO", "Project cleared during application shutdown; skipping rebuild")
+            self._log("INFO", "Project cleared during application shutdown; skipping state refresh")
             return
 
         try:
-            print("[LayerManager] Project cleared detected; rebuilding SAR layer structure")
-            self.ensure_structure(auto_migrate=False)
+            print("[LayerManager] Project cleared detected; refreshing LayerManager state")
+            self.on_project_read()
         except Exception as exc:
-            self._log("WARN", f"Failed to rebuild structure after project clear: {exc}")
+            self._log("WARN", f"Failed to refresh state after project clear: {exc}")
 
     def eventFilter(self, obj, event):
         """Watch the QGIS main window for close events to detect shutdown earlier."""

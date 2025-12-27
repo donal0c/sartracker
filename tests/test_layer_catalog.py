@@ -45,9 +45,14 @@ class MetadataStubLayerManager:
         self.read_fail = read_fail
         self.write_fail = write_fail
         self._metadata = {}
+        self.ensure_calls = 0
 
     def ensure_structure(self):
+        self.ensure_calls += 1
         return None
+
+    def is_sar_project(self):
+        return False
 
     def get_layer_metadata(self, _layer_id):
         if self.read_fail:
@@ -138,6 +143,60 @@ class StubTaskManager:
         self.cancelled.append(task_id)
         return True
 
+
+class StubCacheLayerManager:
+    """LayerManager stub focused on _build_cache startup gating behavior."""
+
+    def __init__(self, *, is_sar_project: bool):
+        self._is_sar_project = is_sar_project
+        self.ensure_calls = 0
+
+    def is_sar_project(self):
+        return self._is_sar_project
+
+    def ensure_structure(self, *args, **kwargs):
+        self.ensure_calls += 1
+        return True
+
+    def get_layer(self, _layer_id):
+        return None
+
+    def get_layer_metadata(self, _layer_id):
+        return {}
+
+
+def test_catalog_build_cache_does_not_ensure_structure_for_non_sar_project(monkeypatch):
+    layer_catalog = _install_catalog_module(monkeypatch)
+
+    class FakeIface:
+        def messageBar(self):
+            return "bar"
+
+        def mainWindow(self):
+            return None
+
+    mgr = StubCacheLayerManager(is_sar_project=False)
+    svc = layer_catalog.LayerCatalogService(FakeIface(), mgr)
+
+    assert mgr.ensure_calls == 0
+    assert isinstance(svc._groups, dict)
+
+
+def test_catalog_build_cache_ensures_structure_for_sar_project(monkeypatch):
+    layer_catalog = _install_catalog_module(monkeypatch)
+
+    class FakeIface:
+        def messageBar(self):
+            return "bar"
+
+        def mainWindow(self):
+            return None
+
+    mgr = StubCacheLayerManager(is_sar_project=True)
+    svc = layer_catalog.LayerCatalogService(FakeIface(), mgr)
+
+    assert mgr.ensure_calls == 1
+    assert isinstance(svc._groups, dict)
     def cancel_all(self):
         self.cancel_all_called = True
 

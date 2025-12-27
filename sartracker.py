@@ -1093,19 +1093,15 @@ class sartracker:
         if LayerManager is not None:
             try:
                 self.layer_manager = LayerManager(self.iface)
-
-                # Ensure canonical layer structure exists
-                structure_ok = self.layer_manager.ensure_structure(auto_migrate=True)
-
-                if structure_ok:
-                    print("[SARTRACKER] Layer structure initialized successfully")
-                else:
-                    warning(
-                        self.iface.messageBar(),
-                        "Layer Structure",
-                        "Layer structure verification failed. Use 'Repair Layers' in Settings if needed.",
-                        duration=5
-                    )
+                # IMPORTANT: Do not mutate the current project during plugin load.
+                # QGIS may still be opening the startup project/template; writing
+                # to the project here can mark it dirty and trigger the
+                # "Do you want to save the current project?" prompt on startup.
+                #
+                # Layer structure is instead ensured lazily:
+                # - when a mission store is set/created
+                # - when opening a SAR project (detected post-projectRead)
+                print("[SARTRACKER] LayerManager initialized (structure init deferred)")
 
             except Exception as e:
                 self.layer_manager = None
@@ -1133,6 +1129,9 @@ class sartracker:
         self._mission_coordinators_cache: str = ""
         self._last_mission_state = None
         self._is_finalizing: bool = False  # Race condition protection
+
+        # Track project changes to avoid double-running startup sync logic.
+        self._last_project_signature: Optional[str] = None
 
         # Initialize layers controller
         self.layers_controller = LayersController(
@@ -1349,6 +1348,25 @@ class sartracker:
         self.sar_panel.gpx_watch_folder_requested.connect(self._on_gpx_watch_folder)
         self._update_measurement_overlay_indicator()
         self._load_existing_mission_storage_state()
+
+        # Keep mission/layer state in sync when users open/close projects.
+        # This also covers the startup project being read after plugin load.
+        try:
+            if hasattr(self.iface, "projectRead"):
+                self.iface.projectRead.connect(self._on_project_read)
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: could not connect projectRead: {exc}")
+        try:
+            if hasattr(self.iface, "newProjectCreated"):
+                self.iface.newProjectCreated.connect(self._on_new_project_created)
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: could not connect newProjectCreated: {exc}")
+
+        # Defer a post-startup sync to avoid mutating the project during QGIS startup.
+        try:
+            QTimer.singleShot(0, lambda: self._sync_project_state(reason="startup"))
+        except Exception:
+            pass
 
         # ============================================================================
         # PHASE 3: Provider Controller Setup
@@ -2175,6 +2193,18 @@ class sartracker:
             # Disconnect application aboutToQuit signal (may already be disconnected by lifecycle)
             try:
                 QCoreApplication.instance().aboutToQuit.disconnect(self._on_app_about_to_quit)
+            except Exception:
+                pass
+
+            # Disconnect project lifecycle signals (avoid duplicate callbacks on reload)
+            try:
+                if hasattr(self.iface, "projectRead"):
+                    self.iface.projectRead.disconnect(self._on_project_read)
+            except Exception:
+                pass
+            try:
+                if hasattr(self.iface, "newProjectCreated"):
+                    self.iface.newProjectCreated.disconnect(self._on_new_project_created)
             except Exception:
                 pass
 
@@ -3183,6 +3213,88 @@ class sartracker:
                 print("[SARTRACKER] Catalog refreshed successfully")
             except Exception as e:
                 print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
+
+    # ------------------------------------------------------------------
+    # Project lifecycle hooks (startup + project open/new)
+    # ------------------------------------------------------------------
+    def _on_project_read(self):
+        """Handle QGIS project read (open/restore/template load)."""
+        self._sync_project_state(reason="projectRead")
+
+    def _on_new_project_created(self):
+        """Handle QGIS new project created."""
+        self._sync_project_state(reason="newProjectCreated")
+
+    def _sync_project_state(self, reason: str = "unknown"):
+        """
+        Synchronize LayerManager + mission UI with the current QGIS project.
+
+        Life-safety: This must not mutate non-SAR projects. We only ensure the
+        SAR layer structure when the project already looks like a SAR Tracker
+        project (e.g., it contains SAR customVariables / root group).
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if not self.layer_manager:
+            return
+
+        project = QgsProject.instance()
+        try:
+            project_file = project.fileName() or ""
+        except Exception:
+            project_file = ""
+
+        try:
+            store = self.layer_manager.get_mission_store() or ""
+        except Exception:
+            store = ""
+
+        signature = f"{project_file}|{store}"
+        if signature == self._last_project_signature:
+            return
+        self._last_project_signature = signature
+
+        try:
+            self.layer_manager.on_project_read()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: LayerManager project sync failed ({reason}): {exc}")
+
+        # Only touch the project if it already indicates a SAR mission project.
+        # Never create/repair structure on an unsaved startup "Untitled Project"
+        # unless a mission store is already configured. This avoids dirtying the
+        # transient startup project and triggering QGIS' save prompt.
+        should_ensure = False
+        try:
+            is_sar = bool(self.layer_manager.is_sar_project())
+            should_ensure = bool(store) or (bool(project_file) and is_sar)
+        except Exception:
+            should_ensure = False
+
+        if should_ensure:
+            try:
+                self.layer_manager.ensure_structure(auto_migrate=True)
+            except Exception as exc:
+                self._log_exception(f"_sync_project_state.ensure_structure.{reason}", exc)
+                warning(
+                    self.iface.messageBar(),
+                    "Layer Structure",
+                    f"Could not verify SAR layer structure for this project: {exc}",
+                    duration=6,
+                )
+            # Optional: helicopter placeholder layers are initialized lazily to
+            # avoid dirtying the startup "Untitled Project" during plugin load.
+            try:
+                if self.layers_controller:
+                    self.layers_controller.ensure_helicopter_layers()
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Helicopter layer init failed: {exc}")
+
+        # Refresh mission storage UI + resume prompt logic now that project vars are stable.
+        try:
+            if self.sar_panel:
+                self._load_existing_mission_storage_state()
+        except Exception as exc:
+            self._log_exception(f"_sync_project_state.load_existing.{reason}", exc)
 
     def _load_existing_mission_storage_state(self):
         """Initialize mission storage label based on current LayerManager state."""
@@ -5422,7 +5534,35 @@ class sartracker:
             return
 
         try:
-            count = self.layers_controller.count_measurement_overlays()
+            # IMPORTANT: Avoid mutating the startup "Untitled Project".
+            # Counting overlays can create the Lines layer if missing, which
+            # dirties the project and can trigger QGIS' save prompt on startup.
+            # Only count when we're in a real SAR project context.
+            project = QgsProject.instance()
+            project_filename = ""
+            try:
+                project_filename = project.fileName() or ""
+            except Exception:
+                project_filename = ""
+
+            mission_store = ""
+            try:
+                if self.layer_manager:
+                    mission_store = str(self.layer_manager.get_mission_store() or "")
+            except Exception:
+                mission_store = ""
+
+            is_sar = False
+            try:
+                if self.layer_manager:
+                    is_sar = bool(self.layer_manager.is_sar_project())
+            except Exception:
+                is_sar = False
+
+            if not ((project_filename or mission_store) and is_sar):
+                count = 0
+            else:
+                count = self.layers_controller.count_measurement_overlays()
         except Exception as e:
             print(f"[SARTRACKER] Warning: Could not count measurement overlays: {e}")
             count = 0

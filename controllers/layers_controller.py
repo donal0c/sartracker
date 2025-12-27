@@ -117,9 +117,34 @@ class LayersController:
             raise RuntimeError(f"Failed to initialize DrawingLayerManager: {e}")
 
         try:
-            self.helicopters = HelicopterLayerManager(iface)
+            # IMPORTANT: Do not create placeholder layers during plugin startup on
+            # an unsaved "Untitled Project". Creating groups/layers marks the
+            # project dirty and can trigger QGIS' save prompt on startup.
+            #
+            # Helicopter placeholder layers are optional and can be initialized
+            # later for SAR projects (file-backed or mission-store backed).
+            should_init_helicopters = False
+            try:
+                project_filename = self.project.fileName() or ""
+            except Exception:
+                project_filename = ""
+            try:
+                mission_store = self.layer_manager.get_mission_store() if self.layer_manager else ""
+            except Exception:
+                mission_store = ""
+            try:
+                is_sar = self.layer_manager.is_sar_project() if self.layer_manager else False
+            except Exception:
+                is_sar = False
+
+            if (project_filename or mission_store) and is_sar:
+                should_init_helicopters = True
+
+            self.helicopters = HelicopterLayerManager(iface) if should_init_helicopters else None
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize HelicopterLayerManager: {e}")
+            # NON-FATAL: Helicopter layers are optional; core SAR functionality must work without them.
+            self.helicopters = None
+            logger.warning("Failed to initialize HelicopterLayerManager (optional): %s", e)
 
         # Initialize catalog service (Phase 1 - CalTopo Console)
         # NON-FATAL: Catalog is optional, core SAR functionality works without it
@@ -131,6 +156,46 @@ class LayersController:
             logger.warning("Failed to initialize catalog service: %s", e)
             logger.warning("Plugin will continue without catalog (core functionality unaffected)")
             logger.exception("Layer catalog initialization error")
+
+    def ensure_helicopter_layers(self) -> bool:
+        """
+        Lazily initialize helicopter placeholder layers for SAR projects.
+
+        IMPORTANT: Must not mutate an unsaved startup "Untitled Project".
+        Returns:
+            True if helicopter manager is initialized or already present.
+        """
+        if getattr(self, "helicopters", None):
+            return True
+
+        if not getattr(self, "layer_manager", None):
+            return False
+
+        try:
+            project_filename = self.project.fileName() or ""
+        except Exception:
+            project_filename = ""
+
+        try:
+            mission_store = self.layer_manager.get_mission_store() or ""
+        except Exception:
+            mission_store = ""
+
+        try:
+            is_sar = bool(self.layer_manager.is_sar_project())
+        except Exception:
+            is_sar = False
+
+        if not ((project_filename or mission_store) and is_sar):
+            return False
+
+        try:
+            self.helicopters = HelicopterLayerManager(self.iface)
+            return True
+        except Exception as exc:
+            self.helicopters = None
+            logger.warning("Failed to lazily initialize HelicopterLayerManager (optional): %s", exc)
+            return False
 
     def _assert_not_read_only(self, operation: str):
         """Raise if mission is finalized/read-only."""

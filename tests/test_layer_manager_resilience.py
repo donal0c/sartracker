@@ -48,6 +48,27 @@ def _install_qgis_stubs():
         def __init__(self, *args, **kwargs):
             super().__init__()
 
+    class QEvent:
+        Close = 19
+
+        def __init__(self, event_type=None):
+            self._type = event_type
+
+        def type(self):
+            return self._type
+
+    class QCoreApplication:
+        _inst = None
+
+        def __init__(self):
+            self.aboutToQuit = DummySignal()
+
+        @classmethod
+        def instance(cls):
+            if cls._inst is None:
+                cls._inst = cls()
+            return cls._inst
+
     class QVariant:
         String = "String"
         Int = "Int"
@@ -58,6 +79,8 @@ def _install_qgis_stubs():
     qtcore_mod.QVariant = QVariant
     qtcore_mod.QObject = QObject
     qtcore_mod.pyqtSignal = pyqtSignal
+    qtcore_mod.QEvent = QEvent
+    qtcore_mod.QCoreApplication = QCoreApplication
 
     class QTimer(QObject):
         def __init__(self, *_args, **_kwargs):
@@ -125,6 +148,7 @@ def _install_qgis_stubs():
         def __init__(self):
             self._custom_vars = {}
             self.layersWillBeRemoved = DummySignal()
+            self.cleared = DummySignal()
 
         @classmethod
         def instance(cls):
@@ -525,6 +549,52 @@ def test_set_mission_store_directory_failure(monkeypatch, tmp_path):
     assert mgr.get_mission_store() is None
     assert messages, "mission store failures should surface an error message"
     assert "Failed to prepare mission store directory" in messages[0][1]
+
+
+def test_get_mission_store_refreshes_from_project(monkeypatch, tmp_path):
+    _ensure_qgis(monkeypatch)
+    manager = _load_manager_module()
+
+    class FakeIface:
+        def messageBar(self):
+            return "bar"
+
+        def mainWindow(self):
+            return None
+
+    mgr = manager.LayerManager(FakeIface())
+    project = manager.QgsProject.instance()
+    store_path = tmp_path / "mission.gpkg"
+    project.setCustomVariables({manager.LayerManager.MISSION_STORE_VAR: str(store_path)})
+
+    assert mgr.get_mission_store() == str(store_path)
+
+
+def test_project_cleared_does_not_rebuild_structure(monkeypatch):
+    _ensure_qgis(monkeypatch)
+    manager = _load_manager_module()
+
+    class FakeIface:
+        def messageBar(self):
+            return "bar"
+
+        def mainWindow(self):
+            return None
+
+    mgr = manager.LayerManager(FakeIface())
+
+    calls = {"ensure_structure": 0}
+
+    def fake_ensure_structure(*_args, **_kwargs):
+        calls["ensure_structure"] += 1
+        return True
+
+    monkeypatch.setattr(mgr, "ensure_structure", fake_ensure_structure)
+
+    project = manager.QgsProject.instance()
+    project.cleared.emit()
+
+    assert calls["ensure_structure"] == 0
 
 
 def test_metadata_migration_sets_guard_and_resets(monkeypatch):

@@ -1284,12 +1284,61 @@ class LayerCatalogService(QObject):
         """
         logger.info("Building layer catalog cache")
 
-        # Ensure LayerManager structure exists
+        # IMPORTANT: Do not mutate generic/non-SAR projects during startup.
+        # Creating SAR groups/layers or writing project variables will mark the
+        # current project dirty. On QGIS startup, the current project is often
+        # an "Untitled Project" that QGIS then replaces (restore session/open
+        # template/open last project). If we dirty it here, QGIS prompts:
+        # "Do you want to save the current project?"
+        #
+        # Only ensure structure when the project already appears to be a SAR
+        # Tracker project (e.g., mission store configured or SAR root group /
+        # schema vars present). Otherwise the catalog should remain empty until
+        # the user explicitly initializes/starts a mission.
+        should_ensure_structure = False
+        project_filename = ""
         try:
-            self.layer_manager.ensure_structure()
-        except Exception as e:
-            logger.exception("LayerManager.ensure_structure failed")
-            self._notify_error("Layer Catalog", f"Layer structure incomplete: {e}")
+            project_filename = self.project.fileName() or ""
+        except Exception:
+            project_filename = ""
+        try:
+            is_sar_project_fn = getattr(self.layer_manager, "is_sar_project", None)
+            if callable(is_sar_project_fn):
+                should_ensure_structure = bool(is_sar_project_fn())
+            else:
+                get_store = getattr(self.layer_manager, "get_mission_store", None)
+                if callable(get_store):
+                    should_ensure_structure = bool(get_store())
+        except Exception:
+            should_ensure_structure = False
+
+        # Hard guard for QGIS startup: never create/repair structure on an
+        # unsaved "Untitled Project" unless a mission store is already configured.
+        # This avoids dirtying the startup project and triggering QGIS' save prompt.
+        mission_store = ""
+        try:
+            get_store = getattr(self.layer_manager, "get_mission_store", None)
+            if callable(get_store):
+                mission_store = str(get_store() or "")
+        except Exception:
+            mission_store = ""
+
+        if should_ensure_structure and (mission_store or project_filename):
+            try:
+                try:
+                    self.layer_manager.ensure_structure(auto_migrate=True)
+                except TypeError:
+                    # Backwards-compatible fallback for stubs/older signatures
+                    self.layer_manager.ensure_structure()
+            except Exception as e:
+                logger.exception("LayerManager.ensure_structure failed")
+                self._notify_error("Layer Catalog", f"Layer structure incomplete: {e}")
+        else:
+            logger.info(
+                "Skipping ensure_structure: non-SAR or unsaved project (file='%s', mission_store=%s)",
+                project_filename,
+                "set" if bool(mission_store) else "unset",
+            )
 
         # Disconnect existing per-layer signal hooks before rebuilding cache
         self._disconnect_all_layer_signals()
