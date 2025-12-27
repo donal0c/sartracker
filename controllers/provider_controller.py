@@ -2,38 +2,48 @@
 """
 Provider Controller for SAR Tracker.
 
-Manages data provider lifecycle: selection, testing, polling, and status.
+Manages data provider lifecycle: selection, testing, polling, refresh, and status.
 Ensures provider operations follow AI_CODE_REFERENCE.md patterns for
 timers, tasks, signals, and defensive guards.
 
-Phase 3 - UI & Controller Preparation:
-This controller orchestrates provider changes using the two-phase commit
-pattern from Phase 2, exposes status for diagnostics, and manages polling
-timers with proper cleanup.
+Phase 8 - Provider Workflow Consolidation:
+This controller is the SINGLE OWNER of all provider workflows:
+- Provider selection + connection testing (two-phase commit)
+- Refresh scheduling/polling
+- Refresh/load tasks (start/stop/complete/error handling)
+- Config save/load/migration helpers
 
 Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
+
+LIFE-SAFETY CRITICAL: All async handlers use defensive guards (Pattern 9).
 """
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
-from typing import Optional, Dict, Any
+from datetime import datetime
+from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer, QSettings
+from typing import Optional, Dict, Any, Callable, List
 
 from ..providers.registry import registry as provider_registry
 from ..providers.base import Provider
 from ..utils.task_manager import TaskManager
 from ..utils.notify import (
     info, warning, error, success,
-    safe_error, safe_success, safe_warning
+    safe_error, safe_success, safe_warning, safe_info
 )
+from ..utils.provider_results import sanitize_provider_results
+from ..config.keys import ConfigStore, SETTINGS_KEYS
+from ..utils.secure_store import SecureStore
 
 
 class ProviderController(QObject):
     """
-    Controller for provider selection, connection testing, and polling.
+    Controller for provider selection, connection testing, polling, and refresh.
 
-    Responsibilities:
+    Phase 8 - Single Owner of Provider Workflows:
     - Manage active provider instance + config
     - Orchestrate connection tests via TaskManager (Pattern 6)
     - Control polling timer with four-layer cleanup (Pattern 7)
+    - Own refresh task lifecycle (start/complete/error)
+    - Handle config persistence (save/load/migrate)
     - Emit status updates for UI and diagnostics
     - Implement two-phase commit for provider changes (Phase 2 pattern)
 
@@ -41,7 +51,7 @@ class ProviderController(QObject):
         status_changed: Emitted when provider status changes
             Args: dict with keys:
                 - provider: str (provider name or None)
-                - state: str ('ok', 'error', 'testing', 'connecting')
+                - state: str ('ok', 'error', 'testing', 'connecting', 'refreshing')
                 - message: str (status message for UI)
                 - last_refresh: str or None (ISO timestamp)
                 - devices_count: int (cached device count)
@@ -51,13 +61,43 @@ class ProviderController(QObject):
         config_error: Emitted when provider config validation fails
             Args: str (error message for UI)
 
+        provider_connected: Emitted after successful provider connection
+            Args: (provider_name: str, config: dict)
+
+        refresh_started: Emitted when refresh begins
+            Args: None
+
+        refresh_complete: Emitted when refresh succeeds with sanitized results
+            Args: dict with keys:
+                - current: List[dict] - current positions
+                - breadcrumbs: List[dict] - breadcrumb points
+                - devices: List[dict] - device summaries
+                - breadcrumb_processing: dict or None
+                - breadcrumb_failures: List[str] - device-specific failures
+                - dropped: dict - counts of dropped records
+                - was_cached: bool - True if data came from cache
+                - cache_age_seconds: float or None
+                - outage_recovered: bool - True if this is first success after failures
+                - outage_duration_seconds: float or None
+
+        refresh_error: Emitted when refresh fails
+            Args: str (error message)
+
     LIFE-SAFETY CRITICAL: All async handlers use defensive guards (Pattern 9).
     """
 
+    # Status and config signals
     status_changed = pyqtSignal(dict)   # {'provider': str, 'state': 'ok|error|testing', ...}
     config_error = pyqtSignal(str)      # For UI to display via notify.error
     provider_connected = pyqtSignal(str, dict)  # (provider_name, config) - emitted on successful connection
-    refresh_requested = pyqtSignal()  # Trigger data refresh (connected to sartracker._on_refresh_data)
+
+    # Refresh lifecycle signals (Phase 8)
+    refresh_started = pyqtSignal()      # Emitted when refresh begins
+    refresh_complete = pyqtSignal(dict) # Emitted with sanitized results
+    refresh_error = pyqtSignal(str)     # Emitted with error message
+
+    # Legacy signal - kept for backwards compatibility during migration
+    refresh_requested = pyqtSignal()    # DEPRECATED: Use start_refresh() instead
 
     def __init__(self, iface, task_manager: TaskManager, parent=None):
         """
@@ -100,6 +140,22 @@ class ProviderController(QObject):
         self._last_error_message: Optional[str] = None
         self._last_refresh_duration_ms: Optional[float] = None
         self._last_status_dict = self._build_status_dict('ok', 'No provider loaded')
+
+        # ================================================================
+        # Phase 8: Refresh state management
+        # ================================================================
+        self._refresh_in_progress = False
+        self._current_refresh_task = None
+        self._refresh_started_at: Optional[datetime] = None
+
+        # SAR-la0: Track network failures for recovery notification
+        self._consecutive_refresh_failures = 0
+        self._first_failure_time: Optional[datetime] = None
+
+        # Dependency injection slots (set via set_*() methods)
+        self._layers_controller = None
+        self._sar_panel = None
+        self._mission_start_getter: Optional[Callable[[], Optional[str]]] = None
 
     def set_provider(self, provider_name: str, config: Dict[str, Any], test_only: bool = False):
         """
@@ -334,8 +390,9 @@ class ProviderController(QObject):
 
             # FIX ISSUE #1: Auto-load data after successful connection
             # Trigger initial refresh so map isn't empty (regression fix)
+            # Phase 8: Call start_refresh() directly instead of emitting deprecated signal
             print(f"[PROVIDER_CONTROLLER] Triggering initial data load for {self.provider_name}")
-            self.refresh_requested.emit()
+            self.start_refresh()
 
         except Exception as e:
             # DEFENSIVE: Catch all exceptions to prevent error handler crashes
@@ -488,9 +545,8 @@ class ProviderController(QObject):
             )
             return False
 
-        # Emit refresh signal (sartracker.py will handle actual refresh via _on_refresh_data)
-        self.refresh_requested.emit()
-        return True
+        # Phase 8: Call start_refresh() directly instead of emitting deprecated signal
+        return self.start_refresh()
 
     def _on_poll_timer(self):
         """
@@ -646,6 +702,19 @@ class ProviderController(QObject):
             # Clean up shadow state
             self._cleanup_shadow_state()
 
+            # Phase 8: Cancel any in-progress refresh
+            if self._current_refresh_task:
+                try:
+                    self._current_refresh_task.cancel()
+                except Exception:
+                    pass
+                self._current_refresh_task = None
+
+            # Clear dependency references
+            self._layers_controller = None
+            self._sar_panel = None
+            self._mission_start_getter = None
+
             print("[PROVIDER_CONTROLLER] Cleanup complete")
 
         except Exception as e:
@@ -653,3 +722,727 @@ class ProviderController(QObject):
             print(f"[PROVIDER_CONTROLLER] Warning: Error during cleanup: {e}")
             import traceback
             traceback.print_exc()
+
+    # ========================================================================
+    # Phase 8: Dependency Injection
+    # ========================================================================
+
+    def set_layers_controller(self, layers_controller):
+        """
+        Inject layers controller for refresh result handling.
+
+        Args:
+            layers_controller: LayersController instance for updating map layers
+
+        Qt5/Qt6 Compatible: Pure Python reference assignment.
+        """
+        self._layers_controller = layers_controller
+
+    def set_panel(self, panel):
+        """
+        Inject SAR panel for UI updates during refresh.
+
+        Args:
+            panel: SARPanel instance for device list and loading state
+
+        Qt5/Qt6 Compatible: Pure Python reference assignment.
+        """
+        self._sar_panel = panel
+
+    def set_mission_start_getter(self, getter: Callable[[], Optional[str]]):
+        """
+        Inject callback to get mission start time for breadcrumb filtering.
+
+        Args:
+            getter: Callable returning ISO8601 timestamp or None
+
+        Qt5/Qt6 Compatible: Pure Python callback.
+        """
+        self._mission_start_getter = getter
+
+    # ========================================================================
+    # Phase 8: Refresh Workflow (Consolidated)
+    # ========================================================================
+
+    def start_refresh(self, since_iso: Optional[str] = None) -> bool:
+        """
+        Start a data refresh using background task.
+
+        This method owns the entire refresh lifecycle:
+        - Creates provider-specific refresh task
+        - Manages refresh state
+        - Emits signals for UI updates
+
+        Args:
+            since_iso: Optional ISO8601 timestamp for breadcrumb filtering.
+                      If None and mission_start_getter is set, uses mission start time.
+
+        Returns:
+            True if refresh started, False if blocked or no provider
+
+        Qt5/Qt6 Compatible: Uses QgsTask via TaskManager.
+        """
+        if self._is_shutting_down:
+            return False
+
+        if not self.provider:
+            safe_warning(
+                self.iface,
+                "SAR Tracker",
+                "No data source loaded. Please load a data source first.",
+                duration=3
+            )
+            return False
+
+        # Concurrent refresh protection
+        if self._refresh_in_progress:
+            safe_warning(
+                self.iface,
+                "SAR Tracker",
+                "Refresh already in progress, please wait...",
+                duration=2
+            )
+            return False
+
+        try:
+            # Set refresh flag
+            self._refresh_in_progress = True
+            self._refresh_started_at = datetime.now()
+
+            # Emit started signal for UI
+            self.refresh_started.emit()
+            self._emit_status('refreshing', 'Refreshing data...')
+
+            # Show loading state in panel if available
+            if self._sar_panel:
+                try:
+                    self._sar_panel.set_loading_state(True)
+                except Exception as e:
+                    print(f"[PROVIDER_CONTROLLER] Warning: Could not set panel loading state: {e}")
+
+            # Get mission start time for breadcrumb filtering
+            effective_since = since_iso
+            if effective_since is None and self._mission_start_getter:
+                try:
+                    effective_since = self._mission_start_getter()
+                except Exception as e:
+                    print(f"[PROVIDER_CONTROLLER] Warning: Could not get mission start time: {e}")
+
+            # Create provider-specific background task
+            task = self.provider.create_refresh_task(
+                "Refreshing tracking data",
+                since_iso=effective_since
+            )
+
+            # Start task with managed lifecycle
+            self.task_manager.start_task(
+                task=task,
+                on_complete=self._on_refresh_task_complete,
+                on_error=self._on_refresh_task_error,
+                task_id="provider_refresh"
+            )
+
+            # Store task reference for cancellation
+            self._current_refresh_task = task
+
+            print(f"[PROVIDER_CONTROLLER] Refresh started for {self.provider_name}")
+            return True
+
+        except Exception as e:
+            # Reset state on setup error
+            self._refresh_in_progress = False
+            self._refresh_started_at = None
+            self._clear_loading_state()
+
+            print(f"[PROVIDER_CONTROLLER] Error starting refresh: {e}")
+            import traceback
+            traceback.print_exc()
+
+            safe_error(
+                self.iface,
+                "Refresh Error",
+                f"Failed to start refresh: {str(e)}",
+                duration=5
+            )
+            return False
+
+    def _on_refresh_task_complete(self, task):
+        """
+        Handle successful refresh completion (runs in main thread).
+
+        Processes results, updates layers and panel, emits refresh_complete signal.
+
+        Args:
+            task: Completed ProviderRefreshTask with results
+
+        SAFETY: May be called after controller destruction (Pattern 9).
+        """
+        # BUG-030 FIX: Check shutdown flag FIRST
+        if self._is_shutting_down:
+            print("[PROVIDER_CONTROLLER] Refresh completed during shutdown - ignoring")
+            return
+
+        # CRITICAL GUARD: Check if controller components still exist
+        if not self.iface or not self.task_manager:
+            print("[PROVIDER_CONTROLLER] Refresh completed after controller destroyed")
+            self._refresh_in_progress = False
+            return
+
+        try:
+            # Reset refresh state
+            self._refresh_in_progress = False
+            self._current_refresh_task = None
+
+            # SAR-la0: Detect network recovery after failures
+            was_in_outage = self._consecutive_refresh_failures > 0
+            outage_duration = None
+            if was_in_outage and self._first_failure_time:
+                outage_duration = (datetime.now() - self._first_failure_time).total_seconds()
+
+            # Reset failure tracking on success
+            self._consecutive_refresh_failures = 0
+            self._first_failure_time = None
+
+            # Hide loading state
+            self._clear_loading_state()
+
+            # Check if task was cancelled
+            if task.isCanceled():
+                safe_info(self.iface, "SAR Tracker", "Refresh cancelled", duration=2)
+                return
+
+            # Get and sanitize results from background task
+            if not task.results:
+                safe_warning(
+                    self.iface,
+                    "SAR Tracker",
+                    "Refresh completed but no data returned",
+                    duration=3
+                )
+                return
+
+            sanitized, dropped = sanitize_provider_results(task.results)
+            current = sanitized.get('current', [])
+            breadcrumbs = sanitized.get('breadcrumbs', [])
+            devices = sanitized.get('devices', [])
+            breadcrumb_processing = sanitized.get('breadcrumb_processing')
+            breadcrumb_failures = task.results.get('breadcrumb_failures', []) if task.results else []
+
+            print(
+                f"[PROVIDER_CONTROLLER] Refresh payload -> "
+                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
+            )
+
+            # Update cached stats for diagnostics
+            self._cached_device_count = len(devices) if devices else 0
+            self._last_refresh_time = datetime.now().isoformat()
+            if self._refresh_started_at:
+                self._last_refresh_duration_ms = (
+                    datetime.now() - self._refresh_started_at
+                ).total_seconds() * 1000.0
+            else:
+                self._last_refresh_duration_ms = None
+            self._refresh_started_at = None
+
+            # Surface validation drops (non-fatal)
+            dropped_total = sum(dropped.values()) if isinstance(dropped, dict) else 0
+            if dropped_total:
+                print(
+                    f"[PROVIDER_CONTROLLER] Dropped invalid tracking records - "
+                    f"current:{dropped.get('current', 0)} breadcrumbs:{dropped.get('breadcrumbs', 0)} "
+                    f"devices:{dropped.get('devices', 0)}"
+                )
+                safe_warning(
+                    self.iface,
+                    "SAR Tracker",
+                    f"Ignored {dropped_total} invalid tracking records (see log for details).",
+                    duration=4
+                )
+
+            # SAR-nzf: Surface partial breadcrumb failures
+            if breadcrumb_failures:
+                failed_devices = []
+                for failure in breadcrumb_failures[:5]:
+                    if ':' in failure:
+                        device_name = failure.split(':')[0].strip()
+                        failed_devices.append(device_name)
+                    else:
+                        failed_devices.append(failure[:20])
+
+                if len(breadcrumb_failures) > 5:
+                    devices_display = ", ".join(failed_devices) + f" (+{len(breadcrumb_failures) - 5} more)"
+                else:
+                    devices_display = ", ".join(failed_devices)
+
+                safe_warning(
+                    self.iface,
+                    "Trail Data Incomplete",
+                    f"Failed to fetch trails for: {devices_display}",
+                    duration=6
+                )
+                print(f"[PROVIDER_CONTROLLER] SAR-nzf: Breadcrumb failures: {failed_devices}")
+
+            # Update layers if controller available
+            if self._layers_controller:
+                try:
+                    self._layers_controller.update_current_positions(current)
+                    if not current:
+                        print("[PROVIDER_CONTROLLER] Current positions empty - clearing layer")
+                except Exception as layer_err:
+                    print(f"[PROVIDER_CONTROLLER] ERROR update_current_positions: {layer_err}")
+                    import traceback
+                    traceback.print_exc()
+
+                try:
+                    self._layers_controller.update_breadcrumbs(
+                        breadcrumbs,
+                        processed_segments=breadcrumb_processing
+                    )
+                    if not breadcrumbs:
+                        print("[PROVIDER_CONTROLLER] Breadcrumb payload empty - clearing layer")
+                except Exception as breadcrumb_err:
+                    print(f"[PROVIDER_CONTROLLER] ERROR update_breadcrumbs: {breadcrumb_err}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Update device list in panel if available
+            if self._sar_panel:
+                try:
+                    self._sar_panel.update_devices(devices)
+                except Exception as panel_err:
+                    print(f"[PROVIDER_CONTROLLER] ERROR update_devices: {panel_err}")
+                    import traceback
+                    traceback.print_exc()
+
+            # Detect cached data for warning
+            was_cached = False
+            cache_age_seconds = None
+            cache_positions = []  # Initialize outside if block for scope safety
+            if current:
+                cache_positions = [p for p in current if p.get('data_origin') == 'cache']
+                if cache_positions:
+                    was_cached = True
+                    cache_age_seconds = max(p.get('cache_age_seconds', 0) for p in cache_positions)
+
+            # Build result dict for signal
+            result = {
+                'current': current,
+                'breadcrumbs': breadcrumbs,
+                'devices': devices,
+                'breadcrumb_processing': breadcrumb_processing,
+                'breadcrumb_failures': breadcrumb_failures,
+                'dropped': dropped,
+                'was_cached': was_cached,
+                'cache_age_seconds': cache_age_seconds,
+                'outage_recovered': was_in_outage,
+                'outage_duration_seconds': outage_duration,
+            }
+
+            # Emit refresh_complete signal for any additional handlers
+            self.refresh_complete.emit(result)
+
+            # Update status
+            self._emit_status('ok', f'Last refresh: {len(devices)} devices')
+
+            # Show user feedback based on cache/outage state
+            if was_cached and cache_age_seconds:
+                age_minutes = cache_age_seconds / 60
+                if age_minutes >= 60:
+                    age_display = f"{age_minutes / 60:.1f} hours"
+                else:
+                    age_display = f"{age_minutes:.0f} minutes"
+
+                device_cache_stale = any(p.get('device_cache_stale') for p in current)
+                roster_warning = " Team roster may have changed!" if device_cache_stale else ""
+
+                safe_error(
+                    self.iface,
+                    "OFFLINE MODE",
+                    f"Showing CACHED positions ({age_display} old) - Network unavailable!{roster_warning}",
+                    duration=10
+                )
+                print(f"[PROVIDER_CONTROLLER] SAR-fhd: Serving {len(cache_positions)} cached positions")
+
+            elif was_in_outage and outage_duration is not None:
+                # SAR-la0: Show connection restored notification
+                outage_minutes = outage_duration / 60
+                if outage_minutes >= 60:
+                    outage_display = f"{outage_minutes / 60:.1f} hours"
+                elif outage_minutes >= 1:
+                    outage_display = f"{outage_minutes:.0f} minutes"
+                else:
+                    outage_display = f"{outage_duration:.0f} seconds"
+
+                safe_success(
+                    self.iface,
+                    "CONNECTION RESTORED",
+                    f"Network recovered after {outage_display} offline. Positions now live.",
+                    duration=8
+                )
+                print(f"[PROVIDER_CONTROLLER] SAR-la0: Connection restored after {outage_display}")
+
+            elif current or breadcrumbs:
+                safe_success(
+                    self.iface,
+                    "SAR Tracker",
+                    f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
+                    duration=2
+                )
+            else:
+                safe_info(
+                    self.iface,
+                    "SAR Tracker",
+                    "Refresh completed but no tracking data was returned; layers cleared.",
+                    duration=3
+                )
+
+            print(
+                f"[PROVIDER_CONTROLLER] Refresh complete -> "
+                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
+            )
+
+        except Exception as e:
+            # Reset state on processing error
+            self._refresh_in_progress = False
+            self._clear_loading_state()
+
+            print(f"[PROVIDER_CONTROLLER] Error in _on_refresh_task_complete: {e}")
+            import traceback
+            traceback.print_exc()
+
+            safe_error(
+                self.iface,
+                "Refresh Error",
+                f"Error processing refresh results: {str(e)}",
+                duration=5
+            )
+
+    def _on_refresh_task_error(self, task):
+        """
+        Handle refresh task error or termination (runs in main thread).
+
+        Args:
+            task: Failed or terminated ProviderRefreshTask
+
+        SAFETY: May be called after controller destruction (Pattern 9).
+        """
+        # BUG-030 FIX: Check shutdown flag FIRST
+        if self._is_shutting_down:
+            print("[PROVIDER_CONTROLLER] Refresh error during shutdown - ignoring")
+            return
+
+        # CRITICAL GUARD: Check if controller components still exist
+        if not self.iface:
+            print("[PROVIDER_CONTROLLER] Refresh error after controller destroyed")
+            self._refresh_in_progress = False
+            return
+
+        try:
+            # Reset refresh state
+            self._refresh_in_progress = False
+            self._current_refresh_task = None
+            self._refresh_started_at = None
+            self._last_refresh_duration_ms = None
+
+            # SAR-la0: Track consecutive failures for recovery notification
+            self._consecutive_refresh_failures += 1
+            if self._first_failure_time is None:
+                self._first_failure_time = datetime.now()
+                print(f"[PROVIDER_CONTROLLER] SAR-la0: Network outage started at {self._first_failure_time.isoformat()}")
+
+            # Hide loading state
+            self._clear_loading_state()
+
+            # Get error message (defensive hasattr guard)
+            error_msg = (
+                task.error_message
+                if hasattr(task, 'error_message') and task.error_message
+                else "Unknown error during refresh"
+            )
+
+            # Emit error signal
+            self.refresh_error.emit(error_msg)
+
+            # Update status
+            self._emit_status('error', f'Refresh failed: {error_msg}')
+
+            # Show user notification
+            safe_error(
+                self.iface,
+                "Refresh Failed",
+                f"Error refreshing data: {error_msg}",
+                duration=5
+            )
+
+        except Exception as e:
+            # DEFENSIVE: Catch ALL exceptions to prevent crashes in error handler
+            print(f"[PROVIDER_CONTROLLER] Error in _on_refresh_task_error: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # Reset state
+            self._refresh_in_progress = False
+            self._clear_loading_state()
+
+    def _clear_loading_state(self):
+        """Clear loading state in panel if available."""
+        if self._sar_panel:
+            try:
+                self._sar_panel.set_loading_state(False)
+            except Exception:
+                pass
+
+    def cancel_refresh(self):
+        """
+        Cancel any in-progress refresh task.
+
+        Qt5/Qt6 Compatible: Uses QgsTask.cancel().
+        """
+        if self._current_refresh_task:
+            try:
+                self._current_refresh_task.cancel()
+                print("[PROVIDER_CONTROLLER] Refresh task cancelled")
+            except Exception as e:
+                print(f"[PROVIDER_CONTROLLER] Warning: Error cancelling refresh: {e}")
+            finally:
+                self._current_refresh_task = None
+                self._refresh_in_progress = False
+
+    @property
+    def refresh_in_progress(self) -> bool:
+        """Check if a refresh is currently in progress."""
+        return self._refresh_in_progress
+
+    # ========================================================================
+    # Phase 8: Config Persistence
+    # ========================================================================
+
+    def save_config(self, provider_name: str, config: dict):
+        """
+        Save provider configuration to QSettings.
+
+        Called when provider successfully connects. Persists config
+        for auto-restore on next startup.
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Uses QSettings.
+        """
+        try:
+            # Save last provider
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, provider_name)
+
+            # Save provider-specific config
+            if provider_name == 'csv':
+                csv_path = config.get('csv_path', '')
+                ConfigStore.set(SETTINGS_KEYS.PROVIDER_CSV_PATH, csv_path)
+
+            elif provider_name == 'traccar_http':
+                self._persist_traccar_http_settings(config)
+
+            print(f"[PROVIDER_CONTROLLER] Saved provider config: {provider_name}")
+
+        except Exception as e:
+            print(f"[PROVIDER_CONTROLLER] Warning: Failed to save provider config: {e}")
+
+    def load_config_and_auto_connect(self):
+        """
+        Load provider configuration from QSettings and auto-connect if enabled.
+
+        This method handles auto-connection functionality on plugin startup.
+
+        Qt5/Qt6 Compatible: Uses QSettings and ConfigStore.
+        """
+        try:
+            # Check if auto-connect is enabled
+            auto_connect = ConfigStore.get_provider_auto_connect()
+            if not auto_connect:
+                print("[PROVIDER_CONTROLLER] Auto-connect disabled, skipping provider restoration")
+                return
+
+            # Load last provider
+            provider_name = ConfigStore.get(SETTINGS_KEYS.PROVIDER_LAST, None)
+            if not provider_name:
+                print("[PROVIDER_CONTROLLER] No saved provider config found")
+                return
+
+            print(f"[PROVIDER_CONTROLLER] Auto-connecting to saved provider: {provider_name}")
+
+            # Load provider-specific config
+            config = self._load_provider_specific_config(provider_name)
+
+            if not config:
+                print(f"[PROVIDER_CONTROLLER] Incomplete config for {provider_name}, skipping auto-connect")
+                return
+
+            # Auto-connect to provider
+            print(f"[PROVIDER_CONTROLLER] Initiating auto-connect to {provider_name}")
+            self.set_provider(provider_name, config, test_only=False)
+
+        except Exception as e:
+            print(f"[PROVIDER_CONTROLLER] Warning: Failed to auto-connect provider: {e}")
+
+    def _load_provider_specific_config(self, provider_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Load provider-specific configuration from storage.
+
+        Args:
+            provider_name: Provider identifier
+
+        Returns:
+            Config dict or None if incomplete
+        """
+        config = {}
+
+        if provider_name == 'csv':
+            csv_path = ConfigStore.get(SETTINGS_KEYS.PROVIDER_CSV_PATH, None)
+            if csv_path:
+                config['csv_path'] = str(csv_path)
+
+        elif provider_name == 'http_traccar':
+            # Legacy HTTP provider - migrate to traccar_http
+            server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, None)
+            username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, None)
+            password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
+            timeout = ConfigStore.get(
+                SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT,
+                SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT,
+                int
+            )
+
+            if server_url and username and password:
+                legacy_config = {
+                    'server_url': str(server_url),
+                    'username': str(username),
+                    'password': str(password),
+                    'timeout': int(timeout)
+                }
+                converted = self._convert_legacy_http_config(legacy_config)
+                if converted:
+                    # Update stored provider name for future loads
+                    ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, 'traccar_http')
+                    print("[PROVIDER_CONTROLLER] Migrated legacy HTTP provider settings to Traccar HTTP")
+                    return converted
+
+        elif provider_name == 'traccar_http':
+            base_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, None)
+            auth_type = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, 'basic')
+            timeout = ConfigStore.get(
+                SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT,
+                SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT,
+                int
+            )
+            cache_ttl = ConfigStore.get(
+                SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL,
+                SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT,
+                int
+            )
+            enable_cache = ConfigStore.get(
+                SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED,
+                SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT,
+                bool
+            )
+
+            if base_url and auth_type:
+                config = {
+                    'base_url': str(base_url),
+                    'auth_type': str(auth_type),
+                    'timeout_s': int(timeout),
+                    'cache_ttl': int(cache_ttl),
+                    'enable_last_good_cache': bool(enable_cache)
+                }
+
+                if auth_type == 'basic':
+                    username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, None)
+                    # Try SecureStore first
+                    password = SecureStore.get_credential('traccar_http_basic', username)
+                    if not password:
+                        # Fallback to QSettings
+                        password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
+
+                    if username and password:
+                        config['username'] = str(username)
+                        config['password'] = str(password)
+                    else:
+                        config = {}  # Incomplete
+
+                elif auth_type == 'bearer':
+                    # Try SecureStore first
+                    token = SecureStore.get_credential('traccar_http_bearer', 'token')
+                    if not token:
+                        token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
+
+                    if token:
+                        config['token'] = str(token)
+                    else:
+                        config = {}  # Incomplete
+
+        return config if config else None
+
+    def _convert_legacy_http_config(self, legacy_config: dict) -> Optional[dict]:
+        """
+        Convert legacy http_traccar config to traccar_http config dict.
+
+        Args:
+            legacy_config: Old-style config with server_url, username, password
+
+        Returns:
+            Converted config dict or None if invalid
+        """
+        base_url = str(legacy_config.get('server_url', '')).strip()
+        username = str(legacy_config.get('username', '')).strip()
+        password = str(legacy_config.get('password', '')).strip()
+
+        if not base_url or not username or not password:
+            return None
+
+        timeout = int(legacy_config.get('timeout', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
+
+        converted = {
+            'base_url': base_url,
+            'auth_type': 'basic',
+            'username': username,
+            'password': password,
+            'timeout_s': timeout,
+            'cache_ttl': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT,
+            'enable_last_good_cache': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT
+        }
+
+        # Persist immediately so next load finds it
+        self._persist_traccar_http_settings(converted)
+        return converted
+
+    def _persist_traccar_http_settings(self, config: dict):
+        """
+        Persist Traccar HTTP provider settings to QSettings and SecureStore.
+
+        Args:
+            config: Traccar HTTP config dict
+        """
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, config.get('base_url', ''))
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, config.get('auth_type', 'basic'))
+        ConfigStore.set(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT,
+            config.get('timeout_s', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT)
+        )
+        ConfigStore.set(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL,
+            config.get('cache_ttl', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT)
+        )
+        ConfigStore.set(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED,
+            config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT)
+        )
+
+        if config.get('auth_type') == 'basic':
+            username = config.get('username', '')
+            password = config.get('password', '')
+            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, username)
+            # Save password to SecureStore
+            SecureStore.set_credential('traccar_http_basic', username, password)
+        else:
+            token = config.get('token', '')
+            # Save token to SecureStore
+            SecureStore.set_credential('traccar_http_bearer', 'token', token)

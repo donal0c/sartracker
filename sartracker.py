@@ -1175,7 +1175,7 @@ class sartracker:
             pass
 
         # ============================================================================
-        # PHASE 3: Provider Controller Setup
+        # PHASE 3 + PHASE 8: Provider Controller Setup
         # ============================================================================
         # Initialize provider controller (after task_manager and sar_panel)
         if ProviderController is not None:
@@ -1192,15 +1192,17 @@ class sartracker:
                 # Connect controller signals to panel and plugin
                 self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
                 self.provider_controller.config_error.connect(self._on_provider_config_error)
-                self.provider_controller.provider_connected.connect(self._save_provider_config)
-                self.provider_controller.refresh_requested.connect(self._on_refresh_data)
+
+                # Phase 8: Controller now owns config persistence
+                # provider_connected signal triggers save_config internally
+                self.provider_controller.provider_connected.connect(self.provider_controller.save_config)
+
+                # Phase 8: Controller now owns refresh workflow
+                # sar_panel.refresh_requested is connected below after dependency injection
 
                 # Phase N1: Provider dropdown population moved to SettingsPanel (lines 682-696)
 
-                # Load saved provider config (if any)
-                self._load_provider_config()
-
-                print("[SARTRACKER] Provider controller initialized and wired")
+                print("[SARTRACKER] Provider controller initialized")
             except Exception as e:
                 self.provider_controller = None
                 error(
@@ -1274,6 +1276,51 @@ class sartracker:
         else:
             self.settings_panel = None
             print("[SARTRACKER] SettingsPanel not available (import failed)")
+        # ============================================================================
+
+        # ============================================================================
+        # PHASE 8: Provider Controller Dependency Injection
+        # ============================================================================
+        # Inject dependencies now that all controllers are ready
+        if self.provider_controller:
+            try:
+                # Inject layers controller for refresh result handling
+                if self.layers_controller:
+                    self.provider_controller.set_layers_controller(self.layers_controller)
+
+                # Inject panel for loading state and device list updates
+                if self.sar_panel:
+                    self.provider_controller.set_panel(self.sar_panel)
+
+                # Inject mission start getter for breadcrumb filtering
+                self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
+
+                # Connect refresh signals:
+                # Panel refresh button -> controller's start_refresh
+                # (This replaces the old connection to _on_refresh_data)
+                try:
+                    self.sar_panel.refresh_requested.disconnect(self._on_refresh_data)
+                except (TypeError, RuntimeError):
+                    # Signal wasn't connected or already disconnected
+                    pass
+                self.sar_panel.refresh_requested.connect(
+                    lambda: self.provider_controller.start_refresh()
+                )
+
+                # Load saved provider config and auto-connect if enabled
+                # Phase 8: Delegated to controller
+                self.provider_controller.load_config_and_auto_connect()
+
+                print("[SARTRACKER] Phase 8: Provider controller dependencies injected")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Phase 8 dependency injection failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Fallback: reconnect old handler if injection failed
+                try:
+                    self.sar_panel.refresh_requested.connect(self._on_refresh_data)
+                except Exception:
+                    pass
         # ============================================================================
 
         # CRITICAL: Disable drawing tool buttons if tool registry failed to initialize (Issue #2 fix)
@@ -3532,11 +3579,35 @@ class sartracker:
 
     def _on_refresh_data(self):
         """
-        Handle data refresh request using background task.
+        Handle data refresh request.
 
-        This method now uses QgsTask to parse CSVs in a background thread,
-        preventing UI freezes during refresh operations. Includes concurrent
-        refresh protection and proper error handling.
+        Phase 8: This method now delegates to ProviderController.start_refresh().
+        Kept for backwards compatibility with legacy code paths that may still
+        call this method directly.
+
+        Qt5/Qt6 Compatible: Delegates to controller.
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Phase 8: Delegate to controller if available
+        if self.provider_controller:
+            self.provider_controller.start_refresh()
+            return
+
+        # Legacy fallback: if controller not available, show warning
+        if not self.provider:
+            self._notify("warning", "SAR Tracker", "No data source loaded. Please load a data source first.", duration=3)
+            return
+
+        self._notify("warning", "SAR Tracker", "Provider controller not available. Please restart plugin.", duration=5)
+
+    def _on_refresh_data_legacy(self):
+        """
+        DEPRECATED: Legacy refresh implementation.
+
+        Phase 8: This method is kept for reference but no longer called.
+        All refresh logic is now in ProviderController.
 
         Qt5/Qt6 Compatible: Uses QgsTask API which works identically in both versions.
         """
@@ -3870,7 +3941,10 @@ class sartracker:
 
     def _load_provider(self, provider_name: str, config: dict):
         """
-        Load and initialize a data provider via registry.
+        DEPRECATED: Load and initialize a data provider via registry.
+
+        Phase 8: This method is DEPRECATED. Use ProviderController.set_provider() instead.
+        Kept for backwards compatibility with legacy code paths.
 
         ISSUE #1 FIX: Uses transactional two-phase commit pattern.
         New provider is validated in shadow state before replacing current provider.
@@ -3896,6 +3970,10 @@ class sartracker:
 
         Qt5/Qt6 Compatible: Uses provider registry pattern.
         """
+        # Phase 8: Prefer using controller
+        if self.provider_controller:
+            self.provider_controller.set_provider(provider_name, config)
+            return
         # INPUT VALIDATION (mandatory pattern)
         if not provider_name or not isinstance(provider_name, str):
             raise ValueError("Provider name must be a non-empty string")
@@ -4331,12 +4409,17 @@ class sartracker:
         """
         Handle CSV load request from panel.
 
-        Delegates to _load_provider() for provider-agnostic loading.
+        Phase 8: Delegates to ProviderController.set_provider().
 
         Args:
             csv_file: Path to CSV file or folder
         """
-        self._load_provider('csv', {'csv_path': csv_file})
+        # Phase 8: Use controller for all provider loading
+        if self.provider_controller:
+            self.provider_controller.set_provider('csv', {'csv_path': csv_file})
+        else:
+            # Legacy fallback
+            self._load_provider('csv', {'csv_path': csv_file})
 
     def _on_load_complete(self, task):
         """
