@@ -69,6 +69,9 @@ plugin_upload.py
 *.swp
 .cache/
 
+# Build artifacts
+VERSION.txt
+
 # Other files
 cleanup.sh
 
