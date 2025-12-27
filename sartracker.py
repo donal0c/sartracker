@@ -189,6 +189,22 @@ except Exception as e:
         _import_report, 'controllers.provider_controller.ProviderController', e
     )
 
+# Import MissionStorageController (Phase 6 - archive bug fix)
+try:
+    from .controllers.mission_storage_controller import MissionStorageController
+except Exception as e:
+    MissionStorageController = track_import_error(
+        _import_report, 'controllers.mission_storage_controller.MissionStorageController', e
+    )
+
+# Import MissionLogsController (Phase 4 - mission logs extraction)
+try:
+    from .controllers.mission_logs_controller import MissionLogsController
+except Exception as e:
+    MissionLogsController = track_import_error(
+        _import_report, 'controllers.mission_logs_controller.MissionLogsController', e
+    )
+
 # Import SARPanel
 try:
     from .ui.sar_panel import SARPanel
@@ -342,6 +358,8 @@ class sartracker:
         self.polygon_tool = None
         self.tool_registry = None
         self.mission_storage = None
+        self.mission_storage_controller = None  # Phase 6: Archive + backup controller
+        self.mission_logs_controller = None  # Phase 4: Mission logs window controller
         self.mission_controller = None  # Phase N3: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
@@ -875,6 +893,65 @@ class sartracker:
             warn=lambda title, msg, duration=5: warning(self.iface.messageBar(), title, msg, duration=duration)
         )
 
+        # Phase 6: Mission storage controller (archive + backup operations)
+        if MissionStorageController is not None:
+            try:
+                self.mission_storage_controller = MissionStorageController(
+                    iface=self.iface,
+                    task_manager=self.task_manager,
+                    mission_storage=self.mission_storage,
+                    layer_manager=self.layer_manager,
+                    parent=self.iface.mainWindow()
+                )
+                # Connect controller signals to notification handlers
+                self.mission_storage_controller.archive_started.connect(
+                    lambda: info(self.iface.messageBar(), "Mission Archive", "Creating mission archive...", duration=3)
+                )
+                self.mission_storage_controller.archive_completed.connect(
+                    self._on_archive_complete
+                )
+                self.mission_storage_controller.archive_failed.connect(
+                    lambda msg: error(self.iface.messageBar(), "Mission Archive", f"Archive failed: {msg}", duration=8)
+                )
+                # Connect backup signals
+                self.mission_storage_controller.backup_completed.connect(
+                    lambda: success(self.iface.messageBar(), "Mission Backup", "Mission backup completed.", duration=2)
+                )
+                self.mission_storage_controller.backup_failed.connect(
+                    lambda msg: warning(self.iface.messageBar(), "Mission Backup", f"Backup failed: {msg}", duration=5)
+                )
+            except Exception as e:
+                print(f"[SARTRACKER] ERROR initializing MissionStorageController: {e}")
+                traceback.print_exc()
+                self.mission_storage_controller = None
+        else:
+            print("[SARTRACKER] MissionStorageController not available (import failed)")
+
+        # Phase 4: Mission logs controller (marker_controller set later after it's created)
+        if MissionLogsController is not None:
+            try:
+                self.mission_logs_controller = MissionLogsController(
+                    iface=self.iface,
+                    layers_controller=self.layers_controller,
+                    marker_controller=None,  # Set later after marker_controller created
+                    layer_manager=self.layer_manager,
+                    get_mission_paths=self._current_mission_paths,
+                    get_mission_start_iso=self._get_mission_start_iso,
+                    get_audit_user_name=self._get_audit_user_name,
+                    is_unloading=lambda: self._is_unloading or self._app_is_quitting,
+                    parent=self.iface.mainWindow()
+                )
+                # Set safe-mode block callback
+                self.mission_logs_controller.set_safe_mode_block(self._safe_mode_block)
+                print("[SARTRACKER] MissionLogsController initialized")
+            except Exception as e:
+                print(f"[SARTRACKER] ERROR initializing MissionLogsController: {e}")
+                import traceback as tb
+                tb.print_exc()
+                self.mission_logs_controller = None
+        else:
+            print("[SARTRACKER] MissionLogsController not available (import failed)")
+
         # ------------------------------------------------------------------ #
         # Drawing tool initializer
         # ------------------------------------------------------------------ #
@@ -922,6 +999,10 @@ class sartracker:
             )
         else:
             self.marker_controller = None
+
+        # Late-bind marker_controller to mission_logs_controller (created earlier)
+        if self.mission_logs_controller and self.marker_controller:
+            self.mission_logs_controller.set_marker_controller(self.marker_controller)
 
         # Initialize marker map tool
         self.marker_tool = MarkerMapTool(self.iface.mapCanvas(), self.iface)
@@ -1328,7 +1409,17 @@ class sartracker:
             print(traceback.format_exc())
 
     def _show_mission_logs(self):
-        """Show the Mission Logs window (non-modal) for end-of-mission review."""
+        """
+        Show the Mission Logs window (non-modal) for end-of-mission review.
+
+        Phase 4: Now delegates to MissionLogsController when available.
+        """
+        # Use controller if available
+        if self.mission_logs_controller:
+            self.mission_logs_controller.show_window()
+            return
+
+        # Fallback: legacy implementation
         if self._safe_mode_block("Mission Logs"):
             return
 
@@ -1343,7 +1434,6 @@ class sartracker:
                         self._mission_logs_window.activateWindow()
                         return
                 except RuntimeError:
-                    # Window was deleted, create new one
                     self._mission_logs_window = None
 
             # Create new window
@@ -1361,13 +1451,10 @@ class sartracker:
             self._mission_logs_window.set_mission_info_fetcher(self._get_mission_logs_info)
 
             # Wire up signals from the window
-            # Marker signals
             self._mission_logs_window.zoom_requested.connect(self._on_mission_logs_zoom)
             self._mission_logs_window.edit_marker_requested.connect(self._on_mission_logs_edit_marker)
             self._mission_logs_window.delete_marker_requested.connect(self._on_mission_logs_delete_marker)
             self._mission_logs_window.open_attachment_requested.connect(self._on_mission_logs_open_attachment)
-
-            # Layer console signals
             self._mission_logs_window.feature_zoom_requested.connect(self._on_mission_logs_feature_zoom)
             self._mission_logs_window.feature_delete_requested.connect(self._on_mission_logs_feature_delete)
             self._mission_logs_window.feature_rename_requested.connect(self._on_mission_logs_feature_rename)
@@ -2155,6 +2242,42 @@ class sartracker:
             # ============================================================
 
             # ============================================================
+            # Clean up Mission Storage Controller (Phase 6)
+            # ============================================================
+            if self.mission_storage_controller:
+                try:
+                    print("[SARTRACKER] Cleaning up MissionStorageController...")
+                    if hasattr(self.mission_storage_controller, "cleanup"):
+                        self.mission_storage_controller.cleanup()
+                    try:
+                        self.mission_storage_controller.deleteLater()
+                    except Exception:
+                        pass
+                    self.mission_storage_controller = None
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: MissionStorageController cleanup error: {e}")
+                    self.mission_storage_controller = None
+            # ============================================================
+
+            # ============================================================
+            # Clean up Mission Logs Controller (Phase 4)
+            # ============================================================
+            if self.mission_logs_controller:
+                try:
+                    print("[SARTRACKER] Cleaning up MissionLogsController...")
+                    if hasattr(self.mission_logs_controller, "cleanup"):
+                        self.mission_logs_controller.cleanup()
+                    try:
+                        self.mission_logs_controller.deleteLater()
+                    except Exception:
+                        pass
+                    self.mission_logs_controller = None
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: MissionLogsController cleanup error: {e}")
+                    self.mission_logs_controller = None
+            # ============================================================
+
+            # ============================================================
             # Clean up Mission Logs Window
             # ============================================================
             if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
@@ -2561,6 +2684,67 @@ class sartracker:
             traceback.print_exc()
         finally:
             self._is_finalizing = False
+
+    def _start_archive_task(self, paths: MissionPaths, project_path: Optional[Path]):
+        """
+        Start background task to create mission archive.
+
+        Phase 6 BUG FIX: This method was called but never defined, causing
+        AttributeError when finalizing missions. Now delegates to
+        MissionStorageController.start_archive_task().
+
+        Args:
+            paths: MissionPaths with current mission directories
+            project_path: Optional path to QGIS project file to include
+        """
+        if self.mission_storage_controller:
+            started = self.mission_storage_controller.start_archive_task(
+                paths=paths,
+                project_path=project_path,
+                mark_finalized=True
+            )
+            if not started:
+                self._is_finalizing = False
+                self._notify("warning", "Mission Archive", "Archive could not be started.", duration=5)
+        else:
+            # Fallback: no controller available, use synchronous method
+            print("[SARTRACKER] MissionStorageController not available, using fallback archive")
+            try:
+                # Prefer SQLite-safe archive via MissionStorageHelper if available
+                if self.mission_storage:
+                    paths = self._current_mission_paths()
+                    project_path = Path(QgsProject.instance().fileName()) if QgsProject.instance().fileName() else None
+                    archive_path = self.mission_storage.create_archive(paths, project_path)
+                else:
+                    # Last resort: legacy method (NOT SQLite-safe during active writes)
+                    archive_path = self._create_mission_archive()
+                self._mark_mission_finalized()
+                archive_name = archive_path.name if hasattr(archive_path, 'name') else str(archive_path)
+                self._notify("success", "Mission Finalized", f"Archive created: {archive_name}", duration=6)
+                if self.sar_panel:
+                    self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=True)
+            except Exception as exc:
+                self._notify("error", "Mission Archive", f"Archive failed: {exc}", duration=8)
+            finally:
+                self._is_finalizing = False
+
+    def _on_archive_complete(self, archive_path: str):
+        """
+        Handle successful archive completion from MissionStorageController.
+
+        Args:
+            archive_path: Path to the created archive file
+        """
+        self._is_finalizing = False
+
+        # Update UI to show finalized state
+        if self.sar_panel:
+            self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=True)
+
+        # Show success notification
+        archive_name = Path(archive_path).name if archive_path else "archive"
+        self._notify("success", "Mission Finalized", f"Archive created: {archive_name}", duration=6)
+        print(f"[SARTRACKER] Mission archive complete: {archive_path}")
 
     def _on_unlock_mission_requested(self):
         """Handle admin unlock request for finalized missions."""
@@ -3284,38 +3468,49 @@ class sartracker:
             return False
 
     def _start_backup_task(self, paths: MissionPaths):
-        """Run backup sync in background to avoid UI blocking."""
-        from qgis.core import QgsTask
+        """
+        Run backup sync in background to avoid UI blocking.
 
-        class BackupTask(QgsTask):
-            def __init__(self, mission_paths: MissionPaths, storage: MissionStorageHelper):
-                super().__init__("Sync mission backup", QgsTask.CanCancel)
-                self.paths = mission_paths
-                self.storage = storage
-                self.error_message = None
+        Phase 6: Now delegates to MissionStorageController when available.
+        """
+        if self.mission_storage_controller:
+            # Use controller - signals handle notifications
+            self.mission_storage_controller.start_backup_task(paths)
+        else:
+            # Fallback: inline task (legacy path)
+            from qgis.core import QgsTask
 
-            def run(self) -> bool:
-                try:
-                    return bool(self.storage.sync_backup(self.paths))
-                except Exception as exc:
-                    self.error_message = str(exc)
-                    return False
+            class BackupTask(QgsTask):
+                def __init__(self, mission_paths: MissionPaths, storage: MissionStorageHelper):
+                    super().__init__("Sync mission backup", QgsTask.CanCancel)
+                    self.paths = mission_paths
+                    self.storage = storage
+                    self.error_message = None
 
-        task = BackupTask(paths, self.mission_storage)
-        self.task_manager.start_task(
-            task=task,
-            on_complete=lambda t: self._on_backup_complete(t),
-            on_error=lambda t: self._on_backup_error(t),
-            task_id="mission_backup"
-        )
+                def run(self) -> bool:
+                    try:
+                        return bool(self.storage.sync_backup(self.paths))
+                    except Exception as exc:
+                        self.error_message = str(exc)
+                        return False
+
+            task = BackupTask(paths, self.mission_storage)
+            self.task_manager.start_task(
+                task=task,
+                on_complete=lambda t: self._on_backup_complete(t),
+                on_error=lambda t: self._on_backup_error(t),
+                task_id="mission_backup"
+            )
 
     def _on_backup_complete(self, task):
+        """Fallback handler for legacy backup task path."""
         if getattr(task, "error_message", None):
             self._notify("warning", "Mission Backup", f"Backup completed with warnings: {task.error_message}", duration=4)
             return
         self._notify("success", "Mission Backup", "Mission backup completed.", duration=2)
 
     def _on_backup_error(self, task):
+        """Fallback handler for legacy backup task path."""
         msg = getattr(task, "error_message", None) or "Backup task failed."
         self._notify("warning", "Mission Backup", msg, duration=5)
 
