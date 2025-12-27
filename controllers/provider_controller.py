@@ -1446,3 +1446,42 @@ class ProviderController(QObject):
             token = config.get('token', '')
             # Save token to SecureStore
             SecureStore.set_credential('traccar_http_bearer', 'token', token)
+
+    # ========================================================================
+    # Phase 1.2: Signal Handler Wrappers for Settings Panel
+    # ========================================================================
+    # These methods match the SettingsPanel signal signatures and wrap
+    # set_provider() with the appropriate test_only parameter.
+
+    def handle_test_request(self, provider_name: str, config: dict):
+        """
+        Handle provider test request from SettingsPanel.
+
+        Wraps set_provider() with test_only=True for the "Test Connection" button.
+
+        Signal signature: provider_test_requested(str, dict)
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Pure Python slot.
+        """
+        self.set_provider(provider_name, config, test_only=True)
+
+    def handle_save_request(self, provider_name: str, config: dict):
+        """
+        Handle provider save/connect request from SettingsPanel.
+
+        Wraps set_provider() with test_only=False for the "Connect" button.
+        On successful connection, provider config is persisted for auto-restore.
+
+        Signal signature: provider_save_requested(str, dict)
+
+        Args:
+            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            config: Provider configuration dict
+
+        Qt5/Qt6 Compatible: Pure Python slot.
+        """
+        self.set_provider(provider_name, config, test_only=False)

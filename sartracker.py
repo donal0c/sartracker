@@ -355,14 +355,11 @@ class sartracker:
         self.layers_controller = None
         self.provider_controller = None  # Phase 3: Provider orchestration controller
         self.provider = None
-        self.provider_name = None  # Track which provider is active (e.g., 'csv', 'http_traccar')
+        self.provider_name = None  # Track which provider is active (e.g., 'csv', 'traccar_http')
         self.provider_config = None  # Track provider config for reconnection
 
-        # Transactional provider change state (Issue #1 fix)
-        self._pending_provider = None          # Provider being validated
-        self._pending_provider_name = None     # Name of pending provider
-        self._pending_provider_config = None   # Config of pending provider
-        self._pending_provider_task = None     # Connection test task reference
+        # Phase 1.7: Transactional provider state now managed by ProviderController
+        # Removed: _pending_provider, _pending_provider_name, _pending_provider_config, _pending_provider_task
 
         self.sar_panel = None
         self.settings_panel = None  # Phase N1: Dedicated settings/configuration dock
@@ -393,6 +390,19 @@ class sartracker:
         self._coords_point_changed = False  # Track if mouse moved since last update
         self._safe_mode_active = False  # Import failure safe-mode flag
         self._safe_mode_reason = None  # Human-readable Safe Mode reason
+        self._unavailable_features: List[str] = []  # Features unavailable due to controller failures
+
+        # Phase 1 Verification Fix: Initialize mission storage paths in __init__
+        # to prevent AttributeError if _current_mission_paths() called before initGui
+        self._mission_folder_name: Optional[str] = None
+        self._mission_directory: Optional[Path] = None
+        self._mission_attachments_dir: Optional[Path] = None
+        self._mission_backup_directory: Optional[Path] = None
+        self._mission_gpkg_path: Optional[Path] = None
+        self._metadata_collected: bool = False
+        self._mission_coordinators_cache: str = ""
+        self._last_mission_state = None
+        self._is_finalizing: bool = False  # Race condition protection
 
         # Refresh state management (Issue #1: Prevent concurrent refreshes)
         self._refresh_in_progress = False
@@ -464,22 +474,10 @@ class sartracker:
         if tb:
             print(tb)
 
-    def _is_number(self, value) -> bool:
-        """Return True if value can be interpreted as a finite float (excludes bool)."""
-        if value is None or isinstance(value, bool):
-            return False
-        try:
-            return math.isfinite(float(value))
-        except Exception:
-            return False
-
-    def _valid_latlon(self, lat, lon) -> bool:
-        """Basic latitude/longitude validation."""
-        if not self._is_number(lat) or not self._is_number(lon):
-            return False
-        lat_f = float(lat)
-        lon_f = float(lon)
-        return -90.0 <= lat_f <= 90.0 and -180.0 <= lon_f <= 180.0
+    # ========================================================================
+    # Phase 1.6 Refactor V2: Legacy validation utilities removed
+    # _is_number and _valid_latlon are now in MapToolsController
+    # ========================================================================
 
     def _clear_loading_state(self):
         """Safely clear SAR panel loading indicator."""
@@ -555,6 +553,167 @@ class sartracker:
         )
         return True
 
+    def _wire_sar_panel_signals(self) -> List[str]:
+        """
+        Wire SAR panel signals exclusively to controllers.
+
+        NO LEGACY FALLBACKS: If a controller is unavailable, the related UI
+        is disabled and a warning is shown. This is intentional - we want
+        explicit failure rather than hidden fallback paths.
+
+        Returns:
+            List of unavailable feature descriptions for diagnostics.
+        """
+        unavailable_features: List[str] = []
+
+        if not self.sar_panel:
+            unavailable_features.append("SAR Panel not initialized")
+            return unavailable_features
+
+        # ====================================================================
+        # Marker Signals -> MarkerController (via MapToolsController)
+        # ====================================================================
+        if self.marker_controller:
+            # Update marker controller refresh hook
+            self.marker_controller._refresh_log = self._refresh_mission_logs_window
+
+            # Marker editing/deletion/zoom from panel
+            self.sar_panel.marker_edit_requested.connect(self.marker_controller.handle_edit)
+            self.sar_panel.marker_delete_requested.connect(self.marker_controller.handle_delete)
+            self.sar_panel.marker_zoom_requested.connect(self.marker_controller.zoom_to_marker)
+            self.sar_panel.attachment_open_requested.connect(self.marker_controller.open_attachment)
+        else:
+            unavailable_features.append("Marker editing/deletion (MarkerController unavailable)")
+            # Disable marker-related buttons would be done here if SARPanel supported it
+            # For now, signals simply won't be connected - clicks will do nothing
+
+        # ====================================================================
+        # Map Tool Signals -> MapToolsController
+        # ====================================================================
+        if self.map_tools_controller:
+            # Set sar_panel reference on controller
+            self.map_tools_controller.set_sar_panel(self.sar_panel)
+
+            # Marker tool signals
+            self.sar_panel.add_poi_requested.connect(self.map_tools_controller.on_add_poi_requested)
+            self.sar_panel.add_clue_requested.connect(self.map_tools_controller.on_add_clue_requested)
+            self.sar_panel.add_casualty_requested.connect(self.map_tools_controller.on_add_casualty_requested)
+            self.sar_panel.add_hazard_requested.connect(self.map_tools_controller.on_add_hazard_requested)
+
+            # Drawing tool signals
+            self.sar_panel.line_tool_requested.connect(self.map_tools_controller.on_line_tool_requested)
+            self.sar_panel.polygon_tool_requested.connect(self.map_tools_controller.on_polygon_tool_requested)
+            self.sar_panel.range_rings_tool_requested.connect(self.map_tools_controller.on_range_rings_tool_requested)
+            self.sar_panel.bearing_tool_requested.connect(self.map_tools_controller.on_bearing_tool_requested)
+
+            # Measurement and utilities
+            self.sar_panel.coordinate_converter_requested.connect(self.map_tools_controller.on_coordinate_converter_requested)
+            self.sar_panel.measure_distance_requested.connect(self.map_tools_controller.on_measure_distance_requested)
+            self.sar_panel.clear_measurements_requested.connect(self.map_tools_controller.on_clear_measurements_requested)
+
+            # GPX signals
+            self.sar_panel.gpx_import_file_requested.connect(self.map_tools_controller.on_gpx_import_file)
+            self.sar_panel.gpx_import_folder_requested.connect(self.map_tools_controller.on_gpx_import_folder)
+            self.sar_panel.gpx_watch_folder_requested.connect(self.map_tools_controller.on_gpx_watch_folder)
+
+            # Update measurement indicator
+            self.map_tools_controller.update_measurement_indicator()
+        else:
+            unavailable_features.append("Map tools (markers, drawing, measurement, GPX)")
+            # Disable marker buttons
+            for btn_name in ['add_ipp_lkp_button', 'add_clue_button', 'add_hazard_button', 'add_casualty_button']:
+                btn = getattr(self.sar_panel, btn_name, None)
+                if btn:
+                    btn.setEnabled(False)
+                    btn.setToolTip("Map tools unavailable - controller failed to initialize")
+            # Disable drawing tools via panel method
+            self.sar_panel.disable_drawing_tools("MapToolsController unavailable")
+
+        # ====================================================================
+        # Mission Signals (finalize, unlock, autosave) -> Plugin methods
+        # These remain on plugin until Phase 2 extracts MissionLifecycleController
+        # ====================================================================
+        self.sar_panel.finalize_mission_requested.connect(self._on_finalize_mission_requested)
+        self.sar_panel.unlock_mission_requested.connect(self._on_unlock_mission_requested)
+        self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
+
+        # ====================================================================
+        # Provider Signals (refresh, csv load) -> ProviderController or Plugin
+        # ====================================================================
+        # refresh_requested is wired after ProviderController setup in initGui
+        # csv_load_requested stays on plugin for now
+        self.sar_panel.csv_load_requested.connect(self._on_load_csv)
+
+        # ====================================================================
+        # Show warning if features unavailable
+        # ====================================================================
+        if unavailable_features:
+            feature_list = ", ".join(unavailable_features)
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker - Some Features Unavailable",
+                f"Unavailable: {feature_list}. Run Diagnostics for details.",
+                duration=0  # Persistent until dismissed
+            )
+            print(f"[SARTRACKER] Features unavailable after wiring: {feature_list}")
+
+        return unavailable_features
+
+    def _wire_settings_panel_signals(self, unavailable_features: List[str]) -> List[str]:
+        """
+        Wire Settings panel signals exclusively to controllers.
+
+        Phase 1.2: Settings panel provider signals go directly to ProviderController.
+        Settings changes and layer repair remain as thin delegators on the orchestrator
+        since they involve cross-panel coordination.
+
+        NO LEGACY FALLBACKS: If ProviderController is unavailable, provider test/save
+        buttons are disabled.
+
+        Args:
+            unavailable_features: List to extend with any unavailable features.
+
+        Returns:
+            Updated list of unavailable feature descriptions for diagnostics.
+        """
+        if not self.settings_panel:
+            unavailable_features.append("Settings Panel not initialized")
+            return unavailable_features
+
+        # ====================================================================
+        # Provider Signals -> ProviderController
+        # ====================================================================
+        if self.provider_controller:
+            # Wire provider test/save signals directly to controller wrappers
+            self.settings_panel.provider_test_requested.connect(
+                self.provider_controller.handle_test_request
+            )
+            self.settings_panel.provider_save_requested.connect(
+                self.provider_controller.handle_save_request
+            )
+            print("[SARTRACKER] Settings panel provider signals wired to ProviderController")
+        else:
+            unavailable_features.append("Provider test/connect (ProviderController unavailable)")
+            # Disable provider buttons in settings panel if available
+            # Note: SettingsPanel may not have disable methods yet, log for now
+            print("[SARTRACKER] Warning: ProviderController unavailable - provider buttons non-functional")
+
+        # ====================================================================
+        # Settings Changes -> Thin delegator (cross-panel coordination)
+        # This updates SAR panel config based on Settings panel changes.
+        # Stays on orchestrator as it coordinates between two UI panels.
+        # ====================================================================
+        self.settings_panel.settings_changed.connect(self._on_settings_changed)
+
+        # ====================================================================
+        # Layer Repair -> Thin delegator (calls LayerManager)
+        # LayerManager is not a controller but direct layer infrastructure.
+        # This stays on orchestrator as a thin wrapper with notification handling.
+        # ====================================================================
+        self.settings_panel.repair_layers_requested.connect(self._on_repair_layers_requested)
+
+        return unavailable_features
+
     def _current_mission_paths(self) -> Optional[MissionPaths]:
         """Build MissionPaths from current state if available."""
         if not (self._mission_directory and self._mission_attachments_dir and self._mission_gpkg_path):
@@ -567,80 +726,11 @@ class sartracker:
             gpkg_path=self._mission_gpkg_path
         )
 
-    def _setup_status_bar_coords(self) -> bool:
-        """Initialize coordinate label, timer, and map canvas listener."""
-        try:
-            if self._coords_updates_enabled:
-                return True  # Already initialized
-
-            self.coords_label = QLabel()
-            self.coords_label.setMinimumWidth(550)
-            self.coords_label.setMaximumWidth(550)  # Fixed width prevents jitter
-
-            # Use monospace font for stable width
-            font = QFont("Courier New", 10)
-            if not font.exactMatch():
-                font = QFont("Monospace", 10)
-            self.coords_label.setFont(font)
-
-            self.coords_label.setStyleSheet("QLabel { padding: 2px 8px; background-color: #f0f0f0; }")
-            self.iface.statusBarIface().addPermanentWidget(self.coords_label)
-
-            # Set up timer to throttle coordinate updates (50ms = 20 updates/sec max)
-            # Phase 0 fix: Add parent for proper Qt lifecycle (AI_CODE_REFERENCE.md Pattern 7)
-            self.coords_update_timer = QTimer(self.iface.mainWindow())
-            self.coords_update_timer.timeout.connect(self._update_coords_display)
-            self.coords_update_timer.start(50)
-            self._coords_updates_enabled = True
-
-            # Connect to map canvas mouse movement (stores point, actual update happens on timer)
-            # Store connection reference for proper cleanup in unload() (Issue #4)
-            self.iface.mapCanvas().xyCoordinates.connect(self._on_mouse_move)
-            self._map_canvas_connected = True
-            return True
-        except Exception as exc:
-            self._log_exception("_setup_status_bar_coords", exc)
-            warning(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                "Coordinate status display failed to initialize.",
-                duration=5
-            )
-            self._disable_coords_updates("coordinate status bar setup failed")
-            self._map_canvas_connected = False
-            self.coords_update_timer = None
-            self.coords_label = None
-            return False
-
-    def _disable_coords_updates(self, reason: Optional[str] = None):
-        """
-        Stop coordinate update timers and disconnect their signals safely.
-
-        Args:
-            reason: Optional diagnostic string logged once to help trace lifecycle issues.
-        """
-        if reason:
-            print(f"[SARTRACKER] Disabling coordinate updates: {reason}")
-
-        self._coords_updates_enabled = False
-        timer = self.coords_update_timer
-        if timer:
-            try:
-                timer.timeout.disconnect(self._update_coords_display)
-            except (TypeError, RuntimeError):
-                pass
-            try:
-                if timer.isActive():
-                    timer.stop()
-            except Exception:
-                pass
-            try:
-                timer.deleteLater()
-            except Exception:
-                pass
-            self.coords_update_timer = None
-
-        self.last_coords_point = None
+    # ========================================================================
+    # Phase 1.6 Refactor V2: Legacy coordinate setup/cleanup methods removed
+    # _setup_status_bar_coords and _disable_coords_updates are now handled
+    # exclusively by CoordinatesController
+    # ========================================================================
 
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
@@ -845,9 +935,8 @@ class sartracker:
         QCoreApplication.instance().aboutToQuit.connect(self._on_app_about_to_quit)
         self.lifecycle.track_signal(QCoreApplication.instance().aboutToQuit, self._on_app_about_to_quit)
 
-        # Connection test tracking (Issue #2 fix)
-        self._current_connection_task = None
-        self._pending_provider_metadata = None
+        # Phase 1.7: Connection test tracking now in ProviderController
+        # Removed: _current_connection_task, _pending_provider_metadata
 
         # ============================================================================
         # PHASE N2: Layer Manager Setup
@@ -882,16 +971,17 @@ class sartracker:
             print("[SARTRACKER] LayerManager not available (import failed)")
         # ============================================================================
 
-        # Mission storage tracking
-        self._mission_folder_name: Optional[str] = None
-        self._mission_directory: Optional[Path] = None
-        self._mission_attachments_dir: Optional[Path] = None
-        self._mission_backup_directory: Optional[Path] = None
-        self._mission_gpkg_path: Optional[Path] = None
-        self._metadata_collected: bool = False
-        self._mission_coordinators_cache: str = ""
+        # Mission storage tracking - reset on initGui for plugin reload
+        # (Primary initialization is in __init__ for safety - see line 398)
+        self._mission_folder_name = None
+        self._mission_directory = None
+        self._mission_attachments_dir = None
+        self._mission_backup_directory = None
+        self._mission_gpkg_path = None
+        self._metadata_collected = False
+        self._mission_coordinators_cache = ""
         self._last_mission_state = None
-        self._is_finalizing: bool = False  # Race condition protection
+        self._is_finalizing = False
 
         # Track project changes to avoid double-running startup sync logic.
         self._last_project_signature: Optional[str] = None
@@ -1074,81 +1164,16 @@ class sartracker:
         self.sar_panel.hide()  # Hidden by default
 
         # Note: SAR panel cleanup is handled in unload() directly
-        # NOTE: Marker log moved to Mission Logs window (SAR Tracker > Mission Logs...)
-        if self.marker_controller:
-            # Update marker controller refresh hook to refresh Mission Logs window
-            self.marker_controller._refresh_log = self._refresh_mission_logs_window
-        if self.sar_panel:
-            if self.marker_controller:
-                self.sar_panel.marker_edit_requested.connect(self.marker_controller.handle_edit)
-                self.sar_panel.marker_delete_requested.connect(self.marker_controller.handle_delete)
-                self.sar_panel.marker_zoom_requested.connect(self.marker_controller.zoom_to_marker)
-                self.sar_panel.attachment_open_requested.connect(self.marker_controller.open_attachment)
-            elif self.map_tools_controller:
-                # Fallback to map_tools_controller if marker_controller unavailable
-                self.sar_panel.marker_edit_requested.connect(self.map_tools_controller.on_marker_edit_requested)
-                self.sar_panel.marker_delete_requested.connect(self.map_tools_controller.on_marker_delete_requested)
-                self.sar_panel.marker_zoom_requested.connect(self.map_tools_controller.on_marker_zoom_requested)
-            else:
-                # Legacy fallback to plugin methods
-                self.sar_panel.marker_edit_requested.connect(self._on_marker_edit_requested)
-                self.sar_panel.marker_delete_requested.connect(self._on_marker_delete_requested)
-                self.sar_panel.marker_zoom_requested.connect(self._on_marker_zoom_requested)
-            self.sar_panel.finalize_mission_requested.connect(self._on_finalize_mission_requested)
-            self.sar_panel.unlock_mission_requested.connect(self._on_unlock_mission_requested)
 
-        # Connect SAR Panel signals
+        # ====================================================================
+        # Phase 1 Refactor V2: Wire SAR panel signals via helper method
+        # NO LEGACY FALLBACKS - controller failure = features disabled + warning
+        # ====================================================================
+        self._unavailable_features = self._wire_sar_panel_signals()
+
+        # refresh_requested wired after ProviderController setup below
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
-        self.sar_panel.csv_load_requested.connect(self._on_load_csv)
 
-        # Phase 7: Connect map tool signals to MapToolsController
-        if self.map_tools_controller:
-            # Set sar_panel reference on controller (was None during init)
-            self.map_tools_controller.set_sar_panel(self.sar_panel)
-
-            # Marker tool signals
-            self.sar_panel.add_poi_requested.connect(self.map_tools_controller.on_add_poi_requested)
-            self.sar_panel.add_clue_requested.connect(self.map_tools_controller.on_add_clue_requested)
-            self.sar_panel.add_casualty_requested.connect(self.map_tools_controller.on_add_casualty_requested)
-            self.sar_panel.add_hazard_requested.connect(self.map_tools_controller.on_add_hazard_requested)
-
-            # Drawing tool signals
-            self.sar_panel.line_tool_requested.connect(self.map_tools_controller.on_line_tool_requested)
-            self.sar_panel.polygon_tool_requested.connect(self.map_tools_controller.on_polygon_tool_requested)
-            self.sar_panel.range_rings_tool_requested.connect(self.map_tools_controller.on_range_rings_tool_requested)
-            self.sar_panel.bearing_tool_requested.connect(self.map_tools_controller.on_bearing_tool_requested)
-
-            # Measurement and utilities
-            self.sar_panel.coordinate_converter_requested.connect(self.map_tools_controller.on_coordinate_converter_requested)
-            self.sar_panel.measure_distance_requested.connect(self.map_tools_controller.on_measure_distance_requested)
-            self.sar_panel.clear_measurements_requested.connect(self.map_tools_controller.on_clear_measurements_requested)
-
-            # GPX signals
-            self.sar_panel.gpx_import_file_requested.connect(self.map_tools_controller.on_gpx_import_file)
-            self.sar_panel.gpx_import_folder_requested.connect(self.map_tools_controller.on_gpx_import_folder)
-            self.sar_panel.gpx_watch_folder_requested.connect(self.map_tools_controller.on_gpx_watch_folder)
-
-            # Update measurement indicator
-            self.map_tools_controller.update_measurement_indicator()
-        else:
-            # Legacy fallback to plugin methods (MapToolsController unavailable)
-            self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
-            self.sar_panel.add_clue_requested.connect(self._on_add_clue_requested)
-            self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
-            self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
-            self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
-            self.sar_panel.polygon_tool_requested.connect(self._on_polygon_tool_requested)
-            self.sar_panel.range_rings_tool_requested.connect(self._on_range_rings_tool_requested)
-            self.sar_panel.bearing_tool_requested.connect(self._on_bearing_tool_requested)
-            self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
-            self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
-            self.sar_panel.clear_measurements_requested.connect(self._on_clear_measurements_requested)
-            self.sar_panel.gpx_import_file_requested.connect(self._on_gpx_import_file)
-            self.sar_panel.gpx_import_folder_requested.connect(self._on_gpx_import_folder)
-            self.sar_panel.gpx_watch_folder_requested.connect(self._on_gpx_watch_folder)
-            self._update_measurement_overlay_indicator()
-
-        self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
         self._load_existing_mission_storage_state()
 
         # Keep mission/layer state in sync when users open/close projects.
@@ -1233,14 +1258,19 @@ class sartracker:
                 except Exception as dock_exc:
                     print(f"[SARTRACKER] Warning: Failed to dock Settings panel: {dock_exc}")
 
-                # Connect Settings Panel signals
+                # ================================================================
+                # Phase 1.2 Refactor V2: Wire Settings panel signals via helper
+                # Provider signals -> ProviderController (no legacy fallback)
+                # Settings changes and layer repair -> thin delegators
+                # ================================================================
                 try:
-                    self.settings_panel.settings_changed.connect(self._on_settings_changed)
-                    self.settings_panel.provider_test_requested.connect(self._on_provider_test_requested)
-                    self.settings_panel.provider_save_requested.connect(self._on_provider_save_requested)
-                    self.settings_panel.repair_layers_requested.connect(self._on_repair_layers_requested)
+                    self._unavailable_features = self._wire_settings_panel_signals(
+                        self._unavailable_features
+                    )
                 except Exception as sig_exc:
-                    print(f"[SARTRACKER] Warning: Failed to connect Settings panel signals: {sig_exc}")
+                    print(f"[SARTRACKER] Warning: Failed to wire Settings panel signals: {sig_exc}")
+                    import traceback
+                    traceback.print_exc()
 
                 # Populate provider dropdown from registry (if controller available)
                 if self.provider_controller and provider_registry:
@@ -1346,17 +1376,20 @@ class sartracker:
                     _coords_init_success = True
                     print("[SARTRACKER] CoordinatesController initialized successfully")
                 else:
-                    print("[SARTRACKER] CoordinatesController.init() returned False - using fallback")
+                    print("[SARTRACKER] CoordinatesController.init() returned False - coordinates display disabled")
                     self.coordinates_controller = None
             except Exception as exc:
                 self._log_exception("CoordinatesController initialization", exc)
                 self.coordinates_controller = None
         else:
-            print("[SARTRACKER] CoordinatesController import failed - using fallback")
+            print("[SARTRACKER] CoordinatesController import failed - coordinates disabled")
 
-        # Fallback: Use legacy coordinate setup if controller failed
+        # Phase 1.6: NO LEGACY FALLBACK for coordinate setup
+        # If CoordinatesController fails, coordinates display is disabled (safe-mode)
         if not _coords_init_success:
-            self._setup_status_bar_coords()
+            if "_coords_display" not in self._unavailable_features:
+                self._unavailable_features.append("Coordinate status bar (CoordinatesController unavailable)")
+            print("[SARTRACKER] Coordinate display unavailable - controller initialization failed")
 
         # Check for paused mission and prompt to resume
         QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
@@ -1485,156 +1518,20 @@ class sartracker:
         """
         Show the Mission Logs window (non-modal) for end-of-mission review.
 
-        Phase 4: Now delegates to MissionLogsController when available.
+        Phase 1.5 Refactor V2: Delegates exclusively to MissionLogsController.
+        NO LEGACY FALLBACK - if controller unavailable, safe-mode blocks the action.
         """
-        # Use controller if available
+        # Delegate to controller (no fallback - safe-mode handles unavailability)
         if self.mission_logs_controller:
             self.mission_logs_controller.show_window()
-            return
+        else:
+            # Controller unavailable - use safe-mode block
+            self._safe_mode_block("Mission Logs")
 
-        # Fallback: legacy implementation
-        if self._safe_mode_block("Mission Logs"):
-            return
-
-        try:
-            from .ui.mission_logs_window import MissionLogsWindow
-
-            # Reuse existing window if it exists and is visible
-            if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
-                try:
-                    if self._mission_logs_window.isVisible():
-                        self._mission_logs_window.raise_()
-                        self._mission_logs_window.activateWindow()
-                        return
-                except RuntimeError:
-                    self._mission_logs_window = None
-
-            # Create new window
-            self._mission_logs_window = MissionLogsWindow(self.iface.mainWindow())
-
-            # Configure catalog service from layers controller
-            if self.layers_controller and hasattr(self.layers_controller, "catalog"):
-                self._mission_logs_window.set_catalog_service(self.layers_controller.catalog)
-
-            # Configure marker fetcher
-            if self.layers_controller and hasattr(self.layers_controller, "list_markers"):
-                self._mission_logs_window.set_marker_fetcher(self.layers_controller.list_markers)
-
-            # Configure mission info fetcher
-            self._mission_logs_window.set_mission_info_fetcher(self._get_mission_logs_info)
-
-            # Wire up signals from the window
-            self._mission_logs_window.zoom_requested.connect(self._on_mission_logs_zoom)
-            self._mission_logs_window.edit_marker_requested.connect(self._on_mission_logs_edit_marker)
-            self._mission_logs_window.delete_marker_requested.connect(self._on_mission_logs_delete_marker)
-            self._mission_logs_window.open_attachment_requested.connect(self._on_mission_logs_open_attachment)
-            self._mission_logs_window.feature_zoom_requested.connect(self._on_mission_logs_feature_zoom)
-            self._mission_logs_window.feature_delete_requested.connect(self._on_mission_logs_feature_delete)
-            self._mission_logs_window.feature_rename_requested.connect(self._on_mission_logs_feature_rename)
-            self._mission_logs_window.bulk_delete_requested.connect(self._on_mission_logs_bulk_delete)
-            self._mission_logs_window.visibility_toggled.connect(self._on_mission_logs_visibility_toggled)
-            self._mission_logs_window.layer_alias_change_requested.connect(self._on_mission_logs_alias_change)
-            self._mission_logs_window.layer_favorite_toggled.connect(self._on_mission_logs_favorite_toggled)
-            self._mission_logs_window.move_to_section_requested.connect(self._on_mission_logs_move_to_section)
-            self._mission_logs_window.reorder_requested.connect(self._on_mission_logs_reorder)
-            self._mission_logs_window.layer_console_refresh_requested.connect(self._on_mission_logs_refresh)
-            self._mission_logs_window.closed.connect(self._on_mission_logs_closed)
-
-            # Show non-modal
-            self._mission_logs_window.show()
-
-        except Exception as e:
-            error(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Failed to open Mission Logs: {e}",
-                duration=5
-            )
-            print(f"ERROR opening Mission Logs: {e}")
-            print(traceback.format_exc())
-
-    def _get_mission_logs_info(self) -> dict:
-        """
-        Get mission information for the Mission Logs window.
-
-        SAR-31a: Improved exception handling with logging and diagnostic flag.
-        Returns 'data_incomplete' flag if any section failed to load.
-        """
-        info = {
-            "name": None,
-            "status": "inactive",
-            "start_time": None,
-            "end_time": None,
-            "coordinators": "",
-            "primary_store": None,
-            "backup_store": None,
-            "layer_count": 0,
-            "feature_count": 0,
-            "marker_count": 0,
-            "tracking_devices": 0,
-            "breadcrumb_count": 0,
-            "data_incomplete": False,  # SAR-31a: Flag for UI warning
-        }
-
-        try:
-            # Mission name and paths
-            paths = self._current_mission_paths()
-            if paths:
-                info["name"] = paths.mission_name
-                info["status"] = "active"
-                info["primary_store"] = str(paths.gpkg_path) if paths.gpkg_path else None
-                info["backup_store"] = str(paths.backup_directory) if paths.backup_directory else None
-
-            # Coordinators
-            if self.layer_manager:
-                coords = self.layer_manager.get_mission_coordinators()
-                if coords:
-                    info["coordinators"] = coords
-
-            # Start time
-            start_iso = self._get_mission_start_iso()
-            if start_iso:
-                info["start_time"] = start_iso
-
-            # Layer/feature counts
-            if self.layers_controller:
-                try:
-                    if hasattr(self.layers_controller, "get_layer_count"):
-                        info["layer_count"] = self.layers_controller.get_layer_count()
-                    if hasattr(self.layers_controller, "get_feature_count"):
-                        info["feature_count"] = self.layers_controller.get_feature_count()
-                except Exception as exc:
-                    # SAR-31a: Log instead of silent pass
-                    print(f"[SARTRACKER] Warning: Failed to get layer/feature counts: {exc}")
-                    info["data_incomplete"] = True
-
-            # Marker count
-            if self.layers_controller and hasattr(self.layers_controller, "list_markers"):
-                try:
-                    markers = self.layers_controller.list_markers()
-                    info["marker_count"] = len(markers) if markers else 0
-                except Exception as exc:
-                    # SAR-31a: Log instead of silent pass
-                    print(f"[SARTRACKER] Warning: Failed to get marker count: {exc}")
-                    info["data_incomplete"] = True
-
-            # Tracking stats
-            if self.layer_manager:
-                try:
-                    if hasattr(self.layer_manager, "get_device_count"):
-                        info["tracking_devices"] = self.layer_manager.get_device_count()
-                    if hasattr(self.layer_manager, "get_breadcrumb_count"):
-                        info["breadcrumb_count"] = self.layer_manager.get_breadcrumb_count()
-                except Exception as exc:
-                    # SAR-31a: Log instead of silent pass
-                    print(f"[SARTRACKER] Warning: Failed to get tracking stats: {exc}")
-                    info["data_incomplete"] = True
-
-        except Exception as exc:
-            print(f"[SARTRACKER] Warning: Error getting mission logs info: {exc}")
-            info["data_incomplete"] = True
-
-        return info
+    # ========================================================================
+    # Phase 1.5 Refactor V2: Legacy mission logs info method removed
+    # _get_mission_logs_info is now handled by MissionLogsController.get_mission_info()
+    # ========================================================================
 
     def _get_audit_user_name(self) -> str:
         """Best-effort user name for audit fields."""
@@ -1664,256 +1561,28 @@ class sartracker:
 
         return "Unknown"
 
-    def _on_mission_logs_feature_zoom(self, layer_id: str, feature_id):
-        """Handle zoom request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.zoom_to_feature(layer_id, feature_id)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to zoom to feature: {exc}")
-
-    def _on_mission_logs_zoom(self, lat: float, lon: float):
-        """Handle coordinate zoom request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        try:
-            from .utils.exceptions import validate_coordinate_pair, CoordinateError
-            from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
-
-            try:
-                lat, lon = validate_coordinate_pair(lat, lon)
-            except CoordinateError as exc:
-                warning(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"Invalid coordinates: {exc}",
-                    duration=4
-                )
-                return
-
-            # Convert from WGS84 to project CRS
-            wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-            project_crs = QgsProject.instance().crs()
-            transform = QgsCoordinateTransform(wgs84, project_crs, QgsProject.instance())
-
-            point = transform.transform(QgsPointXY(lon, lat))
-
-            # Zoom to point with buffer
-            canvas = self.iface.mapCanvas()
-            current_scale = canvas.scale()
-            canvas.setCenter(point)
-            canvas.zoomScale(min(current_scale, 5000))  # Don't zoom out, only in
-            canvas.refresh()
-        except Exception as exc:
-            print(f"[SARTRACKER] Warning: Failed to zoom to coordinates: {exc}")
-
-    def _on_mission_logs_edit_marker(self, marker_type: str, marker_id: str):
-        """Handle edit marker request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        # Delegate to marker controller if available, else use fallback handler
-        if self.marker_controller:
-            try:
-                self.marker_controller.handle_edit(marker_type, marker_id)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to edit marker: {exc}")
-        else:
-            self._on_marker_edit_requested(marker_type, marker_id)
-
-    def _on_mission_logs_delete_marker(self, marker_type: str, marker_id: str):
-        """Handle delete marker request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        # Delegate to marker controller if available, else use fallback handler
-        if self.marker_controller:
-            try:
-                self.marker_controller.handle_delete(marker_type, marker_id)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to delete marker: {exc}")
-        else:
-            self._on_marker_delete_requested(marker_type, marker_id)
-
-    def _on_mission_logs_open_attachment(self, path: str):
-        """Handle open attachment request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-
-        import os.path
-
-        # Validate path before opening
-        if not path:
-            print("[SARTRACKER] Warning: Empty attachment path")
-            return
-        if not os.path.isfile(path):
-            warning(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Attachment not found: {path}",
-                duration=4
-            )
-            return
-
-        try:
-            from qgis.PyQt.QtCore import QUrl
-            from qgis.PyQt.QtGui import QDesktopServices
-            if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-                raise RuntimeError("QDesktopServices.openUrl returned False")
-        except Exception as exc:
-            warning(self.iface.messageBar(), "SAR Tracker", f"Could not open attachment: {exc}", duration=5)
-            print(f"[SARTRACKER] Warning: Failed to open attachment: {exc}")
-
-    def _on_mission_logs_feature_delete(self, layer_id: str, feature_id):
-        """Handle feature delete request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.delete_feature(
-                    layer_id,
-                    feature_id,
-                    updated_by=self._get_audit_user_name()
-                )
-                self._refresh_mission_logs_window()
-            except Exception as exc:
-                warning(self.iface.messageBar(), "SAR Tracker", f"Delete failed: {exc}", duration=4)
-                print(f"[SARTRACKER] Warning: Failed to delete feature: {exc}")
-
-    def _on_mission_logs_feature_rename(self, layer_id: str, feature_id, new_name: str):
-        """Handle feature rename request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.rename_feature(
-                    layer_id,
-                    feature_id,
-                    new_name,
-                    updated_by=self._get_audit_user_name()
-                )
-                self._refresh_mission_logs_window()
-            except Exception as exc:
-                warning(self.iface.messageBar(), "SAR Tracker", f"Rename failed: {exc}", duration=4)
-                print(f"[SARTRACKER] Warning: Failed to rename feature: {exc}")
-
-    def _on_mission_logs_bulk_delete(self, layer_id: str, feature_ids: list):
-        """Handle bulk delete request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                if not feature_ids:
-                    return
-                if len(feature_ids) > 10:
-                    confirm = QMessageBox.question(
-                        self.iface.mainWindow(),
-                        "Bulk Delete",
-                        f"Delete {len(feature_ids)} features?\nThis action cannot be undone.",
-                        MessageBoxYes | MessageBoxNo,
-                        MessageBoxNo
-                    )
-                    if confirm != MessageBoxYes:
-                        return
-                self.layers_controller.bulk_delete_features(
-                    layer_id,
-                    feature_ids,
-                    confirmed=True,
-                    updated_by=self._get_audit_user_name()
-                )
-                self._refresh_mission_logs_window()
-            except Exception as exc:
-                warning(self.iface.messageBar(), "SAR Tracker", f"Bulk delete failed: {exc}", duration=5)
-                print(f"[SARTRACKER] Warning: Failed to bulk delete features: {exc}")
-
-    def _on_mission_logs_visibility_toggled(self, layer_id: str, visible: bool):
-        """Handle layer visibility toggle from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.set_layer_visibility(layer_id, visible)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to toggle layer visibility: {exc}")
-
-    def _on_mission_logs_alias_change(self, layer_id: str, new_alias: str):
-        """Handle layer alias change from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
-            try:
-                alias_value = new_alias.strip() if new_alias else None
-                self.layers_controller.catalog.set_layer_alias(layer_id, alias_value)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to change layer alias: {exc}")
-
-    def _on_mission_logs_favorite_toggled(self, layer_id: str, is_favorite: bool):
-        """Handle layer favorite toggle from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
-            try:
-                self.layers_controller.catalog.set_layer_favorite(layer_id, is_favorite)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to toggle layer favorite: {exc}")
-
-    def _on_mission_logs_move_to_section(self, feature_id: int, section: str):
-        """Handle move to section request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.move_search_area_to_section(
-                    feature_id=feature_id,
-                    target_section=section
-                )
-                self._refresh_mission_logs_window()
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to move to section: {exc}")
-
-    def _on_mission_logs_reorder(self, layer_id: str, feature_ids: list):
-        """Handle feature reorder request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller:
-            try:
-                self.layers_controller.reorder_features(layer_id, feature_ids)
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Failed to reorder features: {exc}")
-
-    def _on_mission_logs_refresh(self):
-        """Handle manual refresh request from Mission Logs window."""
-        if self._is_unloading or self._app_is_quitting:
-            return
-        if self.layers_controller and hasattr(self.layers_controller, "catalog"):
-            try:
-                self.layers_controller.catalog.rescan_layers()
-            except Exception as exc:
-                print(f"[SARTRACKER] Warning: Catalog rescan failed: {exc}")
-        self._refresh_mission_logs_window()
+    # ========================================================================
+    # Phase 1.5 Refactor V2: Legacy mission logs handlers removed
+    # All _on_mission_logs_* handlers are now handled by MissionLogsController.
+    # Removed ~260 lines of legacy handlers.
+    # ========================================================================
 
     def _refresh_mission_logs_window(self):
-        """Refresh the Mission Logs window if it's open."""
+        """
+        Refresh the Mission Logs window if it's open.
+
+        Phase 1.5: Delegates to MissionLogsController when available.
+        """
         # Guard against refresh during shutdown
         if self._is_unloading or self._app_is_quitting:
             return
-        if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
+
+        # Prefer controller if available
+        if self.mission_logs_controller:
             try:
-                # Check if C++ object is still valid
-                if sip_isdeleted(self._mission_logs_window):
-                    self._mission_logs_window = None
-                    return
-                self._mission_logs_window.refresh()
-            except RuntimeError:
-                # Window C++ object deleted
-                self._mission_logs_window = None
+                self.mission_logs_controller.refresh_window()
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to refresh Mission Logs window: {exc}")
-
-    def _on_mission_logs_closed(self):
-        """Handle Mission Logs window closed signal."""
-        # Just clear the reference, don't try to clean up - window handles its own cleanup
-        self._mission_logs_window = None
 
     def _on_app_about_to_quit(self):
         """
@@ -1928,15 +1597,12 @@ class sartracker:
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
 
-        # Phase 5: Stop coordinate updates early to avoid callbacks into deleted C++ objects
+        # Phase 1.6: Stop coordinate updates early - controller owns cleanup
         try:
             if self.coordinates_controller:
                 self.coordinates_controller.cleanup("application about to quit")
                 self._coords_updates_enabled = False
                 self._map_canvas_connected = False
-            elif self.coords_update_timer or self._coords_updates_enabled:
-                # Fallback for legacy cleanup if controller not available
-                self._disable_coords_updates("application about to quit")
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to disable coord updates on shutdown: {exc}")
 
@@ -2008,14 +1674,11 @@ class sartracker:
             # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
             # This must happen before any other cleanup to prevent timer callbacks
             # from firing while components are being torn down.
-            # Phase 5: Use controller cleanup if available
+            # Phase 1.6: Controller owns coordinate cleanup (no legacy fallback)
             if self.coordinates_controller:
                 self.coordinates_controller.cleanup("plugin unload (early cleanup)")
                 self._coords_updates_enabled = False
                 self._map_canvas_connected = False
-            elif self.coords_update_timer or self._coords_updates_enabled:
-                # Fallback for legacy cleanup
-                self._disable_coords_updates("plugin unload (early cleanup)")
 
             if self.layer_manager:
                 try:
@@ -2092,28 +1755,9 @@ class sartracker:
             # running while we're in the middle of cleanup
             # ============================================================
 
-            # Phase 5: xyCoordinates signal handled by CoordinatesController.cleanup()
-            # (called in early cleanup above). Only do fallback disconnect if controller
-            # was not available or cleanup didn't run for some reason.
-            if not self.coordinates_controller:
-                # Fallback: Disconnect map canvas mouse move signal manually
-                # BUG-045 FIX: Always attempt disconnection regardless of flag state
-                # Flag may be out of sync due to exceptions during setup
-                try:
-                    if self.iface and self.iface.mapCanvas():
-                        self.iface.mapCanvas().xyCoordinates.disconnect(self._on_mouse_move)
-                        print("[SARTRACKER] xyCoordinates signal disconnected successfully (fallback)")
-                except (TypeError, RuntimeError) as e:
-                    # TypeError: Signal not connected (initGui never completed)
-                    # RuntimeError: C++ object already deleted
-                    if self._map_canvas_connected:
-                        # Only warn if we expected to be connected
-                        print(f"[SARTRACKER] BUG-045: Could not disconnect xyCoordinates: {e}")
-                except Exception as e:
-                    # BUG-045 FIX: Catch any other exceptions to ensure cleanup continues
-                    print(f"[SARTRACKER] BUG-045: Unexpected error disconnecting xyCoordinates: {e}")
-                finally:
-                    self._map_canvas_connected = False
+            # Phase 1.6: xyCoordinates signal handled by CoordinatesController.cleanup()
+            # (called in early cleanup above). No legacy fallback needed.
+            self._map_canvas_connected = False
 
             if self.mission_controller:
                 # BUG-078 FIX: Enhanced signal disconnection error handling
@@ -2161,28 +1805,9 @@ class sartracker:
                 finally:
                     self._current_refresh_task = None
 
-            # Legacy cleanup for connection test task (Issue #2 fix)
-            if hasattr(self, '_current_connection_task') and self._current_connection_task:
-                try:
-                    self._current_connection_task.cancel()
-                    self._current_connection_task = None
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Connection task cleanup error: {e}")
-
-            # Clean up pending provider state (Issue #1 fix)
-            if hasattr(self, '_pending_provider_task') and self._pending_provider_task:
-                try:
-                    self._pending_provider_task.cancel()
-                    self._pending_provider_task = None
-                    print("[SARTRACKER] Pending provider task cancelled")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Pending provider task cleanup error: {e}")
-
-            # Clear shadow state variables (Issue #1 fix)
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
+            # Phase 1.7: Connection test and pending provider state cleanup
+            # now handled by ProviderController.cleanup() (called earlier)
+            # Removed orphan cleanup for: _current_connection_task, _pending_provider*
 
             self._refresh_in_progress = False
 
@@ -2193,27 +1818,12 @@ class sartracker:
                     action)
                 self.iface.removeToolBarIcon(action)
 
-            # Phase 5: Coordinate cleanup handled by controller (if available)
+            # Phase 1.6: Coordinate cleanup handled exclusively by controller
             # Controller cleanup was called in early cleanup section above.
-            # Only do fallback cleanup if controller was not available.
-            if not self.coordinates_controller:
-                # Fallback: Stop coordinate update timer
-                if self.coords_update_timer or self._coords_updates_enabled:
-                    self._disable_coords_updates("plugin unload")
-
-                # Fallback: Remove coordinate label from status bar
-                if self.coords_label:
-                    try:
-                        self.iface.statusBarIface().removeWidget(self.coords_label)
-                        self.coords_label.deleteLater()
-                    except:
-                        pass
-                    self.coords_label = None
-            else:
-                # Controller cleaned up - just clear our reference
-                self.coords_label = None
-                self.coords_update_timer = None
-                self.coordinates_controller = None
+            # Clear our references (controller was already cleaned up).
+            self.coords_label = None
+            self.coords_update_timer = None
+            self.coordinates_controller = None
 
             # ============================================================
             # PHASE 7: Clean up MapToolsController (handles all tool cleanup)
@@ -2402,51 +2012,8 @@ class sartracker:
             # ============================================================
 
             # ============================================================
-            # Clean up Mission Logs Window
-            # ============================================================
-            if hasattr(self, "_mission_logs_window") and self._mission_logs_window:
-                try:
-                    # Check if C++ object is still valid before accessing
-                    if sip_isdeleted(self._mission_logs_window):
-                        print("[SARTRACKER] Mission Logs window already deleted, skipping cleanup")
-                        self._mission_logs_window = None
-                    else:
-                        print("[SARTRACKER] Cleaning up Mission Logs window...")
-                        # Disconnect all signals (marker signals)
-                        for signal_name, handler in [
-                            ("zoom_requested", self._on_mission_logs_zoom),
-                            ("edit_marker_requested", self._on_mission_logs_edit_marker),
-                            ("delete_marker_requested", self._on_mission_logs_delete_marker),
-                            ("open_attachment_requested", self._on_mission_logs_open_attachment),
-                            # Layer console signals
-                            ("feature_zoom_requested", self._on_mission_logs_feature_zoom),
-                            ("feature_delete_requested", self._on_mission_logs_feature_delete),
-                            ("feature_rename_requested", self._on_mission_logs_feature_rename),
-                            ("bulk_delete_requested", self._on_mission_logs_bulk_delete),
-                            ("visibility_toggled", self._on_mission_logs_visibility_toggled),
-                            ("layer_alias_change_requested", self._on_mission_logs_alias_change),
-                            ("layer_favorite_toggled", self._on_mission_logs_favorite_toggled),
-                            ("move_to_section_requested", self._on_mission_logs_move_to_section),
-                            ("reorder_requested", self._on_mission_logs_reorder),
-                            ("layer_console_refresh_requested", self._on_mission_logs_refresh),
-                            ("closed", self._on_mission_logs_closed),
-                        ]:
-                            try:
-                                signal = getattr(self._mission_logs_window, signal_name, None)
-                                if signal:
-                                    signal.disconnect(handler)
-                            except (TypeError, RuntimeError):
-                                pass
-
-                        # Clean up and close the window
-                        self._mission_logs_window.cleanup()
-                        self._mission_logs_window.close()
-                        self._mission_logs_window.deleteLater()
-                        print("[SARTRACKER] Mission Logs window cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during Mission Logs window cleanup: {e}")
-                finally:
-                    self._mission_logs_window = None
+            # Phase 1.5: Mission Logs cleanup now handled by MissionLogsController
+            # (cleaned up earlier in controller cleanup section)
             # ============================================================
 
             # Disconnect and clean up SAR Panel
@@ -2701,8 +2268,9 @@ class sartracker:
 
         try:
             removed = self.layers_controller.clear_measurement_overlays()
-            if removed:
-                self._update_measurement_overlay_indicator()
+            if removed and self.map_tools_controller:
+                # Phase 1 Refactor V2: Delegate to MapToolsController
+                self.map_tools_controller.update_measurement_indicator()
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to clear overlays after mission finish: {exc}")
 
@@ -3672,7 +3240,7 @@ class sartracker:
             self.provider_controller.start_refresh()
             return
 
-        # Legacy fallback: if controller not available, show warning
+        # Phase 1.7: Controller unavailable - show safe-mode message
         if not self.provider:
             self._notify("warning", "SAR Tracker", "No data source loaded. Please load a data source first.", duration=3)
             return
@@ -3954,469 +3522,28 @@ class sartracker:
 
     def _load_provider(self, provider_name: str, config: dict):
         """
-        DEPRECATED: Load and initialize a data provider via registry.
+        Load and initialize a data provider via ProviderController.
 
-        Phase 8: This method is DEPRECATED. Use ProviderController.set_provider() instead.
-        Kept for backwards compatibility with legacy code paths.
-
-        ISSUE #1 FIX: Uses transactional two-phase commit pattern.
-        New provider is validated in shadow state before replacing current provider.
-        Current provider remains active until new provider passes connection test.
-
-        Phase 1: Validation
-        - Create new provider in shadow state (_pending_provider)
-        - Test connection asynchronously
-        - Current provider remains active and functional
-
-        Phase 2: Commit (only if validation succeeds)
-        - Replace self.provider with _pending_provider
-        - Clear shadow state
-
-        Rollback (if validation fails):
-        - Discard _pending_provider
-        - Current provider remains unchanged
-        - User sees clear error message
+        Phase 1.7 Refactor V2: NO LEGACY FALLBACK - delegates exclusively to
+        ProviderController. If controller unavailable, shows safe-mode error.
 
         Args:
-            provider_name: Name of provider (e.g., 'csv', 'http_traccar')
+            provider_name: Name of provider (e.g., 'csv', 'traccar_http')
             config: Provider-specific configuration dict
 
-        Qt5/Qt6 Compatible: Uses provider registry pattern.
+        Qt5/Qt6 Compatible: Delegates to controller.
         """
-        # Phase 8: Prefer using controller
         if self.provider_controller:
             self.provider_controller.set_provider(provider_name, config)
-            return
-        # INPUT VALIDATION (mandatory pattern)
-        if not provider_name or not isinstance(provider_name, str):
-            raise ValueError("Provider name must be a non-empty string")
-
-        if config is None or not isinstance(config, dict):
-            raise ValueError("Provider config must be a dictionary")
-
-        # Prevent concurrent operations
-        if self._refresh_in_progress:
-            warning(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                "Please wait for current operation to complete",
-                duration=2
-            )
-            return
-
-        # DEFENSIVE GUARD: Prevent concurrent provider changes
-        if self._pending_provider is not None:
-            warning(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                "Provider change already in progress, please wait...",
-                duration=2
-            )
-            return
-
-        try:
-            # PHASE 1: CREATE NEW PROVIDER IN SHADOW STATE
-            # This does NOT touch self.provider - old provider remains active
-            print(f"[SARTRACKER] Starting provider change: {provider_name}")
-            print(f"[SARTRACKER] Current provider: {self.provider_name}")
-
-            # Create provider via registry (may raise exception)
-            new_provider = provider_registry.get_provider(provider_name, config)
-
-            # Store in SHADOW variables (not committed yet)
-            self._pending_provider = new_provider
-            self._pending_provider_name = provider_name
-            self._pending_provider_config = config
-
-            # Store provider metadata for later use
-            self._pending_provider_metadata = next(
-                (m for m in provider_registry.list_providers() if m.name == provider_name),
-                None
-            )
-
-            # Set loading state for UI feedback
-            self._refresh_in_progress = True
-            if self.sar_panel:
-                self.sar_panel.set_loading_state(True)
-
-            # Show testing message (not "loading" - we're testing, not committed yet)
-            info(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Testing connection to {provider_name}...",
-                duration=2
-            )
-
-            # PHASE 1: TEST CONNECTION IN BACKGROUND
-            # Test the PENDING provider, not the current one
-            from .providers.tasks import ConnectionTestTask
-            test_task = ConnectionTestTask(
-                self._pending_provider,  # Test pending provider
-                f"Testing {provider_name} connection"
-            )
-
-            # Start task with managed lifecycle
-            task_id = self.task_manager.start_task(
-                task=test_task,
-                on_complete=self._on_connection_test_complete,
-                on_error=self._on_connection_test_error,
-                task_id="connection_test"
-            )
-
-            # Store task reference for potential cancellation
-            self._pending_provider_task = test_task
-
-            print(f"[SARTRACKER] Provider validation task started for: {provider_name}")
-
-        except Exception as e:
-            # BUG-063 FIX: Comprehensive state reset on error during provider creation
-            # Reset all state variables to ensure consistent plugin state
-            self._refresh_in_progress = False
-            self._clear_loading_state()
-
-            error(
-                self.iface.messageBar(),
-                "Error Loading Provider",
-                f"Failed to create {provider_name} provider: {str(e)}",
-                duration=5
-            )
-
-            # BUG-063 FIX: Clean up ALL shadow state (DO NOT touch self.provider)
-            # This ensures no stale references remain after error
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-            self._pending_provider_task = None  # BUG-063: Clear task reference
-
-            # BUG-063 FIX: Log error with context for diagnostics
-            import logging
-            logging.getLogger(__name__).error(
-                "BUG-063: Provider creation failed for '%s': %s - state reset complete",
-                provider_name, e
-            )
-            print(f"[SARTRACKER] Provider creation failed: {e}")
-
-    def _on_connection_test_complete(self, task):
-        """
-        Handle connection test completion (runs in main thread).
-
-        ISSUE #1 FIX: Implements two-phase commit for provider changes.
-
-        If connection successful:
-        - PHASE 2 COMMIT: Replace self.provider with validated _pending_provider
-        - Proceed to load initial data
-
-        If connection failed:
-        - ROLLBACK: Discard _pending_provider
-        - Preserve current provider (may be None if this is first load)
-        - Show error to user
-
-        Args:
-            task: Completed ConnectionTestTask
-
-        SAFETY: May be called after plugin unload if signal disconnect failed.
-        Check component existence before accessing.
-        """
-        # BUG-021 FIX: Comprehensive guards for callback safety
-        # Check if plugin is being unloaded or app is quitting
-        if self._is_unloading or self._app_is_quitting:
-            print("[SARTRACKER] Connection test completed during plugin unload, ignoring")
-            # Clean up shadow state
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-            self._pending_provider_task = None
-            return
-
-        # CRITICAL GUARD: Check if plugin components still exist (Pattern 9)
-        if not self.sar_panel:
-            print("[SARTRACKER] Connection test completed after plugin unload, ignoring")
-            # Clean up shadow state
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-            self._pending_provider_task = None
-            return
-
-        # BUG-021 FIX: Check iface and messageBar availability
-        if not self.iface:
-            print("[SARTRACKER] Connection test completed but iface unavailable")
-            return
-
-        try:
-            # Clear task reference
-            self._pending_provider_task = None
-
-            # DEFENSIVE CHECK: Ensure we have pending provider state
-            if self._pending_provider is None:
-                print("[SARTRACKER] Warning: Connection test completed but no pending provider")
-                self._refresh_in_progress = False
-                self._clear_loading_state()
-                return
-
-            # Check if connection test succeeded
-            if not task.success:
-                # ================================================================
-                # ROLLBACK: Connection test failed
-                # ================================================================
-                print(f"[SARTRACKER] Connection test FAILED for {self._pending_provider_name}")
-                print(f"[SARTRACKER] Rolling back to previous provider: {self.provider_name}")
-
-                self._refresh_in_progress = False
-                self._clear_loading_state()
-
-                # Show user-friendly error
-                provider_display = self._pending_provider_name
-                if self._pending_provider_metadata:
-                    provider_display = self._pending_provider_metadata.display_name
-
-                error(
-                    self.iface.messageBar(),
-                    "Connection Failed",
-                    f"Could not connect to {provider_display}. "
-                    + (f"Your current data source ({self.provider_name}) remains active."
-                       if self.provider else "No data source loaded."),
-                    duration=8  # Longer duration for critical message
-                )
-
-                # ROLLBACK: Discard pending provider (keep current provider)
-                self._pending_provider = None
-                self._pending_provider_name = None
-                self._pending_provider_config = None
-                self._pending_provider_metadata = None
-
-                # Current provider (self.provider) is UNCHANGED - rollback complete
-                print(f"[SARTRACKER] Rollback complete. Active provider: {self.provider_name}")
-                return
-
-            # ================================================================
-            # PHASE 2 COMMIT: Connection test succeeded
-            # ================================================================
-            print(f"[SARTRACKER] Connection test SUCCEEDED for {self._pending_provider_name}")
-            print(f"[SARTRACKER] Committing provider change: {self.provider_name} -> {self._pending_provider_name}")
-
-            # Store old provider info for logging
-            old_provider_name = self.provider_name
-
-            # ATOMIC COMMIT: Replace current provider with validated pending provider
-            self.provider = self._pending_provider
-            self.provider_name = self._pending_provider_name
-            self.provider_config = self._pending_provider_config
-
-            # Clear shadow state (commit complete)
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-
-            print(f"[SARTRACKER] Provider commit complete: {old_provider_name} -> {self.provider_name}")
-
-            # Show success notification
-            provider_display = (
-                self._pending_provider_metadata.display_name
-                if self._pending_provider_metadata
-                else self.provider_name
-            )
-
-            success(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Connected to {provider_display} successfully",
-                duration=3
-            )
-
-            # Update data source label with provider-specific info
-            if self.provider_name == 'csv':
-                import os
-                csv_path = self.provider_config.get('csv_path', '')
-                if csv_path:
-                    if os.path.isdir(csv_path):
-                        label = f"{provider_display}: {os.path.basename(csv_path)}"
-                    else:
-                        label = f"{provider_display}: {os.path.basename(csv_path)}"
-                else:
-                    label = provider_display
-            elif self.provider_name == 'http_traccar':
-                server_url = self.provider_config.get('server_url', 'Unknown')
-                label = f"{provider_display}: {server_url}"
-            else:
-                label = provider_display
-
-            # Set data source label (check panel still exists)
-            if self.sar_panel:
-                self.sar_panel.set_data_source(label)
-
-            # Clean up metadata
-            self._pending_provider_metadata = None
-
-            # Update info message for data loading phase
-            info(
-                self.iface.messageBar(),
-                "SAR Tracker",
-                f"Loading initial data from {provider_display}...",
-                duration=2
-            )
-
-            # Verify provider still exists (defensive check for life-safety)
-            if not self.provider:
-                self._refresh_in_progress = False
-                self._clear_loading_state()
-                error(
-                    self.iface.messageBar(),
-                    "Internal Error",
-                    "Provider was cleared during connection test",
-                    duration=5
-                )
-                print("[SARTRACKER] ERROR: Provider is None after commit")
-                return
-
-            # Verify task manager still exists (defensive check)
-            if not self.task_manager:
-                self._refresh_in_progress = False
-                self._clear_loading_state()
-                error(
-                    self.iface.messageBar(),
-                    "Internal Error",
-                    "Task manager was cleared during connection test",
-                    duration=5
-                )
-                print("[SARTRACKER] ERROR: Task manager is None")
-                return
-
-            # Create provider-specific background task for initial data load
-            # Pass mission start time so breadcrumbs are filtered from mission start
-            since_iso = self._get_mission_start_iso()
-            data_task = self.provider.create_refresh_task("Loading tracking data", since_iso=since_iso)
-
-            # Start data load task with managed lifecycle
-            task_id = self.task_manager.start_task(
-                task=data_task,
-                on_complete=self._on_load_complete,
-                on_error=self._on_refresh_error,
-                task_id="load"
-            )
-
-            # Store task reference for backwards compatibility with Issue #4 cleanup
-            self._current_refresh_task = data_task
-
-            print(f"[SARTRACKER] Initial data load task started for: {self.provider_name}")
-
-        except Exception as e:
-            # DEFENSIVE: Catch all exceptions to prevent error handler crashes
-            self._log_exception("_on_connection_test_complete", e)
-
-            # Reset state
-            self._refresh_in_progress = False
-            self._clear_loading_state()
-
-            # Clean up shadow state (preserve current provider on error)
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-
-            error(
-                self.iface.messageBar(),
-                "Error After Connection Test",
-                f"Unexpected error during provider setup: {str(e)}",
-                duration=5
-            )
-
-    def _on_connection_test_error(self, task):
-        """
-        Handle connection test error or cancellation (runs in main thread).
-
-        ISSUE #1 FIX: Implements rollback for provider changes on error/timeout.
-        Preserves current provider state.
-
-        Args:
-            task: Failed or cancelled ConnectionTestTask
-
-        SAFETY: May be called after plugin unload if signal disconnect failed.
-        Check component existence before accessing.
-        """
-        # CRITICAL GUARD: Check if plugin components still exist (Pattern 9)
-        if not self.sar_panel:
-            print("[SARTRACKER] Connection test error after plugin unload, ignoring")
-            # Clean up shadow state
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-            self._pending_provider_task = None
-            return
-
-        try:
-            # Clear task reference
-            self._pending_provider_task = None
-
-            # DEFENSIVE CHECK: Ensure we have pending provider state
-            if self._pending_provider is None:
-                print("[SARTRACKER] Warning: Connection test error but no pending provider")
-                self._refresh_in_progress = False
-                self._clear_loading_state()
-                return
-
-            # ================================================================
-            # ROLLBACK: Connection test failed/timed out/cancelled
-            # ================================================================
-            print(f"[SARTRACKER] Connection test ERROR for {self._pending_provider_name}")
-            print(f"[SARTRACKER] Rolling back to previous provider: {self.provider_name}")
-
-            # Reset refresh state
-            self._refresh_in_progress = False
-
-            # Hide loading state
-            self._clear_loading_state()
-
-            # Get error message
-            error_msg = (
-                task.error_message
-                if hasattr(task, 'error_message') and task.error_message
-                else "Connection test failed or was cancelled"
-            )
-
-            # Show user-friendly error with rollback context
-            provider_display = self._pending_provider_name
-            if self._pending_provider_metadata:
-                provider_display = self._pending_provider_metadata.display_name
-
-            error(
-                self.iface.messageBar(),
-                "Connection Failed",
-                f"{provider_display}: {error_msg}. "
-                + (f"Your current data source ({self.provider_name}) remains active."
-                   if self.provider else "No data source loaded."),
-                duration=8  # Longer duration for critical message
-            )
-
-            # ROLLBACK: Discard pending provider (keep current provider)
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-
-            # Current provider (self.provider) is UNCHANGED - rollback complete
-            print(f"[SARTRACKER] Rollback complete. Active provider: {self.provider_name}")
-
-        except Exception as e:
-            # Last resort error handling
-            self._log_exception("_on_connection_test_error", e)
-
-            # BUG-063 FIX: Best effort comprehensive state cleanup
-            self._pending_provider = None
-            self._pending_provider_name = None
-            self._pending_provider_config = None
-            self._pending_provider_metadata = None
-            self._pending_provider_task = None  # BUG-063: Clear task reference
-            self._refresh_in_progress = False
-
-            try:
-                self._clear_loading_state()
-            except:
-                pass
+        else:
+            # Controller unavailable - use safe-mode block
+            self._safe_mode_block("Load Provider")
+
+    # ========================================================================
+    # Phase 1.7 Refactor V2: Legacy connection test handlers removed
+    # _on_connection_test_complete and _on_connection_test_error are now
+    # handled exclusively by ProviderController. Removed ~320 lines.
+    # ========================================================================
 
     def _on_load_csv(self, csv_file):
         """
@@ -4431,7 +3558,7 @@ class sartracker:
         if self.provider_controller:
             self.provider_controller.set_provider('csv', {'csv_path': csv_file})
         else:
-            # Legacy fallback
+            # Indirect delegation - _load_provider calls _safe_mode_block if controller unavailable
             self._load_provider('csv', {'csv_path': csv_file})
 
     def _on_load_complete(self, task):
@@ -4552,793 +3679,29 @@ class sartracker:
                 duration=5
             )
 
-    def _on_mouse_move(self, point):
-        """
-        Handle mouse movement over map canvas.
-        Just store the point - actual display update happens on timer.
-
-        Args:
-            point: QgsPointXY in map canvas CRS
-
-        SAFETY: This handler may be called after plugin unload if signal
-        disconnect failed. Check widget existence before processing.
-        """
-        # Defensive check: Ensure our widgets haven't been destroyed
-        # This prevents crashes if disconnect failed or event arrived during unload
-        if not self._coords_updates_enabled or not self.coords_label or not self.coords_update_timer:
-            # Plugin is being/has been unloaded, ignore event silently
-            # (This is normal during unload, not an error condition)
-            return
-        try:
-            if sip_isdeleted(self.coords_label):
-                self._disable_coords_updates("coordinate label deleted during mouse move")
-                return
-        except Exception:
-            # sip.isdeleted can throw if sip unavailable; fail closed
-            return
-
-        # Safe to proceed - store point for timer-based update
-        self.last_coords_point = point
-        # BUG-058 FIX: Mark that we have a new point to process
-        self._coords_point_changed = True
-
-    def _update_coords_display(self):
-        """
-        Update coordinate display in status bar.
-        Called by timer to throttle updates.
-
-        SAFETY: Timer may fire during unload or after widgets destroyed.
-        Check existence before accessing Qt objects.
-
-        BUG-049 FIX: Added early exit checks for unload/quit states.
-        BUG-058 FIX: Prevents overlapping callbacks and skips if no mouse movement.
-        """
-        # BUG-049 FIX: Early exit if plugin is being unloaded or app is quitting
-        if getattr(self, '_is_unloading', False) or getattr(self, '_app_is_quitting', False):
-            return
-
-        if not self._coords_updates_enabled:
-            return
-
-        # BUG-058 FIX: Prevent overlapping timer callbacks
-        if self._coords_update_in_progress:
-            return
-
-        # BUG-058 FIX: Skip if no new mouse movement since last update
-        if not self._coords_point_changed:
-            return
-
-        # BUG-058 FIX: Mark callback as in progress and reset changed flag
-        self._coords_update_in_progress = True
-        self._coords_point_changed = False
-
-        try:
-            label = self.coords_label
-            if not label:
-                self._disable_coords_updates("coordinate label missing before update")
-                return
-
-            try:
-                if sip_isdeleted(label):
-                    self.coords_label = None
-                    self._disable_coords_updates("coordinate label deleted before update")
-                    return
-            except Exception:
-                # If sip is unavailable fall back to defensive disable
-                self.coords_label = None
-                self._disable_coords_updates("unable to verify coordinate label state")
-                return
-
-            if not self.last_coords_point:
-                return
-
-            try:
-                canvas = self.iface.mapCanvas()
-            except RuntimeError as exc:
-                self._disable_coords_updates(f"map canvas unavailable: {exc}")
-                return
-
-            if not canvas:
-                self._disable_coords_updates("map canvas not available")
-                return
-
-            try:
-                if sip_isdeleted(canvas):
-                    self._disable_coords_updates("map canvas deleted")
-                    return
-            except Exception:
-                # If sip isn't available just stop the timer to avoid crashes
-                self._disable_coords_updates("unable to verify map canvas state")
-                return
-
-            try:
-                map_settings = canvas.mapSettings()
-                canvas_crs = map_settings.destinationCrs()
-            except RuntimeError as exc:
-                self._disable_coords_updates(f"map settings destroyed: {exc}")
-                return
-
-            if not canvas_crs.isValid() or not self.wgs84.isValid() or not self.itm.isValid():
-                # CRS stack is not ready yet (project loading/unloading)
-                return
-
-            try:
-                # Transform to WGS84
-                transform_to_wgs84 = QgsCoordinateTransform(
-                    canvas_crs,
-                    self.wgs84,
-                    QgsProject.instance()
-                )
-                wgs84_point = transform_to_wgs84.transform(self.last_coords_point)
-
-                # Transform to Irish Grid (ITM)
-                transform_to_itm = QgsCoordinateTransform(
-                    canvas_crs,
-                    self.itm,
-                    QgsProject.instance()
-                )
-                itm_point = transform_to_itm.transform(self.last_coords_point)
-
-                # Format display text with fixed-width formatting
-                coords_text = (
-                    f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
-                    f"Irish Grid: E:{int(itm_point.x()):7d}  N:{int(itm_point.y()):7d}"
-                )
-
-                # Update label (may raise RuntimeError if widget C++ object destroyed)
-                self.coords_label.setText(coords_text)
-
-            except RuntimeError as e:
-                # Qt C++ object has been deleted but Python wrapper still exists
-                # This is expected during cleanup - mark widget as invalid
-                print(f"[SARTRACKER] Coordinate label destroyed, stopping updates")
-                self.coords_label = None
-                self._disable_coords_updates("coordinate label destroyed during update")
-                return
-
-            except Exception as e:
-                # Log unexpected errors instead of silent pass
-                # This helps diagnose real bugs vs normal cleanup issues
-                print(f"[SARTRACKER] Warning: Error updating coordinates display: {e}")
-                # Don't spam console - only log first occurrence
-                if not hasattr(self, '_coords_error_logged'):
-                    import traceback
-                    print(traceback.format_exc())
-                    self._coords_error_logged = True
-
-        finally:
-            # BUG-058 FIX: Always reset in-progress flag
-            self._coords_update_in_progress = False
-
-    def _on_add_poi_requested(self):
-        """Handle Add IPP/LKP button click from SAR Panel."""
-        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
-        if self.tool_registry:
-            self.tool_registry.deactivate_current()
-
-        self.current_marker_type = 'ipp_lkp'
-        self.iface.mapCanvas().setMapTool(self.marker_tool)
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Click on map to add IPP/LKP location",
-            duration=3
-        )
-
-    def _on_add_clue_requested(self):
-        """Handle Add Clue button click from SAR Panel."""
-        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
-        if self.tool_registry:
-            self.tool_registry.deactivate_current()
-
-        self.current_marker_type = 'clue'
-        self.iface.mapCanvas().setMapTool(self.marker_tool)
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Click on map to add Clue location",
-            duration=3
-        )
-
-    def _on_add_casualty_requested(self):
-        """Handle Add Casualty button click from SAR Panel."""
-        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
-        if self.tool_registry:
-            self.tool_registry.deactivate_current()
-
-        self.current_marker_type = 'casualty'
-        self.iface.mapCanvas().setMapTool(self.marker_tool)
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker - CRITICAL",
-            "Click on map to add Casualty location (found injured/deceased person)",
-            duration=5
-        )
-
-    def _on_add_hazard_requested(self):
-        """Handle Add Hazard button click from SAR Panel."""
-        # Deactivate any drawing tools first (Issue #2 fix: check exists before calling)
-        if self.tool_registry:
-            self.tool_registry.deactivate_current()
-
-        self.current_marker_type = 'hazard'
-        self.iface.mapCanvas().setMapTool(self.marker_tool)
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Click on map to add Hazard location",
-            duration=3
-        )
-
-    # Phase 10: _on_marker_clicked removed (dead code - MapToolsController has its own)
-
-    def _on_marker_edit_requested(self, marker_type: str, marker_id: str):
-        """Handle marker edit requests originating from the Marker Log."""
-        if not self.layers_controller or MarkerDialog is None:
-            warning(self.iface.messageBar(),
-                    "Markers",
-                    "Marker editing is unavailable.",
-                    duration=4)
-            return
-
-        try:
-            feature = self.layers_controller.get_marker_feature(marker_type, marker_id)
-            if not feature:
-                warning(self.iface.messageBar(),
-                        "Markers",
-                        "Selected marker no longer exists.",
-                        duration=4)
-                return
-
-            lat, lon, easting, northing = self._extract_marker_coordinates(feature)
-            existing_data = self._build_marker_dialog_payload(feature, marker_type)
-            dialog = MarkerDialog(lat, lon, easting, northing, self.iface.mainWindow(), existing_data=existing_data)
-
-            if dialog_exec(dialog) == DialogAccepted:
-                marker_data = dialog.get_marker_data()
-                marker_data['attachment_path'] = self._ingest_attachment(marker_data.get('attachment_path'))
-                updates = self._build_marker_update_payload(marker_type, marker_data)
-                self.layers_controller.update_marker(marker_type, marker_id, updates, updated_by=marker_data.get('updated_by'))
-                success(self.iface.messageBar(),
-                        "Markers",
-                        f"{marker_data['name']} updated successfully",
-                        duration=3)
-                self._refresh_mission_logs_window()
-        except Exception as exc:
-            error(self.iface.messageBar(),
-                  "Markers",
-                  f"Failed to update marker: {exc}",
-                  duration=5)
-
-    def _on_marker_delete_requested(self, marker_type: str, marker_id: str):
-        """Handle marker deletion requests from Marker Log."""
-        if not self.layers_controller:
-            return
-
-        confirm = QMessageBox.question(
-            self.iface.mainWindow(),
-            "Delete Marker",
-            "Are you sure you want to delete this marker?\nThis action cannot be undone.",
-            MessageBoxYes | MessageBoxNo,
-            MessageBoxNo
-        )
-        if confirm != MessageBoxYes:
-            return
-
-        try:
-            self.layers_controller.delete_marker(marker_type, marker_id)
-            success(self.iface.messageBar(),
-                    "Markers",
-                    "Marker deleted.",
-                    duration=2)
-            self._refresh_mission_logs_window()
-        except Exception as exc:
-            error(self.iface.messageBar(),
-                  "Markers",
-                  f"Failed to delete marker: {exc}",
-                  duration=5)
-
-    def _on_marker_zoom_requested(self, lat: float, lon: float):
-        """Zoom map canvas to marker coordinates."""
-        if not self._valid_latlon(lat, lon):
-            warning(self.iface.messageBar(),
-                    "Markers",
-                    "Marker coordinates are invalid; cannot zoom.",
-                    duration=4)
-            return
-        try:
-            dest_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
-            source_crs = QgsCoordinateReferenceSystem(4326)
-            transform = QgsCoordinateTransform(source_crs, dest_crs, QgsProject.instance())
-            point = transform.transform(QgsPointXY(lon, lat))
-            canvas = self.iface.mapCanvas()
-            canvas.setCenter(point)
-            canvas.zoomScale(2500)
-            canvas.refresh()
-        except Exception as exc:
-            warning(self.iface.messageBar(),
-                    "Markers",
-                    f"Could not zoom to marker: {exc}",
-                    duration=4)
-
-    def _extract_marker_coordinates(self, feature) -> tuple:
-        """Return (lat, lon, easting, northing) with fallbacks."""
-        lat = feature["lat"]
-        lon = feature["lon"]
-        easting = feature["irish_grid_e"]
-        northing = feature["irish_grid_n"]
-
-        if (lat is None or lon is None) and feature.geometry() and not feature.geometry().isEmpty():
-            try:
-                point = feature.geometry().asPoint()
-                if point:
-                    lat = lat or point.y()
-                    lon = lon or point.x()
-            except Exception:
-                pass
-
-        return lat or 0.0, lon or 0.0, easting or 0.0, northing or 0.0
-
-    def _build_marker_dialog_payload(self, feature, marker_type: str) -> Dict[str, object]:
-        """Build payload passed to MarkerDialog for edit mode."""
-        payload: Dict[str, object] = {}
-        for field in feature.fields():
-            payload[field.name()] = feature[field.name()]
-        payload["type"] = marker_type
-        return payload
-
-    def _build_marker_update_payload(self, marker_type: str, marker_data: Dict[str, object]) -> Dict[str, object]:
-        """Prepare attribute updates per marker type."""
-        updates: Dict[str, object] = {
-            "name": marker_data.get("name", ""),
-            "description": marker_data.get("description", ""),
-            "updated_by": marker_data.get("updated_by", ""),
-            "coordinator_ids": marker_data.get("coordinator_ids", ""),
-            "attachment_path": marker_data.get("attachment_path", "")
-        }
-
-        if marker_type == "ipp_lkp":
-            updates["subject_category"] = marker_data.get("subject_category", "")
-        elif marker_type == "clue":
-            updates["clue_type"] = marker_data.get("clue_type", "")
-            updates["confidence"] = marker_data.get("confidence", "")
-        elif marker_type == "hazard":
-            updates["hazard_type"] = marker_data.get("hazard_type", "")
-            updates["severity"] = marker_data.get("severity", "")
-        elif marker_type == "casualty":
-            updates["condition"] = marker_data.get("condition", "")
-            updates["treatment"] = marker_data.get("treatment", "")
-            updates["evacuation_priority"] = marker_data.get("evacuation_priority", "")
-            updates["found_by"] = marker_data.get("found_by", "")
-
-        return updates
-
-    def _on_coordinate_converter_requested(self):
-        """Handle Coordinate Converter button click."""
-        dialog = CoordinateConverterDialog(self.iface.mainWindow())
-
-        # Connect go_to_location signal
-        dialog.go_to_location.connect(self._zoom_to_location)
-
-        dialog_exec(dialog)
-
-    def _zoom_to_location(self, lat, lon):
-        """
-        Zoom map to specified location.
-
-        Args:
-            lat: Latitude (WGS84)
-            lon: Longitude (WGS84)
-        """
-        # Create a small extent around the point
-        point = QgsPointXY(lon, lat)
-
-        # Get canvas CRS
-        canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
-
-        # Transform point to canvas CRS if needed
-        if canvas_crs.authid() != "EPSG:4326":
-            transform = QgsCoordinateTransform(
-                self.wgs84,
-                canvas_crs,
-                QgsProject.instance()
-            )
-            point = transform.transform(point)
-
-        # Create extent (about 500m radius in map units)
-        extent_size = 500  # meters
-        if canvas_crs.isGeographic():
-            # For geographic CRS, use degrees (rough approximation)
-            extent_size = 0.005  # about 500m at this latitude
-
-        extent = QgsRectangle(
-            point.x() - extent_size,
-            point.y() - extent_size,
-            point.x() + extent_size,
-            point.y() + extent_size
-        )
-
-        # Set map extent and refresh
-        self.iface.mapCanvas().setExtent(extent)
-        self.iface.mapCanvas().refresh()
-
-    def _on_measure_distance_requested(self):
-        """Handle Measure Distance & Bearing button click."""
-        self.iface.mapCanvas().setMapTool(self.measure_tool)
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Click two points on the map to measure distance and bearing",
-            duration=5
-        )
-
-    def _on_line_tool_requested(self):
-        """
-        Handle Line Tool button click.
-
-        SAFETY: Guards against tool_registry being None if initialization failed.
-        This prevents AttributeError crashes on main thread (Issue #2 fix).
-        """
-        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
-        if not self.tool_registry:
-            error(
-                self.iface.messageBar(),
-                "Drawing Tool Unavailable",
-                "Line Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
-                duration=0  # Persistent - user must acknowledge
-            )
-            # Auto-open diagnostics for immediate troubleshooting
-            try:
-                self._show_diagnostics()
-            except Exception as e:
-                print(f"[SARTRACKER] Could not open diagnostics: {e}")
-            return  # Early exit - don't attempt to use None registry
-
-        # Safe to proceed - registry exists and is valid
-        print(f"[SARTRACKER] _on_line_tool_requested() called")
-        print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
-        print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
-        self.tool_registry.activate_tool('line')
-        print(f"[SARTRACKER] Line tool activation complete")
-        print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Click to add points. Right-click or ESC to finish line.",
-            duration=5
-        )
-
-    def _on_polygon_tool_requested(self):
-        """
-        Handle Polygon Tool (Search Area) button click.
-
-        SAFETY: Guards against tool_registry being None if initialization failed.
-        This prevents AttributeError crashes on main thread (Issue #2 fix).
-        """
-        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
-        if not self.tool_registry:
-            error(
-                self.iface.messageBar(),
-                "Drawing Tool Unavailable",
-                "Polygon Tool (Search Area) failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
-                duration=0  # Persistent - user must acknowledge
-            )
-            # Auto-open diagnostics for immediate troubleshooting
-            try:
-                self._show_diagnostics()
-            except Exception as e:
-                print(f"[SARTRACKER] Could not open diagnostics: {e}")
-            return  # Early exit - don't attempt to use None registry
-
-        # Safe to proceed - registry exists and is valid
-        print(f"[SARTRACKER] _on_polygon_tool_requested() called")
-        print(f"[SARTRACKER] Current canvas tool before activation: {self.iface.mapCanvas().mapTool()}")
-        print(f"[SARTRACKER] Current active tool name: {self.tool_registry.get_active_tool_name()}")
-        self.tool_registry.activate_tool('polygon')
-        print(f"[SARTRACKER] Polygon tool activation complete")
-        print(f"[SARTRACKER] Canvas tool after activation: {self.iface.mapCanvas().mapTool()}")
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Search Area Tool: Click to add vertices (min 3). Right-click to finish and configure area.",
-            duration=5
-        )
-
-    def _on_range_rings_tool_requested(self):
-        """
-        Handle Range Rings Tool button click.
-
-        SAFETY: Guards against tool_registry being None if initialization failed.
-        This prevents AttributeError crashes on main thread (Issue #2 fix).
-        """
-        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
-        if not self.tool_registry:
-            error(
-                self.iface.messageBar(),
-                "Drawing Tool Unavailable",
-                "Range Rings Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
-                duration=0  # Persistent - user must acknowledge
-            )
-            # Auto-open diagnostics for immediate troubleshooting
-            try:
-                self._show_diagnostics()
-            except Exception as e:
-                print(f"[SARTRACKER] Could not open diagnostics: {e}")
-            return  # Early exit - don't attempt to use None registry
-
-        # Safe to proceed - registry exists and is valid
-        self.tool_registry.activate_tool('range_rings')
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Range Rings Tool: Click center point to configure rings",
-            duration=5
-        )
-
-    def _on_bearing_tool_requested(self):
-        """
-        Handle Bearing Tool button click.
-
-        SAFETY: Guards against tool_registry being None if initialization failed.
-        This prevents AttributeError crashes on main thread (Issue #2 fix).
-        """
-        # CRITICAL GUARD: Check if tool registry exists (Issue #2 fix)
-        if not self.tool_registry:
-            error(
-                self.iface.messageBar(),
-                "Drawing Tool Unavailable",
-                "Bearing Tool failed to load during initialization. Run Diagnostics (SAR Tracker menu) for details.",
-                duration=0  # Persistent - user must acknowledge
-            )
-            # Auto-open diagnostics for immediate troubleshooting
-            try:
-                self._show_diagnostics()
-            except Exception as e:
-                print(f"[SARTRACKER] Could not open diagnostics: {e}")
-            return  # Early exit - don't attempt to use None registry
-
-        # Safe to proceed - registry exists and is valid
-        self.tool_registry.activate_tool('bearing')
-        info(
-            self.iface.messageBar(),
-            "SAR Tracker",
-            "Bearing Line Tool: Click origin point to configure bearing and distance",
-            duration=5
-        )
-
-    def _on_gpx_import_file(self, file_path: str):
-        """
-        Handle GPX file import request.
-
-        LIFE-SAFETY CRITICAL: Validates file and provides clear error messages.
-
-        Args:
-            file_path: Absolute path to GPX file
-        """
-        # Shutdown guard - prevent operations during plugin unload
-        if self._is_unloading or self._app_is_quitting:
-            return
-
-        if not self.layers_controller or not self.layers_controller.drawings:
-            error(
-                self.iface.messageBar(),
-                "GPX Import Failed",
-                "Drawing manager not initialized",
-                duration=0
-            )
-            return
-
-        try:
-            layer, error_msg = self.layers_controller.drawings.import_gpx_file(file_path)
-
-            if layer:
-                success(
-                    self.iface.messageBar(),
-                    "GPX Imported",
-                    f"Imported: {layer.name()} ({layer.featureCount()} features)",
-                    duration=5
-                )
-            else:
-                error(
-                    self.iface.messageBar(),
-                    "GPX Import Failed",
-                    error_msg,
-                    duration=0
-                )
-
-        except Exception as e:
-            self._logger.error(f"GPX import error: {e}", exc_info=True)
-            error(
-                self.iface.messageBar(),
-                "GPX Import Error",
-                f"Unexpected error: {e}",
-                duration=0
-            )
-
-    def _on_gpx_import_folder(self, folder_path: str):
-        """
-        Handle GPX folder import request.
-
-        LIFE-SAFETY CRITICAL: Validates folder and provides summary of results.
-
-        Args:
-            folder_path: Absolute path to folder containing GPX files
-        """
-        # Shutdown guard - prevent operations during plugin unload
-        if self._is_unloading or self._app_is_quitting:
-            return
-
-        if not self.layers_controller or not self.layers_controller.drawings:
-            error(
-                self.iface.messageBar(),
-                "GPX Import Failed",
-                "Drawing manager not initialized",
-                duration=0
-            )
-            return
-
-        try:
-            layers, errors = self.layers_controller.drawings.import_gpx_folder(folder_path)
-
-            if layers:
-                success(
-                    self.iface.messageBar(),
-                    "GPX Folder Imported",
-                    f"Imported {len(layers)} GPX files",
-                    duration=5
-                )
-
-                # Show errors if any
-                if errors:
-                    from .utils.notify import warning
-                    warning(
-                        self.iface.messageBar(),
-                        "Some GPX Files Failed",
-                        f"{len(errors)} files could not be imported. Check QGIS Log Messages for details.",
-                        duration=10
-                    )
-                    for error_msg in errors:
-                        self._logger.warning(f"GPX import failed: {error_msg}")
-
-            else:
-                error(
-                    self.iface.messageBar(),
-                    "GPX Folder Import Failed",
-                    errors[0] if errors else "No GPX files found in folder",
-                    duration=0
-                )
-
-        except Exception as e:
-            self._logger.error(f"GPX folder import error: {e}", exc_info=True)
-            error(
-                self.iface.messageBar(),
-                "GPX Import Error",
-                f"Unexpected error: {e}",
-                duration=0
-            )
-
-    def _on_gpx_watch_folder(self, folder_path: str):
-        """
-        Handle GPX folder watch request.
-
-        LIFE-SAFETY CRITICAL: Starts folder watching for auto-import.
-
-        Args:
-            folder_path: Absolute path to folder to watch
-        """
-        # Shutdown guard - prevent operations during plugin unload
-        if self._is_unloading or self._app_is_quitting:
-            return
-
-        if not self.layers_controller or not self.layers_controller.drawings:
-            error(
-                self.iface.messageBar(),
-                "GPX Watch Failed",
-                "Drawing manager not initialized",
-                duration=0
-            )
-            return
-
-        try:
-            success_flag, error_msg = self.layers_controller.drawings.start_gpx_folder_watch(folder_path)
-
-            if success_flag:
-                success(
-                    self.iface.messageBar(),
-                    "Watching GPX Folder",
-                    f"Existing and new GPX files in {folder_path} will be imported",
-                    duration=10
-                )
-            else:
-                error(
-                    self.iface.messageBar(),
-                    "GPX Watch Failed",
-                    error_msg,
-                    duration=0
-                )
-
-        except Exception as e:
-            self._logger.error(f"GPX watch error: {e}", exc_info=True)
-            error(
-                self.iface.messageBar(),
-                "GPX Watch Error",
-                f"Unexpected error: {e}",
-                duration=0
-            )
-
     # ============================================================================
-    # Phase 10: Dead code removed - drawing/measurement callbacks now in MapToolsController
-    # Removed: _on_line_complete, _on_range_rings_complete, _on_bearing_complete,
-    #          _on_polygon_complete, _on_drawing_cancelled, _on_tool_activated,
-    #          _on_tool_deactivated, _on_measurement_complete, _bearing_to_cardinal,
-    #          _persist_measurement_overlay
+    # Phase 1.6 Refactor V2: Legacy coordinate display handlers removed
+    # _on_mouse_move and _update_coords_display are now handled exclusively
+    # by CoordinatesController. Removed ~160 lines.
     # ============================================================================
 
-    def _update_measurement_overlay_indicator(self):
-        """Update SARPanel measurement badge with current overlay count."""
-        if not self.layers_controller or not self.sar_panel:
-            return
-
-        try:
-            # IMPORTANT: Avoid mutating the startup "Untitled Project".
-            # Counting overlays can create the Lines layer if missing, which
-            # dirties the project and can trigger QGIS' save prompt on startup.
-            # Only count when we're in a real SAR project context.
-            project = QgsProject.instance()
-            project_filename = ""
-            try:
-                project_filename = project.fileName() or ""
-            except Exception:
-                project_filename = ""
-
-            mission_store = ""
-            try:
-                if self.layer_manager:
-                    mission_store = str(self.layer_manager.get_mission_store() or "")
-            except Exception:
-                mission_store = ""
-
-            is_sar = False
-            try:
-                if self.layer_manager:
-                    is_sar = bool(self.layer_manager.is_sar_project())
-            except Exception:
-                is_sar = False
-
-            if not ((project_filename or mission_store) and is_sar):
-                count = 0
-            else:
-                count = self.layers_controller.count_measurement_overlays()
-        except Exception as e:
-            print(f"[SARTRACKER] Warning: Could not count measurement overlays: {e}")
-            count = 0
-
-        try:
-            self.sar_panel.update_measurements_indicator(count)
-        except Exception as panel_err:
-            print(f"[SARTRACKER] Warning: Could not update measurement indicator: {panel_err}")
-
-    def _on_clear_measurements_requested(self):
-        """Handle Clear Measurements request from panel."""
-        if not self.layers_controller:
-            return
-
-        try:
-            removed = self.layers_controller.clear_measurement_overlays()
-            self._update_measurement_overlay_indicator()
-            info(
-                self.iface.messageBar(),
-                "Measurement Overlays",
-                f"Cleared {removed} measurement overlay(s)." if removed else "No measurement overlays to clear.",
-                duration=3
-            )
-        except Exception as exc:
-            error(
-                self.iface.messageBar(),
-                "Measurement Overlays",
-                f"Failed to clear measurement overlays: {exc}",
-                duration=5
-            )
+    # ============================================================================
+    # Phase 1 Refactor V2: Legacy map tool/marker handlers removed
+    # These methods were fallback handlers that are no longer wired after
+    # _wire_sar_panel_signals() was implemented. All functionality now lives
+    # in MapToolsController and MarkerController.
+    #
+    # Removed methods (~630 lines):
+    # - _on_add_poi_requested, _on_add_clue_requested, _on_add_casualty_requested,
+    #   _on_add_hazard_requested
+    # - _on_marker_edit_requested, _on_marker_delete_requested, _on_marker_zoom_requested
+    # - _extract_marker_coordinates, _build_marker_dialog_payload, _build_marker_update_payload
+    # - _on_coordinate_converter_requested, _zoom_to_location
+    # - _on_measure_distance_requested, _on_line_tool_requested, _on_polygon_tool_requested,
+    #   _on_range_rings_tool_requested, _on_bearing_tool_requested
+    # - _on_gpx_import_file, _on_gpx_import_folder, _on_gpx_watch_folder
+    # - _update_measurement_overlay_indicator, _on_clear_measurements_requested
+    # ============================================================================
 
     def _on_autosave_requested(self):
         """Handle auto-save request from SAR Panel."""
@@ -5495,198 +3858,11 @@ class sartracker:
             )
 
     # ============================================================================
-    # PHASE 3: Provider Controller Integration Methods
+    # Phase 1.7 Refactor V2: Legacy provider config methods removed
+    # _save_provider_config, _load_provider_config, _convert_legacy_http_config,
+    # _persist_traccar_http_settings are now handled by ProviderController.
+    # Removed ~190 lines.
     # ============================================================================
-
-    def _save_provider_config(self, provider_name: str, config: dict):
-        """
-        Save provider configuration to QSettings and update plugin provider references.
-
-        This is called when the controller successfully connects to a provider.
-        Updates both QSettings for persistence AND plugin's provider references
-        for refresh operations.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
-            config: Provider configuration dict
-
-        Qt5/Qt6 Compatible: Uses QSettings.
-        """
-        try:
-            # CRITICAL: Update plugin's provider references from controller
-            # The controller owns the provider instance, but sartracker needs
-            # a reference for refresh operations (_on_refresh_data checks self.provider)
-            if self.provider_controller:
-                self.provider = self.provider_controller.provider
-                self.provider_name = self.provider_controller.provider_name
-                self.provider_config = self.provider_controller.provider_config
-                print(f"[SARTRACKER] Updated plugin provider references from controller: {provider_name}")
-
-            # Save to QSettings for auto-restore on next startup
-            settings = QSettings()
-            settings.setValue("SARTracker/Providers/last_provider", provider_name)
-
-            # Save provider-specific config (namespace by provider name)
-            for key, value in config.items():
-                settings.setValue(f"SARTracker/Providers/{provider_name}/{key}", value)
-
-            print(f"[SARTRACKER] Saved provider config to QSettings: {provider_name}")
-
-        except Exception as e:
-            print(f"[SARTRACKER] Warning: Failed to save provider config: {e}")
-
-    def _load_provider_config(self):
-        """
-        Load provider configuration from QSettings and auto-connect if enabled.
-
-        Phase N1: UI population removed - SettingsPanel handles its own UI loading.
-        This method now only handles auto-connection functionality.
-
-        Qt5/Qt6 Compatible: Uses QSettings and ConfigStore.
-        """
-        try:
-            # Check if auto-connect is enabled
-            auto_connect = ConfigStore.get_provider_auto_connect()
-            if not auto_connect:
-                print("[SARTRACKER] Auto-connect disabled, skipping provider restoration")
-                return
-
-            # Load last provider
-            provider_name = ConfigStore.get(SETTINGS_KEYS.PROVIDER_LAST, None)
-            if not provider_name:
-                print("[SARTRACKER] No saved provider config found")
-                return
-
-            print(f"[SARTRACKER] Auto-connecting to saved provider: {provider_name}")
-
-            # Load provider-specific config using ConfigStore
-            config = {}
-            if provider_name == 'csv':
-                csv_path = ConfigStore.get(SETTINGS_KEYS.PROVIDER_CSV_PATH, None)
-                if csv_path:
-                    config['csv_path'] = str(csv_path)
-            elif provider_name == 'http_traccar':
-                server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, None)
-                username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, None)
-                password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
-                timeout = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT, SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT, int)
-                if server_url and username and password:
-                    legacy_config = {
-                        'server_url': str(server_url),
-                        'username': str(username),
-                        'password': str(password),
-                        'timeout': int(timeout)
-                    }
-                    converted = self._convert_legacy_http_config(legacy_config)
-                    if converted:
-                        provider_name = 'traccar_http'
-                        config = converted
-                        ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, 'traccar_http')
-                        print("[SARTRACKER] Migrated legacy HTTP provider settings to Traccar HTTP")
-            elif provider_name == 'traccar_http':
-                base_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, None)
-                auth_type = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, 'basic')
-                timeout = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT, int)
-                cache_ttl = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT, int)
-                enable_cache = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT, bool)
-
-                if base_url and auth_type:
-                    config = {
-                        'base_url': str(base_url),
-                        'auth_type': str(auth_type),
-                        'timeout_s': int(timeout),
-                        'cache_ttl': int(cache_ttl),
-                        'enable_last_good_cache': bool(enable_cache)
-                    }
-
-                    if auth_type == 'basic':
-                        username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, None)
-                        
-                        # Try SecureStore first for password
-                        password = SecureStore.get_credential('traccar_http_basic', username)
-                        if not password:
-                            # Fallback to QSettings (migration scenario)
-                            password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
-
-                        if username and password:
-                            config['username'] = str(username)
-                            config['password'] = str(password)
-                    elif auth_type == 'bearer':
-                        # Try SecureStore first for token
-                        token = SecureStore.get_credential('traccar_http_bearer', 'token')
-                        if not token:
-                             # Fallback to QSettings
-                            token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
-                            
-                        if token:
-                            config['token'] = str(token)
-
-            # Validate config is complete
-            if not config:
-                print(f"[SARTRACKER] Incomplete config for {provider_name}, skipping auto-connect")
-                return
-
-            # Auto-connect to provider (no UI population - SettingsPanel handles that)
-            if self.provider_controller:
-                print(f"[SARTRACKER] Initiating auto-connect to {provider_name}")
-                # Use the existing provider connection handler
-                self._on_provider_save_requested(provider_name, config)
-            else:
-                print("[SARTRACKER] Warning: Provider controller not available for auto-connect")
-
-        except Exception as e:
-            print(f"[SARTRACKER] Warning: Failed to auto-connect provider: {e}")
-
-    def _convert_legacy_http_config(self, legacy_config: dict) -> Optional[dict]:
-        """Convert legacy http_traccar config to traccar_http config dict."""
-        base_url = str(legacy_config.get('server_url', '')).strip()
-        username = str(legacy_config.get('username', '')).strip()
-        password = str(legacy_config.get('password', '')).strip()
-        if not base_url or not username or not password:
-            return None
-
-        timeout = int(legacy_config.get('timeout', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
-
-        converted = {
-            'base_url': base_url,
-            'auth_type': 'basic',
-            'username': username,
-            'password': password,
-            'timeout_s': timeout,
-            'cache_ttl': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT,
-            'enable_last_good_cache': SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT
-        }
-
-        # Persist immediately so next load finds it
-        self._persist_traccar_http_settings(converted)
-        return converted
-
-    def _persist_traccar_http_settings(self, config: dict):
-        """Persist Traccar HTTP provider settings to QSettings."""
-        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_BASE_URL, config.get('base_url', ''))
-        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_AUTH_TYPE, config.get('auth_type', 'basic'))
-        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT, config.get('timeout_s', SETTINGS_KEYS.PROVIDER_TRACCAR_TIMEOUT_DEFAULT))
-        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL, config.get('cache_ttl', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_TTL_DEFAULT))
-        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED, config.get('enable_last_good_cache', SETTINGS_KEYS.PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT))
-        
-        if config.get('auth_type') == 'basic':
-            username = config.get('username', '')
-            password = config.get('password', '')
-            ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, username)
-            
-            # Save password to SecureStore
-            SecureStore.set_credential('traccar_http_basic', username, password)
-            
-            # Legacy fallback (optional, can be removed if SecureStore is 100% reliable)
-            # ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, password)
-        else:
-            token = config.get('token', '')
-            # Save token to SecureStore
-            SecureStore.set_credential('traccar_http_bearer', 'token', token)
-            # ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, token)
-
-    # Phase N1: _populate_provider_dropdown method removed
-    # Provider dropdown is now populated in SettingsPanel during initialization (sartracker.py lines 682-696)
 
     def _on_settings_changed(self, changes: dict):
         """
@@ -5739,59 +3915,12 @@ class sartracker:
                 duration=5
             )
 
-    def _on_provider_test_requested(self, provider_name: str, config: dict):
-        """
-        Handle provider test connection request from panel.
-
-        FIX ISSUE #4: Test-only mode - tests connection without committing provider.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
-            config: Provider configuration dict
-
-        Qt5/Qt6 Compatible: Delegates to ProviderController.
-        """
-        # Defensive guard (Pattern 9)
-        if not self.provider_controller:
-            error(
-                self.iface.messageBar(),
-                "Provider Error",
-                "Provider controller not available",
-                duration=3
-            )
-            return
-
-        print(f"[SARTRACKER] Provider test requested (test-only mode): {provider_name}")
-
-        # Delegate to controller with test_only=True (FIX ISSUE #4)
-        self.provider_controller.set_provider(provider_name, config, test_only=True)
-
-    def _on_provider_save_requested(self, provider_name: str, config: dict):
-        """
-        Handle provider connect/save request from panel.
-
-        FIX ISSUE #4: Connect mode - tests and commits provider on success.
-
-        Args:
-            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
-            config: Provider configuration dict
-
-        Qt5/Qt6 Compatible: Delegates to ProviderController.
-        """
-        # Defensive guard (Pattern 9)
-        if not self.provider_controller:
-            error(
-                self.iface.messageBar(),
-                "Provider Error",
-                "Provider controller not available",
-                duration=3
-            )
-            return
-
-        print(f"[SARTRACKER] Provider connect requested: {provider_name}")
-
-        # Delegate to controller with test_only=False (default - commits on success) (FIX ISSUE #4)
-        self.provider_controller.set_provider(provider_name, config, test_only=False)
+    # ========================================================================
+    # Phase 1.2 Refactor V2: Legacy provider handlers removed
+    # _on_provider_test_requested and _on_provider_save_requested are now
+    # handled directly by ProviderController.handle_test_request() and
+    # ProviderController.handle_save_request() via _wire_settings_panel_signals().
+    # ========================================================================
 
     def _on_repair_layers_requested(self):
         """Handle 'Repair Layer Structure' action from Settings panel."""
@@ -5935,6 +4064,9 @@ class sartracker:
             'vendor': dict(_vendor_info) if _vendor_info else {},
             # Phase 0: Available providers for startup resilience diagnostics
             'available_providers': self._get_available_provider_names(),
+            # Phase 1 Verification: Unavailable features due to controller failures
+            'unavailable_features': list(self._unavailable_features) if self._unavailable_features else [],
+            'safe_mode_active': self._safe_mode_active,
         }
 
         try:
