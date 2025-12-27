@@ -33,207 +33,33 @@ import traceback
 from pathlib import Path
 from datetime import datetime
 
-# Phase 2: Vendor Dependency Injection
-# Ensure bundled dependencies are available before any other imports.
-# This guarantees we use our tested versions of requests, urllib3, etc.
-vendor_path = os.path.join(os.path.dirname(__file__), 'vendor', 'site-packages')
-if not os.path.exists(vendor_path):
-    print(f"[SAR Tracker] Warning: Vendor path not found: {vendor_path}")
+# ---------------------------------------------------------------------------
+# Phase 1 Refactor: Vendor Bootstrap (extracted to services/vendor_bootstrap.py)
+# ---------------------------------------------------------------------------
+# CRITICAL: This MUST run before ANY provider imports that depend on requests.
+# The bootstrap ensures bundled dependencies (requests, urllib3, certifi) are
+# loaded from vendor/site-packages rather than system packages.
+from .services.vendor_bootstrap import bootstrap_vendor, get_vendor_info
 
-# Ensure plugin parent is available for package imports (defensive)
-plugin_root = os.path.dirname(__file__)
-plugin_parent = os.path.dirname(plugin_root)
-if plugin_parent and plugin_parent not in sys.path:
-    sys.path.insert(0, plugin_parent)
-    print(f"[SAR Tracker] Added plugin parent to sys.path: {plugin_parent}")
+# Execute vendor bootstrap at module load time
+_vendor_info = bootstrap_vendor(Path(__file__).parent)
 
 # ---------------------------------------------------------------------------
-# Import tracking and vendor diagnostics
+# Phase 2 Refactor: Import Guard (extracted to services/import_guard.py)
 # ---------------------------------------------------------------------------
-_import_errors = []
-_imports_ok = True
-_vendor_info: Dict[str, Any] = {
-    "using_vendor": False,
-    "requests_path": None,
-    "certifi_path": None,
-    "missing": [],
-    "error": None,
-}
+# Centralized import error tracking with structured reporting.
+# Creates ImportReport at module level; errors tracked via track_import_error().
+from .services.import_guard import (
+    ImportReport,
+    track_import_error,
+    track_optional_import_error,
+    format_error_summary,
+    write_error_log,
+    get_safe_mode_reason,
+    set_import_report,
+)
 
-
-def _verify_vendor_bundle(vendor_dir: Path) -> List[str]:
-    """
-    Verify critical vendor assets exist before imports.
-
-    Returns:
-        List of missing file paths (empty if all present).
-    """
-    required = [
-        vendor_dir / "requests" / "__init__.py",
-        vendor_dir / "urllib3" / "__init__.py",
-        vendor_dir / "charset_normalizer" / "__init__.py",
-        vendor_dir / "idna" / "__init__.py",
-        vendor_dir / "certifi" / "cacert.pem",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
-    return missing
-
-
-def _force_vendor_requests(vendor_dir: Path):
-    """
-    Force requests stack to load from vendor_dir even if system requests was imported.
-
-    Non-fatal:
-        If the vendor stack cannot be loaded reliably, fall back to the system
-        requests stack and record details in _vendor_info for diagnostics.
-    """
-    global _vendor_info
-
-    try:
-        vendor_dir = vendor_dir.resolve()
-    except Exception:
-        vendor_dir = Path(str(vendor_dir))
-    if not vendor_dir.exists():
-        _vendor_info.update(
-            {
-                "using_vendor": False,
-                "requests_path": None,
-                "certifi_path": None,
-                "missing": _verify_vendor_bundle(vendor_dir),
-                "error": f"Vendor directory not found: {vendor_dir}",
-            }
-        )
-        return False
-
-    def _norm_path(path: Path) -> str:
-        try:
-            return os.path.normcase(os.path.normpath(str(path)))
-        except Exception:
-            return str(path).lower()
-
-    vendor_norm = _norm_path(vendor_dir)
-    vendor_marker = os.path.normcase(os.path.normpath(os.path.join("sartracker", "vendor", "site-packages")))
-
-    def _is_vendor_path(path: Path) -> bool:
-        """Best-effort check for a path living under sartracker/vendor/site-packages."""
-        try:
-            path_norm = _norm_path(path)
-        except Exception:
-            return False
-        if path_norm == vendor_norm or path_norm.startswith(vendor_norm + os.sep):
-            return True
-        # Fallback for cases like Windows 8.3 paths or differing drive casing.
-        return vendor_marker in path_norm
-
-    # If requests is already imported from system, clear it and its dependencies
-    def _is_from_vendor(mod_name: str) -> bool:
-        mod = sys.modules.get(mod_name)
-        try:
-            return _is_vendor_path(Path(mod.__file__).resolve())  # type: ignore[arg-type]
-        except Exception:
-            return False
-
-    if "requests" in sys.modules and not _is_from_vendor("requests"):
-        for name in list(sys.modules.keys()):
-            if name == "requests" or name.startswith(("requests.", "urllib3", "charset_normalizer", "idna", "certifi")):
-                sys.modules.pop(name, None)
-
-    # Ensure vendor path is first for import resolution
-    vendor_str = str(vendor_dir)
-    new_sys_path: List[str] = [vendor_str]
-    for entry in list(sys.path):
-        try:
-            if _norm_path(Path(entry)) == vendor_norm:
-                continue
-        except Exception:
-            pass
-        if entry != vendor_str:
-            new_sys_path.append(entry)
-    sys.path = new_sys_path
-
-    try:
-        # Import and validate paths
-        import requests  # noqa: E401
-        import certifi  # noqa: E401
-
-        requests_path = Path(requests.__file__).resolve()
-        cert_path = Path(certifi.where()).resolve()
-
-        if _is_vendor_path(requests_path) and _is_vendor_path(cert_path):
-            _vendor_info.update(
-                {
-                    "using_vendor": True,
-                    "requests_path": str(requests_path),
-                    "certifi_path": str(cert_path),
-                    "missing": [],
-                    "error": None,
-                }
-            )
-            return True
-        raise RuntimeError(
-            f"Requests stack not using vendor bundle. requests: {requests_path}, certifi: {cert_path}"
-        )
-    except Exception as exc:
-        # Fall back to system requests stack (non-fatal) to keep plugin usable.
-        _vendor_info.update(
-            {
-                "using_vendor": False,
-                "requests_path": None,
-                "certifi_path": None,
-                "missing": [],
-                "error": str(exc),
-            }
-        )
-
-        # Remove vendor path from sys.path to avoid mixing vendored/system deps.
-        filtered_sys_path: List[str] = []
-        for entry in list(sys.path):
-            try:
-                if _norm_path(Path(entry)) == vendor_norm:
-                    continue
-            except Exception:
-                pass
-            filtered_sys_path.append(entry)
-        sys.path = filtered_sys_path
-
-        # Clear any partially imported vendor stack
-        for name in list(sys.modules.keys()):
-            if name == "requests" or name.startswith(("requests.", "urllib3", "charset_normalizer", "idna", "certifi")):
-                sys.modules.pop(name, None)
-
-        # Ensure charset helpers exist for minimal requests import compatibility
-        try:
-            from .utils.dependency_guard import ensure_requests_charset_modules
-
-            ensure_requests_charset_modules()
-        except Exception as guard_exc:
-            print(f"[SAR Tracker] Warning: Could not ensure charset helpers: {guard_exc}")
-
-        try:
-            import requests  # noqa: E401
-            import certifi  # noqa: E401
-
-            _vendor_info.update(
-                {
-                    "using_vendor": False,
-                    "requests_path": str(Path(requests.__file__).resolve()),
-                    "certifi_path": str(Path(certifi.where()).resolve()),
-                }
-            )
-        except Exception as sys_exc:
-            _vendor_info.update({"error": f"{_vendor_info.get('error')}; system import failed: {sys_exc}"})
-        return False
-
-
-# Perform vendor verification and force the vendored requests stack
-try:
-    _vendor_missing: List[str] = _verify_vendor_bundle(Path(vendor_path))
-    if _vendor_missing:
-        raise RuntimeError(f"Missing vendor assets: {', '.join(_vendor_missing)}")
-    _force_vendor_requests(Path(vendor_path))
-except Exception as e:
-    _vendor_info.update({"missing": list(locals().get("_vendor_missing", [])), "error": str(e)})
-    print(f"[SAR Tracker] Warning: Vendor bundle unavailable, using system dependencies: {e}")
+_import_report = ImportReport()
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
 from qgis.PyQt.QtGui import QIcon, QFont
@@ -267,6 +93,23 @@ from .config.keys import ConfigStore, SETTINGS_KEYS
 from .utils.secure_store import SecureStore
 from .utils.mission_storage import MissionStorageHelper, MissionPaths
 from .ui.mission_metadata_dialog import MissionMetadataDialog
+
+# Import Phase 3 extracted dialogs with error tracking
+# Note: ImportFailureDialog is special - if it fails to import, we need a fallback
+try:
+    from .ui.mission_resume_dialog import MissionResumeDialog
+except Exception as e:
+    MissionResumeDialog = track_import_error(
+        _import_report, 'ui.mission_resume_dialog.MissionResumeDialog', e
+    )
+
+try:
+    from .ui.import_failure_dialog import ImportFailureDialog
+except Exception as e:
+    ImportFailureDialog = track_import_error(
+        _import_report, 'ui.import_failure_dialog.ImportFailureDialog', e
+    )
+
 from .utils.provider_results import sanitize_provider_results
 from .utils.task_manager import TaskManager
 from .services.lifecycle_manager import PluginLifecycleManager, validate_init_preconditions
@@ -289,238 +132,120 @@ try:
     try:
         from .providers import traccar_http  # noqa: F401
     except Exception as e:
-        _import_errors.append(('providers.traccar_http', e, traceback.format_exc()))
-        print(f"[SARTRACKER] Warning: HTTP provider unavailable (continuing offline): {e}")
-        traccar_http = None
+        traccar_http = track_optional_import_error(
+            _import_report, 'providers.traccar_http', e
+        )
     # Note: provider_registry now contains registered providers (csv + any optional providers that loaded)
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('providers', e, traceback.format_exc()))
-    provider_registry = None
+    provider_registry = track_import_error(_import_report, 'providers', e)
     Provider = None
-    print(f"ERROR importing providers: {e}")
 
 # Import LayersController
 try:
     from .controllers.layers_controller import LayersController
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('controllers.layers_controller.LayersController', e, traceback.format_exc()))
-    LayersController = None
-    print(f"ERROR importing LayersController: {e}")
+    LayersController = track_import_error(
+        _import_report, 'controllers.layers_controller.LayersController', e
+    )
 
 # Import MissionController (mission lifecycle + timers)
 try:
     from .controllers.mission_controller import MissionController, MissionState
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('controllers.mission_controller.MissionController', e, traceback.format_exc()))
-    MissionController = None
+    MissionController = track_import_error(
+        _import_report, 'controllers.mission_controller.MissionController', e
+    )
     MissionState = None
-    print(f"ERROR importing MissionController: {e}")
 
 # Import MarkerController (marker CRUD orchestration)
 try:
     from .controllers.marker_controller import MarkerController
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('controllers.marker_controller.MarkerController', e, traceback.format_exc()))
-    MarkerController = None
-    print(f"ERROR importing MarkerController: {e}")
+    MarkerController = track_import_error(
+        _import_report, 'controllers.marker_controller.MarkerController', e
+    )
 
 # Import LayerManager (Phase N2)
 try:
     from .layers import LayerManager
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('layers.LayerManager', e, traceback.format_exc()))
-    LayerManager = None
-    print(f"ERROR importing LayerManager: {e}")
+    LayerManager = track_import_error(
+        _import_report, 'layers.LayerManager', e
+    )
 
 # Import schema constants used for layer recovery safeguards
 try:
     from .layers.schema import GroupNames
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('layers.schema.GroupNames', e, traceback.format_exc()))
-    GroupNames = None
-    print(f"ERROR importing GroupNames: {e}")
+    GroupNames = track_import_error(
+        _import_report, 'layers.schema.GroupNames', e
+    )
 
 # Import ProviderController (Phase 3)
 try:
     from .controllers.provider_controller import ProviderController
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('controllers.provider_controller.ProviderController', e, traceback.format_exc()))
-    ProviderController = None
-    print(f"ERROR importing ProviderController: {e}")
+    ProviderController = track_import_error(
+        _import_report, 'controllers.provider_controller.ProviderController', e
+    )
 
 # Import SARPanel
 try:
     from .ui.sar_panel import SARPanel
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('ui.sar_panel.SARPanel', e, traceback.format_exc()))
-    SARPanel = None
-    print(f"ERROR importing SARPanel: {e}")
+    SARPanel = track_import_error(
+        _import_report, 'ui.sar_panel.SARPanel', e
+    )
 
 # Import SettingsPanel (Phase N1)
 try:
     from .ui.settings_panel import SettingsPanel
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('ui.settings_panel.SettingsPanel', e, traceback.format_exc()))
-    SettingsPanel = None
-    print(f"ERROR importing SettingsPanel: {e}")
+    SettingsPanel = track_import_error(
+        _import_report, 'ui.settings_panel.SettingsPanel', e
+    )
 
 # Import MarkerMapTool
 try:
     from .maptools.marker_tool import MarkerMapTool
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('maptools.marker_tool.MarkerMapTool', e, traceback.format_exc()))
-    MarkerMapTool = None
-    print(f"ERROR importing MarkerMapTool: {e}")
+    MarkerMapTool = track_import_error(
+        _import_report, 'maptools.marker_tool.MarkerMapTool', e
+    )
 
 # Import MeasureTool
 try:
     from .maptools.measure_tool import MeasureTool
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('maptools.measure_tool.MeasureTool', e, traceback.format_exc()))
-    MeasureTool = None
-    print(f"ERROR importing MeasureTool: {e}")
+    MeasureTool = track_import_error(
+        _import_report, 'maptools.measure_tool.MeasureTool', e
+    )
 
 # Import MarkerDialog
 try:
     from .ui.marker_dialog import MarkerDialog
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('ui.marker_dialog.MarkerDialog', e, traceback.format_exc()))
-    MarkerDialog = None
-    print(f"ERROR importing MarkerDialog: {e}")
+    MarkerDialog = track_import_error(
+        _import_report, 'ui.marker_dialog.MarkerDialog', e
+    )
 
 # Import CoordinateConverterDialog
 try:
     from .ui.coordinate_converter_dialog import CoordinateConverterDialog
 except Exception as e:
-    _imports_ok = False
-    _import_errors.append(('ui.coordinate_converter_dialog.CoordinateConverterDialog', e, traceback.format_exc()))
-    CoordinateConverterDialog = None
-    print(f"ERROR importing CoordinateConverterDialog: {e}")
+    CoordinateConverterDialog = track_import_error(
+        _import_report, 'ui.coordinate_converter_dialog.CoordinateConverterDialog', e
+    )
+
+# Store import report for diagnostics access
+set_import_report(_import_report)
 
 
-class MissionResumeDialog(BaseDialog):
-    """
-    Dialog to prompt user to resume a paused mission.
-
-    Shows mission details and offers two options:
-    - Resume Mission: Restore saved mission state
-    - Start Fresh: Clear saved state and begin new mission
-
-    Qt5/Qt6 Compatible: Uses BaseDialog for rendering workarounds.
-    """
-
-    def __init__(self, saved_state, parent=None):
-        """
-        Initialize mission resume dialog.
-
-        Args:
-            saved_state: Dictionary containing mission state data
-                Required keys: 'name', 'start_time'
-            parent: Parent widget (should be iface.mainWindow())
-        """
-        super().__init__(parent)
-        self.saved_state = saved_state
-        self.setWindowTitle("Resume Mission?")
-        self.setModal(True)
-        self.setMinimumWidth(400)
-
-        self._setup_ui()
-
-    def _setup_ui(self):
-        """Build the dialog UI."""
-        layout = QVBoxLayout()
-
-        # Format start time for display
-        try:
-            start_time_display = self.saved_state['start_time'][:19].replace('T', ' ')
-        except (IndexError, KeyError):
-            start_time_display = self.saved_state.get('start_time', 'Unknown')
-
-        # Message label
-        message = QLabel(
-            f"<b>Found paused mission:</b><br><br>"
-            f"Mission: {self.saved_state.get('name', 'Unknown')}<br>"
-            f"Started: {start_time_display}<br><br>"
-            f"Do you want to resume this mission?"
-        )
-        message.setWordWrap(True)
-        layout.addWidget(message)
-
-        # Buttons
-        button_layout = QHBoxLayout()
-
-        resume_button = QPushButton("Resume Mission")
-        resume_button.setDefault(True)
-        resume_button.clicked.connect(self.accept)
-        button_layout.addWidget(resume_button)
-
-        cancel_button = QPushButton("Start Fresh")
-        cancel_button.clicked.connect(self.reject)
-        button_layout.addWidget(cancel_button)
-
-        layout.addLayout(button_layout)
-
-        # Apply layout (triggers BaseDialog workarounds)
-        self.setLayout(layout)
-
-
-class ImportFailureDialog(BaseDialog):
-    """
-    Dialog to display import failure details when plugin fails to load.
-
-    Shows detailed error information in a scrollable text area to help
-    users diagnose and report plugin initialization problems.
-
-    Qt5/Qt6 Compatible: Uses BaseDialog for rendering workarounds.
-    """
-
-    def __init__(self, error_summary, parent=None):
-        """
-        Initialize import failure dialog.
-
-        Args:
-            error_summary: Formatted string containing error details
-            parent: Parent widget (should be iface.mainWindow())
-        """
-        super().__init__(parent)
-        self.error_summary = error_summary
-        self.setWindowTitle("SAR Tracker - Import Failure")
-        self.setMinimumSize(700, 500)
-
-        self._setup_ui()
-
-    def _setup_ui(self):
-        """Build the dialog UI."""
-        from qgis.PyQt.QtWidgets import QTextEdit
-
-        layout = QVBoxLayout()
-
-        # Scrollable text area for error details
-        text_edit = QTextEdit()
-        text_edit.setReadOnly(True)
-        text_edit.setPlainText(self.error_summary)
-        text_edit.setFont(QFont("Courier New", 9))
-        layout.addWidget(text_edit)
-
-        # Close button
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button)
-
-        # Apply layout (triggers BaseDialog workarounds)
-        self.setLayout(layout)
+# ---------------------------------------------------------------------------
+# Phase 3 Refactor: Dialog classes moved to ui/ modules
+# ---------------------------------------------------------------------------
+# MissionResumeDialog -> ui/mission_resume_dialog.py
+# ImportFailureDialog -> ui/import_failure_dialog.py
 
 
 class sartracker:
@@ -1057,8 +782,8 @@ class sartracker:
         #
         # If any imports failed during module loading, we display a clear error
         # message and abort initialization to prevent cryptic crashes later.
-        if not _imports_ok:
-            self._handle_import_failure(_import_errors)
+        if not _import_report.ok:
+            self._handle_import_failure(_import_report)
             return  # Abort initialization - do not proceed with component setup
 
         # If we reach here, all imports succeeded and we can safely proceed
@@ -1487,7 +1212,7 @@ class sartracker:
         print(f"[SARTRACKER] Plugin initialization complete. {len(self.lifecycle.registry._components)} components registered.")
         print(f"[SARTRACKER] Menu items in self.actions: {len(self.actions)}")
 
-    def _handle_import_failure(self, errors):
+    def _handle_import_failure(self, report):
         """
         Handle import failures with clear user guidance.
 
@@ -1495,28 +1220,16 @@ class sartracker:
         module loading. It displays both a persistent message bar warning and a
         detailed modal dialog to help users diagnose and resolve the issue.
 
+        Phase 2 Refactor: Now accepts ImportReport instead of legacy error list.
+
         Args:
-            errors: List of (module_name, exception, traceback) tuples
+            report: ImportReport containing error details
 
         Qt5/Qt6 Compatible: Uses utils.notify helpers and BaseDialog
         """
         # LOGGING: Write errors to a file so user can find them even if dialog fails
-        log_path = None
-        try:
-            import tempfile
-            from datetime import datetime
-            log_path = os.path.join(tempfile.gettempdir(), f"sartracker_import_errors_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
-            with open(log_path, 'w') as f:
-                f.write("SAR TRACKER IMPORT ERRORS\n")
-                f.write("=========================\n")
-                for module_name, exc, tb in errors:
-                    f.write(f"Module: {module_name}\n")
-                    f.write(f"Error: {exc}\n")
-                    f.write(f"Traceback:\n{tb}\n")
-                    f.write("-" * 50 + "\n")
-            print(f"[SARTRACKER] Import errors written to: {log_path}")
-        except Exception as e:
-            print(f"[SARTRACKER] Failed to write error log: {e}")
+        # Phase 2: Delegate to import_guard.write_error_log()
+        log_path = write_error_log(report)
 
         # Show persistent message bar warning
         msg = "Plugin failed to load due to import errors. Check the dialog for details."
@@ -1530,32 +1243,26 @@ class sartracker:
         )
 
         # Build detailed error message
-        error_summary = "SAR Tracker failed to load due to the following import errors:\n\n"
-
-        for module_name, exc, tb in errors:
-            error_summary += f"❌ Module: {module_name}\n"
-            error_summary += f"   Error: {type(exc).__name__}: {exc}\n\n"
-
-        error_summary += "\n" + "="*70 + "\n"
-        error_summary += "SUGGESTED ACTIONS:\n"
-        error_summary += "="*70 + "\n\n"
-        error_summary += "1. Verify all plugin files are present and not corrupted\n"
-        error_summary += "2. Run Diagnostics: Plugins > SAR Tracker > Diagnostics\n"
-        error_summary += "3. Run Smoke Test: Plugins > SAR Tracker > Run Smoke Test\n"
-        error_summary += "4. Try reinstalling the plugin\n"
-        error_summary += "5. Check QGIS Python console for additional details\n"
-        error_summary += "6. Ensure you have compatible QGIS version (3.28+)\n\n"
-        if log_path:
-            error_summary += f"Log file: {log_path}\n\n"
-        error_summary += "="*70 + "\n"
-        error_summary += "TECHNICAL DETAILS (first error):\n"
-        error_summary += "="*70 + "\n\n"
-        error_summary += errors[0][2]  # Include full traceback of first error
+        # Phase 2: Delegate to import_guard.format_error_summary()
+        error_summary = format_error_summary(report, log_path)
 
         # Show import failure dialog using BaseDialog (Issue #2 fix)
-        dialog = ImportFailureDialog(error_summary, parent=self.iface.mainWindow())
-        dialog_exec(dialog)
-        failure_reason = f"{errors[0][0]}: {errors[0][1]}"
+        # Fallback to QMessageBox if ImportFailureDialog itself failed to import
+        if ImportFailureDialog is not None:
+            dialog = ImportFailureDialog(error_summary, parent=self.iface.mainWindow())
+            dialog_exec(dialog)
+        else:
+            # Fallback: use basic QMessageBox if our dialog couldn't load
+            QMessageBox.critical(
+                self.iface.mainWindow(),
+                "SAR Tracker - Critical Import Error",
+                f"Plugin failed to load. Details logged to: {log_path}\n\n"
+                "Check QGIS Python console for full error details."
+            )
+
+        # Enter safe mode with reason from first critical error
+        # Phase 2: Delegate to import_guard.get_safe_mode_reason()
+        failure_reason = get_safe_mode_reason(report)
         self._enter_safe_mode(failure_reason)
 
     def _show_settings(self):
