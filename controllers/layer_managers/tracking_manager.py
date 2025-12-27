@@ -1789,6 +1789,13 @@ class TrackingLayerManager(BaseLayerManager):
                 seg_device_id = seg.get('device_id')
                 if seg_device_id:
                     segments_by_device[seg_device_id].append(seg)
+            # Robust fallback: preprocessing can yield no segments when points exist but update gaps
+            # exceed time_gap_minutes (default 5 minutes). Build locally so trails are still visible.
+            if not segments_by_device and by_device:
+                for device_id, device_positions in by_device.items():
+                    device_segments = build_segments_from_positions(device_positions, gap_minutes)
+                    if device_segments:
+                        segments_by_device[device_id] = device_segments
         else:
             # Build segments per device from positions
             for device_id, device_positions in by_device.items():
@@ -2670,6 +2677,15 @@ class TrackingLayerManager(BaseLayerManager):
             invalid_count = sanitized_positions.invalid_count
             last_error = sanitized_positions.last_error
             segments = build_segments_from_positions(sanitized_positions.valid, gap_minutes)
+        elif not segments and positions:
+            # Robust fallback: provider preprocessing can yield zero LineString segments even when
+            # multiple points exist (e.g., update interval exceeds time_gap_minutes). Since we render
+            # breadcrumbs as LineStrings, "no segments" becomes "no breadcrumbs". Rebuild locally.
+            sanitized_positions = sanitize_breadcrumb_positions(positions)
+            invalid_count = sanitized_positions.invalid_count
+            last_error = sanitized_positions.last_error
+            if len(sanitized_positions.valid) >= 2:
+                segments = build_segments_from_positions(sanitized_positions.valid, gap_minutes)
 
         self._apply_breadcrumb_results(
             layer,

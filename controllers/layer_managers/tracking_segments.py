@@ -199,6 +199,7 @@ def build_segments_from_positions(
             continue
 
         current_segment = [device_pts[0]]
+        drawable_segments: List[List[Dict[str, Any]]] = []
 
         for idx in range(1, len(device_pts)):
             pos = device_pts[idx]
@@ -231,17 +232,24 @@ def build_segments_from_positions(
                 gap_minutes = float('inf')  # Force segment break
 
             if gap_minutes > time_gap_minutes:
-                # Save segment even if it contains only one point - single position
-                # reports are valuable in SAR operations (e.g., distress signals)
-                if len(current_segment) >= 1:
-                    segments.append(_segment_from_points(device_id, current_segment[0]["name"], current_segment))
+                if len(current_segment) >= 2:
+                    drawable_segments.append(list(current_segment))
                 current_segment = [pos]
             else:
                 current_segment.append(pos)
 
-        # Save final segment, including single-point segments
-        if len(current_segment) >= 1:
-            segments.append(_segment_from_points(device_id, current_segment[0]["name"], current_segment))
+        if len(current_segment) >= 2:
+            drawable_segments.append(list(current_segment))
+
+        # If we have >=2 points total but produced no drawable segments (e.g., every gap exceeds the
+        # threshold), fall back to adjacent pairs so operators see *some* movement history instead
+        # of an empty map.
+        if not drawable_segments and len(device_pts) >= 2:
+            for idx in range(1, len(device_pts)):
+                drawable_segments.append([device_pts[idx - 1], device_pts[idx]])
+
+        for seg_points in drawable_segments:
+            segments.append(_segment_from_points(device_id, seg_points[0]["name"], seg_points))
 
     return segments
 

@@ -700,19 +700,37 @@ class TraccarHttpProvider(Provider):
                                 except Exception as e:
                                     logger.warning("Failed to normalize bulk breadcrumb record: %s", e)
                             bulk_positions.sort(key=lambda x: (x['device_id'], x['ts']))
-                            # SAR-63m: Log performance comparison
+                            # CRITICAL BUGFIX (BC-TRACCAR-001):
+                            # Some Traccar servers respond to /api/positions?from&to with *only* the
+                            # latest position per device (effectively the same as /api/positions for current).
+                            #
+                            # Breadcrumb rendering requires >=2 points per device to create a LineString.
+                            # If we accept "single-point-per-device" payloads here, trails will be empty
+                            # across all platforms even while Current Positions updates correctly.
+                            #
+                            # Robust behavior: only accept bulk mode when it yields at least one device
+                            # with multiple points; otherwise fall back to per-device queries.
+                            if self._bulk_payload_has_trail_history(bulk_positions):
+                                # SAR-63m: Log performance comparison
+                                logger.info(
+                                    "SAR-63m: Bulk breadcrumbs fetched: %d positions for %d devices in %.2fs "
+                                    "(vs ~%.1fs estimated for per-device with %d workers)",
+                                    len(bulk_positions),
+                                    device_count,
+                                    bulk_duration,
+                                    (device_count / self.breadcrumb_workers) * 2.0,  # Estimate ~2s per batch
+                                    self.breadcrumb_workers
+                                )
+                                annotated_bulk = self._annotate_origin(bulk_positions, origin='live')
+                                _report_progress(1, 1)
+                                return annotated_bulk
+
                             logger.info(
-                                "SAR-63m: Bulk breadcrumbs fetched: %d positions for %d devices in %.2fs "
-                                "(vs ~%.1fs estimated for per-device with %d workers)",
+                                "BC-TRACCAR-001: Bulk breadcrumb query returned no multi-point history "
+                                "(%d positions; %d devices). Falling back to per-device queries.",
                                 len(bulk_positions),
                                 device_count,
-                                bulk_duration,
-                                (device_count / self.breadcrumb_workers) * 2.0,  # Estimate ~2s per batch
-                                self.breadcrumb_workers
                             )
-                            annotated_bulk = self._annotate_origin(bulk_positions, origin='live')
-                            _report_progress(1, 1)
-                            return annotated_bulk
                         else:
                             logger.warning(
                                 "SAR-63m: Bulk breadcrumb response invalid (type=%s); falling back to per-device",
@@ -952,6 +970,37 @@ class TraccarHttpProvider(Provider):
                 provider_name='traccar_http',
                 recoverable=False
             )
+
+    @staticmethod
+    def _bulk_payload_has_trail_history(positions: List[FeatureDict]) -> bool:
+        """
+        Determine whether a bulk breadcrumb payload contains enough history to draw trails.
+
+        Life-safety rationale:
+        - Breadcrumbs are rendered as LineString segments, which require >=2 points.
+        - If a bulk query yields only one point per device, accepting it will clear trails
+          and the map will show no movement history even during active tracking.
+
+        Args:
+            positions: Normalized provider positions.
+
+        Returns:
+            True if at least one device has >=2 points, else False.
+        """
+        if not positions:
+            return False
+
+        counts: Dict[str, int] = {}
+        for pos in positions:
+            try:
+                device_id = pos.get("device_id")
+            except Exception:
+                continue
+            if not device_id:
+                continue
+            counts[device_id] = counts.get(device_id, 0) + 1
+
+        return any(count >= 2 for count in counts.values())
 
     def get_devices(self, session=None) -> List[Dict[str, Any]]:
         """
@@ -1453,11 +1502,7 @@ class TraccarHttpProvider(Provider):
         Raises:
             NotImplementedError
         """
-        raise ProviderDataError(
-            "Traccar HTTP provider does not support saving casualties",
-            provider_name='traccar_http',
-            recoverable=False
-        )
+        raise NotImplementedError("Traccar HTTP provider does not support saving casualties")
 
     def save_poi(self, mission_id: int, name: str, lat: float, lon: float,
                 poi_type: str = "", irish_grid_e: Optional[float] = None,
@@ -1469,11 +1514,7 @@ class TraccarHttpProvider(Provider):
         Raises:
             NotImplementedError
         """
-        raise ProviderDataError(
-            "Traccar HTTP provider does not support saving POIs",
-            provider_name='traccar_http',
-            recoverable=False
-        )
+        raise NotImplementedError("Traccar HTTP provider does not support saving POIs")
 
     def test_connection(self, session=None) -> bool:
         """
