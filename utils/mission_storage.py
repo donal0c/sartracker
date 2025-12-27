@@ -38,6 +38,190 @@ class MissionPaths:
     gpkg_path: Path
 
 
+@dataclass
+class MissionSessionState:
+    """
+    Runtime mission session state for controllers and UI coordination.
+
+    This dataclass consolidates mission state that was previously scattered
+    across sartracker.py instance variables. It provides a clean interface
+    for passing mission context between controllers and the UI.
+
+    Differences from MissionPaths:
+    - MissionPaths: Filesystem paths only (for storage operations)
+    - MissionSessionState: Runtime session context (for controllers/UI)
+
+    Phase 2 Refactor: This enables clean dependency injection and reduces
+    coupling between sartracker.py and controllers.
+
+    LIFE-SAFETY CRITICAL: Mission state transitions must be handled carefully.
+    Prefer immutable snapshots when passing state across boundaries.
+    """
+    # Filesystem paths (mirrors MissionPaths for convenience)
+    mission_name: str
+    mission_dir: Optional[Path]
+    attachments_dir: Optional[Path]
+    backup_dir: Optional[Path]
+    gpkg_path: Optional[Path]
+
+    # Project context
+    project_path: Optional[Path] = None
+
+    # Finalization state
+    is_finalized: bool = False
+
+    # Active session tracking
+    is_active: bool = False
+    start_time: Optional[datetime] = None
+
+    # Coordinator metadata
+    coordinators: str = ""
+    metadata_collected: bool = False
+
+    @classmethod
+    def from_paths(
+        cls,
+        paths: MissionPaths,
+        *,
+        project_path: Optional[Path] = None,
+        is_finalized: bool = False,
+        is_active: bool = False,
+        start_time: Optional[datetime] = None,
+        coordinators: str = "",
+        metadata_collected: bool = False,
+    ) -> "MissionSessionState":
+        """
+        Create MissionSessionState from MissionPaths with additional context.
+
+        Args:
+            paths: MissionPaths with filesystem locations
+            project_path: Optional QGIS project file path
+            is_finalized: Whether mission is marked as finalized
+            is_active: Whether mission is actively being tracked
+            start_time: Mission start timestamp (UTC)
+            coordinators: Comma-separated coordinator names
+            metadata_collected: Whether coordinator metadata has been collected
+
+        Returns:
+            MissionSessionState with combined filesystem and runtime state
+        """
+        return cls(
+            mission_name=paths.name,
+            mission_dir=paths.mission_dir,
+            attachments_dir=paths.attachments_dir,
+            backup_dir=paths.backup_dir,
+            gpkg_path=paths.gpkg_path,
+            project_path=project_path,
+            is_finalized=is_finalized,
+            is_active=is_active,
+            start_time=start_time,
+            coordinators=coordinators,
+            metadata_collected=metadata_collected,
+        )
+
+    @classmethod
+    def empty(cls) -> "MissionSessionState":
+        """
+        Create an empty/idle MissionSessionState.
+
+        Use when no mission is loaded or mission has been cleared.
+        """
+        return cls(
+            mission_name="",
+            mission_dir=None,
+            attachments_dir=None,
+            backup_dir=None,
+            gpkg_path=None,
+            project_path=None,
+            is_finalized=False,
+            is_active=False,
+            start_time=None,
+            coordinators="",
+            metadata_collected=False,
+        )
+
+    def to_paths(self) -> Optional[MissionPaths]:
+        """
+        Convert to MissionPaths if all required filesystem paths are set.
+
+        Returns:
+            MissionPaths if valid, None if any required path is missing
+
+        Use for passing to MissionStorageHelper operations that expect MissionPaths.
+        """
+        if not self.mission_name or not self.mission_dir or not self.gpkg_path:
+            return None
+        if not self.attachments_dir:
+            return None
+        return MissionPaths(
+            name=self.mission_name,
+            mission_dir=self.mission_dir,
+            attachments_dir=self.attachments_dir,
+            backup_dir=self.backup_dir,
+            gpkg_path=self.gpkg_path,
+        )
+
+    def has_storage(self) -> bool:
+        """Check if mission storage is configured (gpkg_path is set and exists)."""
+        return bool(self.gpkg_path and self.gpkg_path.exists())
+
+    def has_coordinators(self) -> bool:
+        """Check if coordinators have been recorded for this mission."""
+        return bool(self.coordinators and self.coordinators.strip())
+
+    def snapshot(self) -> "MissionSessionState":
+        """
+        Create an immutable snapshot of current state.
+
+        Use when passing state to background tasks or across thread boundaries
+        to prevent race conditions from state mutations.
+
+        Returns:
+            New MissionSessionState instance with same values
+        """
+        return MissionSessionState(
+            mission_name=self.mission_name,
+            mission_dir=self.mission_dir,
+            attachments_dir=self.attachments_dir,
+            backup_dir=self.backup_dir,
+            gpkg_path=self.gpkg_path,
+            project_path=self.project_path,
+            is_finalized=self.is_finalized,
+            is_active=self.is_active,
+            start_time=self.start_time,
+            coordinators=self.coordinators,
+            metadata_collected=self.metadata_collected,
+        )
+
+    def status_dict(self) -> dict:
+        """
+        Return state as dictionary for diagnostics and logging.
+
+        Returns:
+            Dict with string-serializable values for status display.
+            Empty/whitespace-only strings are normalized to None.
+        """
+        # Normalize strings: empty or whitespace-only becomes None
+        mission_name = self.mission_name.strip() if self.mission_name else None
+        mission_name = mission_name if mission_name else None
+        coordinators = self.coordinators.strip() if self.coordinators else None
+        coordinators = coordinators if coordinators else None
+
+        return {
+            "mission_name": mission_name,
+            "mission_dir": str(self.mission_dir) if self.mission_dir else None,
+            "gpkg_path": str(self.gpkg_path) if self.gpkg_path else None,
+            "backup_dir": str(self.backup_dir) if self.backup_dir else None,
+            "project_path": str(self.project_path) if self.project_path else None,
+            "is_finalized": self.is_finalized,
+            "is_active": self.is_active,
+            "start_time": self.start_time.isoformat() if self.start_time else None,
+            "coordinators": coordinators,
+            "metadata_collected": self.metadata_collected,
+            "has_storage": self.has_storage(),
+        }
+
+
 # =============================================================================
 # Safe GeoPackage Backup Functions
 # =============================================================================

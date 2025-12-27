@@ -10,6 +10,7 @@ from .mission_controller import MissionController, MissionState
 from .mission_storage_controller import MissionStorageController
 from .mission_logs_controller import MissionLogsController
 from .coordinates_controller import CoordinatesController
+from .mission_lifecycle_controller import MissionLifecycleController
 
 __all__ = [
     'LayersController',
@@ -18,4 +19,5 @@ __all__ = [
     'MissionStorageController',
     'MissionLogsController',
     'CoordinatesController',
+    'MissionLifecycleController',
 ]
