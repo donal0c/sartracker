@@ -213,6 +213,14 @@ except Exception as e:
         _import_report, 'controllers.coordinates_controller.CoordinatesController', e
     )
 
+# Import MapToolsController (Phase 7 - map tools extraction)
+try:
+    from .controllers.map_tools_controller import MapToolsController
+except Exception as e:
+    MapToolsController = track_import_error(
+        _import_report, 'controllers.map_tools_controller.MapToolsController', e
+    )
+
 # Import SARPanel
 try:
     from .ui.sar_panel import SARPanel
@@ -369,6 +377,7 @@ class sartracker:
         self.mission_storage_controller = None  # Phase 6: Archive + backup controller
         self.mission_logs_controller = None  # Phase 4: Mission logs window controller
         self.coordinates_controller = None  # Phase 5: Status bar coordinates controller
+        self.map_tools_controller = None  # Phase 7: Map tools controller
         self.mission_controller = None  # Phase N3: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
@@ -964,40 +973,11 @@ class sartracker:
             print("[SARTRACKER] MissionLogsController not available (import failed)")
 
         # ------------------------------------------------------------------ #
-        # Drawing tool initializer
+        # Phase 7: Drawing tool initializer moved to MapToolsController
         # ------------------------------------------------------------------ #
-        # pylint: disable=attribute-defined-outside-init
-        def _init_drawing_tool(self, tool_attr, import_path, class_name, ctor, hooks):
-            try:
-                package_name = __package__ or (__name__.rpartition('.')[0] or __name__)
-                if not package_name or package_name == "__main__":
-                    package_name = Path(__file__).resolve().parent.name
-
-                # First attempt: relative import using package context (preferred)
-                try:
-                    module = import_module(import_path, package=package_name)
-                    resolved_name = f"{package_name}{import_path}"
-                except ModuleNotFoundError as import_error:
-                    # Fallback: build absolute module path manually
-                    if import_path.startswith('.'):
-                        resolved_name = f"{package_name}{import_path}"
-                    else:
-                        resolved_name = import_path
-                    module = import_module(resolved_name)
-
-                cls = getattr(module, class_name)
-                tool = ctor(cls)
-                hooks(tool)
-                setattr(self, tool_attr, tool)
-            except Exception as e:
-                setattr(self, tool_attr, None)
-                warning(self.iface.messageBar(), "SAR Tracker",
-                        f"{class_name} failed to load: {e}", duration=5)
-                print(f"ERROR initializing {class_name} from {resolved_name if 'resolved_name' in locals() else import_path}: {e}")
-                traceback.print_exc()
-
-        # Bind helper as instance method
-        self._init_drawing_tool = _init_drawing_tool.__get__(self, sartracker)
+        # Tool initialization is now handled by MapToolsController.init()
+        # The controller owns: marker_tool, measure_tool, line_tool,
+        # range_ring_tool, bearing_tool, polygon_tool, and tool_registry
 
         # Marker interaction controller (delegates marker CRUD workflows)
         if MarkerController is not None and self.layers_controller:
@@ -1015,90 +995,56 @@ class sartracker:
         if self.mission_logs_controller and self.marker_controller:
             self.mission_logs_controller.set_marker_controller(self.marker_controller)
 
-        # Initialize marker map tool
-        self.marker_tool = MarkerMapTool(self.iface.mapCanvas(), self.iface)
-        self.marker_tool.marker_clicked.connect(self._on_marker_clicked)
+        # ============================================================================
+        # PHASE 7: Initialize MapToolsController
+        # ============================================================================
+        # The MapToolsController now owns all map tools: marker, measure, drawing,
+        # and GPX functionality. Tool references are kept on plugin for compatibility.
+        if MapToolsController is not None:
+            try:
+                self.map_tools_controller = MapToolsController(
+                    iface=self.iface,
+                    layers_controller=self.layers_controller,
+                    marker_controller=self.marker_controller,
+                    layer_manager=self.layer_manager,
+                    sar_panel=None,  # Will be set after panel creation
+                    error_handler=self.error_handler,
+                    ingest_attachment=self._ingest_attachment,
+                    get_mission_directory=lambda: self._mission_directory,
+                    refresh_mission_logs_window=self._refresh_mission_logs_window,
+                    show_diagnostics=self._show_diagnostics,
+                    is_unloading=lambda: self._is_unloading,
+                    is_app_quitting=lambda: self._app_is_quitting,
+                    log_exception=self._log_exception,
+                    parent=self.iface.mainWindow()
+                )
+                # Initialize all tools
+                self.map_tools_controller.init()
 
-        # Initialize measure tool
-        self.measure_tool = MeasureTool(self.iface.mapCanvas())
-        self.measure_tool.measurement_complete.connect(self._on_measurement_complete)
+                # Keep references for compatibility and diagnostics
+                self.marker_tool = self.map_tools_controller.marker_tool
+                self.measure_tool = self.map_tools_controller.measure_tool
+                self.line_tool = self.map_tools_controller.line_tool
+                self.range_ring_tool = self.map_tools_controller.range_ring_tool
+                self.bearing_tool = self.map_tools_controller.bearing_tool
+                self.polygon_tool = self.map_tools_controller.polygon_tool
+                self.tool_registry = self.map_tools_controller.tool_registry
 
-        # Initialize drawing tools with shared helper
-        self._init_drawing_tool(
-            tool_attr="line_tool",
-            import_path=".maptools",
-            class_name="LineTool",
-            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller),
-            hooks=lambda tool: (
-                tool.drawing_complete.connect(self._on_line_complete),
-                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
-                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Line drawing"))
-            )
-        )
-        self._init_drawing_tool(
-            tool_attr="range_ring_tool",
-            import_path=".maptools",
-            class_name="RangeRingTool",
-            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
-            hooks=lambda tool: (
-                tool.drawing_complete.connect(self._on_range_rings_complete),
-                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
-                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Range ring"))
-            )
-        )
-        self._init_drawing_tool(
-            tool_attr="bearing_tool",
-            import_path=".maptools",
-            class_name="BearingTool",
-            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
-            hooks=lambda tool: (
-                tool.drawing_complete.connect(self._on_bearing_complete),
-                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
-                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Bearing line"))
-            )
-        )
-        self._init_drawing_tool(
-            tool_attr="polygon_tool",
-            import_path=".maptools",
-            class_name="PolygonTool",
-            ctor=lambda cls: cls(self.iface.mapCanvas(), self.layers_controller, self.iface),
-            hooks=lambda tool: (
-                tool.drawing_complete.connect(self._on_polygon_complete),
-                tool.drawing_cancelled.connect(self._on_drawing_cancelled),
-                tool.drawing_error.connect(lambda e: self.error_handler.handle_exception(e, "Polygon drawing"))
-            )
-        )
-
-        # Initialize Tool Registry (with error handling for late-binding import)
-        try:
-            from .maptools import ToolRegistry
-            self.tool_registry = ToolRegistry(self.iface.mapCanvas(), self.iface)
-            # Only register tools that successfully loaded
-            if self.line_tool:
-                self.tool_registry.register_tool('line', self.line_tool)
-            if self.range_ring_tool:
-                self.tool_registry.register_tool('range_rings', self.range_ring_tool)
-            if self.bearing_tool:
-                self.tool_registry.register_tool('bearing', self.bearing_tool)
-            if self.polygon_tool:
-                self.tool_registry.register_tool('polygon', self.polygon_tool)
-            self.tool_registry.tool_activated.connect(self._on_tool_activated)
-            self.tool_registry.tool_deactivated.connect(self._on_tool_deactivated)
-        except Exception as e:
-            self.tool_registry = None
-
-            # NOTE: Drawing tool buttons will be disabled after SAR panel creation (line 594)
-            # Cannot disable here because panel doesn't exist yet
-
-            # Show clear error message to user
-            error(
-                self.iface.messageBar(),
-                "SAR Tracker - Drawing Tools Unavailable",
-                f"Drawing tools failed to initialize: {e}. Other features remain available. Run Diagnostics for details.",
-                duration=0  # Persistent - user must acknowledge
-            )
-            print(f"[SARTRACKER] ERROR initializing ToolRegistry: {e}")
-            print(f"[SARTRACKER] Drawing tools will be disabled after panel creation")
+                print("[SARTRACKER] MapToolsController initialized")
+            except Exception as e:
+                self.map_tools_controller = None
+                print(f"[SARTRACKER] ERROR initializing MapToolsController: {e}")
+                traceback.print_exc()
+                error(
+                    self.iface.messageBar(),
+                    "SAR Tracker - Map Tools Unavailable",
+                    f"Map tools failed to initialize: {e}. Run Diagnostics for details.",
+                    duration=0
+                )
+        else:
+            self.map_tools_controller = None
+            print("[SARTRACKER] MapToolsController import failed, map tools unavailable")
+        # ============================================================================
 
         # Initialize Mission Controller (Phase N3)
         if MissionController is not None:
@@ -1138,7 +1084,13 @@ class sartracker:
                 self.sar_panel.marker_delete_requested.connect(self.marker_controller.handle_delete)
                 self.sar_panel.marker_zoom_requested.connect(self.marker_controller.zoom_to_marker)
                 self.sar_panel.attachment_open_requested.connect(self.marker_controller.open_attachment)
+            elif self.map_tools_controller:
+                # Fallback to map_tools_controller if marker_controller unavailable
+                self.sar_panel.marker_edit_requested.connect(self.map_tools_controller.on_marker_edit_requested)
+                self.sar_panel.marker_delete_requested.connect(self.map_tools_controller.on_marker_delete_requested)
+                self.sar_panel.marker_zoom_requested.connect(self.map_tools_controller.on_marker_zoom_requested)
             else:
+                # Legacy fallback to plugin methods
                 self.sar_panel.marker_edit_requested.connect(self._on_marker_edit_requested)
                 self.sar_panel.marker_delete_requested.connect(self._on_marker_delete_requested)
                 self.sar_panel.marker_zoom_requested.connect(self._on_marker_zoom_requested)
@@ -1148,22 +1100,55 @@ class sartracker:
         # Connect SAR Panel signals
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
         self.sar_panel.csv_load_requested.connect(self._on_load_csv)
-        self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
-        self.sar_panel.add_clue_requested.connect(self._on_add_clue_requested)
-        self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
-        self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
-        self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
-        self.sar_panel.polygon_tool_requested.connect(self._on_polygon_tool_requested)
-        self.sar_panel.range_rings_tool_requested.connect(self._on_range_rings_tool_requested)
-        self.sar_panel.bearing_tool_requested.connect(self._on_bearing_tool_requested)
-        self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
-        self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
+
+        # Phase 7: Connect map tool signals to MapToolsController
+        if self.map_tools_controller:
+            # Set sar_panel reference on controller (was None during init)
+            self.map_tools_controller.set_sar_panel(self.sar_panel)
+
+            # Marker tool signals
+            self.sar_panel.add_poi_requested.connect(self.map_tools_controller.on_add_poi_requested)
+            self.sar_panel.add_clue_requested.connect(self.map_tools_controller.on_add_clue_requested)
+            self.sar_panel.add_casualty_requested.connect(self.map_tools_controller.on_add_casualty_requested)
+            self.sar_panel.add_hazard_requested.connect(self.map_tools_controller.on_add_hazard_requested)
+
+            # Drawing tool signals
+            self.sar_panel.line_tool_requested.connect(self.map_tools_controller.on_line_tool_requested)
+            self.sar_panel.polygon_tool_requested.connect(self.map_tools_controller.on_polygon_tool_requested)
+            self.sar_panel.range_rings_tool_requested.connect(self.map_tools_controller.on_range_rings_tool_requested)
+            self.sar_panel.bearing_tool_requested.connect(self.map_tools_controller.on_bearing_tool_requested)
+
+            # Measurement and utilities
+            self.sar_panel.coordinate_converter_requested.connect(self.map_tools_controller.on_coordinate_converter_requested)
+            self.sar_panel.measure_distance_requested.connect(self.map_tools_controller.on_measure_distance_requested)
+            self.sar_panel.clear_measurements_requested.connect(self.map_tools_controller.on_clear_measurements_requested)
+
+            # GPX signals
+            self.sar_panel.gpx_import_file_requested.connect(self.map_tools_controller.on_gpx_import_file)
+            self.sar_panel.gpx_import_folder_requested.connect(self.map_tools_controller.on_gpx_import_folder)
+            self.sar_panel.gpx_watch_folder_requested.connect(self.map_tools_controller.on_gpx_watch_folder)
+
+            # Update measurement indicator
+            self.map_tools_controller.update_measurement_indicator()
+        else:
+            # Legacy fallback to plugin methods (MapToolsController unavailable)
+            self.sar_panel.add_poi_requested.connect(self._on_add_poi_requested)
+            self.sar_panel.add_clue_requested.connect(self._on_add_clue_requested)
+            self.sar_panel.add_casualty_requested.connect(self._on_add_casualty_requested)
+            self.sar_panel.add_hazard_requested.connect(self._on_add_hazard_requested)
+            self.sar_panel.line_tool_requested.connect(self._on_line_tool_requested)
+            self.sar_panel.polygon_tool_requested.connect(self._on_polygon_tool_requested)
+            self.sar_panel.range_rings_tool_requested.connect(self._on_range_rings_tool_requested)
+            self.sar_panel.bearing_tool_requested.connect(self._on_bearing_tool_requested)
+            self.sar_panel.coordinate_converter_requested.connect(self._on_coordinate_converter_requested)
+            self.sar_panel.measure_distance_requested.connect(self._on_measure_distance_requested)
+            self.sar_panel.clear_measurements_requested.connect(self._on_clear_measurements_requested)
+            self.sar_panel.gpx_import_file_requested.connect(self._on_gpx_import_file)
+            self.sar_panel.gpx_import_folder_requested.connect(self._on_gpx_import_folder)
+            self.sar_panel.gpx_watch_folder_requested.connect(self._on_gpx_watch_folder)
+            self._update_measurement_overlay_indicator()
+
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
-        self.sar_panel.clear_measurements_requested.connect(self._on_clear_measurements_requested)
-        self.sar_panel.gpx_import_file_requested.connect(self._on_gpx_import_file)
-        self.sar_panel.gpx_import_folder_requested.connect(self._on_gpx_import_folder)
-        self.sar_panel.gpx_watch_folder_requested.connect(self._on_gpx_watch_folder)
-        self._update_measurement_overlay_indicator()
         self._load_existing_mission_storage_state()
 
         # Keep mission/layer state in sync when users open/close projects.
@@ -2230,37 +2215,64 @@ class sartracker:
                 self.coords_update_timer = None
                 self.coordinates_controller = None
 
-            # Deactivate and clean up all map tools
-            if self.tool_registry:
+            # ============================================================
+            # PHASE 7: Clean up MapToolsController (handles all tool cleanup)
+            # ============================================================
+            if self.map_tools_controller:
                 try:
-                    self.tool_registry.deactivate_current()
-                except:
-                    pass
-
-            # Clean up individual tools
-            for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
-                tool = getattr(self, tool_attr, None)
-                if tool:
+                    print("[SARTRACKER] Cleaning up MapToolsController...")
+                    if hasattr(self.map_tools_controller, "cleanup"):
+                        self.map_tools_controller.cleanup("plugin unload")
                     try:
-                        # Deactivate if it's the current tool
-                        if self.iface.mapCanvas().mapTool() == tool:
-                            self.iface.mapCanvas().unsetMapTool(tool)
-                        # Call deactivate method if exists
-                        if hasattr(tool, 'deactivate'):
-                            tool.deactivate()
-                        # Delete the tool
-                        tool.deleteLater()
+                        self.map_tools_controller.deleteLater()
+                    except Exception:
+                        pass
+                    print("[SARTRACKER] MapToolsController cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: MapToolsController cleanup error: {e}")
+                finally:
+                    self.map_tools_controller = None
+                    # Clear compatibility references (now owned by controller)
+                    self.marker_tool = None
+                    self.measure_tool = None
+                    self.line_tool = None
+                    self.range_ring_tool = None
+                    self.bearing_tool = None
+                    self.polygon_tool = None
+                    self.tool_registry = None
+            else:
+                # Fallback: Clean up tools directly if controller wasn't available
+                if self.tool_registry:
+                    try:
+                        self.tool_registry.deactivate_current()
                     except:
                         pass
-                    setattr(self, tool_attr, None)
 
-            # Clean up tool registry
-            if self.tool_registry:
-                try:
-                    self.tool_registry.deleteLater()
-                except:
-                    pass
-                self.tool_registry = None
+                # Clean up individual tools
+                for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
+                    tool = getattr(self, tool_attr, None)
+                    if tool:
+                        try:
+                            # Deactivate if it's the current tool
+                            if self.iface.mapCanvas().mapTool() == tool:
+                                self.iface.mapCanvas().unsetMapTool(tool)
+                            # Call deactivate method if exists
+                            if hasattr(tool, 'deactivate'):
+                                tool.deactivate()
+                            # Delete the tool
+                            tool.deleteLater()
+                        except:
+                            pass
+                        setattr(self, tool_attr, None)
+
+                # Clean up tool registry
+                if self.tool_registry:
+                    try:
+                        self.tool_registry.deleteLater()
+                    except:
+                        pass
+                    self.tool_registry = None
+            # ============================================================
 
             # ============================================================
             # PHASE N1: Clean up Layers Controller (Phase 1 - CalTopo Console)
