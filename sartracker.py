@@ -205,6 +205,14 @@ except Exception as e:
         _import_report, 'controllers.mission_logs_controller.MissionLogsController', e
     )
 
+# Import MissionLifecycleController (Phase 2 - mission lifecycle extraction)
+try:
+    from .controllers.mission_lifecycle_controller import MissionLifecycleController
+except Exception as e:
+    MissionLifecycleController = track_import_error(
+        _import_report, 'controllers.mission_lifecycle_controller.MissionLifecycleController', e
+    )
+
 # Import CoordinatesController (Phase 5 - status bar coordinates extraction)
 try:
     from .controllers.coordinates_controller import CoordinatesController
@@ -375,7 +383,8 @@ class sartracker:
         self.mission_logs_controller = None  # Phase 4: Mission logs window controller
         self.coordinates_controller = None  # Phase 5: Status bar coordinates controller
         self.map_tools_controller = None  # Phase 7: Map tools controller
-        self.mission_controller = None  # Phase N3: Mission lifecycle controller
+        self.mission_controller = None  # Phase N3: Mission timing controller
+        self.mission_lifecycle_controller = None  # Phase 2: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
         self.current_marker_type = None  # 'poi' or 'casualty'
         # Phase 5: Coordinate display state moved to CoordinatesController
@@ -630,11 +639,24 @@ class sartracker:
             self.sar_panel.disable_drawing_tools("MapToolsController unavailable")
 
         # ====================================================================
-        # Mission Signals (finalize, unlock, autosave) -> Plugin methods
-        # These remain on plugin until Phase 2 extracts MissionLifecycleController
+        # Mission Signals (finalize, unlock, autosave) -> MissionLifecycleController
+        # Phase 2: Routes to controller when available, thin delegators otherwise
         # ====================================================================
-        self.sar_panel.finalize_mission_requested.connect(self._on_finalize_mission_requested)
-        self.sar_panel.unlock_mission_requested.connect(self._on_unlock_mission_requested)
+        if self.mission_lifecycle_controller:
+            # Wire directly to controller methods
+            self.sar_panel.finalize_mission_requested.connect(
+                self.mission_lifecycle_controller.on_finalize_requested
+            )
+            self.sar_panel.unlock_mission_requested.connect(
+                self.mission_lifecycle_controller.on_unlock_requested
+            )
+        else:
+            # Legacy fallback when controller unavailable
+            self.sar_panel.finalize_mission_requested.connect(self._on_finalize_mission_requested)
+            self.sar_panel.unlock_mission_requested.connect(self._on_unlock_mission_requested)
+            unavailable_features.append("Mission finalization (MissionLifecycleController unavailable)")
+
+        # Autosave stays on plugin - involves project save and cross-component coordination
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
 
         # ====================================================================
@@ -1153,6 +1175,68 @@ class sartracker:
         else:
             self.mission_controller = None
             print("[SARTRACKER] MissionController import failed, mission UI limited")
+
+        # ============================================================================
+        # PHASE 2: Mission Lifecycle Controller Setup
+        # ============================================================================
+        # Initialize mission lifecycle controller (manages mission storage, project
+        # hooks, backup/autosave, finalization workflows)
+        if MissionLifecycleController is not None:
+            try:
+                self.mission_lifecycle_controller = MissionLifecycleController(
+                    iface=self.iface,
+                    layer_manager=self.layer_manager,
+                    mission_storage=self.mission_storage,
+                    mission_controller=self.mission_controller,
+                    mission_storage_controller=self.mission_storage_controller,
+                    task_manager=self.task_manager,
+                    is_unloading=lambda: self._is_unloading,
+                    is_app_quitting=lambda: self._app_is_quitting,
+                    log_exception=self._log_exception,
+                    parent=self.iface.mainWindow()
+                )
+
+                # Connect archive signals from MissionStorageController to lifecycle controller
+                # CRITICAL: Without these connections, _is_finalizing flag never resets
+                if self.mission_storage_controller:
+                    self.mission_storage_controller.archive_succeeded.connect(
+                        self.mission_lifecycle_controller.on_archive_complete
+                    )
+                    self.mission_storage_controller.archive_failed.connect(
+                        self.mission_lifecycle_controller.on_archive_failed
+                    )
+
+                # Connect lifecycle controller signals for orchestrator callbacks
+                # structure_ensured: Layer structure ready - init helicopter layers
+                self.mission_lifecycle_controller.structure_ensured.connect(
+                    self._on_lifecycle_structure_ensured
+                )
+                # storage_prepared: New mission storage created - rebuild layers
+                self.mission_lifecycle_controller.storage_prepared.connect(
+                    self._on_lifecycle_storage_prepared
+                )
+                # storage_loaded: Storage loaded (new or resumed) - update UI
+                self.mission_lifecycle_controller.storage_loaded.connect(
+                    self._on_lifecycle_storage_loaded
+                )
+                # session_state_changed: Mission session state updated - update UI
+                self.mission_lifecycle_controller.session_state_changed.connect(
+                    self._on_lifecycle_session_state_changed
+                )
+                # finalization_state_changed: Mission finalized/unlocked
+                self.mission_lifecycle_controller.finalization_state_changed.connect(
+                    self._on_lifecycle_finalization_state_changed
+                )
+
+                print("[SARTRACKER] MissionLifecycleController initialized")
+            except Exception as e:
+                self.mission_lifecycle_controller = None
+                print(f"[SARTRACKER] ERROR initializing MissionLifecycleController: {e}")
+                traceback.print_exc()
+        else:
+            self.mission_lifecycle_controller = None
+            print("[SARTRACKER] MissionLifecycleController import failed, mission lifecycle features limited")
+        # ============================================================================
 
         # Initialize SAR Panel
         self.sar_panel = SARPanel(
@@ -1973,6 +2057,49 @@ class sartracker:
                     except Exception:
                         pass
                     self.provider_controller = None
+            # ============================================================
+
+            # ============================================================
+            # Clean up Mission Lifecycle Controller (Phase 2)
+            # ============================================================
+            # MUST be cleaned up BEFORE MissionStorageController since it
+            # holds references to storage controller signals
+            if self.mission_lifecycle_controller:
+                try:
+                    print("[SARTRACKER] Cleaning up MissionLifecycleController...")
+                    # Disconnect signals first
+                    try:
+                        self.mission_lifecycle_controller.structure_ensured.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        self.mission_lifecycle_controller.storage_prepared.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        self.mission_lifecycle_controller.storage_loaded.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        self.mission_lifecycle_controller.session_state_changed.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        self.mission_lifecycle_controller.finalization_state_changed.disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+                    # Call cleanup method
+                    if hasattr(self.mission_lifecycle_controller, "cleanup"):
+                        self.mission_lifecycle_controller.cleanup()
+                    try:
+                        self.mission_lifecycle_controller.deleteLater()
+                    except Exception:
+                        pass
+                    self.mission_lifecycle_controller = None
+                    print("[SARTRACKER] MissionLifecycleController cleaned up")
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: MissionLifecycleController cleanup error: {e}")
+                    self.mission_lifecycle_controller = None
             # ============================================================
 
             # ============================================================
@@ -2801,12 +2928,168 @@ class sartracker:
     # Project lifecycle hooks (startup + project open/new)
     # ------------------------------------------------------------------
     def _on_project_read(self):
-        """Handle QGIS project read (open/restore/template load)."""
-        self._sync_project_state(reason="projectRead")
+        """
+        Handle QGIS project read (open/restore/template load).
+
+        Phase 2: Delegates to MissionLifecycleController when available.
+        """
+        if self.mission_lifecycle_controller:
+            self.mission_lifecycle_controller.on_project_read()
+        else:
+            # Legacy fallback
+            self._sync_project_state(reason="projectRead")
 
     def _on_new_project_created(self):
-        """Handle QGIS new project created."""
-        self._sync_project_state(reason="newProjectCreated")
+        """
+        Handle QGIS new project created.
+
+        Phase 2: Delegates to MissionLifecycleController when available.
+        """
+        if self.mission_lifecycle_controller:
+            self.mission_lifecycle_controller.on_new_project_created()
+        else:
+            # Legacy fallback
+            self._sync_project_state(reason="newProjectCreated")
+
+    # ------------------------------------------------------------------
+    # MissionLifecycleController signal handlers (Phase 2)
+    # ------------------------------------------------------------------
+    def _on_lifecycle_structure_ensured(self):
+        """
+        Handle structure_ensured signal from MissionLifecycleController.
+
+        Called after layer structure is ensured - initialize helicopter layers.
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+        try:
+            if self.layers_controller:
+                self.layers_controller.ensure_helicopter_layers()
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Helicopter layer init failed: {exc}")
+
+    def _on_lifecycle_storage_prepared(self):
+        """
+        Handle storage_prepared signal from MissionLifecycleController.
+
+        Called after new mission storage is created - rebuild layers and update UI.
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Sync instance variables from controller state
+        self._sync_mission_state_from_controller()
+
+        # Rebuild layers for the new store
+        self._rebuild_layers_for_new_store()
+
+        # Update UI
+        self._update_mission_storage_status(active=True)
+
+        # Refresh catalog cache
+        if self.layers_controller and self.layers_controller.catalog:
+            try:
+                print("[SARTRACKER] Refreshing catalog for new mission...")
+                self.layers_controller.catalog._build_cache()
+                print("[SARTRACKER] Catalog refreshed successfully")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Catalog refresh failed: {e}")
+
+        # Ensure layers are visible
+        self._recover_missing_layers()
+
+    def _on_lifecycle_storage_loaded(self, is_active: bool):
+        """
+        Handle storage_loaded signal from MissionLifecycleController.
+
+        Args:
+            is_active: Whether mission is currently active
+
+        Called after storage state is loaded - update UI.
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Sync instance variables from controller state
+        self._sync_mission_state_from_controller()
+
+        # Update storage status in UI
+        self._update_mission_storage_status(active=is_active)
+
+        # Show finalize button if mission is not active
+        if self.sar_panel and not is_active:
+            is_finalized = self._check_mission_finalized()
+            self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
+
+        # Ensure layers remain visible
+        self._recover_missing_layers()
+
+    def _on_lifecycle_session_state_changed(self, state):
+        """
+        Handle session_state_changed signal from MissionLifecycleController.
+
+        Args:
+            state: MissionSessionState snapshot
+
+        Updates local instance variables and UI to reflect controller state.
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Sync instance variables from state snapshot
+        self._sync_mission_state_from_snapshot(state)
+
+        # Update storage status in UI
+        is_active = getattr(state, 'is_active', False)
+        self._update_mission_storage_status(active=is_active)
+
+    def _on_lifecycle_finalization_state_changed(self, is_finalized: bool):
+        """
+        Handle finalization_state_changed signal from MissionLifecycleController.
+
+        Args:
+            is_finalized: Whether mission is now finalized
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Update finalize button in SAR panel
+        if self.sar_panel:
+            self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=is_finalized)
+
+    def _sync_mission_state_from_controller(self):
+        """
+        Sync local instance variables from MissionLifecycleController state.
+
+        This maintains backwards compatibility with code that reads
+        instance variables directly (diagnostics, legacy methods).
+        """
+        if not self.mission_lifecycle_controller:
+            return
+
+        try:
+            state = self.mission_lifecycle_controller.get_session_state()
+            self._sync_mission_state_from_snapshot(state)
+        except Exception as exc:
+            self._log_exception("_sync_mission_state_from_controller", exc)
+
+    def _sync_mission_state_from_snapshot(self, state):
+        """
+        Sync local instance variables from a MissionSessionState snapshot.
+
+        Args:
+            state: MissionSessionState snapshot object
+        """
+        try:
+            self._mission_folder_name = getattr(state, 'mission_name', None)
+            self._mission_directory = getattr(state, 'mission_dir', None)
+            self._mission_attachments_dir = getattr(state, 'attachments_dir', None)
+            self._mission_backup_directory = getattr(state, 'backup_dir', None)
+            self._mission_gpkg_path = getattr(state, 'gpkg_path', None)
+            self._mission_coordinators_cache = getattr(state, 'coordinators', '') or ''
+            self._metadata_collected = getattr(state, 'metadata_collected', False)
+        except Exception as exc:
+            self._log_exception("_sync_mission_state_from_snapshot", exc)
 
     def _sync_project_state(self, reason: str = "unknown"):
         """
@@ -4158,6 +4441,28 @@ class sartracker:
                     status['provider_refresh_duration_ms'] = controller_status.get('last_refresh_duration_ms', self._last_refresh_duration_ms)
                 except Exception as controller_error:
                     print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
+            # ============================================================
+
+            # ============================================================
+            # PHASE 2: Read mission lifecycle controller status
+            # ============================================================
+            if self.mission_lifecycle_controller:
+                try:
+                    lifecycle_status = self.mission_lifecycle_controller.status_snapshot()
+                    status['mission_lifecycle'] = lifecycle_status
+                    # Also populate top-level storage fields for backwards compatibility
+                    status['mission_storage_path'] = str(lifecycle_status.get('gpkg_path')) if lifecycle_status.get('gpkg_path') else None
+                    status['mission_backup_path'] = str(lifecycle_status.get('backup_dir')) if lifecycle_status.get('backup_dir') else None
+                    status['mission_finalized'] = lifecycle_status.get('is_finalized', False)
+                    status['mission_coordinators'] = lifecycle_status.get('coordinators', '')
+                except Exception as lifecycle_error:
+                    print(f"[SARTRACKER] Warning: Error reading mission lifecycle status: {lifecycle_error}")
+            else:
+                # Fallback to legacy instance variables when controller unavailable
+                status['mission_storage_path'] = str(self._mission_gpkg_path) if self._mission_gpkg_path else None
+                status['mission_backup_path'] = str(self._mission_backup_directory) if self._mission_backup_directory else None
+                status['mission_finalized'] = self._check_mission_finalized() if self.layer_manager else False
+                status['mission_coordinators'] = self._mission_coordinators_cache or ''
             # ============================================================
 
         except Exception as e:
