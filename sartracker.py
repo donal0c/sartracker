@@ -1199,7 +1199,7 @@ class sartracker:
                 # Connect archive signals from MissionStorageController to lifecycle controller
                 # CRITICAL: Without these connections, _is_finalizing flag never resets
                 if self.mission_storage_controller:
-                    self.mission_storage_controller.archive_succeeded.connect(
+                    self.mission_storage_controller.archive_completed.connect(
                         self.mission_lifecycle_controller.on_archive_complete
                     )
                     self.mission_storage_controller.archive_failed.connect(
@@ -1232,6 +1232,7 @@ class sartracker:
             except Exception as e:
                 self.mission_lifecycle_controller = None
                 print(f"[SARTRACKER] ERROR initializing MissionLifecycleController: {e}")
+                import traceback
                 traceback.print_exc()
         else:
             self.mission_lifecycle_controller = None
