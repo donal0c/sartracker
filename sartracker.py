@@ -1258,7 +1258,11 @@ class sartracker:
         # refresh_requested wired after ProviderController setup below
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
 
-        self._load_existing_mission_storage_state()
+        # Phase 2: Initial storage state load - delegate to controller when available
+        if self.mission_lifecycle_controller:
+            self.mission_lifecycle_controller.load_existing_storage_state()
+        else:
+            self._load_existing_mission_storage_state()
 
         # Keep mission/layer state in sync when users open/close projects.
         # This also covers the startup project being read after plugin load.
@@ -1274,8 +1278,12 @@ class sartracker:
             print(f"[SARTRACKER] Warning: could not connect newProjectCreated: {exc}")
 
         # Defer a post-startup sync to avoid mutating the project during QGIS startup.
+        # Phase 2: Use controller when available
         try:
-            QTimer.singleShot(0, lambda: self._sync_project_state(reason="startup"))
+            if self.mission_lifecycle_controller:
+                QTimer.singleShot(0, lambda: self.mission_lifecycle_controller.sync_project_state(reason="startup"))
+            else:
+                QTimer.singleShot(0, lambda: self._sync_project_state(reason="startup"))
         except Exception:
             pass
 
@@ -4181,7 +4189,11 @@ class sartracker:
                     print(f"[SARTRACKER] Applied auto-save config: enabled={enabled}, interval={interval}m")
 
             if 'mission_primary_root' in changes or 'mission_backup_root' in changes:
-                self._load_existing_mission_storage_state()
+                # Phase 2: Use controller when available
+                if self.mission_lifecycle_controller:
+                    self.mission_lifecycle_controller.load_existing_storage_state()
+                else:
+                    self._load_existing_mission_storage_state()
                 if 'mission_backup_root' in changes and self._mission_folder_name:
                     self._mission_backup_directory = self._ensure_backup_directory(create=True)
                     if self._mission_backup_directory:
