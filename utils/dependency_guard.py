@@ -33,7 +33,10 @@ def _try_import(module_name: str) -> bool:
     try:
         importlib.import_module(module_name)
         return True
-    except ModuleNotFoundError:
+    except Exception as exc:
+        # Clear partially imported modules to avoid masking real failures.
+        sys.modules.pop(module_name, None)
+        print(f"[SAR Tracker] Charset helper import failed for {module_name}: {exc}")
         return False
 
 
@@ -161,5 +164,4 @@ def get_charset_guard_status() -> Dict[str, object]:
         "fallbacks": installed,
         "using_fallback": bool(installed),
     }
-
 

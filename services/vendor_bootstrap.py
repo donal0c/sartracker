@@ -22,7 +22,7 @@ Usage:
     # Later, for diagnostics
     vendor_info = get_vendor_info()
 """
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from pathlib import Path
 import sys
 import os
@@ -34,6 +34,10 @@ import os
 _vendor_info: Dict[str, Any] = {
     "using_vendor": False,
     "requests_path": None,
+    "urllib3_path": None,
+    "idna_path": None,
+    "charset_path": None,
+    "charset_module": None,
     "certifi_path": None,
     "missing": [],
     "error": None,
@@ -49,6 +53,10 @@ def get_vendor_info() -> Dict[str, Any]:
         Dict containing:
             - using_vendor: bool - True if vendor bundle is active
             - requests_path: str or None - Path to requests package
+            - urllib3_path: str or None - Path to urllib3 package
+            - idna_path: str or None - Path to idna package
+            - charset_path: str or None - Path to charset module (charset_normalizer/chardet)
+            - charset_module: str or None - Name of charset module in use
             - certifi_path: str or None - Path to CA certificate bundle
             - missing: List[str] - List of missing vendor assets
             - error: str or None - Error message if bootstrap failed
@@ -133,20 +141,48 @@ def _force_vendor_requests(vendor_dir: Path) -> bool:
         # Fallback for cases like Windows 8.3 paths or differing drive casing.
         return vendor_marker in path_norm
 
-    # If requests is already imported from system, clear it and its dependencies
-    def _is_from_vendor(mod_name: str) -> bool:
-        mod = sys.modules.get(mod_name)
-        try:
-            return _is_vendor_path(Path(mod.__file__).resolve())  # type: ignore[arg-type]
-        except Exception:
-            return False
+    stack_modules = (
+        "requests",
+        "urllib3",
+        "charset_normalizer",
+        "chardet",
+        "idna",
+        "certifi",
+    )
 
-    if "requests" in sys.modules and not _is_from_vendor("requests"):
-        for name in list(sys.modules.keys()):
-            if name == "requests" or name.startswith(
-                ("requests.", "urllib3", "charset_normalizer", "idna", "certifi")
-            ):
-                sys.modules.pop(name, None)
+    def _module_path(mod: object) -> Optional[Path]:
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file:
+            return None
+        try:
+            return Path(mod_file).resolve()
+        except Exception:
+            return Path(str(mod_file))
+
+    def _is_vendor_module(mod: object) -> bool:
+        mod_path = _module_path(mod)
+        return bool(mod_path and _is_vendor_path(mod_path))
+
+    def _is_stack_module(name: str) -> bool:
+        return any(
+            name == base or name.startswith(base + ".") for base in stack_modules
+        )
+
+    # Purge non-vendored stack modules to avoid mixing system and vendor deps.
+    for name, mod in list(sys.modules.items()):
+        if _is_stack_module(name) and not _is_vendor_module(mod):
+            sys.modules.pop(name, None)
+
+    def _load_charset_module() -> Tuple[Optional[str], Optional[Path]]:
+        try:
+            import charset_normalizer as _charset_mod  # noqa: E401
+            return "charset_normalizer", _module_path(_charset_mod)
+        except Exception:
+            try:
+                import chardet as _charset_mod  # noqa: E401
+                return "chardet", _module_path(_charset_mod)
+            except Exception:
+                return None, None
 
     # Ensure vendor path is first for import resolution
     vendor_str = str(vendor_dir)
@@ -164,31 +200,61 @@ def _force_vendor_requests(vendor_dir: Path) -> bool:
     try:
         # Import and validate paths
         import requests  # noqa: E401
+        import urllib3  # noqa: E401
+        import idna  # noqa: E401
         import certifi  # noqa: E401
 
-        requests_path = Path(requests.__file__).resolve()
+        requests_path = _module_path(requests)
+        urllib3_path = _module_path(urllib3)
+        idna_path = _module_path(idna)
+        charset_module, charset_path = _load_charset_module()
         cert_path = Path(certifi.where()).resolve()
 
-        if _is_vendor_path(requests_path) and _is_vendor_path(cert_path):
-            _vendor_info.update(
-                {
-                    "using_vendor": True,
-                    "requests_path": str(requests_path),
-                    "certifi_path": str(cert_path),
-                    "missing": [],
-                    "error": None,
-                }
+        stack_mismatch: List[str] = []
+
+        def _check_vendor_path(label: str, path: Optional[Path]) -> None:
+            if not path or not _is_vendor_path(path):
+                stack_mismatch.append(f"{label}: {path}")
+
+        _check_vendor_path("requests", requests_path)
+        _check_vendor_path("urllib3", urllib3_path)
+        _check_vendor_path("idna", idna_path)
+        _check_vendor_path("certifi", cert_path)
+
+        if charset_module:
+            _check_vendor_path(charset_module, charset_path)
+        else:
+            stack_mismatch.append("charset helper missing")
+
+        if stack_mismatch:
+            raise RuntimeError(
+                "Requests stack not using vendor bundle: " + "; ".join(stack_mismatch)
             )
-            return True
-        raise RuntimeError(
-            f"Requests stack not using vendor bundle. requests: {requests_path}, certifi: {cert_path}"
+
+        _vendor_info.update(
+            {
+                "using_vendor": True,
+                "requests_path": str(requests_path) if requests_path else None,
+                "urllib3_path": str(urllib3_path) if urllib3_path else None,
+                "idna_path": str(idna_path) if idna_path else None,
+                "charset_path": str(charset_path) if charset_path else None,
+                "charset_module": charset_module,
+                "certifi_path": str(cert_path),
+                "missing": [],
+                "error": None,
+            }
         )
+        return True
     except Exception as exc:
         # Fall back to system requests stack (non-fatal) to keep plugin usable.
         _vendor_info.update(
             {
                 "using_vendor": False,
                 "requests_path": None,
+                "urllib3_path": None,
+                "idna_path": None,
+                "charset_path": None,
+                "charset_module": None,
                 "certifi_path": None,
                 "missing": [],
                 "error": str(exc),
@@ -224,13 +290,25 @@ def _force_vendor_requests(vendor_dir: Path) -> bool:
 
         try:
             import requests  # noqa: E401
+            import urllib3  # noqa: E401
+            import idna  # noqa: E401
             import certifi  # noqa: E401
+
+            requests_path = _module_path(requests)
+            urllib3_path = _module_path(urllib3)
+            idna_path = _module_path(idna)
+            charset_module, charset_path = _load_charset_module()
+            cert_path = Path(certifi.where()).resolve()
 
             _vendor_info.update(
                 {
                     "using_vendor": False,
-                    "requests_path": str(Path(requests.__file__).resolve()),
-                    "certifi_path": str(Path(certifi.where()).resolve()),
+                    "requests_path": str(requests_path) if requests_path else None,
+                    "urllib3_path": str(urllib3_path) if urllib3_path else None,
+                    "idna_path": str(idna_path) if idna_path else None,
+                    "charset_path": str(charset_path) if charset_path else None,
+                    "charset_module": charset_module,
+                    "certifi_path": str(cert_path),
                 }
             )
         except Exception as sys_exc:

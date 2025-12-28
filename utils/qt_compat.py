@@ -101,6 +101,7 @@ Functions (2 functions):
 Total: 89 exported symbols for Qt5/Qt6 compatibility
 """
 
+from qgis.PyQt import QtCore
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import QLineEdit
 
@@ -126,14 +127,16 @@ except AttributeError:
     PasswordEchoMode = QLineEdit.Password
     NormalEchoMode = QLineEdit.Normal
 
-# Try to detect Qt version by checking for scoped enum attributes
+# Try to detect Qt version by using the Qt runtime version string.
 try:
-    # Qt6 style - enums are in sub-namespaces
-    _test = Qt.DockWidgetArea.LeftDockWidgetArea
-    QT_VERSION = 6
-except AttributeError:
-    # Qt5 style - enums are directly in Qt namespace
-    QT_VERSION = 5
+    QT_VERSION = int(QtCore.QT_VERSION_STR.split(".", 1)[0])
+except Exception:
+    # Fallback for environments that don't expose QT_VERSION_STR.
+    try:
+        _test = Qt.DockWidgetArea.LeftDockWidgetArea
+        QT_VERSION = 6
+    except AttributeError:
+        QT_VERSION = 5
 
 
 # =============================================================================
@@ -621,10 +624,9 @@ def dialog_exec(dialog):
         if result == QDialog.Accepted:
             ...
     """
-    if QT_VERSION == 6:
-        return dialog.exec()
-    else:  # Qt5
+    if hasattr(dialog, "exec_"):
         return dialog.exec_()
+    return dialog.exec()
 
 
 # =============================================================================

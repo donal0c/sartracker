@@ -116,6 +116,10 @@ class TestGetVendorInfo:
         required_keys = [
             "using_vendor",
             "requests_path",
+            "urllib3_path",
+            "idna_path",
+            "charset_path",
+            "charset_module",
             "certifi_path",
             "missing",
             "error",
@@ -242,3 +246,68 @@ class TestIntegrationWithSartracker:
             if "qgis" not in str(e).lower():
                 raise
             pytest.skip("QGIS not available for full integration test")
+
+
+class TestForceVendorRequests:
+    """Tests for _force_vendor_requests behavior with stub packages."""
+
+    def test_force_vendor_requests_purges_system_modules(self, tmp_path):
+        from sartracker.services import vendor_bootstrap as vb
+
+        vendor_dir = tmp_path / "vendor"
+        vendor_dir.mkdir()
+
+        def _make_pkg(name, content=""):
+            pkg_dir = vendor_dir / name
+            pkg_dir.mkdir()
+            (pkg_dir / "__init__.py").write_text(content, encoding="utf-8")
+            return pkg_dir
+
+        _make_pkg("requests")
+        _make_pkg("urllib3")
+        _make_pkg("idna")
+        _make_pkg("charset_normalizer")
+        certifi_dir = _make_pkg(
+            "certifi",
+            "from pathlib import Path\n"
+            "def where():\n"
+            "    return str(Path(__file__).resolve().parent / 'cacert.pem')\n",
+        )
+        (certifi_dir / "cacert.pem").write_text("stub-ca", encoding="utf-8")
+
+        saved_modules = {}
+        for name in ("requests", "urllib3", "idna", "charset_normalizer", "certifi"):
+            saved_modules[name] = sys.modules.get(name)
+
+        try:
+            # Seed system modules to ensure purge logic runs.
+            system_root = tmp_path / "system"
+            system_root.mkdir()
+            for name in ("requests", "urllib3"):
+                module = MagicMock()
+                module.__file__ = str(system_root / name / "__init__.py")
+                sys.modules[name] = module
+
+            original_sys_path = list(sys.path)
+            original_state = dict(vb._vendor_info)
+            try:
+                result = vb._force_vendor_requests(vendor_dir)
+                info = vb.get_vendor_info()
+
+                assert result is True
+                assert info["using_vendor"] is True
+                assert info["requests_path"] and str(vendor_dir) in info["requests_path"]
+                assert info["urllib3_path"] and str(vendor_dir) in info["urllib3_path"]
+                assert info["idna_path"] and str(vendor_dir) in info["idna_path"]
+                assert info["charset_path"] and str(vendor_dir) in info["charset_path"]
+                assert info["certifi_path"] and str(vendor_dir) in info["certifi_path"]
+            finally:
+                sys.path = original_sys_path
+                vb._vendor_info.clear()
+                vb._vendor_info.update(original_state)
+        finally:
+            for name, module in saved_modules.items():
+                if module is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
