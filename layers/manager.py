@@ -589,26 +589,28 @@ class LayerManager(QObject):
 
         # BUG-079 FIX: Use list() to avoid dict modification during iteration
         # and check sip_isdeleted before accessing layer.id()
-        for layer_id in layer_ids:
-            cache_keys_to_remove = []
-            for k, v in list(self._layer_cache.items()):
-                try:
-                    # BUG-079: Check if C++ object is still valid before accessing
-                    if v is None or sip_isdeleted(v):
+        # BUG-FIX: Use _cache_lock for thread safety (consistent with get_layer)
+        with self._cache_lock:
+            for layer_id in layer_ids:
+                cache_keys_to_remove = []
+                for k, v in list(self._layer_cache.items()):
+                    try:
+                        # BUG-079: Check if C++ object is still valid before accessing
+                        if v is None or sip_isdeleted(v):
+                            cache_keys_to_remove.append(k)
+                            continue
+                        if v.id() == layer_id:
+                            cache_keys_to_remove.append(k)
+                    except (RuntimeError, AttributeError, TypeError):
+                        # BUG-079: Layer C++ object already deleted - mark for removal
                         cache_keys_to_remove.append(k)
-                        continue
-                    if v.id() == layer_id:
-                        cache_keys_to_remove.append(k)
-                except (RuntimeError, AttributeError, TypeError):
-                    # BUG-079: Layer C++ object already deleted - mark for removal
-                    cache_keys_to_remove.append(k)
 
-            for key in cache_keys_to_remove:
-                try:
-                    del self._layer_cache[key]
-                    print(f"[LayerManager] Removed {key} from cache")
-                except KeyError:
-                    pass  # Already removed
+                for key in cache_keys_to_remove:
+                    try:
+                        del self._layer_cache[key]
+                        print(f"[LayerManager] Removed {key} from cache")
+                    except KeyError:
+                        pass  # Already removed
 
     def _on_project_cleared(self):
         """

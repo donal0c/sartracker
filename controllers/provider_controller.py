@@ -359,10 +359,13 @@ class ProviderController(QObject):
             # Stop polling timer for old provider
             self.stop_polling()
 
-            # ATOMIC COMMIT: Replace current provider with validated pending provider
-            self.provider = self._pending_provider
-            self.provider_name = self._pending_provider_name
-            self.provider_config = self._pending_provider_config
+            # ATOMIC COMMIT: Use tuple assignment for true atomicity
+            # BUG-FIX: Prevents inconsistent state if exception occurs between assignments
+            self.provider, self.provider_name, self.provider_config = (
+                self._pending_provider,
+                self._pending_provider_name,
+                self._pending_provider_config
+            )
 
             # Store config for signal emission (before clearing shadow state)
             connected_name = self.provider_name
@@ -983,23 +986,33 @@ class ProviderController(QObject):
                 print(f"[PROVIDER_CONTROLLER] SAR-nzf: Breadcrumb failures: {failed_devices}")
 
             # Update layers if controller available
+            # BUG-FIX: Only update layers when we have data to prevent clearing
+            # existing positions during network glitches. This is LIFE-SAFETY CRITICAL
+            # as losing team positions during a rescue could be dangerous.
             if self._layers_controller:
                 try:
-                    self._layers_controller.update_current_positions(current)
-                    if not current:
-                        print("[PROVIDER_CONTROLLER] Current positions empty - clearing layer")
+                    if current:
+                        # Only update when we have data
+                        self._layers_controller.update_current_positions(current)
+                    else:
+                        # SAFETY: Do NOT clear existing positions on empty response
+                        # This preserves last known positions during network issues
+                        print("[PROVIDER_CONTROLLER] Current positions empty - PRESERVING existing layer data (network glitch protection)")
                 except Exception as layer_err:
                     print(f"[PROVIDER_CONTROLLER] ERROR update_current_positions: {layer_err}")
                     import traceback
                     traceback.print_exc()
 
                 try:
-                    self._layers_controller.update_breadcrumbs(
-                        breadcrumbs,
-                        processed_segments=breadcrumb_processing
-                    )
-                    if not breadcrumbs:
-                        print("[PROVIDER_CONTROLLER] Breadcrumb payload empty - clearing layer")
+                    if breadcrumbs:
+                        # Only update when we have data
+                        self._layers_controller.update_breadcrumbs(
+                            breadcrumbs,
+                            processed_segments=breadcrumb_processing
+                        )
+                    else:
+                        # SAFETY: Do NOT clear existing breadcrumbs on empty response
+                        print("[PROVIDER_CONTROLLER] Breadcrumb payload empty - PRESERVING existing layer data (network glitch protection)")
                 except Exception as breadcrumb_err:
                     print(f"[PROVIDER_CONTROLLER] ERROR update_breadcrumbs: {breadcrumb_err}")
                     import traceback

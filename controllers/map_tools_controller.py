@@ -220,7 +220,8 @@ class MapToolsController(QObject):
             # Initialize measure tool
             try:
                 from ..maptools.measure_tool import MeasureTool
-                self.measure_tool = MeasureTool(self.iface.mapCanvas())
+                # BUG-FIX: Pass iface for notification support
+                self.measure_tool = MeasureTool(self.iface.mapCanvas(), self.iface)
                 self.measure_tool.measurement_complete.connect(self._on_measurement_complete)
                 print("[MapToolsController] MeasureTool initialized")
             except Exception as e:

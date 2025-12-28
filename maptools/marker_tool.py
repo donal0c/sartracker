@@ -6,6 +6,7 @@ Custom QGIS map tool for adding POI and Casualty markers by clicking on map.
 """
 
 import logging
+import math
 from typing import Optional
 
 from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
@@ -98,14 +99,37 @@ class MarkerMapTool(QgsMapTool):
             logger.exception("Marker transform failure: %s", detail)
             self._report_transform_failure("Coordinate transform failed", detail)
             return  # Don't emit signal with bad coordinates
-        
-        # Emit signal with coordinates
-        self.marker_clicked.emit(
-            wgs84_point.y(),  # latitude
-            wgs84_point.x(),  # longitude
-            itm_point.x(),    # easting
-            itm_point.y()     # northing
-        )
+
+        # LIFE-SAFETY CRITICAL: Validate coordinates are not NaN/Inf before placing marker
+        # Invalid coordinates could misdirect rescue teams
+        lat, lon = wgs84_point.y(), wgs84_point.x()
+        easting, northing = itm_point.x(), itm_point.y()
+
+        if (math.isnan(lat) or math.isnan(lon) or math.isinf(lat) or math.isinf(lon)):
+            self._report_transform_failure(
+                "Invalid coordinates",
+                "Transform produced NaN/Inf values for WGS84 coordinates"
+            )
+            return
+
+        if (math.isnan(easting) or math.isnan(northing) or
+            math.isinf(easting) or math.isinf(northing)):
+            self._report_transform_failure(
+                "Invalid ITM coordinates",
+                "Transform produced NaN/Inf values for Irish Grid coordinates"
+            )
+            return
+
+        # Validate coordinate ranges (sanity check)
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            self._report_transform_failure(
+                "Coordinates out of range",
+                f"Latitude {lat} or longitude {lon} outside valid range"
+            )
+            return
+
+        # Emit signal with validated coordinates
+        self.marker_clicked.emit(lat, lon, easting, northing)
     
     def canvasMoveEvent(self, event):
         """Handle mouse move (optional - could show preview)."""

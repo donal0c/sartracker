@@ -31,7 +31,10 @@ from qgis.core import QgsProject
 
 from ..utils.mission_storage import MissionPaths, MissionSessionState, MissionStorageHelper
 from ..utils.notify import info, warning, error, success
-from ..utils.qt_compat import dialog_exec, DialogAccepted, ISODate
+from ..utils.qt_compat import (
+    dialog_exec, DialogAccepted, ISODate,
+    MessageBoxQuestion, AcceptRole, RejectRole
+)
 from ..config.keys import ConfigStore
 
 # sip.isdeleted import pattern (Qt5/Qt6 compatible)
@@ -711,10 +714,10 @@ class MissionLifecycleController(QObject):
         dialog = QMessageBox(self.iface.mainWindow())
         dialog.setWindowTitle("Resume Mission?")
         dialog.setText(message)
-        dialog.setIcon(QMessageBox.Question)
+        dialog.setIcon(MessageBoxQuestion)
 
-        resume_button = dialog.addButton("Resume", QMessageBox.AcceptRole)
-        start_fresh_button = dialog.addButton("Start Fresh", QMessageBox.RejectRole)
+        resume_button = dialog.addButton("Resume", AcceptRole)
+        start_fresh_button = dialog.addButton("Start Fresh", RejectRole)
         dialog.setDefaultButton(resume_button)
 
         dialog_exec(dialog)
@@ -1706,10 +1709,33 @@ class MissionLifecycleController(QObject):
 
         Args:
             archive_path: Path to the created archive file
+
+        LIFE-SAFETY CRITICAL: Validates archive exists before marking mission finalized.
         """
         self._set_is_finalizing(False)
 
-        # Update state
+        # BUG-FIX: Validate archive path before marking as finalized
+        # This prevents data loss if archive task reported success but file wasn't created
+        if not archive_path:
+            warning(
+                self.iface.messageBar(),
+                "Mission Finalize",
+                "Archive completion signaled but no path provided. Mission NOT marked as finalized.",
+                duration=8
+            )
+            return
+
+        archive_file = Path(archive_path)
+        if not archive_file.exists():
+            warning(
+                self.iface.messageBar(),
+                "Mission Finalize",
+                f"Archive file not found: {archive_path}. Mission NOT marked as finalized.",
+                duration=8
+            )
+            return
+
+        # Update state - only after validation passes
         self._update_session_state(is_finalized=True)
 
         # Emit signals

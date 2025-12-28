@@ -19,6 +19,7 @@ crash during plugin reload cycles. All defensive guards from the original
 implementation are preserved.
 """
 
+import math
 from typing import Optional, Callable, TYPE_CHECKING
 
 from qgis.PyQt.QtCore import QObject, QTimer
@@ -331,10 +332,19 @@ class CoordinatesController(QObject):
                 )
                 itm_point = transform_to_itm.transform(self.last_coords_point)
 
+                # BUG-FIX: Validate transformed coordinates before display
+                # int(NaN) raises ValueError, and displaying invalid coords is dangerous
+                if (math.isnan(wgs84_point.x()) or math.isnan(wgs84_point.y()) or
+                    math.isnan(itm_point.x()) or math.isnan(itm_point.y()) or
+                    math.isinf(wgs84_point.x()) or math.isinf(wgs84_point.y()) or
+                    math.isinf(itm_point.x()) or math.isinf(itm_point.y())):
+                    return  # Skip update, keep last valid display
+
                 # Format display text with fixed-width formatting
+                # BUG-FIX: Use round() instead of int() for consistency (BUG-029)
                 coords_text = (
                     f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
-                    f"Irish Grid: E:{int(itm_point.x()):7d}  N:{int(itm_point.y()):7d}"
+                    f"Irish Grid: E:{round(itm_point.x()):7d}  N:{round(itm_point.y()):7d}"
                 )
 
                 # Update label (may raise RuntimeError if widget C++ object destroyed)

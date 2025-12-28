@@ -489,6 +489,92 @@ except (AttributeError, ImportError):
 
 
 # =============================================================================
+# QMessageBox Icon enums (Qt5/Qt6 compatible)
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QMessageBox as _QMB
+    if QT_VERSION == 6:
+        try:
+            MessageBoxQuestion = _QMB.Icon.Question
+            MessageBoxInformation = _QMB.Icon.Information
+            MessageBoxWarning = _QMB.Icon.Warning
+            MessageBoxCritical = _QMB.Icon.Critical
+            MessageBoxNoIcon = _QMB.Icon.NoIcon
+        except AttributeError:
+            # Fallback if Icon not scoped
+            MessageBoxQuestion = _QMB.Question
+            MessageBoxInformation = _QMB.Information
+            MessageBoxWarning = _QMB.Warning
+            MessageBoxCritical = _QMB.Critical
+            MessageBoxNoIcon = _QMB.NoIcon
+    else:
+        # Qt5: Direct access
+        MessageBoxQuestion = _QMB.Question
+        MessageBoxInformation = _QMB.Information
+        MessageBoxWarning = _QMB.Warning
+        MessageBoxCritical = _QMB.Critical
+        MessageBoxNoIcon = _QMB.NoIcon
+except (AttributeError, ImportError):
+    # Fallback values
+    MessageBoxQuestion = 4
+    MessageBoxInformation = 1
+    MessageBoxWarning = 2
+    MessageBoxCritical = 3
+    MessageBoxNoIcon = 0
+
+
+# =============================================================================
+# QMessageBox ButtonRole enums (Qt5/Qt6 compatible)
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QMessageBox as _QMB2
+    if QT_VERSION == 6:
+        try:
+            AcceptRole = _QMB2.ButtonRole.AcceptRole
+            RejectRole = _QMB2.ButtonRole.RejectRole
+            DestructiveRole = _QMB2.ButtonRole.DestructiveRole
+            ActionRole = _QMB2.ButtonRole.ActionRole
+            HelpRole = _QMB2.ButtonRole.HelpRole
+            YesRole = _QMB2.ButtonRole.YesRole
+            NoRole = _QMB2.ButtonRole.NoRole
+            ApplyRole = _QMB2.ButtonRole.ApplyRole
+            ResetRole = _QMB2.ButtonRole.ResetRole
+        except AttributeError:
+            # Fallback if ButtonRole not scoped
+            AcceptRole = _QMB2.AcceptRole
+            RejectRole = _QMB2.RejectRole
+            DestructiveRole = _QMB2.DestructiveRole
+            ActionRole = _QMB2.ActionRole
+            HelpRole = _QMB2.HelpRole
+            YesRole = _QMB2.YesRole
+            NoRole = _QMB2.NoRole
+            ApplyRole = _QMB2.ApplyRole
+            ResetRole = _QMB2.ResetRole
+    else:
+        # Qt5: Direct access
+        AcceptRole = _QMB2.AcceptRole
+        RejectRole = _QMB2.RejectRole
+        DestructiveRole = _QMB2.DestructiveRole
+        ActionRole = _QMB2.ActionRole
+        HelpRole = _QMB2.HelpRole
+        YesRole = _QMB2.YesRole
+        NoRole = _QMB2.NoRole
+        ApplyRole = _QMB2.ApplyRole
+        ResetRole = _QMB2.ResetRole
+except (AttributeError, ImportError):
+    # Fallback values (based on Qt enum integer values)
+    AcceptRole = 0
+    RejectRole = 1
+    DestructiveRole = 2
+    ActionRole = 3
+    HelpRole = 4
+    YesRole = 5
+    NoRole = 6
+    ApplyRole = 8
+    ResetRole = 7
+
+
+# =============================================================================
 # QDialog result codes
 # =============================================================================
 try:
@@ -752,6 +838,29 @@ __all__ = [
     'MessageBoxNo',
     'MessageBoxApply',
     'MessageBoxClose',
+    # QMessageBox Icon
+    'MessageBoxQuestion',
+    'MessageBoxInformation',
+    'MessageBoxWarning',
+    'MessageBoxCritical',
+    'MessageBoxNoIcon',
+    # QMessageBox ButtonRole
+    'AcceptRole',
+    'RejectRole',
+    'DestructiveRole',
+    'ActionRole',
+    'HelpRole',
+    'YesRole',
+    'NoRole',
+    'ApplyRole',
+    'ResetRole',
+    # sip helper
+    'sip_isdeleted',
+    # QLineEdit echo modes
+    'PasswordEchoMode',
+    'NormalEchoMode',
+    # WidgetAttribute
+    'WA_DeleteOnClose',
     # EventLoop
     'AllEvents',
     'ExcludeUserInputEvents',

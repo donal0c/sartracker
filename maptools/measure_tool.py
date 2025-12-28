@@ -37,15 +37,17 @@ class MeasureTool(QgsMapTool):
 
     measurement_complete = pyqtSignal(float, float, float, QgsPointXY, QgsPointXY)
 
-    def __init__(self, canvas):
+    def __init__(self, canvas, iface=None):
         """
         Initialize measure tool.
 
         Args:
             canvas: QGIS map canvas
+            iface: QGIS interface instance (for notifications)
         """
         super().__init__(canvas)
         self.canvas = canvas
+        self.iface = iface
         self.setCursor(QCursor(CrossCursor))
 
         # Measurement state
@@ -135,7 +137,14 @@ class MeasureTool(QgsMapTool):
         except Exception as e:
             error_msg = f"Failed to transform coordinates for measurement: {e}"
             logger.error(error_msg)
-            notify_warning("Coordinate transform failed", error_msg)
+            # BUG-FIX: notify_warning requires message_bar, title, message
+            if self.iface:
+                notify_warning(
+                    self.iface.messageBar(),
+                    "Coordinate transform failed",
+                    error_msg,
+                    duration=5
+                )
             raise RuntimeError(error_msg)
 
         # Calculate distance using ellipsoidal calculation

@@ -140,21 +140,29 @@ class CSVRefreshTask(ProviderRefreshTask):
             if self.check_cancellation("CSV task start"):
                 return False
 
+            # BUG-FIX: Copy to local variable to prevent TOCTOU race condition
+            # Between check and use, self.provider could become None during shutdown
+            # (Same fix as TraccarRefreshTask)
+            provider = self.provider
+            if not provider:
+                self.error_message = "Provider no longer available"
+                return False
+
             # Parse current positions (uses file-level caching)
-            current = self.provider.get_current()
+            current = provider.get_current()
 
             # Check for cancellation after each major operation
             if self.check_cancellation("CSV after get_current"):
                 return False
 
             # Parse breadcrumbs (historical trail)
-            breadcrumbs = self.provider.get_breadcrumbs(since_iso=self.since_iso)
+            breadcrumbs = provider.get_breadcrumbs(since_iso=self.since_iso)
 
             if self.check_cancellation("CSV after get_breadcrumbs"):
                 return False
 
             # Get device list
-            devices = self.provider.get_devices()
+            devices = provider.get_devices()
 
             if self.check_cancellation("CSV after get_devices"):
                 return False
@@ -602,12 +610,16 @@ class TraccarRefreshTask(ProviderRefreshTask):
             True if successful, False if error occurred
         """
         # BUG-049 fix: Check provider exists before calling methods
-        if not self.provider:
+        # BUG-FIX: Copy to local variable to prevent TOCTOU race condition
+        # Between the check and use, self.provider could become None during shutdown
+        provider = self.provider
+        if not provider:
             self.error_message = "Provider no longer available"
             return False
 
         # Create thread-local session for this task
-        session = self.provider._create_session()
+        # Use local reference to prevent race condition
+        session = provider._create_session()
         fallback_features = None
 
         try:
@@ -634,10 +646,10 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 return list(device_map.values())
 
             try:
-                devices = self.provider.get_devices(session=session)
+                devices = provider.get_devices(session=session)
             except (ProviderNetworkError, ProviderDataError) as e:
-                if fallback_features is None and getattr(self.provider, 'enable_last_good_cache', False):
-                    fallback_features = self.provider._load_last_good_cache()
+                if fallback_features is None and getattr(provider, 'enable_last_good_cache', False):
+                    fallback_features = provider._load_last_good_cache()
                 if fallback_features:
                     logger.info("Using cached devices due to %s: %s", e.__class__.__name__, e)
                     devices = _devices_from_features(fallback_features)
@@ -661,10 +673,10 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
             # Fetch current positions with session
             try:
-                current = self.provider.get_current(session=session)
+                current = provider.get_current(session=session)
             except (ProviderNetworkError, ProviderDataError) as e:
-                if fallback_features is None and getattr(self.provider, 'enable_last_good_cache', False):
-                    fallback_features = self.provider._load_last_good_cache()
+                if fallback_features is None and getattr(provider, 'enable_last_good_cache', False):
+                    fallback_features = provider._load_last_good_cache()
                 if fallback_features:
                     logger.info("Using cached positions due to %s: %s", e.__class__.__name__, e)
                     current = fallback_features
@@ -699,7 +711,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 self.setProgress(start + (end - start) * fraction_val)
 
             try:
-                breadcrumbs = self.provider.get_breadcrumbs(
+                breadcrumbs = provider.get_breadcrumbs(
                     since_iso=self.since_iso,
                     session=session,
                     cancel_check=self.isCanceled,
@@ -707,7 +719,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 )
             except (ProviderNetworkError, ProviderDataError) as e:
                 logger.info("%s fetching breadcrumbs: %s", e.__class__.__name__, e)
-                breadcrumbs = self.provider._load_last_good_breadcrumbs() if getattr(self.provider, 'enable_last_good_cache', False) else []
+                breadcrumbs = provider._load_last_good_breadcrumbs() if getattr(provider, 'enable_last_good_cache', False) else []
                 if breadcrumbs:
                     logger.info("Using cached breadcrumbs (%d points)", len(breadcrumbs))
                 _breadcrumb_progress(1.0)
@@ -773,8 +785,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
             # SAR-nzf FIX: Include breadcrumb failures for UI notification
             breadcrumb_failures = []
             try:
-                with self.provider._cache_lock:
-                    breadcrumb_failures = list(self.provider._last_breadcrumb_failures)
+                with provider._cache_lock:
+                    breadcrumb_failures = list(provider._last_breadcrumb_failures)
             except Exception:
                 pass  # Silently ignore if provider doesn't have this field
 
@@ -789,8 +801,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
             # Persist last-good payload (positions + breadcrumbs) for offline resilience
             try:
-                if getattr(self.provider, 'enable_last_good_cache', False):
-                    self.provider._save_last_good_cache(current, breadcrumbs)
+                if getattr(provider, 'enable_last_good_cache', False):
+                    provider._save_last_good_cache(current, breadcrumbs)
             except Exception as cache_err:
                 logger.warning("Failed to persist last-good cache: %s", cache_err)
 

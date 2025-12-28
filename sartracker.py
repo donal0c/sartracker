@@ -83,7 +83,10 @@ from .resources import *
 import os.path
 
 # Import Qt5/Qt6 compatible constants and functions
-from .utils.qt_compat import Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted, MessageBoxYes, MessageBoxNo, ISODate
+from .utils.qt_compat import (
+    Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted,
+    MessageBoxYes, MessageBoxNo, ISODate, MessageBoxQuestion, AcceptRole, RejectRole
+)
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.exceptions import SARTrackerError
@@ -2178,8 +2181,9 @@ class sartracker:
         if self.tool_registry:
             try:
                 self.tool_registry.deactivate_current()
-            except:
-                pass
+            except Exception as e:
+                # BUG-FIX: Log instead of silent swallow for debugging
+                print(f"[SARTRACKER] Tool deactivation error during cleanup: {e}")
 
         for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
             tool = getattr(self, tool_attr, None)
@@ -2190,15 +2194,17 @@ class sartracker:
                     if hasattr(tool, 'deactivate'):
                         tool.deactivate()
                     tool.deleteLater()
-                except:
-                    pass
+                except Exception as e:
+                    # BUG-FIX: Log instead of silent swallow for debugging
+                    print(f"[SARTRACKER] Tool cleanup error for {tool_attr}: {e}")
                 setattr(self, tool_attr, None)
 
         if self.tool_registry:
             try:
                 self.tool_registry.deleteLater()
-            except:
-                pass
+            except Exception as e:
+                # BUG-FIX: Log instead of silent swallow for debugging
+                print(f"[SARTRACKER] Tool registry cleanup error: {e}")
             self.tool_registry = None
 
     def _unload_layer_infrastructure(self):
@@ -2425,13 +2431,21 @@ class sartracker:
             except Exception as e:
                 print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
 
-            # Disconnect signals
+            # Disconnect signals - COMPLETE list matching _wire_sar_panel_signals
             panel_signals = [
+                # Tool signals
                 'refresh_requested', 'csv_load_requested', 'add_poi_requested',
                 'add_clue_requested', 'add_casualty_requested', 'add_hazard_requested',
                 'line_tool_requested', 'polygon_tool_requested', 'range_rings_tool_requested',
                 'bearing_tool_requested', 'coordinate_converter_requested',
-                'measure_distance_requested', 'autosave_requested', 'clear_measurements_requested'
+                'measure_distance_requested', 'autosave_requested', 'clear_measurements_requested',
+                # Mission lifecycle signals
+                'finalize_mission_requested', 'unlock_mission_requested',
+                # Marker management signals
+                'marker_edit_requested', 'marker_delete_requested', 'marker_zoom_requested',
+                'attachment_open_requested',
+                # GPX import signals
+                'gpx_import_file_requested', 'gpx_import_folder_requested', 'gpx_watch_folder_requested'
             ]
             for signal_name in panel_signals:
                 try:
@@ -2466,7 +2480,8 @@ class sartracker:
         BUG-079 FIX: Check if already cleaned up or deleted before accessing.
         """
         if self.settings_panel and not self._is_qt_deleted(self.settings_panel):
-            for sig_name in ['settings_changed', 'provider_test_requested', 'provider_save_requested']:
+            # COMPLETE list of settings panel signals
+            for sig_name in ['settings_changed', 'provider_test_requested', 'provider_save_requested', 'repair_layers_requested']:
                 try:
                     getattr(self.settings_panel, sig_name).disconnect()
                 except TypeError:
@@ -2495,12 +2510,41 @@ class sartracker:
         """Clear remaining references.
 
         Phase 4.2: Final cleanup step.
+        BUG-FIX: Ensure ALL controllers and services are cleaned up to prevent
+        memory leaks and stale references during plugin reload.
         """
+        # Clear controllers
         if self.layers_controller:
             self.layers_controller = None
 
         if self.provider:
             self.provider = None
+
+        # BUG-FIX: Clean up marker_controller (was missing)
+        if hasattr(self, 'marker_controller') and self.marker_controller:
+            self.marker_controller = None
+
+        # BUG-FIX: Clean up diagnostics_service (was missing)
+        if hasattr(self, 'diagnostics_service') and self.diagnostics_service:
+            self.diagnostics_service = None
+
+        # BUG-FIX: Clean up error_handler (was missing)
+        if hasattr(self, 'error_handler') and self.error_handler:
+            self.error_handler = None
+
+        # BUG-FIX: Clean up mission_storage helper (was missing)
+        if hasattr(self, 'mission_storage') and self.mission_storage:
+            self.mission_storage = None
+
+        # Clean up lifecycle manager
+        if hasattr(self, 'lifecycle') and self.lifecycle:
+            self.lifecycle = None
+
+        # Clean up CRS objects
+        if hasattr(self, 'wgs84'):
+            self.wgs84 = None
+        if hasattr(self, 'itm'):
+            self.itm = None
 
 
     def run(self):
@@ -2959,10 +3003,10 @@ class sartracker:
         dialog = QMessageBox(self.iface.mainWindow())
         dialog.setWindowTitle("Resume Mission?")
         dialog.setText(message)
-        dialog.setIcon(QMessageBox.Question)
+        dialog.setIcon(MessageBoxQuestion)
 
-        resume_button = dialog.addButton("Resume", QMessageBox.AcceptRole)
-        start_fresh_button = dialog.addButton("Start Fresh", QMessageBox.RejectRole)
+        resume_button = dialog.addButton("Resume", AcceptRole)
+        start_fresh_button = dialog.addButton("Start Fresh", RejectRole)
         dialog.setDefaultButton(resume_button)
 
         dialog_exec(dialog)

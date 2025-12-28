@@ -304,6 +304,13 @@ class FileCSVProvider(Provider):
                             skipped_coord_range += 1
                             continue  # Invalid longitude, skip row
 
+                        # LIFE-SAFETY CRITICAL: Reject Null Island (0,0) - common GPS failure indicator
+                        # Consistent with HTTP provider validation (BUG-FIX: consistency across providers)
+                        if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+                            skipped_coord_range += 1
+                            logger.debug("Skipping Null Island position (0,0) - likely GPS failure")
+                            continue
+
                         # Validate timestamp format (BUG-041 fix)
                         # CRITICAL: Invalid timestamps can cause wrong "latest" position
                         timestamp_str = row.get('Time', '')
