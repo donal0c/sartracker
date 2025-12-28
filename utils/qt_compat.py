@@ -103,6 +103,19 @@ Total: 89 exported symbols for Qt5/Qt6 compatibility
 
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtWidgets import QLineEdit
+
+# =============================================================================
+# sip isdeleted helper (Qt5/Qt6 compatible)
+# =============================================================================
+try:
+    from qgis.PyQt.sip import isdeleted as sip_isdeleted
+except Exception:
+    try:
+        import sip
+        sip_isdeleted = sip.isdeleted
+    except Exception:
+        def sip_isdeleted(_obj):
+            return False
 # =============================================================================
 # QLineEdit echo modes
 # =============================================================================
@@ -247,7 +260,11 @@ if QT_VERSION == 6:
     Key_Backspace = Qt.Key.Key_Backspace
     Key_Tab = Qt.Key.Key_Tab
     Key_Space = Qt.Key.Key_Space
-    Key_F5 = Qt.Key.Key_F5
+    # F5 key for refresh - use fallback value if not available in some Qt6 versions
+    try:
+        Key_F5 = Qt.Key.Key_F5
+    except AttributeError:
+        Key_F5 = 0x01000034  # Qt.Key.Key_F5 numeric value
     # Arrow keys for navigation
     Key_Left = Qt.Key.Key_Left
     Key_Right = Qt.Key.Key_Right

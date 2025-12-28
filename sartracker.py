@@ -113,6 +113,7 @@ except Exception as e:
 from .utils.provider_results import sanitize_provider_results
 from .utils.task_manager import TaskManager
 from .services.lifecycle_manager import PluginLifecycleManager, validate_init_preconditions
+from .services.diagnostics_service import DiagnosticsService
 
 # Import our SAR tracking components with individual error tracking
 # This allows us to detect and report exactly which imports fail, preventing
@@ -308,6 +309,9 @@ class sartracker:
         self._skip_layer_ops = False   # Guard to avoid layer mutations during shutdown
         # BUG-019/BUG-021 FIX: Flag to prevent callbacks during plugin unload
         self._is_unloading = False
+
+        # Phase 4.4: Initialize diagnostics service for centralized status gathering
+        self.diagnostics_service = DiagnosticsService()
 
         # Create centralized error handler (Issue #3)
         # LIFECYCLE SAFETY: Pass iface, not messageBar(), to resolve at use time
@@ -837,18 +841,22 @@ class sartracker:
         return action
 
     def initGui(self):
-        """Create the menu entries and toolbar icons inside the QGIS GUI."""
-        # Configure logging early - routes Python logging to QGIS Log Messages panel
-        try:
-            from .utils.logging_config import configure_logging, get_logger
-            configure_logging()
-            self._logger = get_logger("sartracker")
-            self._logger.info("initGui() starting... (v0.3.1)")
-            self._logger.debug("Plugin dir: %s", self.plugin_dir)
-        except Exception as e:
-            # Fallback to print if logging setup fails
-            print(f"[SARTRACKER] Logging setup failed: {e}")
-            self._logger = None
+        """Create the menu entries and toolbar icons inside the QGIS GUI.
+
+        Phase 4 Refactor: This method now delegates to helper sections:
+        - _init_logging(): Configure logging early
+        - _init_actions(): Create menu items and toolbar icons
+        - _init_task_manager(): Initialize TaskManager for background ops
+        - _init_layer_manager(): Initialize LayerManager for layer hierarchy
+        - _init_controllers(): Initialize all controllers with DI
+        - _init_panels(): Create SAR and Settings dock panels
+        - _connect_signals(): Wire panel signals to controllers
+        - _post_init_state(): Final state setup and lifecycle completion
+        """
+        # ====================================================================
+        # STEP 1: Initialize logging
+        # ====================================================================
+        self._init_logging()
 
         print("[SARTRACKER] initGui() starting... (v0.3.1-debug)")
         print(f"[SARTRACKER] Plugin dir: {self.plugin_dir}")
@@ -863,6 +871,82 @@ class sartracker:
                 duration=8
             )
 
+        # ====================================================================
+        # STEP 2: Initialize menu actions (MUST come before fail-fast check
+        # so Diagnostics menu is available even if imports failed)
+        # ====================================================================
+        self._init_actions()
+
+        # ====================================================================
+        # FAIL-FAST CHECK: Abort initialization if critical imports failed
+        # ====================================================================
+        if not _import_report.ok:
+            self._handle_import_failure(_import_report)
+            return  # Abort - Diagnostics menu is available
+
+        # will be set False in run()
+        self.first_start = True
+
+        # ====================================================================
+        # STEP 3: Initialize core infrastructure
+        # ====================================================================
+        self._init_task_manager()
+        self._init_layer_manager()
+        self._init_mission_storage_state()
+
+        # ====================================================================
+        # STEP 4: Initialize all controllers
+        # ====================================================================
+        self._init_controllers()
+
+        # ====================================================================
+        # STEP 5: Initialize UI panels
+        # ====================================================================
+        self._init_panels()
+
+        # ====================================================================
+        # STEP 6: Connect signals between panels and controllers
+        # ====================================================================
+        self._connect_signals()
+
+        # ====================================================================
+        # STEP 7: Post-initialization state setup
+        # ====================================================================
+        self._post_init_state()
+
+        # Phase 1 Refactor: Mark initialization complete for lifecycle tracking
+        self.lifecycle.mark_init_complete()
+        print(f"[SARTRACKER] Plugin initialization complete. {len(self.lifecycle.registry._components)} components registered.")
+        print(f"[SARTRACKER] Menu items in self.actions: {len(self.actions)}")
+
+    def _init_logging(self):
+        """Initialize logging configuration.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        Routes Python logging to QGIS Log Messages panel.
+        """
+        try:
+            from .utils.logging_config import configure_logging, get_logger
+            configure_logging()
+            self._logger = get_logger("sartracker")
+            self._logger.info("initGui() starting... (v0.3.1)")
+            self._logger.debug("Plugin dir: %s", self.plugin_dir)
+        except Exception as e:
+            # Fallback to print if logging setup fails
+            print(f"[SARTRACKER] Logging setup failed: {e}")
+            self._logger = None
+
+    def _init_actions(self):
+        """Initialize menu actions and toolbar icons.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        Creates:
+        - Main toolbar icon
+        - Settings menu item
+        - Diagnostics menu item (CRITICAL: must exist for safe-mode)
+        - Mission Logs menu item
+        - Smoke Test menu item
+        """
         # Use absolute path to icon file
         icon_path = os.path.join(self.plugin_dir, 'icon.png')
         self.add_action(
@@ -886,7 +970,7 @@ class sartracker:
         except Exception as e:
             print(f"[SARTRACKER] ERROR adding Settings menu: {e}")
 
-        # Add Diagnostics menu item
+        # Add Diagnostics menu item (CRITICAL: Must always be available for safe-mode)
         try:
             self.diagnostics_action = QAction("Diagnostics", self.iface.mainWindow())
             self.diagnostics_action.triggered.connect(self._show_diagnostics)
@@ -916,28 +1000,15 @@ class sartracker:
         except Exception as e:
             print(f"[SARTRACKER] ERROR adding Smoke Test menu: {e}")
 
-        # ============================================================================
-        # FAIL-FAST CHECK: Abort initialization if critical imports failed
-        # ============================================================================
-        # This MUST come AFTER Diagnostics and Smoke Test menus are added,
-        # ensuring users can access diagnostic tools even when imports fail.
-        #
-        # If any imports failed during module loading, we display a clear error
-        # message and abort initialization to prevent cryptic crashes later.
-        if not _import_report.ok:
-            self._handle_import_failure(_import_report)
-            return  # Abort initialization - do not proceed with component setup
+    def _init_task_manager(self):
+        """Initialize TaskManager for background operations.
 
-        # If we reach here, all imports succeeded and we can safely proceed
-        # ============================================================================
-
-        # will be set False in run()
-        self.first_start = True
-
-        # Initialize task manager for background operations (Issue #6 fix)
+        Phase 4.1: Extracted from initGui for clarity.
+        Creates TaskManager, registers with lifecycle, connects aboutToQuit signal.
+        """
         self.task_manager = TaskManager()
 
-        # Phase 1 Refactor: Register task manager with lifecycle for coordinated cleanup
+        # Register task manager with lifecycle for coordinated cleanup
         self.lifecycle.register_component(
             'task_manager',
             self.task_manager,
@@ -945,30 +1016,21 @@ class sartracker:
         )
 
         # Connect to application aboutToQuit signal for safe shutdown
-        # This prevents race conditions where tasks outlive the plugin during QGIS exit
         QCoreApplication.instance().aboutToQuit.connect(self._on_app_about_to_quit)
         self.lifecycle.track_signal(QCoreApplication.instance().aboutToQuit, self._on_app_about_to_quit)
 
-        # Phase 1.7: Connection test tracking now in ProviderController
-        # Removed: _current_connection_task, _pending_provider_metadata
+    def _init_layer_manager(self):
+        """Initialize LayerManager for canonical layer hierarchy.
 
-        # ============================================================================
-        # PHASE N2: Layer Manager Setup
-        # ============================================================================
-        # Initialize layer manager for canonical layer hierarchy (Phase N2)
+        Phase 4.1: Extracted from initGui for clarity.
+        Creates LayerManager (defers structure init to avoid dirtying startup project).
+        """
         if LayerManager is not None:
             try:
                 self.layer_manager = LayerManager(self.iface)
                 # IMPORTANT: Do not mutate the current project during plugin load.
-                # QGIS may still be opening the startup project/template; writing
-                # to the project here can mark it dirty and trigger the
-                # "Do you want to save the current project?" prompt on startup.
-                #
-                # Layer structure is instead ensured lazily:
-                # - when a mission store is set/created
-                # - when opening a SAR project (detected post-projectRead)
+                # Layer structure is ensured lazily when mission store is set/created.
                 print("[SARTRACKER] LayerManager initialized (structure init deferred)")
-
             except Exception as e:
                 self.layer_manager = None
                 warning(
@@ -978,15 +1040,16 @@ class sartracker:
                     duration=5
                 )
                 print(f"[SARTRACKER] ERROR initializing LayerManager: {e}")
-                import traceback
                 traceback.print_exc()
         else:
             self.layer_manager = None
             print("[SARTRACKER] LayerManager not available (import failed)")
-        # ============================================================================
 
-        # Mission storage tracking - reset on initGui for plugin reload
-        # (Primary initialization is in __init__ for safety - see line 398)
+    def _init_mission_storage_state(self):
+        """Reset mission storage tracking state for plugin reload.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        """
         self._mission_folder_name = None
         self._mission_directory = None
         self._mission_attachments_dir = None
@@ -996,19 +1059,20 @@ class sartracker:
         self._mission_coordinators_cache = ""
         self._last_mission_state = None
         self._is_finalizing = False
-
-        # Track project changes to avoid double-running startup sync logic.
         self._last_project_signature: Optional[str] = None
 
+    def _init_controllers(self):
+        """Initialize all controllers with dependency injection.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        Creates controllers in dependency order with proper DI wiring.
+        """
         # Initialize layers controller
         self.layers_controller = LayersController(
             self.iface,
             layer_manager=self.layer_manager,
             task_manager=self.task_manager
         )
-
-        # Note: layer_manager and layers_controller cleanup is handled in unload()
-        # directly to avoid lifecycle registration side effects
 
         # Mission storage helper (filesystem + backups)
         self.mission_storage = MissionStorageHelper(
@@ -1018,6 +1082,31 @@ class sartracker:
         )
 
         # Phase 6: Mission storage controller (archive + backup operations)
+        self._init_mission_storage_controller()
+
+        # Phase 4: Mission logs controller
+        self._init_mission_logs_controller()
+
+        # Marker interaction controller
+        self._init_marker_controller()
+
+        # Phase 7: MapToolsController (marker, measure, drawing, GPX)
+        self._init_map_tools_controller()
+
+        # Phase N3: Mission Controller (timing)
+        self._init_mission_controller()
+
+        # Phase 2: Mission Lifecycle Controller
+        self._init_mission_lifecycle_controller()
+
+        # Phase 3: Provider Controller
+        self._init_provider_controller()
+
+    def _init_mission_storage_controller(self):
+        """Initialize MissionStorageController for archive + backup.
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MissionStorageController is not None:
             try:
                 self.mission_storage_controller = MissionStorageController(
@@ -1037,7 +1126,6 @@ class sartracker:
                 self.mission_storage_controller.archive_failed.connect(
                     lambda msg: error(self.iface.messageBar(), "Mission Archive", f"Archive failed: {msg}", duration=8)
                 )
-                # Connect backup signals
                 self.mission_storage_controller.backup_completed.connect(
                     lambda: success(self.iface.messageBar(), "Mission Backup", "Mission backup completed.", duration=2)
                 )
@@ -1051,7 +1139,11 @@ class sartracker:
         else:
             print("[SARTRACKER] MissionStorageController not available (import failed)")
 
-        # Phase 4: Mission logs controller (marker_controller set later after it's created)
+    def _init_mission_logs_controller(self):
+        """Initialize MissionLogsController.
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MissionLogsController is not None:
             try:
                 self.mission_logs_controller = MissionLogsController(
@@ -1065,25 +1157,20 @@ class sartracker:
                     is_unloading=lambda: self._is_unloading or self._app_is_quitting,
                     parent=self.iface.mainWindow()
                 )
-                # Set safe-mode block callback
                 self.mission_logs_controller.set_safe_mode_block(self._safe_mode_block)
                 print("[SARTRACKER] MissionLogsController initialized")
             except Exception as e:
                 print(f"[SARTRACKER] ERROR initializing MissionLogsController: {e}")
-                import traceback as tb
-                tb.print_exc()
+                traceback.print_exc()
                 self.mission_logs_controller = None
         else:
             print("[SARTRACKER] MissionLogsController not available (import failed)")
 
-        # ------------------------------------------------------------------ #
-        # Phase 7: Drawing tool initializer moved to MapToolsController
-        # ------------------------------------------------------------------ #
-        # Tool initialization is now handled by MapToolsController.init()
-        # The controller owns: marker_tool, measure_tool, line_tool,
-        # range_ring_tool, bearing_tool, polygon_tool, and tool_registry
+    def _init_marker_controller(self):
+        """Initialize MarkerController for marker CRUD.
 
-        # Marker interaction controller (delegates marker CRUD workflows)
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MarkerController is not None and self.layers_controller:
             self.marker_controller = MarkerController(
                 self.iface,
@@ -1095,15 +1182,15 @@ class sartracker:
         else:
             self.marker_controller = None
 
-        # Late-bind marker_controller to mission_logs_controller (created earlier)
+        # Late-bind marker_controller to mission_logs_controller
         if self.mission_logs_controller and self.marker_controller:
             self.mission_logs_controller.set_marker_controller(self.marker_controller)
 
-        # ============================================================================
-        # PHASE 7: Initialize MapToolsController
-        # ============================================================================
-        # The MapToolsController now owns all map tools: marker, measure, drawing,
-        # and GPX functionality. Tool references are kept on plugin for compatibility.
+    def _init_map_tools_controller(self):
+        """Initialize MapToolsController (marker, measure, drawing, GPX).
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MapToolsController is not None:
             try:
                 self.map_tools_controller = MapToolsController(
@@ -1111,7 +1198,7 @@ class sartracker:
                     layers_controller=self.layers_controller,
                     marker_controller=self.marker_controller,
                     layer_manager=self.layer_manager,
-                    sar_panel=None,  # Will be set after panel creation
+                    sar_panel=None,  # Set after panel creation
                     error_handler=self.error_handler,
                     ingest_attachment=self._ingest_attachment,
                     get_mission_directory=lambda: self._mission_directory,
@@ -1122,7 +1209,6 @@ class sartracker:
                     log_exception=self._log_exception,
                     parent=self.iface.mainWindow()
                 )
-                # Initialize all tools
                 self.map_tools_controller.init()
 
                 # Keep references for compatibility and diagnostics
@@ -1148,9 +1234,12 @@ class sartracker:
         else:
             self.map_tools_controller = None
             print("[SARTRACKER] MapToolsController import failed, map tools unavailable")
-        # ============================================================================
 
-        # Initialize Mission Controller (Phase N3)
+    def _init_mission_controller(self):
+        """Initialize MissionController for mission timing.
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MissionController is not None:
             try:
                 self.mission_controller = MissionController(parent=self.iface.mainWindow())
@@ -1168,11 +1257,11 @@ class sartracker:
             self.mission_controller = None
             print("[SARTRACKER] MissionController import failed, mission UI limited")
 
-        # ============================================================================
-        # PHASE 2: Mission Lifecycle Controller Setup
-        # ============================================================================
-        # Initialize mission lifecycle controller (manages mission storage, project
-        # hooks, backup/autosave, finalization workflows)
+    def _init_mission_lifecycle_controller(self):
+        """Initialize MissionLifecycleController for mission storage/hooks/finalization.
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
         if MissionLifecycleController is not None:
             try:
                 self.mission_lifecycle_controller = MissionLifecycleController(
@@ -1188,8 +1277,7 @@ class sartracker:
                     parent=self.iface.mainWindow()
                 )
 
-                # Connect archive signals from MissionStorageController to lifecycle controller
-                # CRITICAL: Without these connections, _is_finalizing flag never resets
+                # Connect archive signals from MissionStorageController
                 if self.mission_storage_controller:
                     self.mission_storage_controller.archive_completed.connect(
                         self.mission_lifecycle_controller.on_archive_complete
@@ -1198,24 +1286,19 @@ class sartracker:
                         self.mission_lifecycle_controller.on_archive_failed
                     )
 
-                # Connect lifecycle controller signals for orchestrator callbacks
-                # structure_ensured: Layer structure ready - init helicopter layers
+                # Connect lifecycle controller signals
                 self.mission_lifecycle_controller.structure_ensured.connect(
                     self._on_lifecycle_structure_ensured
                 )
-                # storage_prepared: New mission storage created - rebuild layers
                 self.mission_lifecycle_controller.storage_prepared.connect(
                     self._on_lifecycle_storage_prepared
                 )
-                # storage_loaded: Storage loaded (new or resumed) - update UI
                 self.mission_lifecycle_controller.storage_loaded.connect(
                     self._on_lifecycle_storage_loaded
                 )
-                # session_state_changed: Mission session state updated - update UI
                 self.mission_lifecycle_controller.session_state_changed.connect(
                     self._on_lifecycle_session_state_changed
                 )
-                # finalization_state_changed: Mission finalized/unlocked
                 self.mission_lifecycle_controller.finalization_state_changed.connect(
                     self._on_lifecycle_finalization_state_changed
                 )
@@ -1224,13 +1307,48 @@ class sartracker:
             except Exception as e:
                 self.mission_lifecycle_controller = None
                 print(f"[SARTRACKER] ERROR initializing MissionLifecycleController: {e}")
-                import traceback
                 traceback.print_exc()
         else:
             self.mission_lifecycle_controller = None
             print("[SARTRACKER] MissionLifecycleController import failed, mission lifecycle features limited")
-        # ============================================================================
 
+    def _init_provider_controller(self):
+        """Initialize ProviderController for data provider management.
+
+        Phase 4.1: Sub-helper for _init_controllers.
+        """
+        if ProviderController is not None:
+            try:
+                self.provider_controller = ProviderController(
+                    self.iface,
+                    self.task_manager,
+                    parent=self.iface.mainWindow()
+                )
+                print("[SARTRACKER] Provider controller initialized")
+            except Exception as e:
+                self.provider_controller = None
+                error(
+                    self.iface.messageBar(),
+                    "SAR Tracker - Provider Controller Unavailable",
+                    f"Provider controller failed to initialize: {e}. CSV loading available via legacy workflow.",
+                    duration=0
+                )
+                print(f"[SARTRACKER] ERROR initializing ProviderController: {e}")
+        else:
+            self.provider_controller = None
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Provider Controller Unavailable",
+                "Provider controller not available. CSV loading available via legacy workflow.",
+                duration=0
+            )
+            print("[SARTRACKER] ProviderController not available (import failed)")
+
+    def _init_panels(self):
+        """Initialize SAR Panel and Settings Panel dock widgets.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        """
         # Initialize SAR Panel
         self.sar_panel = SARPanel(
             self.iface.mainWindow(),
@@ -1240,25 +1358,72 @@ class sartracker:
         self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
         self.sar_panel.hide()  # Hidden by default
 
-        # Note: SAR panel cleanup is handled in unload() directly
+        # Initialize Settings Panel (Phase N1)
+        if SettingsPanel is not None:
+            try:
+                self.settings_panel = SettingsPanel(self.iface.mainWindow())
+                try:
+                    self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
+                    self.settings_panel.hide()  # Hidden by default
+                except Exception as dock_exc:
+                    print(f"[SARTRACKER] Warning: Failed to dock Settings panel: {dock_exc}")
+                print("[SARTRACKER] Settings panel initialized")
+            except Exception as e:
+                self.settings_panel = None
+                error(
+                    self.iface.messageBar(),
+                    "SAR Tracker - Settings Panel Unavailable",
+                    f"Settings panel failed to initialize: {e}.",
+                    duration=0
+                )
+                print(f"[SARTRACKER] ERROR initializing SettingsPanel: {e}")
+        else:
+            self.settings_panel = None
+            print("[SARTRACKER] SettingsPanel not available (import failed)")
 
-        # ====================================================================
-        # Phase 1 Refactor V2: Wire SAR panel signals via helper method
-        # NO LEGACY FALLBACKS - controller failure = features disabled + warning
-        # ====================================================================
+    def _connect_signals(self):
+        """Connect signals between panels and controllers.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        """
+        # Wire SAR panel signals to controllers
         self._unavailable_features = self._wire_sar_panel_signals()
 
-        # refresh_requested wired after ProviderController setup below
+        # Temporary connection - will be replaced after provider controller DI
         self.sar_panel.refresh_requested.connect(self._on_refresh_data)
 
-        # Phase 2: Initial storage state load - delegate to controller when available
-        if self.mission_lifecycle_controller:
-            self.mission_lifecycle_controller.load_existing_storage_state()
-        else:
-            self._load_existing_mission_storage_state()
+        # Wire Settings panel signals
+        if self.settings_panel:
+            try:
+                self._unavailable_features = self._wire_settings_panel_signals(
+                    self._unavailable_features
+                )
+            except Exception as sig_exc:
+                print(f"[SARTRACKER] Warning: Failed to wire Settings panel signals: {sig_exc}")
+                traceback.print_exc()
 
-        # Keep mission/layer state in sync when users open/close projects.
-        # This also covers the startup project being read after plugin load.
+            # Populate provider dropdown
+            if self.provider_controller and provider_registry:
+                try:
+                    providers_list = provider_registry.list_providers()
+                    providers_metadata = [
+                        {
+                            'name': p.name,
+                            'display_name': p.display_name,
+                            'description': p.description
+                        }
+                        for p in providers_list
+                    ]
+                    self.settings_panel.populate_providers(providers_metadata)
+                    print(f"[SARTRACKER] Populated {len(providers_metadata)} providers in Settings Panel")
+                except Exception as dropdown_error:
+                    print(f"[SARTRACKER] Warning: Failed to populate provider dropdown: {dropdown_error}")
+
+        # Wire Provider Controller signals and DI
+        if self.provider_controller:
+            self._wire_provider_controller()
+
+        # Connect project lifecycle signals
         try:
             if hasattr(self.iface, "projectRead"):
                 self.iface.projectRead.connect(self._on_project_read)
@@ -1270,8 +1435,58 @@ class sartracker:
         except Exception as exc:
             print(f"[SARTRACKER] Warning: could not connect newProjectCreated: {exc}")
 
-        # Defer a post-startup sync to avoid mutating the project during QGIS startup.
-        # Phase 2: Use controller when available
+    def _wire_provider_controller(self):
+        """Wire Provider Controller signals and inject dependencies.
+
+        Phase 4.1: Sub-helper for _connect_signals.
+        """
+        try:
+            # Connect controller signals to panel
+            self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
+            self.provider_controller.provider_connected.connect(self.provider_controller.save_config)
+
+            # Inject dependencies
+            if self.layers_controller:
+                self.provider_controller.set_layers_controller(self.layers_controller)
+            if self.sar_panel:
+                self.provider_controller.set_panel(self.sar_panel)
+            self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
+
+            # Rewire refresh signal to controller
+            try:
+                self.sar_panel.refresh_requested.disconnect(self._on_refresh_data)
+            except (TypeError, RuntimeError):
+                pass
+            self.sar_panel.refresh_requested.connect(
+                lambda: self.provider_controller.start_refresh()
+            )
+
+            # Load saved config and auto-connect
+            self.provider_controller.load_config_and_auto_connect()
+
+            print("[SARTRACKER] Provider controller signals wired and dependencies injected")
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: Provider controller wiring failed: {e}")
+            traceback.print_exc()
+            # Fallback: reconnect old handler
+            try:
+                self.sar_panel.refresh_requested.connect(self._on_refresh_data)
+            except Exception:
+                pass
+
+    def _post_init_state(self):
+        """Post-initialization state setup.
+
+        Phase 4.1: Extracted from initGui for clarity.
+        Handles final state setup after all components are initialized.
+        """
+        # Initial storage state load
+        if self.mission_lifecycle_controller:
+            self.mission_lifecycle_controller.load_existing_storage_state()
+        else:
+            self._load_existing_mission_storage_state()
+
+        # Defer project state sync
         try:
             if self.mission_lifecycle_controller:
                 QTimer.singleShot(0, lambda: self.mission_lifecycle_controller.sync_project_state(reason="startup"))
@@ -1280,168 +1495,22 @@ class sartracker:
         except Exception:
             pass
 
-        # ============================================================================
-        # PHASE 3 + PHASE 8: Provider Controller Setup
-        # ============================================================================
-        # Initialize provider controller (after task_manager and sar_panel)
-        if ProviderController is not None:
-            try:
-                self.provider_controller = ProviderController(
-                    self.iface,
-                    self.task_manager,
-                    parent=self.iface.mainWindow()
-                )
-
-                # Phase N1: SARPanel provider signals removed - configuration moved to Settings Panel
-                # Provider test/save signals now come from SettingsPanel only
-
-                # Connect controller signals to panel
-                self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
-                # Phase 3: config_error signal removed - ProviderController now shows errors directly
-
-                # Phase 8: Controller now owns config persistence
-                # provider_connected signal triggers save_config internally
-                self.provider_controller.provider_connected.connect(self.provider_controller.save_config)
-
-                # Phase 8: Controller now owns refresh workflow
-                # sar_panel.refresh_requested is connected below after dependency injection
-
-                # Phase N1: Provider dropdown population moved to SettingsPanel (lines 682-696)
-
-                print("[SARTRACKER] Provider controller initialized")
-            except Exception as e:
-                self.provider_controller = None
-                error(
-                    self.iface.messageBar(),
-                    "SAR Tracker - Provider Controller Unavailable",
-                    f"Provider controller failed to initialize: {e}. CSV loading available via legacy workflow.",
-                    duration=0  # Persistent
-                )
-                print(f"[SARTRACKER] ERROR initializing ProviderController: {e}")
-        else:
-            self.provider_controller = None
-            error(
-                self.iface.messageBar(),
-                "SAR Tracker - Provider Controller Unavailable",
-                "Provider controller not available. CSV loading available via legacy workflow.",
-                duration=0  # Persistent
-            )
-            print("[SARTRACKER] ProviderController not available (import failed)")
-        # ============================================================================
-
-        # ============================================================================
-        # PHASE N1: Settings Panel Setup
-        # ============================================================================
-        # Initialize settings panel (after provider_controller for dropdown population)
-        if SettingsPanel is not None:
-            try:
-                self.settings_panel = SettingsPanel(self.iface.mainWindow())
-                # Always dock the settings panel even if population fails
-                try:
-                    self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
-                    self.settings_panel.hide()  # Hidden by default, accessible via menu
-                except Exception as dock_exc:
-                    print(f"[SARTRACKER] Warning: Failed to dock Settings panel: {dock_exc}")
-
-                # ================================================================
-                # Phase 1.2 Refactor V2: Wire Settings panel signals via helper
-                # Provider signals -> ProviderController (no legacy fallback)
-                # Settings changes and layer repair -> thin delegators
-                # ================================================================
-                try:
-                    self._unavailable_features = self._wire_settings_panel_signals(
-                        self._unavailable_features
-                    )
-                except Exception as sig_exc:
-                    print(f"[SARTRACKER] Warning: Failed to wire Settings panel signals: {sig_exc}")
-                    import traceback
-                    traceback.print_exc()
-
-                # Populate provider dropdown from registry (if controller available)
-                if self.provider_controller and provider_registry:
-                    try:
-                        providers_list = provider_registry.list_providers()
-                        providers_metadata = [
-                            {
-                                'name': p.name,
-                                'display_name': p.display_name,
-                                'description': p.description
-                            }
-                            for p in providers_list
-                        ]
-                        self.settings_panel.populate_providers(providers_metadata)
-                        print(f"[SARTRACKER] Populated {len(providers_metadata)} providers in Settings Panel")
-                    except Exception as dropdown_error:
-                        print(f"[SARTRACKER] Warning: Failed to populate Settings Panel provider dropdown: {dropdown_error}")
-
-                print("[SARTRACKER] Settings panel initialized")
-            except Exception as e:
-                self.settings_panel = None
-                error(
-                    self.iface.messageBar(),
-                    "SAR Tracker - Settings Panel Unavailable",
-                    f"Settings panel failed to initialize: {e}. Settings accessible via SARPanel.",
-                    duration=0  # Persistent
-                )
-                print(f"[SARTRACKER] ERROR initializing SettingsPanel: {e}")
-        else:
-            self.settings_panel = None
-            print("[SARTRACKER] SettingsPanel not available (import failed)")
-        # ============================================================================
-
-        # ============================================================================
-        # PHASE 8: Provider Controller Dependency Injection
-        # ============================================================================
-        # Inject dependencies now that all controllers are ready
-        if self.provider_controller:
-            try:
-                # Inject layers controller for refresh result handling
-                if self.layers_controller:
-                    self.provider_controller.set_layers_controller(self.layers_controller)
-
-                # Inject panel for loading state and device list updates
-                if self.sar_panel:
-                    self.provider_controller.set_panel(self.sar_panel)
-
-                # Inject mission start getter for breadcrumb filtering
-                self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
-
-                # Connect refresh signals:
-                # Panel refresh button -> controller's start_refresh
-                # (This replaces the old connection to _on_refresh_data)
-                try:
-                    self.sar_panel.refresh_requested.disconnect(self._on_refresh_data)
-                except (TypeError, RuntimeError):
-                    # Signal wasn't connected or already disconnected
-                    pass
-                self.sar_panel.refresh_requested.connect(
-                    lambda: self.provider_controller.start_refresh()
-                )
-
-                # Load saved provider config and auto-connect if enabled
-                # Phase 8: Delegated to controller
-                self.provider_controller.load_config_and_auto_connect()
-
-                print("[SARTRACKER] Phase 8: Provider controller dependencies injected")
-            except Exception as e:
-                print(f"[SARTRACKER] Warning: Phase 8 dependency injection failed: {e}")
-                import traceback
-                traceback.print_exc()
-                # Fallback: reconnect old handler if injection failed
-                try:
-                    self.sar_panel.refresh_requested.connect(self._on_refresh_data)
-                except Exception:
-                    pass
-        # ============================================================================
-
-        # CRITICAL: Disable drawing tool buttons if tool registry failed to initialize (Issue #2 fix)
-        # This check MUST come after SAR panel creation since panel is created after tool registry
+        # Disable drawing tools if registry failed
         if not self.tool_registry:
             self.sar_panel.disable_drawing_tools("Tool Registry failed to load")
             print("[SARTRACKER] Drawing tool buttons disabled due to registry initialization failure")
 
-        # Phase 5: Initialize coordinate display controller
-        # Creates status bar label, timer, and map canvas signal connection
+        # Initialize coordinate display controller
+        self._init_coordinates_controller()
+
+        # Check for paused mission (delayed to let QGIS fully load)
+        QTimer.singleShot(1000, self._check_for_paused_mission)
+
+    def _init_coordinates_controller(self):
+        """Initialize CoordinatesController for status bar display.
+
+        Phase 4.1: Sub-helper for _post_init_state.
+        """
         _coords_init_success = False
         if CoordinatesController:
             try:
@@ -1453,7 +1522,6 @@ class sartracker:
                     parent=self.iface.mainWindow()
                 )
                 if self.coordinates_controller.init():
-                    # Update compatibility references to controller state
                     self.coords_label = self.coordinates_controller.coords_label
                     self.coords_update_timer = self.coordinates_controller.coords_update_timer
                     self._coords_updates_enabled = True
@@ -1461,7 +1529,7 @@ class sartracker:
                     _coords_init_success = True
                     print("[SARTRACKER] CoordinatesController initialized successfully")
                 else:
-                    print("[SARTRACKER] CoordinatesController.init() returned False - coordinates display disabled")
+                    print("[SARTRACKER] CoordinatesController.init() returned False")
                     self.coordinates_controller = None
             except Exception as exc:
                 self._log_exception("CoordinatesController initialization", exc)
@@ -1469,20 +1537,60 @@ class sartracker:
         else:
             print("[SARTRACKER] CoordinatesController import failed - coordinates disabled")
 
-        # Phase 1.6: NO LEGACY FALLBACK for coordinate setup
-        # If CoordinatesController fails, coordinates display is disabled (safe-mode)
         if not _coords_init_success:
             if "_coords_display" not in self._unavailable_features:
                 self._unavailable_features.append("Coordinate status bar (CoordinatesController unavailable)")
             print("[SARTRACKER] Coordinate display unavailable - controller initialization failed")
 
-        # Check for paused mission and prompt to resume
-        QTimer.singleShot(1000, self._check_for_paused_mission)  # Delay 1s to let QGIS fully load
+        # Phase 4.4: Wire up diagnostics service dependencies
+        self._init_diagnostics_service()
 
-        # Phase 1 Refactor: Mark initialization complete for lifecycle tracking
-        self.lifecycle.mark_init_complete()
-        print(f"[SARTRACKER] Plugin initialization complete. {len(self.lifecycle.registry._components)} components registered.")
-        print(f"[SARTRACKER] Menu items in self.actions: {len(self.actions)}")
+    def _init_diagnostics_service(self):
+        """Initialize diagnostics service with controller dependencies.
+
+        Phase 4.4: Wires up DiagnosticsService after all controllers are ready.
+        """
+        if not self.diagnostics_service:
+            return
+
+        try:
+            # Inject controller references
+            self.diagnostics_service.set_mission_controller(self.mission_controller)
+            self.diagnostics_service.set_provider_controller(self.provider_controller)
+            self.diagnostics_service.set_mission_lifecycle_controller(self.mission_lifecycle_controller)
+            self.diagnostics_service.set_task_manager(self.task_manager)
+            self.diagnostics_service.set_tool_registry(self.tool_registry)
+            self.diagnostics_service.set_sar_panel(self.sar_panel)
+            self.diagnostics_service.set_layer_manager(self.layer_manager)
+
+            # Inject plugin-level state callbacks
+            self.diagnostics_service.set_unavailable_features_getter(
+                lambda: list(self._unavailable_features) if self._unavailable_features else []
+            )
+            self.diagnostics_service.set_safe_mode_active_getter(
+                lambda: self._safe_mode_active
+            )
+            self.diagnostics_service.set_available_providers_getter(
+                self._get_available_provider_names
+            )
+            self.diagnostics_service.set_vendor_info_getter(
+                lambda: dict(_vendor_info) if _vendor_info else {}
+            )
+            self.diagnostics_service.set_charset_guard_status_getter(
+                get_charset_guard_status
+            )
+
+            # Inject legacy storage fallback callbacks
+            self.diagnostics_service.set_legacy_storage_getters(
+                gpkg_path=lambda: str(self._mission_gpkg_path) if self._mission_gpkg_path else None,
+                backup_dir=lambda: str(self._mission_backup_directory) if self._mission_backup_directory else None,
+                finalized=lambda: self._check_mission_finalized() if self.layer_manager else False,
+                coordinators=lambda: self._mission_coordinators_cache or ''
+            )
+
+            print("[SARTRACKER] DiagnosticsService initialized with dependencies")
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: DiagnosticsService setup failed: {e}")
 
     def _handle_import_failure(self, report):
         """
@@ -1673,598 +1781,726 @@ class sartracker:
         """
         Handle application exit signal.
         Cancels all tasks immediately to prevent race conditions during QGIS shutdown.
+
+        BUG-079 FIX: Must null all controllers after cleanup to prevent double
+        cleanup in unload() which runs after this handler.
         """
+        print("[SARTRACKER] Application about to quit - starting early cleanup")
         self._app_is_quitting = True
         self._skip_layer_ops = True
-        if self.layer_manager:
+        self._is_unloading = True  # BUG-079: Also set unloading flag early
+
+        # Flag layer manager for shutdown FIRST
+        if self.layer_manager and not self._is_qt_deleted(self.layer_manager):
             try:
                 self.layer_manager.set_application_closing(True)
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
 
+        # Cancel all background tasks IMMEDIATELY to prevent callbacks during destruction
+        try:
+            if self.task_manager and not self._is_qt_deleted(self.task_manager):
+                active_count = self.task_manager.get_active_count()
+                if active_count > 0:
+                    print(f"[SARTRACKER] Cancelling {active_count} active task(s) on quit")
+                    self.task_manager.cancel_all(wait_timeout_ms=3000)
+        except Exception as e:
+            print(f"[SARTRACKER] Error cancelling tasks on quit: {e}")
+
         # Phase 1.6: Stop coordinate updates early - controller owns cleanup
         try:
-            if self.coordinates_controller:
+            if self.coordinates_controller and not self._is_qt_deleted(self.coordinates_controller):
                 self.coordinates_controller.cleanup("application about to quit")
                 self._coords_updates_enabled = False
                 self._map_canvas_connected = False
+            self.coordinates_controller = None  # BUG-079: Null to prevent double cleanup
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to disable coord updates on shutdown: {exc}")
+            self.coordinates_controller = None
 
         # Stop provider polling early (critical on Windows exit crash reports)
         try:
-            if self.provider_controller and hasattr(self.provider_controller, "cleanup"):
-                self.provider_controller.cleanup()
+            if self.provider_controller and not self._is_qt_deleted(self.provider_controller):
+                if hasattr(self.provider_controller, "cleanup"):
+                    self.provider_controller.cleanup()
+            self.provider_controller = None  # BUG-079: Null to prevent double cleanup
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to stop provider controller on shutdown: {exc}")
+            self.provider_controller = None
+
+        # Clean up mission lifecycle controller early
+        try:
+            if self.mission_lifecycle_controller and not self._is_qt_deleted(self.mission_lifecycle_controller):
+                if hasattr(self.mission_lifecycle_controller, "cleanup"):
+                    self.mission_lifecycle_controller.cleanup()
+            self.mission_lifecycle_controller = None  # BUG-079: Null to prevent double cleanup
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to cleanup mission lifecycle controller: {exc}")
+            self.mission_lifecycle_controller = None
+
+        # Clean up mission storage controller early
+        try:
+            if self.mission_storage_controller and not self._is_qt_deleted(self.mission_storage_controller):
+                if hasattr(self.mission_storage_controller, "cleanup"):
+                    self.mission_storage_controller.cleanup()
+            self.mission_storage_controller = None  # BUG-079: Null to prevent double cleanup
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to cleanup mission storage controller: {exc}")
+            self.mission_storage_controller = None
 
         # Disconnect project/layer signals and stop related timers early.
         # This reduces the chance of Python slots running while QGIS C++ is tearing down the layer tree.
         try:
-            if self.layer_manager:
+            if self.layer_manager and not self._is_qt_deleted(self.layer_manager):
                 try:
                     self.layer_manager.disconnect_signals()
                 except Exception as exc:
                     print(f"[SARTRACKER] Warning: Failed to disconnect layer manager signals on shutdown: {exc}")
-            if self.layers_controller:
+            if self.layers_controller and not self._is_qt_deleted(self.layers_controller):
                 try:
                     self.layers_controller.cleanup()
                 except Exception as exc:
                     print(f"[SARTRACKER] Warning: Failed to clean up layers controller on shutdown: {exc}")
-                finally:
-                    self.layers_controller = None
+            self.layers_controller = None  # BUG-079: Null to prevent double cleanup
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Early layers cleanup failed on shutdown: {exc}")
+            self.layers_controller = None
 
         # Stop mission timer early to prevent late UI updates during shutdown.
         try:
-            if self.mission_controller and hasattr(self.mission_controller, "cleanup"):
-                self.mission_controller.cleanup()
+            if self.mission_controller and not self._is_qt_deleted(self.mission_controller):
+                if hasattr(self.mission_controller, "cleanup"):
+                    self.mission_controller.cleanup()
+            self.mission_controller = None  # BUG-079: Null to prevent double cleanup
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to stop mission controller on shutdown: {exc}")
+            self.mission_controller = None
+
+        # Clean up map tools controller early
+        try:
+            if self.map_tools_controller and not self._is_qt_deleted(self.map_tools_controller):
+                if hasattr(self.map_tools_controller, "cleanup"):
+                    self.map_tools_controller.cleanup("application about to quit")
+            self.map_tools_controller = None  # BUG-079: Null to prevent double cleanup
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to cleanup map tools controller: {exc}")
+            self.map_tools_controller = None
 
         # Best-effort stop SAR panel timers (avoid full cleanup/UI restoration here)
         try:
-            if self.sar_panel:
+            if self.sar_panel and not self._is_qt_deleted(self.sar_panel):
                 for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
                     timer = getattr(self.sar_panel, timer_name, None)
-                    if timer:
+                    if timer and not self._is_qt_deleted(timer):
                         try:
                             if timer.isActive():
                                 timer.stop()
                         except Exception:
                             pass
-                # NOTE: Layer Console moved to Mission Logs window
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to stop SAR panel timers on shutdown: {exc}")
 
-        try:
-            if self.task_manager and self.task_manager.get_active_count() > 0:
-                print("[SARTRACKER] Application about to quit - forcing task cancellation")
-                self.task_manager.cancel_all()
-        except Exception as e:
-            print(f"[SARTRACKER] Error during early cleanup: {e}")
+        print("[SARTRACKER] Application about to quit - early cleanup complete")
 
     def unload(self):
-        """Removes the plugin menu item and icon from QGIS GUI."""
+        """Removes the plugin menu item and icon from QGIS GUI.
+
+        Phase 4.2 Refactor: Delegates to helper sections for clean lifecycle:
+        1. _unload_set_flags(): Set unloading flags immediately
+        2. _unload_cancel_tasks(): Cancel all background tasks FIRST
+        3. _unload_lifecycle_cleanup(): Use PluginLifecycleManager
+        4. _unload_disconnect_signals(): Disconnect high-risk signals
+        5. _unload_controllers(): Clean up all controllers
+        6. _unload_panels(): Clean up UI panels
+        7. _unload_clear_references(): Clear remaining references
+        """
         try:
-            # BUG-019/BUG-021 FIX: Set unloading flag immediately to protect callbacks
-            self._is_unloading = True
-            self._skip_layer_ops = True
+            # STEP 1: Set flags immediately to protect callbacks
+            self._unload_set_flags()
 
-            # LIFECYCLE SAFETY: Notify error handler to suppress notifications during shutdown
-            if hasattr(self, 'error_handler') and self.error_handler:
-                self.error_handler.set_unloading(True)
+            # STEP 2: Cancel tasks FIRST (LIFE-SAFETY CRITICAL)
+            self._unload_cancel_tasks()
 
-            # BUG-019 FIX: Stop coordinate update timer FIRST to prevent race conditions
-            # This must happen before any other cleanup to prevent timer callbacks
-            # from firing while components are being torn down.
-            # Phase 1.6: Controller owns coordinate cleanup (no legacy fallback)
-            if self.coordinates_controller:
-                self.coordinates_controller.cleanup("plugin unload (early cleanup)")
-                self._coords_updates_enabled = False
-                self._map_canvas_connected = False
+            # STEP 3: Use lifecycle manager for coordinated cleanup
+            self._unload_lifecycle_cleanup()
 
-            if self.layer_manager:
-                try:
-                    self.layer_manager.set_application_closing(True)
-                except Exception as exc:
-                    print(f"[SARTRACKER] Warning: Could not set layer manager shutdown flag: {exc}")
+            # STEP 4: Disconnect high-risk signals
+            self._unload_disconnect_signals()
 
-            # ============================================================
-            # CRASH FIX: Cancel all background tasks IMMEDIATELY
-            # This MUST happen before ANY component cleanup to prevent
-            # race conditions where background threads try to access
-            # components being destroyed.
-            #
-            # LIFE-SAFETY CRITICAL: This prevents segmentation faults
-            # during plugin unload that occur when QGIS task manager
-            # threads try to access destroyed Qt objects.
-            # ============================================================
-            if self.task_manager:
-                try:
-                    active_count = self.task_manager.get_active_count()
-                    if active_count > 0:
-                        print(f"[SARTRACKER] EARLY CLEANUP: Cancelling {active_count} active task(s) and waiting...")
-                        # This now waits synchronously for tasks to finish (5 second timeout)
-                        self.task_manager.cancel_all(wait_timeout_ms=5000)
-                        print("[SARTRACKER] All tasks cancelled and threads stopped")
-                    else:
-                        print("[SARTRACKER] No active tasks to cancel")
-                except Exception as e:
-                    print(f"[SARTRACKER] ERROR: TaskManager early cleanup failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-            # ============================================================
+            # STEP 5: Remove menu items and toolbar icons
+            self._unload_remove_actions()
 
-            # ============================================================
-            # Phase 1 Refactor: Use lifecycle manager for coordinated cleanup
-            # Lifecycle cleanup handles:
-            # - Signal disconnection (in reverse order of connection)
-            # - Component cleanup (in reverse dependency order)
-            # ============================================================
-            if hasattr(self, 'lifecycle') and self.lifecycle:
-                print("[SARTRACKER] Starting lifecycle cleanup...")
-                lifecycle_errors = self.lifecycle.cleanup()
-                if lifecycle_errors:
-                    for comp_name, err in lifecycle_errors.items():
-                        print(f"[SARTRACKER] Warning: Lifecycle cleanup error for {comp_name}: {err}")
-                print("[SARTRACKER] Lifecycle cleanup complete")
+            # STEP 6: Clean up all controllers
+            self._unload_controllers()
 
-            # ============================================================
-            # Legacy cleanup below (kept for safety during gradual migration)
-            # TODO: Remove once lifecycle manager handles all components
-            # ============================================================
+            # STEP 7: Clean up UI panels
+            self._unload_panels()
 
-            # Disconnect application aboutToQuit signal (may already be disconnected by lifecycle)
-            try:
-                QCoreApplication.instance().aboutToQuit.disconnect(self._on_app_about_to_quit)
-            except Exception:
-                pass
-
-            # Disconnect project lifecycle signals (avoid duplicate callbacks on reload)
-            try:
-                if hasattr(self.iface, "projectRead"):
-                    self.iface.projectRead.disconnect(self._on_project_read)
-            except Exception:
-                pass
-            try:
-                if hasattr(self.iface, "newProjectCreated"):
-                    self.iface.newProjectCreated.disconnect(self._on_new_project_created)
-            except Exception:
-                pass
-
-            # ============================================================
-            # CRITICAL: Disconnect signals FIRST (Issue #4 fix)
-            # Do this BEFORE cleaning up widgets to prevent handlers from
-            # running while we're in the middle of cleanup
-            # ============================================================
-
-            # Phase 1.6: xyCoordinates signal handled by CoordinatesController.cleanup()
-            # (called in early cleanup above). No legacy fallback needed.
-            self._map_canvas_connected = False
-
-            if self.mission_controller:
-                # BUG-078 FIX: Enhanced signal disconnection error handling
-                try:
-                    self.mission_controller.mission_state_changed.disconnect(self._on_mission_state_changed)
-                except TypeError:
-                    # Signal not connected - expected if initialization failed
-                    pass
-                except Exception as e:
-                    # BUG-078 FIX: Log unexpected disconnection errors
-                    print(f"[SARTRACKER] BUG-078: Error disconnecting mission_state_changed: {type(e).__name__}: {e}")
-
-                try:
-                    self.mission_controller.mission_timing_updated.disconnect(self._on_mission_timing_update)
-                except TypeError:
-                    # Signal not connected - expected if initialization failed
-                    pass
-                except Exception as e:
-                    # BUG-078 FIX: Log unexpected disconnection errors
-                    print(f"[SARTRACKER] BUG-078: Error disconnecting mission_timing_updated: {type(e).__name__}: {e}")
-
-                self.mission_controller.cleanup()
-                self.mission_controller = None
-
-            # CRASH FIX: TaskManager cleanup moved to EARLY CLEANUP section above
-            # (before any component cleanup). This section now just nullifies the reference.
-            if self.task_manager:
-                self.task_manager = None
-
-            # Phase 3: Legacy refresh task cleanup removed
-            # - _current_refresh_task now managed by ProviderController.cancel_refresh()
-            # - _refresh_in_progress now managed by ProviderController
-            # ProviderController.cleanup() was called in early cleanup section above
-
-            # Remove menu items and toolbar icons
-            for action in self.actions:
-                self.iface.removePluginMenu(
-                    self.tr(u'&sartracker'),
-                    action)
-                self.iface.removeToolBarIcon(action)
-
-            # Phase 1.6: Coordinate cleanup handled exclusively by controller
-            # Controller cleanup was called in early cleanup section above.
-            # Clear our references (controller was already cleaned up).
-            self.coords_label = None
-            self.coords_update_timer = None
-            self.coordinates_controller = None
-
-            # ============================================================
-            # PHASE 7: Clean up MapToolsController (handles all tool cleanup)
-            # ============================================================
-            if self.map_tools_controller:
-                try:
-                    print("[SARTRACKER] Cleaning up MapToolsController...")
-                    if hasattr(self.map_tools_controller, "cleanup"):
-                        self.map_tools_controller.cleanup("plugin unload")
-                    try:
-                        self.map_tools_controller.deleteLater()
-                    except Exception:
-                        pass
-                    print("[SARTRACKER] MapToolsController cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: MapToolsController cleanup error: {e}")
-                finally:
-                    self.map_tools_controller = None
-                    # Clear compatibility references (now owned by controller)
-                    self.marker_tool = None
-                    self.measure_tool = None
-                    self.line_tool = None
-                    self.range_ring_tool = None
-                    self.bearing_tool = None
-                    self.polygon_tool = None
-                    self.tool_registry = None
-            else:
-                # Fallback: Clean up tools directly if controller wasn't available
-                if self.tool_registry:
-                    try:
-                        self.tool_registry.deactivate_current()
-                    except:
-                        pass
-
-                # Clean up individual tools
-                for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
-                    tool = getattr(self, tool_attr, None)
-                    if tool:
-                        try:
-                            # Deactivate if it's the current tool
-                            if self.iface.mapCanvas().mapTool() == tool:
-                                self.iface.mapCanvas().unsetMapTool(tool)
-                            # Call deactivate method if exists
-                            if hasattr(tool, 'deactivate'):
-                                tool.deactivate()
-                            # Delete the tool
-                            tool.deleteLater()
-                        except:
-                            pass
-                        setattr(self, tool_attr, None)
-
-                # Clean up tool registry
-                if self.tool_registry:
-                    try:
-                        self.tool_registry.deleteLater()
-                    except:
-                        pass
-                    self.tool_registry = None
-            # ============================================================
-
-            # ============================================================
-            # PHASE N1: Clean up Layers Controller (Phase 1 - CalTopo Console)
-            # ============================================================
-            # CRITICAL FIX: Disconnect layer_manager signals FIRST (prevent catalog from receiving signals)
-            if self.layer_manager:
-                try:
-                    print("[SARTRACKER] Disconnecting layer manager signals...")
-                    self.layer_manager.disconnect_signals()
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Layer manager signal disconnect error: {e}")
-
-            # THEN cleanup layers controller (catalog safe - no layer signals will fire)
-            if self.layers_controller:
-                try:
-                    print("[SARTRACKER] Cleaning up layers controller...")
-                    self.layers_controller.cleanup()
-                    print("[SARTRACKER] Layers controller cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during layers controller cleanup: {e}")
-                finally:
-                    self.layers_controller = None
-            # ============================================================
-
-            # ============================================================
-            # PHASE N2: Clean up Layer Manager
-            # ============================================================
-            if self.layer_manager:
-                try:
-                    # Clear caches (signals already disconnected above)
-                    self.layer_manager.clear_cache()
-                    print("[SARTRACKER] Layer manager cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during layer manager cleanup: {e}")
-                finally:
-                    self.layer_manager = None
-            # ============================================================
-            # Note: Drawing manager cleanup (including GPX watch) is handled
-            # by layers_controller.cleanup() -> drawings.cleanup()
-            # ============================================================
-
-            # ============================================================
-            # PHASE 3: Clean up Provider Controller
-            # ============================================================
-            if self.provider_controller:
-                controller = self.provider_controller
-                try:
-                    # BUG-078 FIX: Enhanced signal disconnection for provider controller
-                    try:
-                        controller.status_changed.disconnect()
-                    except TypeError:
-                        pass  # Signal not connected
-                    except Exception as e:
-                        print(f"[SARTRACKER] BUG-078: Error disconnecting status_changed: {type(e).__name__}: {e}")
-
-                    try:
-                        controller.config_error.disconnect()
-                    except TypeError:
-                        pass  # Signal not connected
-                    except Exception as e:
-                        print(f"[SARTRACKER] BUG-078: Error disconnecting config_error: {type(e).__name__}: {e}")
-
-                    try:
-                        controller.provider_connected.disconnect()
-                    except TypeError:
-                        pass  # Signal not connected
-                    except Exception as e:
-                        print(f"[SARTRACKER] BUG-078: Error disconnecting provider_connected: {type(e).__name__}: {e}")
-
-                    try:
-                        controller.refresh_requested.disconnect()
-                    except TypeError:
-                        pass  # Signal not connected
-                    except Exception as e:
-                        print(f"[SARTRACKER] BUG-078: Error disconnecting refresh_requested: {type(e).__name__}: {e}")
-                except Exception as e:
-                    # Defensive: do not let disconnect failures block cleanup
-                    print(f"[SARTRACKER] BUG-078: Error accessing provider_controller for cleanup: {e}")
-                finally:
-                    # CRITICAL: Always stop polling/timers even if disconnecting signals succeeded
-                    try:
-                        if hasattr(controller, "cleanup"):
-                            controller.cleanup()
-                    except Exception as e:
-                        print(f"[SARTRACKER] Warning: Error during provider controller cleanup: {e}")
-                    try:
-                        controller.deleteLater()
-                    except Exception:
-                        pass
-                    self.provider_controller = None
-            # ============================================================
-
-            # ============================================================
-            # Clean up Mission Lifecycle Controller (Phase 2)
-            # ============================================================
-            # MUST be cleaned up BEFORE MissionStorageController since it
-            # holds references to storage controller signals
-            if self.mission_lifecycle_controller:
-                try:
-                    print("[SARTRACKER] Cleaning up MissionLifecycleController...")
-
-                    # CRITICAL: Disconnect incoming archive signals FIRST
-                    # These signals from MissionStorageController call methods on
-                    # lifecycle controller - must disconnect before deletion
-                    if self.mission_storage_controller:
-                        try:
-                            self.mission_storage_controller.archive_completed.disconnect(
-                                self.mission_lifecycle_controller.on_archive_complete
-                            )
-                        except (TypeError, RuntimeError):
-                            pass
-                        try:
-                            self.mission_storage_controller.archive_failed.disconnect(
-                                self.mission_lifecycle_controller.on_archive_failed
-                            )
-                        except (TypeError, RuntimeError):
-                            pass
-
-                    # Disconnect outgoing signals
-                    try:
-                        self.mission_lifecycle_controller.structure_ensured.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        self.mission_lifecycle_controller.storage_prepared.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        self.mission_lifecycle_controller.storage_loaded.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        self.mission_lifecycle_controller.session_state_changed.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    try:
-                        self.mission_lifecycle_controller.finalization_state_changed.disconnect()
-                    except (TypeError, RuntimeError):
-                        pass
-                    # Call cleanup method
-                    if hasattr(self.mission_lifecycle_controller, "cleanup"):
-                        self.mission_lifecycle_controller.cleanup()
-                    try:
-                        self.mission_lifecycle_controller.deleteLater()
-                    except Exception:
-                        pass
-                    self.mission_lifecycle_controller = None
-                    print("[SARTRACKER] MissionLifecycleController cleaned up")
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: MissionLifecycleController cleanup error: {e}")
-                    self.mission_lifecycle_controller = None
-            # ============================================================
-
-            # ============================================================
-            # Clean up Mission Storage Controller (Phase 6)
-            # ============================================================
-            if self.mission_storage_controller:
-                try:
-                    print("[SARTRACKER] Cleaning up MissionStorageController...")
-                    if hasattr(self.mission_storage_controller, "cleanup"):
-                        self.mission_storage_controller.cleanup()
-                    try:
-                        self.mission_storage_controller.deleteLater()
-                    except Exception:
-                        pass
-                    self.mission_storage_controller = None
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: MissionStorageController cleanup error: {e}")
-                    self.mission_storage_controller = None
-            # ============================================================
-
-            # ============================================================
-            # Clean up Mission Logs Controller (Phase 4)
-            # ============================================================
-            if self.mission_logs_controller:
-                try:
-                    print("[SARTRACKER] Cleaning up MissionLogsController...")
-                    if hasattr(self.mission_logs_controller, "cleanup"):
-                        self.mission_logs_controller.cleanup()
-                    try:
-                        self.mission_logs_controller.deleteLater()
-                    except Exception:
-                        pass
-                    self.mission_logs_controller = None
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: MissionLogsController cleanup error: {e}")
-                    self.mission_logs_controller = None
-            # ============================================================
-
-            # ============================================================
-            # Phase 1.5: Mission Logs cleanup now handled by MissionLogsController
-            # (cleaned up earlier in controller cleanup section)
-            # ============================================================
-
-            # Disconnect and clean up SAR Panel
-            if self.sar_panel:
-                # Stop all timers BEFORE disconnecting signals (Issue #5 fix)
-                try:
-                    # During application shutdown, avoid running full SARPanel.cleanup()
-                    # because it may attempt to restore hidden panels (Focus Mode) and
-                    # touch UI objects that are already being torn down.
-                    if hasattr(self.sar_panel, 'cleanup') and not self._app_is_quitting:
-                        self.sar_panel.cleanup()
-                    else:
-                        # Best-effort stop timers without UI restoration
-                        for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
-                            timer = getattr(self.sar_panel, timer_name, None)
-                            if timer:
-                                try:
-                                    if timer.isActive():
-                                        timer.stop()
-                                except Exception:
-                                    pass
-                        # NOTE: Layer Console moved to Mission Logs window
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
-
-                try:
-                    # Disconnect all signals (only those that exist in SARPanel)
-                    panel_signals = [
-                        'refresh_requested',
-                        'csv_load_requested',
-                        'add_poi_requested',
-                        'add_clue_requested',
-                        'add_casualty_requested',
-                        'add_hazard_requested',
-                        'line_tool_requested',
-                        'polygon_tool_requested',
-                        'range_rings_tool_requested',
-                        'bearing_tool_requested',
-                        'coordinate_converter_requested',
-                        'measure_distance_requested',
-                        'autosave_requested',
-                        'clear_measurements_requested'
-                    ]
-                    # BUG-078 FIX: Enhanced panel signal disconnection
-                    for signal_name in panel_signals:
-                        signal = getattr(self.sar_panel, signal_name, None)
-                        if signal:
-                            try:
-                                signal.disconnect()
-                            except TypeError:
-                                # Signal not connected - expected if initialization incomplete
-                                pass
-                            except Exception as e:
-                                # BUG-078 FIX: Log unexpected errors during disconnection
-                                print(f"[SARTRACKER] BUG-078: Error disconnecting {signal_name}: {type(e).__name__}: {e}")
-                except Exception as e:
-                    # BUG-078 FIX: Log errors accessing panel
-                    print(f"[SARTRACKER] BUG-078: Error accessing sar_panel for cleanup: {e}")
-
-                try:
-                    # Remove from dock widget area
-                    self.iface.removeDockWidget(self.sar_panel)
-                    # Delete the panel
-                    self.sar_panel.deleteLater()
-                except:
-                    pass
-                self.sar_panel = None
-
-            # ============================================================
-            # PHASE N1: Clean up Settings Panel
-            # ============================================================
-            if self.settings_panel:
-                # BUG-078 FIX: Enhanced settings panel signal disconnection
-                try:
-                    self.settings_panel.settings_changed.disconnect()
-                except TypeError:
-                    pass  # Signal not connected
-                except Exception as e:
-                    print(f"[SARTRACKER] BUG-078: Error disconnecting settings_changed: {type(e).__name__}: {e}")
-
-                try:
-                    self.settings_panel.provider_test_requested.disconnect()
-                except TypeError:
-                    pass  # Signal not connected
-                except Exception as e:
-                    print(f"[SARTRACKER] BUG-078: Error disconnecting provider_test_requested: {type(e).__name__}: {e}")
-
-                try:
-                    self.settings_panel.provider_save_requested.disconnect()
-                except TypeError:
-                    pass  # Signal not connected
-                except Exception as e:
-                    print(f"[SARTRACKER] BUG-078: Error disconnecting provider_save_requested: {type(e).__name__}: {e}")
-
-                try:
-                    # Remove from dock widget area
-                    self.iface.removeDockWidget(self.settings_panel)
-                    # Delete the panel
-                    self.settings_panel.deleteLater()
-                except:
-                    pass
-                self.settings_panel = None
-                print("[SARTRACKER] Settings panel cleaned up")
-            # ============================================================
-
-            # Clean up layers controller
-            if self.layers_controller:
-                try:
-                    self.layers_controller = None
-                except:
-                    pass
-
-            # Clean up provider reference
-            # Phase 3: Cached state cleanup now handled by ProviderController.cleanup()
-            if self.provider:
-                try:
-                    self.provider = None
-                except:
-                    pass
+            # STEP 8: Clear remaining references
+            self._unload_clear_references()
 
         except Exception as e:
             print(f"Error during plugin unload: {e}")
-            import traceback
             traceback.print_exc()
+
+    def _unload_set_flags(self):
+        """Set unloading flags immediately to protect callbacks.
+
+        Phase 4.2: First step in unload sequence.
+        """
+        self._is_unloading = True
+        self._skip_layer_ops = True
+
+        # Notify error handler to suppress notifications during shutdown
+        if hasattr(self, 'error_handler') and self.error_handler:
+            self.error_handler.set_unloading(True)
+
+        # Stop coordinate updates FIRST to prevent timer race conditions
+        if self.coordinates_controller:
+            self.coordinates_controller.cleanup("plugin unload (early cleanup)")
+            self._coords_updates_enabled = False
+            self._map_canvas_connected = False
+
+        # Flag layer manager for shutdown
+        if self.layer_manager:
+            try:
+                self.layer_manager.set_application_closing(True)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Could not set layer manager shutdown flag: {exc}")
+
+    def _unload_cancel_tasks(self):
+        """Cancel all background tasks IMMEDIATELY.
+
+        Phase 4.2: LIFE-SAFETY CRITICAL - must happen before ANY component cleanup.
+        Prevents segmentation faults from background threads accessing destroyed objects.
+        """
+        if self.task_manager:
+            try:
+                active_count = self.task_manager.get_active_count()
+                if active_count > 0:
+                    print(f"[SARTRACKER] EARLY CLEANUP: Cancelling {active_count} active task(s)...")
+                    self.task_manager.cancel_all(wait_timeout_ms=5000)
+                    print("[SARTRACKER] All tasks cancelled and threads stopped")
+                else:
+                    print("[SARTRACKER] No active tasks to cancel")
+            except Exception as e:
+                print(f"[SARTRACKER] ERROR: TaskManager early cleanup failed: {e}")
+                traceback.print_exc()
+
+    def _unload_lifecycle_cleanup(self):
+        """Use lifecycle manager for coordinated cleanup.
+
+        Phase 4.2: Handles signal disconnection and component cleanup in reverse order.
+        """
+        if hasattr(self, 'lifecycle') and self.lifecycle:
+            print("[SARTRACKER] Starting lifecycle cleanup...")
+            lifecycle_errors = self.lifecycle.cleanup()
+            if lifecycle_errors:
+                for comp_name, err in lifecycle_errors.items():
+                    print(f"[SARTRACKER] Warning: Lifecycle cleanup error for {comp_name}: {err}")
+            print("[SARTRACKER] Lifecycle cleanup complete")
+
+    def _unload_disconnect_signals(self):
+        """Disconnect high-risk signals.
+
+        Phase 4.2: Must happen BEFORE cleaning up widgets (Issue #4 fix).
+        BUG-079 FIX: Added _is_qt_deleted checks to prevent crashes on shutdown.
+        """
+        # Disconnect application aboutToQuit signal
+        try:
+            app = QCoreApplication.instance()
+            if app and not self._is_qt_deleted(app):
+                app.aboutToQuit.disconnect(self._on_app_about_to_quit)
+        except Exception:
+            pass
+
+        # Disconnect project lifecycle signals
+        try:
+            if self.iface and not self._is_qt_deleted(self.iface):
+                if hasattr(self.iface, "projectRead"):
+                    self.iface.projectRead.disconnect(self._on_project_read)
+        except Exception:
+            pass
+        try:
+            if self.iface and not self._is_qt_deleted(self.iface):
+                if hasattr(self.iface, "newProjectCreated"):
+                    self.iface.newProjectCreated.disconnect(self._on_new_project_created)
+        except Exception:
+            pass
+
+        # Clear map canvas connection flag
+        self._map_canvas_connected = False
+
+        # Disconnect and cleanup mission controller (BUG-079: check if already cleaned)
+        if self.mission_controller and not self._is_qt_deleted(self.mission_controller):
+            self._safe_disconnect(
+                self.mission_controller.mission_state_changed,
+                self._on_mission_state_changed,
+                "mission_state_changed"
+            )
+            self._safe_disconnect(
+                self.mission_controller.mission_timing_updated,
+                self._on_mission_timing_update,
+                "mission_timing_updated"
+            )
+            try:
+                self.mission_controller.cleanup()
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: mission_controller cleanup error: {e}")
+            self.mission_controller = None
+
+    def _safe_disconnect(self, signal, slot, name: str):
+        """Safely disconnect a signal with error handling.
+
+        Phase 4.2: Helper for consistent signal disconnection.
+        """
+        try:
+            signal.disconnect(slot)
+        except TypeError:
+            pass  # Signal not connected
+        except Exception as e:
+            print(f"[SARTRACKER] BUG-078: Error disconnecting {name}: {type(e).__name__}: {e}")
+
+    def _is_qt_deleted(self, obj) -> bool:
+        """Check if a Qt object has been deleted.
+
+        BUG-079 FIX: During QGIS shutdown, C++ objects may be destroyed
+        before Python wrappers are nulled. This helper safely checks
+        object validity before accessing.
+
+        Args:
+            obj: Any object, but especially Qt/QObject instances
+
+        Returns:
+            True if object is None or has been deleted, False if valid
+        """
+        if obj is None:
+            return True
+        try:
+            if sip_isdeleted(obj):
+                return True
+        except (TypeError, AttributeError):
+            # Not a Qt object or sip not available - assume valid
+            pass
+        except RuntimeError:
+            # Wrapped C++ object has been deleted
+            return True
+        return False
+
+    def _unload_remove_actions(self):
+        """Remove menu items and toolbar icons.
+
+        Phase 4.2: Clean up QGIS UI integrations.
+        """
+        for action in self.actions:
+            self.iface.removePluginMenu(self.tr(u'&sartracker'), action)
+            self.iface.removeToolBarIcon(action)
+
+    def _unload_controllers(self):
+        """Clean up all controllers in reverse dependency order.
+
+        Phase 4.2: Controllers must be cleaned up before panels.
+        """
+        # Clear coordinate controller references (already cleaned up in _unload_set_flags)
+        self.coords_label = None
+        self.coords_update_timer = None
+        self.coordinates_controller = None
+
+        # Clean up MapToolsController
+        self._unload_map_tools_controller()
+
+        # Clean up Layer infrastructure
+        self._unload_layer_infrastructure()
+
+        # Clean up Provider Controller
+        self._unload_provider_controller()
+
+        # Clean up Mission Lifecycle Controller (BEFORE storage controller)
+        self._unload_mission_lifecycle_controller()
+
+        # Clean up Mission Storage Controller
+        self._unload_mission_storage_controller()
+
+        # Clean up Mission Logs Controller
+        self._unload_mission_logs_controller()
+
+        # Nullify task manager reference (already cancelled in _unload_cancel_tasks)
+        if self.task_manager:
+            self.task_manager = None
+
+    def _unload_map_tools_controller(self):
+        """Clean up MapToolsController and tools.
+
+        Phase 4.2: Sub-helper for _unload_controllers.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.map_tools_controller and not self._is_qt_deleted(self.map_tools_controller):
+            try:
+                print("[SARTRACKER] Cleaning up MapToolsController...")
+                if hasattr(self.map_tools_controller, "cleanup"):
+                    self.map_tools_controller.cleanup("plugin unload")
+                try:
+                    if not self._is_qt_deleted(self.map_tools_controller):
+                        self.map_tools_controller.deleteLater()
+                except Exception:
+                    pass
+                print("[SARTRACKER] MapToolsController cleaned up")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: MapToolsController cleanup error: {e}")
+            finally:
+                self.map_tools_controller = None
+                self.marker_tool = None
+                self.measure_tool = None
+                self.line_tool = None
+                self.range_ring_tool = None
+                self.bearing_tool = None
+                self.polygon_tool = None
+                self.tool_registry = None
+        elif self.map_tools_controller:
+            # Controller exists but is deleted - just null the references
+            self.map_tools_controller = None
+            self.marker_tool = None
+            self.measure_tool = None
+            self.line_tool = None
+            self.range_ring_tool = None
+            self.bearing_tool = None
+            self.polygon_tool = None
+            self.tool_registry = None
+        else:
+            # Fallback: Clean up tools directly if controller wasn't available
+            self._unload_tools_fallback()
+
+    def _unload_tools_fallback(self):
+        """Fallback tool cleanup when MapToolsController unavailable.
+
+        Phase 4.2: Sub-helper for _unload_map_tools_controller.
+        """
+        if self.tool_registry:
+            try:
+                self.tool_registry.deactivate_current()
+            except:
+                pass
+
+        for tool_attr in ['marker_tool', 'measure_tool', 'line_tool', 'range_ring_tool', 'bearing_tool', 'polygon_tool']:
+            tool = getattr(self, tool_attr, None)
+            if tool:
+                try:
+                    if self.iface.mapCanvas().mapTool() == tool:
+                        self.iface.mapCanvas().unsetMapTool(tool)
+                    if hasattr(tool, 'deactivate'):
+                        tool.deactivate()
+                    tool.deleteLater()
+                except:
+                    pass
+                setattr(self, tool_attr, None)
+
+        if self.tool_registry:
+            try:
+                self.tool_registry.deleteLater()
+            except:
+                pass
+            self.tool_registry = None
+
+    def _unload_layer_infrastructure(self):
+        """Clean up layer manager and layers controller.
+
+        Phase 4.2: Sub-helper for _unload_controllers.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        # Disconnect layer_manager signals FIRST
+        if self.layer_manager and not self._is_qt_deleted(self.layer_manager):
+            try:
+                print("[SARTRACKER] Disconnecting layer manager signals...")
+                self.layer_manager.disconnect_signals()
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Layer manager signal disconnect error: {e}")
+
+        # Clean up layers controller (BUG-079: check if already cleaned)
+        if self.layers_controller and not self._is_qt_deleted(self.layers_controller):
+            try:
+                print("[SARTRACKER] Cleaning up layers controller...")
+                self.layers_controller.cleanup()
+                print("[SARTRACKER] Layers controller cleaned up")
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Error during layers controller cleanup: {e}")
+            finally:
+                self.layers_controller = None
+        elif self.layers_controller:
+            # Controller exists but is deleted - just null the reference
+            self.layers_controller = None
+
+        # Clean up layer manager (BUG-079: check if already cleaned)
+        if self.layer_manager and not self._is_qt_deleted(self.layer_manager):
+            try:
+                self.layer_manager.clear_cache()
+                print("[SARTRACKER] Layer manager cleaned up")
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Error during layer manager cleanup: {e}")
+            finally:
+                self.layer_manager = None
+        elif self.layer_manager:
+            # Manager exists but is deleted - just null the reference
+            self.layer_manager = None
+
+    def _unload_provider_controller(self):
+        """Clean up Provider Controller.
+
+        Phase 4.2: Sub-helper for _unload_controllers.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.provider_controller and not self._is_qt_deleted(self.provider_controller):
+            controller = self.provider_controller
+            try:
+                # Disconnect signals
+                for sig_name in ['status_changed', 'config_error', 'provider_connected', 'refresh_requested']:
+                    try:
+                        sig = getattr(controller, sig_name, None)
+                        if sig:
+                            sig.disconnect()
+                    except TypeError:
+                        pass
+                    except RuntimeError:
+                        pass  # BUG-079: C++ object already deleted
+                    except Exception as e:
+                        print(f"[SARTRACKER] BUG-078: Error disconnecting {sig_name}: {type(e).__name__}: {e}")
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception as e:
+                print(f"[SARTRACKER] BUG-078: Error accessing provider_controller for cleanup: {e}")
+            finally:
+                try:
+                    if hasattr(controller, "cleanup") and not self._is_qt_deleted(controller):
+                        controller.cleanup()
+                except RuntimeError:
+                    pass  # BUG-079: C++ object already deleted
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error during provider controller cleanup: {e}")
+                try:
+                    if not self._is_qt_deleted(controller):
+                        controller.deleteLater()
+                except Exception:
+                    pass
+                self.provider_controller = None
+        elif self.provider_controller:
+            # Controller exists but is deleted - just null the reference
+            self.provider_controller = None
+
+    def _unload_mission_lifecycle_controller(self):
+        """Clean up Mission Lifecycle Controller.
+
+        Phase 4.2: Sub-helper for _unload_controllers. Must run BEFORE storage controller.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.mission_lifecycle_controller and not self._is_qt_deleted(self.mission_lifecycle_controller):
+            try:
+                print("[SARTRACKER] Cleaning up MissionLifecycleController...")
+
+                # Disconnect incoming archive signals from storage controller
+                if self.mission_storage_controller and not self._is_qt_deleted(self.mission_storage_controller):
+                    try:
+                        self.mission_storage_controller.archive_completed.disconnect(
+                            self.mission_lifecycle_controller.on_archive_complete
+                        )
+                    except (TypeError, RuntimeError):
+                        pass
+                    try:
+                        self.mission_storage_controller.archive_failed.disconnect(
+                            self.mission_lifecycle_controller.on_archive_failed
+                        )
+                    except (TypeError, RuntimeError):
+                        pass
+
+                # Disconnect outgoing signals
+                for sig_name in ['structure_ensured', 'storage_prepared', 'storage_loaded',
+                                 'session_state_changed', 'finalization_state_changed']:
+                    try:
+                        getattr(self.mission_lifecycle_controller, sig_name).disconnect()
+                    except (TypeError, RuntimeError):
+                        pass
+
+                if hasattr(self.mission_lifecycle_controller, "cleanup"):
+                    self.mission_lifecycle_controller.cleanup()
+                try:
+                    if not self._is_qt_deleted(self.mission_lifecycle_controller):
+                        self.mission_lifecycle_controller.deleteLater()
+                except Exception:
+                    pass
+                self.mission_lifecycle_controller = None
+                print("[SARTRACKER] MissionLifecycleController cleaned up")
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: MissionLifecycleController cleanup error: {e}")
+                self.mission_lifecycle_controller = None
+        elif self.mission_lifecycle_controller:
+            # Controller exists but is deleted - just null the reference
+            self.mission_lifecycle_controller = None
+
+    def _unload_mission_storage_controller(self):
+        """Clean up Mission Storage Controller.
+
+        Phase 4.2: Sub-helper for _unload_controllers.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.mission_storage_controller and not self._is_qt_deleted(self.mission_storage_controller):
+            try:
+                print("[SARTRACKER] Cleaning up MissionStorageController...")
+                if hasattr(self.mission_storage_controller, "cleanup"):
+                    self.mission_storage_controller.cleanup()
+                try:
+                    if not self._is_qt_deleted(self.mission_storage_controller):
+                        self.mission_storage_controller.deleteLater()
+                except Exception:
+                    pass
+                self.mission_storage_controller = None
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: MissionStorageController cleanup error: {e}")
+                self.mission_storage_controller = None
+        elif self.mission_storage_controller:
+            # Controller exists but is deleted - just null the reference
+            self.mission_storage_controller = None
+
+    def _unload_mission_logs_controller(self):
+        """Clean up Mission Logs Controller.
+
+        Phase 4.2: Sub-helper for _unload_controllers.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.mission_logs_controller and not self._is_qt_deleted(self.mission_logs_controller):
+            try:
+                print("[SARTRACKER] Cleaning up MissionLogsController...")
+                if hasattr(self.mission_logs_controller, "cleanup"):
+                    self.mission_logs_controller.cleanup()
+                try:
+                    if not self._is_qt_deleted(self.mission_logs_controller):
+                        self.mission_logs_controller.deleteLater()
+                except Exception:
+                    pass
+                self.mission_logs_controller = None
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: MissionLogsController cleanup error: {e}")
+                self.mission_logs_controller = None
+        elif self.mission_logs_controller:
+            # Controller exists but is deleted - just null the reference
+            self.mission_logs_controller = None
+
+    def _unload_panels(self):
+        """Clean up UI panels.
+
+        Phase 4.2: Panels must be cleaned up after controllers.
+        """
+        # Clean up SAR Panel
+        self._unload_sar_panel()
+
+        # Clean up Settings Panel
+        self._unload_settings_panel()
+
+    def _unload_sar_panel(self):
+        """Clean up SAR Panel.
+
+        Phase 4.2: Sub-helper for _unload_panels.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.sar_panel and not self._is_qt_deleted(self.sar_panel):
+            try:
+                # During shutdown, avoid running full cleanup (may restore hidden panels)
+                if hasattr(self.sar_panel, 'cleanup') and not self._app_is_quitting:
+                    self.sar_panel.cleanup()
+                else:
+                    # Best-effort stop timers
+                    for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+                        timer = getattr(self.sar_panel, timer_name, None)
+                        if timer and not self._is_qt_deleted(timer):
+                            try:
+                                if timer.isActive():
+                                    timer.stop()
+                            except Exception:
+                                pass
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: Error during SARPanel cleanup: {e}")
+
+            # Disconnect signals
+            panel_signals = [
+                'refresh_requested', 'csv_load_requested', 'add_poi_requested',
+                'add_clue_requested', 'add_casualty_requested', 'add_hazard_requested',
+                'line_tool_requested', 'polygon_tool_requested', 'range_rings_tool_requested',
+                'bearing_tool_requested', 'coordinate_converter_requested',
+                'measure_distance_requested', 'autosave_requested', 'clear_measurements_requested'
+            ]
+            for signal_name in panel_signals:
+                try:
+                    signal = getattr(self.sar_panel, signal_name, None)
+                    if signal:
+                        signal.disconnect()
+                except TypeError:
+                    pass
+                except RuntimeError:
+                    pass  # BUG-079: C++ object already deleted
+                except Exception as e:
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting {signal_name}: {type(e).__name__}: {e}")
+
+            try:
+                if self.iface and not self._is_qt_deleted(self.iface):
+                    self.iface.removeDockWidget(self.sar_panel)
+                if not self._is_qt_deleted(self.sar_panel):
+                    self.sar_panel.deleteLater()
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception:
+                pass
+            self.sar_panel = None
+        elif self.sar_panel:
+            # Panel exists but is deleted - just null the reference
+            self.sar_panel = None
+
+    def _unload_settings_panel(self):
+        """Clean up Settings Panel.
+
+        Phase 4.2: Sub-helper for _unload_panels.
+        BUG-079 FIX: Check if already cleaned up or deleted before accessing.
+        """
+        if self.settings_panel and not self._is_qt_deleted(self.settings_panel):
+            for sig_name in ['settings_changed', 'provider_test_requested', 'provider_save_requested']:
+                try:
+                    getattr(self.settings_panel, sig_name).disconnect()
+                except TypeError:
+                    pass
+                except RuntimeError:
+                    pass  # BUG-079: C++ object already deleted
+                except Exception as e:
+                    print(f"[SARTRACKER] BUG-078: Error disconnecting {sig_name}: {type(e).__name__}: {e}")
+
+            try:
+                if self.iface and not self._is_qt_deleted(self.iface):
+                    self.iface.removeDockWidget(self.settings_panel)
+                if not self._is_qt_deleted(self.settings_panel):
+                    self.settings_panel.deleteLater()
+            except RuntimeError:
+                pass  # BUG-079: C++ object already deleted
+            except Exception:
+                pass
+            self.settings_panel = None
+            print("[SARTRACKER] Settings panel cleaned up")
+        elif self.settings_panel:
+            # Panel exists but is deleted - just null the reference
+            self.settings_panel = None
+
+    def _unload_clear_references(self):
+        """Clear remaining references.
+
+        Phase 4.2: Final cleanup step.
+        """
+        if self.layers_controller:
+            self.layers_controller = None
+
+        if self.provider:
+            self.provider = None
 
 
     def run(self):
@@ -3886,6 +4122,9 @@ class sartracker:
         """
         Get current plugin status for diagnostics.
 
+        Phase 4.4 Refactor: Now delegates to DiagnosticsService for centralized
+        status gathering. Falls back to legacy implementation if service unavailable.
+
         This is a lightweight read-only API for diagnostic tools
         to inspect plugin state without tight coupling to internal components.
 
@@ -3901,11 +4140,20 @@ class sartracker:
                 - active_tasks_count: int (number of active background tasks)
 
         Qt5/Qt6 Compatible: Pure Python data structures, no Qt types.
+        """
+        # Phase 4.4: Delegate to DiagnosticsService
+        if self.diagnostics_service:
+            return self.diagnostics_service.get_status(debug_hook)
 
-        Issue #4 Fix: Replaces widget tree scanning pattern with explicit API contract.
-        Issue #1 Fix: Returns cached device count populated by background refresh tasks.
-                      Never performs network I/O on UI thread.
-        Phase 0 Enhancement: Added active_tasks_count for health monitoring.
+        # Fallback: Return minimal status if service unavailable
+        return self._get_plugin_status_legacy(debug_hook)
+
+    def _get_plugin_status_legacy(self, debug_hook=None) -> dict:
+        """
+        Legacy plugin status implementation.
+
+        Phase 4.4: Kept as fallback when DiagnosticsService is unavailable.
+        This should only be needed during early initialization or error recovery.
         """
         status = {
             'mission_active': False,
@@ -3917,146 +4165,37 @@ class sartracker:
             'provider_type': None,
             'devices_count': 0,
             'last_refresh': None,
-            'last_refresh_duration_ms': None,  # Phase 3: Populated from ProviderController
-            'active_tasks_count': 0,  # Phase 0: Task manager health metric
-            # NEW: Tool registry status (Issue #2 fix)
+            'last_refresh_duration_ms': None,
+            'active_tasks_count': 0,
             'tool_registry_loaded': False,
             'drawing_tools_available': False,
             'charset_guard': get_charset_guard_status(),
-            # Vendor diagnostics
             'vendor': dict(_vendor_info) if _vendor_info else {},
-            # Phase 0: Available providers for startup resilience diagnostics
             'available_providers': self._get_available_provider_names(),
-            # Phase 1 Verification: Unavailable features due to controller failures
             'unavailable_features': list(self._unavailable_features) if self._unavailable_features else [],
             'safe_mode_active': self._safe_mode_active,
         }
 
         try:
-            # Safely read SAR panel state
+            # Minimal state gathering from available components
             if self.mission_controller:
                 snapshot = self.mission_controller.status_snapshot()
                 state_value = snapshot.get('state')
                 status['mission_active'] = state_value in ('active', 'paused')
                 status['mission_paused'] = state_value == 'paused'
                 status['mission_name'] = snapshot.get('mission_name')
-                status['mission_elapsed_seconds'] = snapshot.get('elapsed_seconds', 0.0)
-                status['mission_active_seconds'] = snapshot.get('active_seconds', 0.0)
-            elif self.sar_panel:
-                status['mission_active'] = getattr(self.sar_panel, 'mission_active', False)
-                status['mission_paused'] = getattr(self.sar_panel, 'is_paused', False)
-                if hasattr(self.sar_panel, 'mission_name_input'):
-                    mission_name = self.sar_panel.mission_name_input.text().strip()
-                    status['mission_name'] = mission_name if mission_name else None
 
-            # Safely read provider state from ProviderController
-            # Phase 3: All provider state now comes from controller
-            if self.provider_controller and self.provider_controller.provider:
-                status['provider_type'] = self.provider_controller.provider_name
-
-                # Get data source display string
-                provider_name = self.provider_controller.provider_name
-                provider_config = self.provider_controller.provider_config or {}
-                if provider_name == 'csv':
-                    csv_path = provider_config.get('csv_path', '')
-                    if csv_path:
-                        status['data_source'] = f"CSV: {os.path.basename(csv_path)}"
-                elif provider_name == 'http_traccar':
-                    status['data_source'] = "HTTP: Traccar Server"
-                elif provider_name == 'traccar_http':
-                    base_url = provider_config.get('base_url')
-                    status['data_source'] = f"HTTP: {base_url}" if base_url else "HTTP: Traccar Server"
-                else:
-                    status['data_source'] = provider_name
-
-                # ============================================================
-                # Phase 3: Get cached stats from ProviderController.status_snapshot()
-                # Cache is updated by background refresh tasks, never blocks UI
-                # ============================================================
-                controller_snapshot = self.provider_controller.status_snapshot()
-                status['devices_count'] = controller_snapshot.get('devices_count', 0)
-                status['last_refresh'] = controller_snapshot.get('last_refresh')
-                status['last_refresh_duration_ms'] = controller_snapshot.get('last_refresh_duration_ms')
-
-                # Provider-specific diagnostics
-                provider = self.provider_controller.provider
-                if hasattr(provider, 'get_cache_stats'):
-                    try:
-                        status['provider_cache_stats'] = provider.get_cache_stats()
-                    except Exception as cache_stats_err:
-                        print(f"[SARTRACKER] Warning: Error reading provider cache stats: {cache_stats_err}")
-
-            # Read tool registry status (Issue #2 fix)
-            status['tool_registry_loaded'] = self.tool_registry is not None
-            if self.tool_registry:
-                # Count how many tools are registered
-                try:
-                    # Check if registry has a method to get registered tool count
-                    if hasattr(self.tool_registry, 'get_registered_tools'):
-                        registered_tools = self.tool_registry.get_registered_tools()
-                        status['drawing_tools_available'] = len(registered_tools) > 0
-                    else:
-                        # Fallback: assume tools are available if registry exists
-                        status['drawing_tools_available'] = True
-                except Exception as tool_error:
-                    print(f"[SARTRACKER] Warning: Error reading tool registry status: {tool_error}")
-
-            # Read task manager status (Phase 0: Health monitoring)
-            # See AI_CODE_REFERENCE.md – Pattern 6 (TaskManager)
             if self.task_manager:
                 try:
                     status['active_tasks_count'] = self.task_manager.get_active_count()
-                except Exception as task_error:
-                    print(f"[SARTRACKER] Warning: Error reading task manager status: {task_error}")
-                    status['active_tasks_count'] = 0
+                except Exception:
+                    pass
 
-            # ============================================================
-            # PHASE 3: Read additional provider controller status
-            # Note: Basic stats (devices_count, last_refresh) already read above
-            # ============================================================
-            if self.provider_controller:
-                try:
-                    # Reuse snapshot if already fetched above, otherwise fetch now
-                    if 'controller_snapshot' not in locals():
-                        controller_snapshot = self.provider_controller.status_snapshot()
-                    # Merge controller status into plugin status
-                    status['provider_controller_state'] = controller_snapshot.get('state', 'unknown')
-                    status['provider_poll_active'] = controller_snapshot.get('poll_active', False)
-                    status['provider_poll_interval'] = controller_snapshot.get('poll_interval', None)
-                    status['provider_base_url'] = controller_snapshot.get('provider_base_url')
-                    status['provider_last_error'] = controller_snapshot.get('last_error')
-                    status['provider_status_message'] = controller_snapshot.get('message')
-                    status['provider_refresh_duration_ms'] = controller_snapshot.get('last_refresh_duration_ms')
-                except Exception as controller_error:
-                    print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
-            # ============================================================
-
-            # ============================================================
-            # PHASE 2: Read mission lifecycle controller status
-            # ============================================================
-            if self.mission_lifecycle_controller:
-                try:
-                    lifecycle_status = self.mission_lifecycle_controller.status_snapshot()
-                    status['mission_lifecycle'] = lifecycle_status
-                    # Also populate top-level storage fields for backwards compatibility
-                    status['mission_storage_path'] = str(lifecycle_status.get('gpkg_path')) if lifecycle_status.get('gpkg_path') else None
-                    status['mission_backup_path'] = str(lifecycle_status.get('backup_dir')) if lifecycle_status.get('backup_dir') else None
-                    status['mission_finalized'] = lifecycle_status.get('is_finalized', False)
-                    status['mission_coordinators'] = lifecycle_status.get('coordinators', '')
-                except Exception as lifecycle_error:
-                    print(f"[SARTRACKER] Warning: Error reading mission lifecycle status: {lifecycle_error}")
-            else:
-                # Fallback to legacy instance variables when controller unavailable
-                status['mission_storage_path'] = str(self._mission_gpkg_path) if self._mission_gpkg_path else None
-                status['mission_backup_path'] = str(self._mission_backup_directory) if self._mission_backup_directory else None
-                status['mission_finalized'] = self._check_mission_finalized() if self.layer_manager else False
-                status['mission_coordinators'] = self._mission_coordinators_cache or ''
-            # ============================================================
+            status['tool_registry_loaded'] = self.tool_registry is not None
+            status['drawing_tools_available'] = self.tool_registry is not None
 
         except Exception as e:
-            # Defensive: Don't let diagnostics query crash plugin
-            # See AI_CODE_REFERENCE.md – Pattern 9 (Defensive Guards)
-            print(f"[SARTRACKER] Warning: Error reading plugin status: {e}")
+            print(f"[SARTRACKER] Warning: Error in legacy status: {e}")
 
         if debug_hook:
             try:

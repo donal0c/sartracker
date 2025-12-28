@@ -493,17 +493,40 @@ class LayerManager(QObject):
         return root.findLayer(layer.id())
 
     def disconnect_signals(self):
-        """Disconnect from project signals on cleanup."""
+        """Disconnect from project signals on cleanup.
+
+        BUG-079 FIX: Added sip_isdeleted checks to prevent crashes when
+        Qt objects have been deleted during QGIS shutdown.
+        """
+        # Import sip_isdeleted for safe C++ object access
+        try:
+            from ..utils.qt_compat import sip_isdeleted
+        except ImportError:
+            sip_isdeleted = lambda x: False  # Fallback - assume valid
+
+        # BUG-079: Set application_closing flag FIRST to prevent callbacks
+        self._application_closing = True
+
         if self._signals_connected:
             try:
-                self.project.layersWillBeRemoved.disconnect(self._on_layers_removed)
+                # BUG-079: Check project is valid before disconnecting
+                if self.project and not sip_isdeleted(self.project):
+                    self.project.layersWillBeRemoved.disconnect(self._on_layers_removed)
+                self._signals_connected = False
+            except (TypeError, RuntimeError):
+                # Signal already disconnected or object deleted
                 self._signals_connected = False
             except Exception as e:
                 print(f"[LayerManager] Warning: Could not disconnect signals: {e}")
+                self._signals_connected = False
 
         if self._project_cleared_connected:
             try:
-                self.project.cleared.disconnect(self._on_project_cleared)
+                # BUG-079: Check project is valid before disconnecting
+                if self.project and not sip_isdeleted(self.project):
+                    self.project.cleared.disconnect(self._on_project_cleared)
+            except (TypeError, RuntimeError):
+                pass  # Signal already disconnected or object deleted
             except Exception as exc:
                 self._log("WARN", f"Could not disconnect project cleared signal: {exc}")
             finally:
@@ -511,19 +534,27 @@ class LayerManager(QObject):
 
         if self._about_to_quit_connected:
             app = QCoreApplication.instance()
-            if app:
+            if app and not sip_isdeleted(app):
                 try:
                     app.aboutToQuit.disconnect(self._handle_app_about_to_quit)
+                except (TypeError, RuntimeError):
+                    pass  # Signal already disconnected or object deleted
                 except Exception as exc:
                     self._log("WARN", f"Could not disconnect shutdown handler: {exc}")
             self._about_to_quit_connected = False
 
         if self._event_filter_installed and self._main_window:
             try:
-                self._main_window.removeEventFilter(self)
+                # BUG-079: Check main window is valid before removing filter
+                if not sip_isdeleted(self._main_window):
+                    self._main_window.removeEventFilter(self)
+            except (TypeError, RuntimeError):
+                pass  # Object already deleted
             except Exception as exc:
                 self._log("WARN", f"Could not remove event filter: {exc}")
-            self._event_filter_installed = False
+            finally:
+                self._event_filter_installed = False
+                self._main_window = None  # Clear reference
 
     def set_application_closing(self, closing: bool = True):
         """Allow external callers to mark that QGIS shutdown has started."""
@@ -539,18 +570,45 @@ class LayerManager(QObject):
 
         Args:
             layer_ids: List of layer IDs being removed
+
+        BUG-079 FIX: Added sip_isdeleted checks to prevent SIGSEGV when accessing
+        layer objects whose C++ counterparts have been deleted during QGIS shutdown.
         """
         # CRITICAL: Skip during QGIS shutdown to prevent access violation crashes
         # During app exit, cached layer objects may have deleted C++ objects
         if self._application_closing:
             return
 
+        # Import sip_isdeleted for safe C++ object access
+        try:
+            from ..utils.qt_compat import sip_isdeleted
+        except ImportError:
+            # Fallback if import fails - clear entire cache to be safe
+            self._layer_cache.clear()
+            return
+
+        # BUG-079 FIX: Use list() to avoid dict modification during iteration
+        # and check sip_isdeleted before accessing layer.id()
         for layer_id in layer_ids:
-            # Remove from cache if present
-            cache_keys_to_remove = [k for k, v in self._layer_cache.items() if v.id() == layer_id]
+            cache_keys_to_remove = []
+            for k, v in list(self._layer_cache.items()):
+                try:
+                    # BUG-079: Check if C++ object is still valid before accessing
+                    if v is None or sip_isdeleted(v):
+                        cache_keys_to_remove.append(k)
+                        continue
+                    if v.id() == layer_id:
+                        cache_keys_to_remove.append(k)
+                except (RuntimeError, AttributeError, TypeError):
+                    # BUG-079: Layer C++ object already deleted - mark for removal
+                    cache_keys_to_remove.append(k)
+
             for key in cache_keys_to_remove:
-                del self._layer_cache[key]
-                print(f"[LayerManager] Removed {key} from cache")
+                try:
+                    del self._layer_cache[key]
+                    print(f"[LayerManager] Removed {key} from cache")
+                except KeyError:
+                    pass  # Already removed
 
     def _on_project_cleared(self):
         """
@@ -560,26 +618,57 @@ class LayerManager(QObject):
         The plugin must not rebuild/create SAR layers here, because doing so can
         mark a transient project dirty and trigger QGIS' "Do you want to save
         the current project?" prompt unexpectedly.
+
+        BUG-079 FIX: Added additional safety checks during shutdown.
         """
         if self._application_closing:
             self._log("INFO", "Project cleared during application shutdown; skipping state refresh")
+            # BUG-079: Clear caches immediately during shutdown to prevent stale references
+            with self._cache_lock:
+                self._layer_cache.clear()
+                self._group_cache.clear()
             return
 
         try:
             print("[LayerManager] Project cleared detected; refreshing LayerManager state")
             self.on_project_read()
+        except RuntimeError as exc:
+            # BUG-079: C++ object deleted - this is expected during shutdown
+            self._log("INFO", f"Project cleared during C++ teardown: {exc}")
         except Exception as exc:
             self._log("WARN", f"Failed to refresh state after project clear: {exc}")
 
     def eventFilter(self, obj, event):
-        """Watch the QGIS main window for close events to detect shutdown earlier."""
+        """Watch the QGIS main window for close events to detect shutdown earlier.
+
+        BUG-079 FIX: Added safety checks to prevent crashes during Qt teardown.
+        """
+        # BUG-079: Skip if we're already closing to avoid unnecessary processing
+        if self._application_closing:
+            try:
+                return super().eventFilter(obj, event)
+            except (RuntimeError, TypeError):
+                return False  # Object deleted
+
         if obj == self._main_window and event is not None:
             try:
                 if event.type() == QEvent.Close:
                     self._application_closing = True
+                    # BUG-079: Clear caches immediately on close to prevent stale access
+                    with self._cache_lock:
+                        self._layer_cache.clear()
+                        self._group_cache.clear()
+            except (RuntimeError, TypeError):
+                # BUG-079: Qt object deleted - mark as closing
+                self._application_closing = True
             except Exception:
                 pass
-        return super().eventFilter(obj, event)
+
+        try:
+            return super().eventFilter(obj, event)
+        except (RuntimeError, TypeError):
+            # BUG-079: Parent object deleted
+            return False
 
     def ensure_structure(self, auto_migrate: bool = True) -> bool:
         """
@@ -827,6 +916,8 @@ class LayerManager(QObject):
 
             # Check if group exists
             group = current_parent.findGroup(group_name)
+            if group and not self._group_exists(group):
+                group = None
 
             if not group:
                 # Create group
@@ -852,10 +943,24 @@ class LayerManager(QObject):
             True if group exists, False otherwise
         """
         try:
+            from ..utils.qt_compat import sip_isdeleted
+        except Exception:
+            sip_isdeleted = lambda _obj: False
+
+        if group is None:
+            return False
+
+        try:
+            if sip_isdeleted(group):
+                return False
+        except Exception:
+            return False
+
+        try:
             # Try to access a property - will fail if group deleted
             _ = group.name()
             return True
-        except:
+        except (RuntimeError, AttributeError, TypeError):
             return False
 
     def _run_migrations(self):

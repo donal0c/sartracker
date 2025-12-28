@@ -1636,6 +1636,11 @@ class LayerCatalogService(QObject):
         if self._cleanup_in_progress:
             return
 
+        # Skip handling during application shutdown (prevents teardown races)
+        layer_manager = getattr(self, "layer_manager", None)
+        if getattr(layer_manager, "_application_closing", False):
+            return
+
         # DEFENSIVE GUARD
         if not self.layer_manager or not self._layers:
             return
