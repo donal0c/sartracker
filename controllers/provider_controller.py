@@ -187,6 +187,15 @@ class ProviderController(QObject):
 
         Qt5/Qt6 Compatible: Pure Python + pyqtSignal.
         """
+        if self._is_shutting_down or self._task_manager_shutting_down():
+            safe_warning(
+                self.iface,
+                "Provider Controller",
+                "Cannot change provider during shutdown.",
+                duration=3
+            )
+            return
+
         # INPUT VALIDATION (AI_CODE_REFERENCE.md - mandatory pattern)
         if not provider_name or not isinstance(provider_name, str):
             raise ValueError("Provider name must be a non-empty string")
@@ -785,7 +794,7 @@ class ProviderController(QObject):
 
         Qt5/Qt6 Compatible: Uses QgsTask via TaskManager.
         """
-        if self._is_shutting_down:
+        if self._is_shutting_down or self._task_manager_shutting_down():
             return False
 
         if not self.provider:
@@ -868,6 +877,17 @@ class ProviderController(QObject):
                 duration=5
             )
             return False
+
+    def _task_manager_shutting_down(self) -> bool:
+        """Check if the task manager is in shutdown mode."""
+        if not self.task_manager:
+            return False
+        if hasattr(self.task_manager, "is_shutting_down"):
+            try:
+                return bool(self.task_manager.is_shutting_down())
+            except Exception:
+                return True
+        return False
 
     def _on_refresh_task_complete(self, task):
         """

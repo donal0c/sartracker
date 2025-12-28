@@ -83,6 +83,19 @@ class DiagnosticsService:
         if obj is None:
             return True
         try:
+            try:
+                from qgis.PyQt.sip import isdeleted as sip_isdeleted
+            except Exception:
+                try:
+                    import sip
+                    sip_isdeleted = sip.isdeleted
+                except Exception:
+                    sip_isdeleted = None
+            if sip_isdeleted is not None:
+                return bool(sip_isdeleted(obj))
+        except Exception:
+            return True
+        try:
             _ = obj.__class__
         except RuntimeError:
             return True

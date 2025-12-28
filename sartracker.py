@@ -398,6 +398,7 @@ class sartracker:
         self._mission_coordinators_cache: str = ""
         self._last_mission_state = None
         self._is_finalizing: bool = False  # Race condition protection
+        self._critical_init_failed: bool = False
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -461,6 +462,34 @@ class sartracker:
                 self.sar_panel.set_loading_state(False)
         except Exception as exc:
             self._log_exception("_clear_loading_state", exc)
+
+    def _stop_sar_panel_timers(self, reason: str):
+        """Stop SAR panel timers early to prevent shutdown races."""
+        if not self.sar_panel or self._is_qt_deleted(self.sar_panel):
+            return
+        for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+            timer = getattr(self.sar_panel, timer_name, None)
+            if not timer or self._is_qt_deleted(timer):
+                continue
+            try:
+                if timer.isActive():
+                    timer.stop()
+                    print(f"[SARTRACKER] Stopped SAR panel timer '{timer_name}' ({reason})")
+            except Exception:
+                pass
+
+    def _shutdown_provider_controller(self, reason: str, *, nullify: bool = False):
+        """Stop provider polling/refresh early to prevent teardown races."""
+        if not self.provider_controller or self._is_qt_deleted(self.provider_controller):
+            return
+        try:
+            if hasattr(self.provider_controller, "cleanup"):
+                self.provider_controller.cleanup()
+                print(f"[SARTRACKER] Provider controller shutdown ({reason})")
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Failed to stop provider controller on shutdown ({reason}): {exc}")
+        if nullify:
+            self.provider_controller = None
 
     def _components_ready(self, *attrs) -> bool:
         """
@@ -884,11 +913,15 @@ class sartracker:
         # STEP 4: Initialize all controllers
         # ====================================================================
         self._init_controllers()
+        if self._critical_init_failed:
+            return
 
         # ====================================================================
         # STEP 5: Initialize UI panels
         # ====================================================================
         self._init_panels()
+        if self._critical_init_failed:
+            return
 
         # ====================================================================
         # STEP 6: Connect signals between panels and controllers
@@ -1054,11 +1087,18 @@ class sartracker:
         Creates controllers in dependency order with proper DI wiring.
         """
         # Initialize layers controller
-        self.layers_controller = LayersController(
-            self.iface,
-            layer_manager=self.layer_manager,
-            task_manager=self.task_manager
-        )
+        try:
+            self.layers_controller = LayersController(
+                self.iface,
+                layer_manager=self.layer_manager,
+                task_manager=self.task_manager
+            )
+        except Exception as exc:
+            self.layers_controller = None
+            self._critical_init_failed = True
+            self._log_exception("LayersController initialization", exc)
+            self._enter_safe_mode(f"LayersController failed to initialize: {exc}")
+            return
 
         # Mission storage helper (filesystem + backups)
         self.mission_storage = MissionStorageHelper(
@@ -1336,13 +1376,20 @@ class sartracker:
         Phase 4.1: Extracted from initGui for clarity.
         """
         # Initialize SAR Panel
-        self.sar_panel = SARPanel(
-            self.iface.mainWindow(),
-            mission_controller=self.mission_controller,
-            layers_controller=self.layers_controller
-        )
-        self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
-        self.sar_panel.hide()  # Hidden by default
+        try:
+            self.sar_panel = SARPanel(
+                self.iface.mainWindow(),
+                mission_controller=self.mission_controller,
+                layers_controller=self.layers_controller
+            )
+            self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
+            self.sar_panel.hide()  # Hidden by default
+        except Exception as exc:
+            self.sar_panel = None
+            self._critical_init_failed = True
+            self._log_exception("SARPanel initialization", exc)
+            self._enter_safe_mode(f"SAR Panel failed to initialize: {exc}")
+            return
 
         # Initialize Settings Panel (Phase N1)
         if SettingsPanel is not None:
@@ -1794,6 +1841,19 @@ class sartracker:
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to flag layer manager shutdown: {exc}")
 
+        # Stop SAR panel timers early to prevent autosave races
+        self._stop_sar_panel_timers("application about to quit (early)")
+
+        # Prevent new tasks from being queued during shutdown
+        if self.task_manager and hasattr(self.task_manager, "begin_shutdown"):
+            try:
+                self.task_manager.begin_shutdown()
+            except Exception:
+                pass
+
+        # Stop provider polling early (critical on Windows exit crash reports)
+        self._shutdown_provider_controller("application about to quit (early)", nullify=True)
+
         # Cancel all background tasks IMMEDIATELY to prevent callbacks during destruction
         try:
             if self.task_manager and not self._is_qt_deleted(self.task_manager):
@@ -1814,16 +1874,6 @@ class sartracker:
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to disable coord updates on shutdown: {exc}")
             self.coordinates_controller = None
-
-        # Stop provider polling early (critical on Windows exit crash reports)
-        try:
-            if self.provider_controller and not self._is_qt_deleted(self.provider_controller):
-                if hasattr(self.provider_controller, "cleanup"):
-                    self.provider_controller.cleanup()
-            self.provider_controller = None  # BUG-079: Null to prevent double cleanup
-        except Exception as exc:
-            print(f"[SARTRACKER] Warning: Failed to stop provider controller on shutdown: {exc}")
-            self.provider_controller = None
 
         # Clean up mission lifecycle controller early
         try:
@@ -1883,20 +1933,6 @@ class sartracker:
             print(f"[SARTRACKER] Warning: Failed to cleanup map tools controller: {exc}")
             self.map_tools_controller = None
 
-        # Best-effort stop SAR panel timers (avoid full cleanup/UI restoration here)
-        try:
-            if self.sar_panel and not self._is_qt_deleted(self.sar_panel):
-                for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
-                    timer = getattr(self.sar_panel, timer_name, None)
-                    if timer and not self._is_qt_deleted(timer):
-                        try:
-                            if timer.isActive():
-                                timer.stop()
-                        except Exception:
-                            pass
-        except Exception as exc:
-            print(f"[SARTRACKER] Warning: Failed to stop SAR panel timers on shutdown: {exc}")
-
         print("[SARTRACKER] Application about to quit - early cleanup complete")
 
     def unload(self):
@@ -1951,6 +1987,19 @@ class sartracker:
         # Notify error handler to suppress notifications during shutdown
         if hasattr(self, 'error_handler') and self.error_handler:
             self.error_handler.set_unloading(True)
+
+        # Stop SAR panel timers early to prevent autosave races
+        self._stop_sar_panel_timers("plugin unload (early)")
+
+        # Prevent new tasks from being queued during shutdown
+        if self.task_manager and hasattr(self.task_manager, "begin_shutdown"):
+            try:
+                self.task_manager.begin_shutdown()
+            except Exception:
+                pass
+
+        # Stop provider polling/refresh before cancelling tasks
+        self._shutdown_provider_controller("plugin unload (early)")
 
         # Stop coordinate updates FIRST to prevent timer race conditions
         if self.coordinates_controller and not self._is_qt_deleted(self.coordinates_controller):
@@ -2655,7 +2704,9 @@ class sartracker:
 
     def _on_mission_timing_update(self, elapsed_seconds, active_seconds):
         """Relay timing updates to SARPanel."""
-        if self.sar_panel:
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.sar_panel and not self._is_qt_deleted(self.sar_panel):
             try:
                 self.sar_panel.update_mission_timers(elapsed_seconds, active_seconds)
             except Exception as panel_error:
@@ -3868,6 +3919,8 @@ class sartracker:
 
     def _on_autosave_requested(self):
         """Handle auto-save request from SAR Panel."""
+        if self._is_unloading or self._app_is_quitting:
+            return
         try:
             # Save the current QGIS project
             project = QgsProject.instance()

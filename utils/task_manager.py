@@ -82,6 +82,13 @@ class TaskManager(QObject):
             crashes, the task will be removed from the active tasks dictionary
             and signals will be disconnected.
         """
+        # Do not start new tasks during shutdown.
+        if self._shutting_down:
+            if not task_id:
+                task_id = f"task_{id(task)}"
+            logger.warning("Refusing to start task %s during shutdown", task_id)
+            return task_id
+
         # Generate task ID if not provided
         if not task_id:
             task_id = f"task_{id(task)}"
@@ -104,6 +111,10 @@ class TaskManager(QObject):
         QgsApplication.taskManager().addTask(task)
 
         return task_id
+
+    def begin_shutdown(self):
+        """Prevent new tasks from being queued during shutdown."""
+        self._shutting_down = True
 
     def _handle_complete(self, task_id: str, task: QgsTask, callback: Optional[Callable]):
         """
