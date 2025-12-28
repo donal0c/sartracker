@@ -132,8 +132,49 @@ class ComponentRegistry:
 
         Components that depend on others are cleaned up first.
         """
-        # Simple reverse of init order (components added later depend on earlier ones)
-        return list(reversed(self._init_order))
+        if not self._components:
+            return []
+
+        # Build dependency graph (dep -> dependents) for topo sort.
+        graph: Dict[str, Set[str]] = {name: set() for name in self._components.keys()}
+        for name, info in self._components.items():
+            for dep in info.dependencies:
+                if dep in graph:
+                    graph[dep].add(name)
+
+        order: List[str] = []
+        temp: Set[str] = set()
+        perm: Set[str] = set()
+        cycle_detected = False
+
+        def visit(node: str) -> None:
+            nonlocal cycle_detected
+            if node in perm:
+                return
+            if node in temp:
+                cycle_detected = True
+                return
+            temp.add(node)
+            for child in graph.get(node, ()):
+                visit(child)
+            temp.remove(node)
+            perm.add(node)
+            order.append(node)
+
+        # Use init order for deterministic traversal
+        for node in self._init_order:
+            if node in graph:
+                visit(node)
+        for node in graph:
+            if node not in perm:
+                visit(node)
+
+        if cycle_detected:
+            # Fallback: best-effort reverse init order
+            return list(reversed(self._init_order))
+
+        # Topo order has deps before dependents; cleanup wants dependents first.
+        return list(reversed(order))
 
     def cleanup_all(self, log_fn: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
         """

@@ -57,6 +57,37 @@ class DiagnosticsService:
         self._get_mission_finalized: Optional[Callable[[], bool]] = None
         self._get_coordinators_cache: Optional[Callable[[], str]] = None
 
+    def reset(self) -> None:
+        """Clear all references to allow safe teardown."""
+        self._mission_controller = None
+        self._provider_controller = None
+        self._mission_lifecycle_controller = None
+        self._task_manager = None
+        self._tool_registry = None
+        self._sar_panel = None
+        self._layer_manager = None
+
+        self._get_unavailable_features = None
+        self._get_safe_mode_active = None
+        self._get_available_providers = None
+        self._get_vendor_info = None
+        self._get_charset_guard_status = None
+
+        self._get_mission_gpkg_path = None
+        self._get_mission_backup_dir = None
+        self._get_mission_finalized = None
+        self._get_coordinators_cache = None
+
+    def _is_deleted(self, obj: Any) -> bool:
+        """Best-effort check for deleted Qt objects without importing Qt."""
+        if obj is None:
+            return True
+        try:
+            _ = obj.__class__
+        except RuntimeError:
+            return True
+        return False
+
     # ========================================================================
     # Dependency Injection Methods
     # ========================================================================
@@ -203,7 +234,7 @@ class DiagnosticsService:
 
     def _gather_mission_status(self, status: Dict[str, Any]) -> None:
         """Gather mission status from controller or panel fallback."""
-        if self._mission_controller:
+        if self._mission_controller and not self._is_deleted(self._mission_controller):
             try:
                 snapshot = self._mission_controller.status_snapshot()
                 state_value = snapshot.get('state')
@@ -215,7 +246,7 @@ class DiagnosticsService:
             except Exception as e:
                 print(f"[SARTRACKER] Warning: Error reading mission controller: {e}")
 
-        elif self._sar_panel:
+        elif self._sar_panel and not self._is_deleted(self._sar_panel):
             # Legacy fallback to panel state
             try:
                 status['mission_active'] = getattr(self._sar_panel, 'mission_active', False)
@@ -228,7 +259,7 @@ class DiagnosticsService:
 
     def _gather_provider_status(self, status: Dict[str, Any]) -> None:
         """Gather provider status from ProviderController."""
-        if not self._provider_controller:
+        if not self._provider_controller or self._is_deleted(self._provider_controller):
             return
 
         try:
@@ -285,7 +316,7 @@ class DiagnosticsService:
         """Gather tool registry status."""
         status['tool_registry_loaded'] = self._tool_registry is not None
 
-        if self._tool_registry:
+        if self._tool_registry and not self._is_deleted(self._tool_registry):
             try:
                 if hasattr(self._tool_registry, 'get_registered_tools'):
                     registered_tools = self._tool_registry.get_registered_tools()
@@ -297,7 +328,7 @@ class DiagnosticsService:
 
     def _gather_task_status(self, status: Dict[str, Any]) -> None:
         """Gather task manager status."""
-        if self._task_manager:
+        if self._task_manager and not self._is_deleted(self._task_manager):
             try:
                 status['active_tasks_count'] = self._task_manager.get_active_count()
             except Exception as e:
@@ -305,7 +336,7 @@ class DiagnosticsService:
 
     def _gather_lifecycle_status(self, status: Dict[str, Any]) -> None:
         """Gather mission lifecycle controller status."""
-        if self._mission_lifecycle_controller:
+        if self._mission_lifecycle_controller and not self._is_deleted(self._mission_lifecycle_controller):
             try:
                 lifecycle_status = self._mission_lifecycle_controller.status_snapshot()
                 status['mission_lifecycle'] = lifecycle_status

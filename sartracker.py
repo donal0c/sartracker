@@ -1455,14 +1455,12 @@ class sartracker:
                 self.provider_controller.set_panel(self.sar_panel)
             self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
 
-            # Rewire refresh signal to controller
+            # Rewire refresh signal to controller with a single guarded handler
             try:
-                self.sar_panel.refresh_requested.disconnect(self._on_refresh_data)
+                self.sar_panel.refresh_requested.disconnect()
             except (TypeError, RuntimeError):
                 pass
-            self.sar_panel.refresh_requested.connect(
-                lambda: self.provider_controller.start_refresh()
-            )
+            self.sar_panel.refresh_requested.connect(self._on_panel_refresh_requested)
 
             # Load saved config and auto-connect
             self.provider_controller.load_config_and_auto_connect()
@@ -1471,7 +1469,11 @@ class sartracker:
         except Exception as e:
             print(f"[SARTRACKER] Warning: Provider controller wiring failed: {e}")
             traceback.print_exc()
-            # Fallback: reconnect old handler
+            # Fallback: reconnect old handler only
+            try:
+                self.sar_panel.refresh_requested.disconnect()
+            except (TypeError, RuntimeError):
+                pass
             try:
                 self.sar_panel.refresh_requested.connect(self._on_refresh_data)
             except Exception:
@@ -1491,10 +1493,7 @@ class sartracker:
 
         # Defer project state sync
         try:
-            if self.mission_lifecycle_controller:
-                QTimer.singleShot(0, lambda: self.mission_lifecycle_controller.sync_project_state(reason="startup"))
-            else:
-                QTimer.singleShot(0, lambda: self._sync_project_state(reason="startup"))
+            QTimer.singleShot(0, lambda: self._deferred_sync_project_state("startup"))
         except Exception:
             pass
 
@@ -1594,6 +1593,18 @@ class sartracker:
             print("[SARTRACKER] DiagnosticsService initialized with dependencies")
         except Exception as e:
             print(f"[SARTRACKER] Warning: DiagnosticsService setup failed: {e}")
+
+    def _deferred_sync_project_state(self, reason: str):
+        """Run a guarded project sync from a deferred callback."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.mission_lifecycle_controller:
+            try:
+                self.mission_lifecycle_controller.sync_project_state(reason=reason)
+            except Exception as exc:
+                self._log_exception(f"_deferred_sync_project_state.{reason}", exc)
+        else:
+            self._sync_project_state(reason=reason)
 
     def _handle_import_failure(self, report):
         """
@@ -1959,10 +1970,14 @@ class sartracker:
             self.error_handler.set_unloading(True)
 
         # Stop coordinate updates FIRST to prevent timer race conditions
-        if self.coordinates_controller:
-            self.coordinates_controller.cleanup("plugin unload (early cleanup)")
-            self._coords_updates_enabled = False
-            self._map_canvas_connected = False
+        if self.coordinates_controller and not self._is_qt_deleted(self.coordinates_controller):
+            try:
+                self.coordinates_controller.cleanup("plugin unload (early cleanup)")
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: CoordinatesController early cleanup failed: {exc}")
+            finally:
+                self._coords_updates_enabled = False
+                self._map_canvas_connected = False
 
         # Flag layer manager for shutdown
         if self.layer_manager:
@@ -2095,9 +2110,19 @@ class sartracker:
 
         Phase 4.2: Clean up QGIS UI integrations.
         """
+        if not self.iface or self._is_qt_deleted(self.iface):
+            return
         for action in self.actions:
-            self.iface.removePluginMenu(self.tr(u'&sartracker'), action)
-            self.iface.removeToolBarIcon(action)
+            if not action or self._is_qt_deleted(action):
+                continue
+            try:
+                self.iface.removePluginMenu(self.tr(u'&sartracker'), action)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to remove menu action: {exc}")
+            try:
+                self.iface.removeToolBarIcon(action)
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to remove toolbar icon: {exc}")
 
     def _unload_controllers(self):
         """Clean up all controllers in reverse dependency order.
@@ -2526,6 +2551,10 @@ class sartracker:
 
         # BUG-FIX: Clean up diagnostics_service (was missing)
         if hasattr(self, 'diagnostics_service') and self.diagnostics_service:
+            try:
+                self.diagnostics_service.reset()
+            except Exception:
+                pass
             self.diagnostics_service = None
 
         # BUG-FIX: Clean up error_handler (was missing)
@@ -3780,6 +3809,15 @@ class sartracker:
         # Render coordinators with semicolon separator for readability
         coord_display = "; ".join([c.strip() for c in coordinators.split(",") if c.strip()]) if coordinators else ""
         self.sar_panel.update_mission_storage(primary, backup, active=active, coordinators=coord_display)
+
+    def _on_panel_refresh_requested(self):
+        """Handle refresh requests from the SAR panel with unload guards."""
+        if self._is_unloading or self._app_is_quitting:
+            return
+        if self.provider_controller:
+            self.provider_controller.start_refresh()
+            return
+        self._on_refresh_data()
 
     def _on_refresh_data(self):
         """
