@@ -22,13 +22,8 @@
  ***************************************************************************/
 """
 from typing import Optional, Dict, List, Any
-from importlib import import_module
-import importlib
-import sys
 import os
 import re
-import shutil
-import math
 import traceback
 from pathlib import Path
 from datetime import datetime
@@ -62,8 +57,8 @@ from .services.import_guard import (
 _import_report = ImportReport()
 
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication, QTimer
-from qgis.PyQt.QtGui import QIcon, QFont
-from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QLabel, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QInputDialog
+from qgis.PyQt.QtGui import QIcon
+from qgis.PyQt.QtWidgets import QAction, QFileDialog, QMessageBox, QInputDialog
 try:
     from qgis.PyQt.sip import isdeleted as sip_isdeleted
 except ImportError:  # pragma: no cover - fallback for PyQt versions without qgis.PyQt.sip
@@ -74,26 +69,21 @@ except ImportError:  # pragma: no cover - fallback for PyQt versions without qgi
         def sip_isdeleted(_obj):
             return False
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsProject, QgsPointXY, QgsRectangle, QgsApplication
+    QgsCoordinateReferenceSystem, QgsProject, QgsApplication
 )
 
 # Initialize Qt resources from file resources.py
 from .resources import *
-import os.path
 
 # Import Qt5/Qt6 compatible constants and functions
 from .utils.qt_compat import (
-    Qt, RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted,
-    MessageBoxYes, MessageBoxNo, ISODate, MessageBoxQuestion, AcceptRole, RejectRole
+    RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted,
+    ISODate, MessageBoxQuestion, AcceptRole, RejectRole
 )
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
-from .utils.exceptions import SARTrackerError
-from .utils.dialog_utils import BaseDialog
 from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
-from .config.keys import ConfigStore, SETTINGS_KEYS
-from .utils.secure_store import SecureStore
+from .config.keys import ConfigStore
 from .utils.mission_storage import MissionStorageHelper, MissionPaths
 from .ui.mission_metadata_dialog import MissionMetadataDialog
 
@@ -113,9 +103,8 @@ except Exception as e:
         _import_report, 'ui.import_failure_dialog.ImportFailureDialog', e
     )
 
-from .utils.provider_results import sanitize_provider_results
 from .utils.task_manager import TaskManager
-from .services.lifecycle_manager import PluginLifecycleManager, validate_init_preconditions
+from .services.lifecycle_manager import PluginLifecycleManager
 from .services.diagnostics_service import DiagnosticsService
 
 # Import our SAR tracking components with individual error tracking
@@ -369,12 +358,7 @@ class sartracker:
         self.layer_manager = None  # Phase N2: Canonical layer hierarchy manager
         self.layers_controller = None
         self.provider_controller = None  # Phase 3: Provider orchestration controller
-        self.provider = None
-        self.provider_name = None  # Track which provider is active (e.g., 'csv', 'traccar_http')
-        self.provider_config = None  # Track provider config for reconnection
-
-        # Phase 1.7: Transactional provider state now managed by ProviderController
-        # Removed: _pending_provider, _pending_provider_name, _pending_provider_config, _pending_provider_task
+        self.provider = None  # Legacy reference (managed by ProviderController)
 
         self.sar_panel = None
         self.settings_panel = None  # Phase N1: Dedicated settings/configuration dock
@@ -393,17 +377,12 @@ class sartracker:
         self.mission_controller = None  # Phase N3: Mission timing controller
         self.mission_lifecycle_controller = None  # Phase 2: Mission lifecycle controller
         self.task_manager = None  # Task lifecycle management (Issue #6)
-        self.current_marker_type = None  # 'poi' or 'casualty'
         # Phase 5: Coordinate display state moved to CoordinatesController
         # These are kept as compatibility references pointing to controller state
         self.coords_label = None  # Status bar coordinate display (ref to controller.coords_label)
-        self.last_coords_point = None  # Last mouse position (ref to controller.last_coords_point)
         self.coords_update_timer = None  # Timer (ref to controller.coords_update_timer)
         self._map_canvas_connected = False  # Track xyCoordinates signal (ref to controller)
         self._coords_updates_enabled = False  # Guard for timer callbacks (ref to controller)
-        # BUG-058 FIX: Prevent overlapping timer callbacks and unnecessary updates
-        self._coords_update_in_progress = False  # Guard against overlapping callbacks
-        self._coords_point_changed = False  # Track if mouse moved since last update
         self._safe_mode_active = False  # Import failure safe-mode flag
         self._safe_mode_reason = None  # Human-readable Safe Mode reason
         self._unavailable_features: List[str] = []  # Features unavailable due to controller failures
@@ -419,18 +398,6 @@ class sartracker:
         self._mission_coordinators_cache: str = ""
         self._last_mission_state = None
         self._is_finalizing: bool = False  # Race condition protection
-
-        # Phase 3: Refresh state management moved to ProviderController
-        # - _refresh_in_progress, _current_refresh_task, _refresh_started_at
-        # - _cached_device_count, _last_refresh_time, _last_refresh_duration_ms
-        # - _consecutive_refresh_failures, _first_failure_time
-        # Now accessed via provider_controller.status_snapshot()
-
-        # Coordinate systems
-        self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
-        # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
-        self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -527,7 +494,11 @@ class sartracker:
         return True
 
     def _enter_safe_mode(self, reason: str):
-        """Disable operational actions after fatal import failures."""
+        """Disable operational actions after fatal import failures.
+
+        Shows a persistent message bar warning and disables all actions
+        except Diagnostics and Smoke Test.
+        """
         self._safe_mode_active = True
         self._safe_mode_reason = reason
         keep_enabled = {
@@ -542,6 +513,18 @@ class sartracker:
                 action.setToolTip("Disabled due to critical import failure. Use Diagnostics for details.")
             except Exception:
                 pass
+
+        # Show persistent message bar warning (duration=0 means persistent)
+        try:
+            error(
+                self.iface.messageBar(),
+                "SAR Tracker - Safe Mode",
+                "Some features unavailable; see Diagnostics menu for details.",
+                duration=0  # Persistent until user dismisses
+            )
+        except Exception:
+            pass  # messageBar may not be available yet
+
         print(f"[SARTRACKER] Safe mode enabled: {reason}")
 
     def _safe_mode_block(self, action_label: str, *, allow_diagnostics: bool = False) -> bool:
@@ -2569,13 +2552,6 @@ class sartracker:
         if hasattr(self, 'lifecycle') and self.lifecycle:
             self.lifecycle = None
 
-        # Clean up CRS objects
-        if hasattr(self, 'wgs84'):
-            self.wgs84 = None
-        if hasattr(self, 'itm'):
-            self.itm = None
-
-
     def run(self):
         """
         Toggle SAR Tracker panel visibility.
@@ -2722,10 +2698,11 @@ class sartracker:
         """
         cleared_items = []
 
-        # Clear CSV provider cache if available
+        # Clear CSV provider cache if available (via ProviderController)
         try:
-            if self.provider and hasattr(self.provider, '_cache'):
-                cache = self.provider._cache
+            provider = getattr(self.provider_controller, 'provider', None) if self.provider_controller else None
+            if provider and hasattr(provider, '_cache'):
+                cache = provider._cache
                 if hasattr(cache, 'clear'):
                     # Get stats before clearing for logging
                     stats = cache.get_stats() if hasattr(cache, 'get_stats') else {}
@@ -3837,11 +3814,7 @@ class sartracker:
             self.provider_controller.start_refresh()
             return
 
-        # Phase 1.7: Controller unavailable - show safe-mode message
-        if not self.provider:
-            self._notify("warning", "SAR Tracker", "No data source loaded. Please load a data source first.", duration=3)
-            return
-
+        # Controller unavailable - show safe-mode message
         self._notify("warning", "SAR Tracker", "Provider controller not available. Please restart plugin.", duration=5)
 
     # ========================================================================
