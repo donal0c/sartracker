@@ -184,9 +184,10 @@ class MissionLifecycleController(QObject):
         self._is_shutting_down: bool = False
 
         # Finalization in-progress flag (prevents duplicate finalization)
+        # Protected by _state_lock for thread safety
         self._is_finalizing: bool = False
 
-        # Thread-safe lock for state access (protects _session_state)
+        # Thread-safe lock for state access (protects _session_state AND _is_finalizing)
         # Required because background task callbacks may access state from worker threads
         self._state_lock = threading.RLock()
 
@@ -278,6 +279,47 @@ class MissionLifecycleController(QObject):
     def has_storage(self) -> bool:
         """Check if mission storage is configured and exists."""
         return self._session_state.has_storage()
+
+    # ------------------------------------------------------------------
+    # Finalization Flag Access (Thread-Safe)
+    # ------------------------------------------------------------------
+
+    def _get_is_finalizing(self) -> bool:
+        """
+        Thread-safe read of _is_finalizing flag.
+
+        Returns:
+            bool: True if finalization is in progress
+        """
+        with self._state_lock:
+            return self._is_finalizing
+
+    def _set_is_finalizing(self, value: bool) -> None:
+        """
+        Thread-safe write of _is_finalizing flag.
+
+        Args:
+            value: New flag value
+        """
+        with self._state_lock:
+            self._is_finalizing = value
+
+    def _try_start_finalizing(self) -> bool:
+        """
+        Atomically check and set _is_finalizing flag.
+
+        Returns:
+            bool: True if flag was False and is now True (we got the lock),
+                  False if finalization already in progress
+
+        THREAD-SAFETY: Atomic check-and-set prevents race conditions where
+        two threads could both pass an if-check before either sets the flag.
+        """
+        with self._state_lock:
+            if self._is_finalizing:
+                return False
+            self._is_finalizing = True
+            return True
 
     # ------------------------------------------------------------------
     # Session State Updates (Internal Methods)
@@ -583,12 +625,12 @@ class MissionLifecycleController(QObject):
         Returns:
             Dict with controller state information
 
-        THREAD-SAFETY: Uses lock for atomic read of session state.
+        THREAD-SAFETY: Uses lock for atomic read of session state and flags.
         """
         with self._state_lock:
             state_dict = self._session_state.status_dict()
+            state_dict["is_finalizing"] = self._is_finalizing
         state_dict["is_shutting_down"] = self._is_shutting_down
-        state_dict["is_finalizing"] = self._is_finalizing
         state_dict["has_layer_manager"] = self.layer_manager is not None
         state_dict["has_mission_storage"] = self.mission_storage is not None
         state_dict["has_mission_controller"] = self.mission_controller is not None
@@ -1503,16 +1545,6 @@ class MissionLifecycleController(QObject):
         if self._is_shutting_down or self._is_unloading() or self._is_app_quitting():
             return False
 
-        # Race condition protection: prevent duplicate finalization
-        if self._is_finalizing:
-            info(
-                self.iface.messageBar(),
-                "Finalize Mission",
-                "Finalization already in progress, please wait.",
-                duration=3
-            )
-            return False
-
         paths = self.get_current_paths()
         if not paths:
             error(
@@ -1533,7 +1565,16 @@ class MissionLifecycleController(QObject):
             )
             return False
 
-        self._is_finalizing = True
+        # THREAD-SAFE: Atomic check-and-set prevents race conditions
+        if not self._try_start_finalizing():
+            info(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "Finalization already in progress, please wait.",
+                duration=3
+            )
+            return False
+
         try:
             # Save project before archiving
             project = QgsProject.instance()
@@ -1547,7 +1588,7 @@ class MissionLifecycleController(QObject):
                     "Please save the project before finalizing the mission.",
                     duration=5
                 )
-                self._is_finalizing = False
+                self._set_is_finalizing(False)
                 return False
 
             project_path = Path(project.fileName()) if project.fileName() else None
@@ -1556,7 +1597,7 @@ class MissionLifecycleController(QObject):
             return self.start_archive_task(paths, project_path)
 
         except Exception as exc:
-            self._is_finalizing = False
+            self._set_is_finalizing(False)
             if self._log_exception:
                 self._log_exception("on_finalize_requested", exc)
             error(
@@ -1595,7 +1636,7 @@ class MissionLifecycleController(QObject):
                 mark_finalized=True
             )
             if not started:
-                self._is_finalizing = False
+                self._set_is_finalizing(False)
                 warning(
                     self.iface.messageBar(),
                     "Mission Archive",
@@ -1616,7 +1657,7 @@ class MissionLifecycleController(QObject):
                     "No storage helper available for archive.",
                     duration=5
                 )
-                self._is_finalizing = False
+                self._set_is_finalizing(False)
                 return False
 
             # Mark as finalized
@@ -1655,7 +1696,7 @@ class MissionLifecycleController(QObject):
             return False
 
         finally:
-            self._is_finalizing = False
+            self._set_is_finalizing(False)
 
     def on_archive_complete(self, archive_path: str) -> None:
         """
@@ -1666,7 +1707,7 @@ class MissionLifecycleController(QObject):
         Args:
             archive_path: Path to the created archive file
         """
-        self._is_finalizing = False
+        self._set_is_finalizing(False)
 
         # Update state
         self._update_session_state(is_finalized=True)
@@ -1695,7 +1736,7 @@ class MissionLifecycleController(QObject):
         Args:
             error_message: Error description
         """
-        self._is_finalizing = False
+        self._set_is_finalizing(False)
 
         if not self._is_shutting_down:
             self.archive_failed.emit(error_message)

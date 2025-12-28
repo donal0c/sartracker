@@ -2076,7 +2076,25 @@ class sartracker:
             if self.mission_lifecycle_controller:
                 try:
                     print("[SARTRACKER] Cleaning up MissionLifecycleController...")
-                    # Disconnect signals first
+
+                    # CRITICAL: Disconnect incoming archive signals FIRST
+                    # These signals from MissionStorageController call methods on
+                    # lifecycle controller - must disconnect before deletion
+                    if self.mission_storage_controller:
+                        try:
+                            self.mission_storage_controller.archive_completed.disconnect(
+                                self.mission_lifecycle_controller.on_archive_complete
+                            )
+                        except (TypeError, RuntimeError):
+                            pass
+                        try:
+                            self.mission_storage_controller.archive_failed.disconnect(
+                                self.mission_lifecycle_controller.on_archive_failed
+                            )
+                        except (TypeError, RuntimeError):
+                            pass
+
+                    # Disconnect outgoing signals
                     try:
                         self.mission_lifecycle_controller.structure_ensured.disconnect()
                     except (TypeError, RuntimeError):
