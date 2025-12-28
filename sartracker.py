@@ -413,19 +413,11 @@ class sartracker:
         self._last_mission_state = None
         self._is_finalizing: bool = False  # Race condition protection
 
-        # Refresh state management (Issue #1: Prevent concurrent refreshes)
-        self._refresh_in_progress = False
-        self._current_refresh_task = None  # For backwards compatibility with Issue #4 cleanup
-        self._refresh_started_at = None  # Timestamp for refresh duration
-
-        # Cached data for diagnostics (Issue #1 fix)
-        self._cached_device_count = 0  # Last known device count
-        self._last_refresh_time = None  # ISO timestamp of last successful refresh
-        self._last_refresh_duration_ms = None  # Duration of last refresh in ms
-
-        # SAR-la0: Track network failures for recovery notification
-        self._consecutive_refresh_failures = 0
-        self._first_failure_time = None  # When the outage started
+        # Phase 3: Refresh state management moved to ProviderController
+        # - _refresh_in_progress, _current_refresh_task, _refresh_started_at
+        # - _cached_device_count, _last_refresh_time, _last_refresh_duration_ms
+        # - _consecutive_refresh_failures, _first_failure_time
+        # Now accessed via provider_controller.status_snapshot()
 
         # Coordinate systems
         self.wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -1303,9 +1295,9 @@ class sartracker:
                 # Phase N1: SARPanel provider signals removed - configuration moved to Settings Panel
                 # Provider test/save signals now come from SettingsPanel only
 
-                # Connect controller signals to panel and plugin
+                # Connect controller signals to panel
                 self.provider_controller.status_changed.connect(self.sar_panel.update_provider_status)
-                self.provider_controller.config_error.connect(self._on_provider_config_error)
+                # Phase 3: config_error signal removed - ProviderController now shows errors directly
 
                 # Phase 8: Controller now owns config persistence
                 # provider_connected signal triggers save_config internally
@@ -1880,29 +1872,10 @@ class sartracker:
             if self.task_manager:
                 self.task_manager = None
 
-            # Legacy cleanup (for backwards compatibility if TaskManager not initialized)
-            if self._current_refresh_task:
-                try:
-                    # Disconnect signals BEFORE canceling
-                    try:
-                        self._current_refresh_task.taskCompleted.disconnect()
-                    except TypeError:
-                        pass
-                    try:
-                        self._current_refresh_task.taskTerminated.disconnect()
-                    except TypeError:
-                        pass
-                    self._current_refresh_task.cancel()
-                except Exception as e:
-                    print(f"[SARTRACKER] Warning: Legacy task cleanup error: {e}")
-                finally:
-                    self._current_refresh_task = None
-
-            # Phase 1.7: Connection test and pending provider state cleanup
-            # now handled by ProviderController.cleanup() (called earlier)
-            # Removed orphan cleanup for: _current_connection_task, _pending_provider*
-
-            self._refresh_in_progress = False
+            # Phase 3: Legacy refresh task cleanup removed
+            # - _current_refresh_task now managed by ProviderController.cancel_refresh()
+            # - _refresh_in_progress now managed by ProviderController
+            # ProviderController.cleanup() was called in early cleanup section above
 
             # Remove menu items and toolbar icons
             for action in self.actions:
@@ -2280,15 +2253,11 @@ class sartracker:
                 except:
                     pass
 
-            # Clean up provider
+            # Clean up provider reference
+            # Phase 3: Cached state cleanup now handled by ProviderController.cleanup()
             if self.provider:
                 try:
                     self.provider = None
-                    # ============================================================
-                    # ISSUE #1 FIX: Clear cached device count when provider removed
-                    # ============================================================
-                    self._cached_device_count = 0
-                    self._last_refresh_time = None
                 except:
                     pass
 
@@ -3557,437 +3526,30 @@ class sartracker:
 
         self._notify("warning", "SAR Tracker", "Provider controller not available. Please restart plugin.", duration=5)
 
-    # Phase 10: _on_refresh_data_legacy removed (dead code - never called)
-    # All refresh logic now in ProviderController
-
-    def _on_refresh_complete(self, task):
-        """
-        Handle successful refresh completion (runs in main thread).
-
-        Args:
-            task: Completed ProviderRefreshTask with results
-
-        SAFETY: May be called after plugin unload if signal disconnect failed
-        or task completed during unload. Check component existence.
-        """
-        # BUG-021 FIX: Comprehensive guards for callback safety
-        # Check if plugin is being unloaded or components are missing
-        if self._is_unloading or self._app_is_quitting:
-            print("[SARTRACKER] Refresh completed during plugin unload, ignoring results")
-            return
-
-        # CRITICAL GUARD: Check if plugin components still exist
-        if not self.layers_controller or not self.sar_panel:
-            print("[SARTRACKER] Refresh completed after plugin unload, ignoring results")
-            return
-
-        # BUG-021 FIX: Additional guard - check task_manager is available
-        if not self.task_manager:
-            print("[SARTRACKER] Refresh completed but task manager unavailable")
-            return
-
-        try:
-            # Reset refresh state
-            self._refresh_in_progress = False
-            self._current_refresh_task = None
-
-            # SAR-la0: Detect network recovery after failures
-            was_in_outage = self._consecutive_refresh_failures > 0
-            outage_duration = None
-            if was_in_outage and self._first_failure_time:
-                outage_duration = (datetime.now() - self._first_failure_time).total_seconds()
-            # Reset failure tracking on success
-            self._consecutive_refresh_failures = 0
-            self._first_failure_time = None
-
-            # Hide loading state (check again before accessing)
-            self._clear_loading_state()
-
-            # Check if task was cancelled
-            if task.isCanceled():
-                self._notify("info", "SAR Tracker", "Refresh cancelled", duration=2)
-                return
-
-            # Get and sanitize results from background task
-            if not task.results:
-                self._notify("warning", "SAR Tracker", "Refresh completed but no data returned", duration=3)
-                return
-
-            sanitized, dropped = sanitize_provider_results(task.results)
-            current = sanitized.get('current', [])
-            breadcrumbs = sanitized.get('breadcrumbs', [])
-            devices = sanitized.get('devices', [])
-            breadcrumb_processing = sanitized.get('breadcrumb_processing')
-            # SAR-nzf: Get breadcrumb failures for notification
-            breadcrumb_failures = task.results.get('breadcrumb_failures', []) if task.results else []
-
-            print(
-                "[SARTRACKER] Refresh payload -> "
-                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
-            )
-
-            # ============================================================
-            # ISSUE #1 FIX: Update cached device count for diagnostics
-            # This happens AFTER background task completes, never on UI thread
-            # ============================================================
-            try:
-                from datetime import datetime
-                self._cached_device_count = len(devices) if devices else 0
-                self._last_refresh_time = datetime.now().isoformat()
-                if self._refresh_started_at:
-                    self._last_refresh_duration_ms = (datetime.now() - self._refresh_started_at).total_seconds() * 1000.0
-                else:
-                    self._last_refresh_duration_ms = None
-                self._refresh_started_at = None
-            except Exception as cache_error:
-                print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
-
-            # Surface validation drops (non-fatal)
-            dropped_total = sum(dropped.values()) if isinstance(dropped, dict) else 0
-            if dropped_total:
-                try:
-                    print(f"[SARTRACKER] Dropped invalid tracking records - current:{dropped.get('current', 0)} breadcrumbs:{dropped.get('breadcrumbs', 0)} devices:{dropped.get('devices', 0)}")
-                except Exception:
-                    pass
-                self._notify("warning", "SAR Tracker", f"Ignored {dropped_total} invalid tracking records (see log for details).", duration=4)
-
-            # SAR-nzf FIX: Surface partial breadcrumb failures prominently
-            if breadcrumb_failures:
-                # Extract device names from failure messages (format: "DeviceName: error message")
-                failed_devices = []
-                for failure in breadcrumb_failures[:5]:  # Limit to first 5 to avoid long messages
-                    if ':' in failure:
-                        device_name = failure.split(':')[0].strip()
-                        failed_devices.append(device_name)
-                    else:
-                        failed_devices.append(failure[:20])  # Truncate if no device name
-
-                if len(breadcrumb_failures) > 5:
-                    devices_display = ", ".join(failed_devices) + f" (+{len(breadcrumb_failures) - 5} more)"
-                else:
-                    devices_display = ", ".join(failed_devices)
-
-                self._notify(
-                    "warning",
-                    "Trail Data Incomplete",
-                    f"Failed to fetch trails for: {devices_display}",
-                    duration=6
-                )
-                print(f"[SARTRACKER] SAR-nzf: Breadcrumb failures for {len(breadcrumb_failures)} devices: {failed_devices}")
-
-            # Update layers (main thread operation) with instrumentation
-            try:
-                self.layers_controller.update_current_positions(current)
-                if not current:
-                    print("[SARTRACKER] Current positions payload is empty - clearing layer")
-            except Exception as layer_err:
-                import traceback
-                print(f"[SARTRACKER] ERROR update_current_positions: {layer_err}")
-                traceback.print_exc()
-
-            try:
-                self.layers_controller.update_breadcrumbs(
-                    breadcrumbs,
-                    processed_segments=breadcrumb_processing
-                )
-                if not breadcrumbs:
-                    print("[SARTRACKER] Breadcrumb payload is empty - clearing layer")
-            except Exception as breadcrumb_err:
-                import traceback
-                print(f"[SARTRACKER] ERROR update_breadcrumbs: {breadcrumb_err}")
-                traceback.print_exc()
-
-            # Update device list in panel
-            if self.sar_panel:
-                try:
-                    self.sar_panel.update_devices(devices)
-                except Exception as panel_err:
-                    import traceback
-                    print(f"[SARTRACKER] ERROR update_devices: {panel_err}")
-                    traceback.print_exc()
-
-            # FIX ISSUE #2: Update provider controller stats for status strip
-            if self.provider_controller:
-                self.provider_controller.update_refresh_stats(
-                    self._cached_device_count,
-                    self._last_refresh_time,
-                    refresh_duration_ms=self._last_refresh_duration_ms
-                )
-                print(f"[SARTRACKER] Updated controller stats: {self._cached_device_count} devices")
-
-            # Show user feedback
-            print(
-                "[SARTRACKER] Refresh complete -> "
-                f"current:{len(current)} breadcrumbs:{len(breadcrumbs)} devices:{len(devices)}"
-            )
-
-            # SAR-fhd FIX: Detect and prominently warn about cached data
-            cache_warning_shown = False
-            if current:
-                # Check if any position is from cache
-                cache_positions = [p for p in current if p.get('data_origin') == 'cache']
-                if cache_positions:
-                    # Get max cache age for prominent display
-                    max_cache_age = max(p.get('cache_age_seconds', 0) for p in cache_positions)
-                    age_minutes = max_cache_age / 60
-
-                    if age_minutes >= 60:
-                        age_display = f"{age_minutes / 60:.1f} hours"
-                    else:
-                        age_display = f"{age_minutes:.0f} minutes"
-
-                    # SAR-1zb FIX: Check if device cache is also stale
-                    device_cache_stale = any(p.get('device_cache_stale') for p in cache_positions)
-                    roster_warning = " Team roster may have changed!" if device_cache_stale else ""
-
-                    # CRITICAL: Show prominent, long-duration warning
-                    self._notify(
-                        "error",  # Use error level for maximum visibility
-                        "OFFLINE MODE",
-                        f"Showing CACHED positions ({age_display} old) - Network unavailable!{roster_warning}",
-                        duration=10  # 10 seconds - much longer than normal
-                    )
-                    cache_warning_shown = True
-                    print(f"[SARTRACKER] SAR-fhd: Serving {len(cache_positions)} cached positions ({age_display} old, device_cache_stale={device_cache_stale})")
-
-            if not cache_warning_shown:
-                # SAR-la0: Show connection restored notification after outage
-                if was_in_outage and outage_duration is not None:
-                    outage_minutes = outage_duration / 60
-                    if outage_minutes >= 60:
-                        outage_display = f"{outage_minutes / 60:.1f} hours"
-                    elif outage_minutes >= 1:
-                        outage_display = f"{outage_minutes:.0f} minutes"
-                    else:
-                        outage_display = f"{outage_duration:.0f} seconds"
-
-                    self._notify(
-                        "success",
-                        "CONNECTION RESTORED",
-                        f"Network recovered after {outage_display} offline. Positions now live.",
-                        duration=8  # Long duration to ensure coordinator sees it
-                    )
-                    print(f"[SARTRACKER] SAR-la0: Connection restored after {outage_display}")
-                elif current or breadcrumbs:
-                    self._notify("success", "SAR Tracker", f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points", duration=2)
-                else:
-                    self._notify("info", "SAR Tracker", "Refresh completed but no tracking data was returned; layers cleared.", duration=3)
-
-        except Exception as e:
-            # Reset state on processing error
-            self._refresh_in_progress = False
-            self._clear_loading_state()
-
-            self._log_exception("_on_refresh_complete", e)
-
-            self._notify("error", "Refresh Error", f"Error processing refresh results: {str(e)}", duration=5)
-
-    def _on_refresh_error(self, task):
-        """
-        Handle refresh task error or termination (runs in main thread).
-
-        Args:
-            task: Failed or terminated ProviderRefreshTask
-
-        SAFETY: May be called after plugin unload if signal disconnect failed
-        or task terminated during unload. Check component existence.
-        """
-        # CRITICAL GUARD: Check if plugin components still exist
-        if not self._components_ready("sar_panel"):
-            print("[SARTRACKER] Refresh error after plugin unload, ignoring")
-            return
-
-        try:
-            # Reset refresh state
-            self._refresh_in_progress = False
-            self._current_refresh_task = None
-            self._refresh_started_at = None
-            self._last_refresh_duration_ms = None
-
-            # SAR-la0: Track consecutive failures for recovery notification
-            self._consecutive_refresh_failures += 1
-            if self._first_failure_time is None:
-                self._first_failure_time = datetime.now()
-                print(f"[SARTRACKER] SAR-la0: Network outage started at {self._first_failure_time.isoformat()}")
-
-            # Hide loading state
-            self._clear_loading_state()
-
-            # Show error message
-            error_msg = task.error_message if task.error_message else "Unknown error during refresh"
-            self._notify("error", "Refresh Failed", f"Error refreshing data: {error_msg}", duration=5)
-
-        except Exception as e:
-            # DEFENSIVE: Catch ALL exceptions to prevent crashes in error handler
-            self._log_exception("_on_refresh_error", e)
-
-            # Reset state (safe even if components are None)
-            self._refresh_in_progress = False
-
-            # Try to update UI, but don't crash if components are gone
-            try:
-                self._clear_loading_state()
-            except:
-                pass
-
-    def _load_provider(self, provider_name: str, config: dict):
-        """
-        Load and initialize a data provider via ProviderController.
-
-        Phase 1.7 Refactor V2: NO LEGACY FALLBACK - delegates exclusively to
-        ProviderController. If controller unavailable, shows safe-mode error.
-
-        Args:
-            provider_name: Name of provider (e.g., 'csv', 'traccar_http')
-            config: Provider-specific configuration dict
-
-        Qt5/Qt6 Compatible: Delegates to controller.
-        """
-        if self.provider_controller:
-            self.provider_controller.set_provider(provider_name, config)
-        else:
-            # Controller unavailable - use safe-mode block
-            self._safe_mode_block("Load Provider")
-
     # ========================================================================
-    # Phase 1.7 Refactor V2: Legacy connection test handlers removed
-    # _on_connection_test_complete and _on_connection_test_error are now
-    # handled exclusively by ProviderController. Removed ~320 lines.
+    # Phase 3 Refactor V2: Legacy refresh handlers removed (~430 lines)
+    # _on_refresh_complete, _on_refresh_error, _load_provider now live in
+    # ProviderController. Callbacks handled by ProviderController._on_refresh_task_complete
+    # and ProviderController._on_refresh_task_error.
     # ========================================================================
 
     def _on_load_csv(self, csv_file):
         """
         Handle CSV load request from panel.
 
-        Phase 8: Delegates to ProviderController.set_provider().
+        Phase 3: Delegates directly to ProviderController.set_provider().
 
         Args:
             csv_file: Path to CSV file or folder
         """
-        # Phase 8: Use controller for all provider loading
         if self.provider_controller:
             self.provider_controller.set_provider('csv', {'csv_path': csv_file})
         else:
-            # Indirect delegation - _load_provider calls _safe_mode_block if controller unavailable
-            self._load_provider('csv', {'csv_path': csv_file})
+            # Controller unavailable - show safe-mode message
+            self._safe_mode_block("Load CSV")
 
-    def _on_load_complete(self, task):
-        """
-        Handle provider load completion (runs in main thread).
-
-        Args:
-            task: Completed ProviderRefreshTask with results
-
-        SAFETY: May be called after plugin unload if signal disconnect failed
-        or task completed during unload. Check component existence.
-        """
-        # CRITICAL GUARD: Check if plugin components still exist
-        if not self.layers_controller or not self.sar_panel:
-            print("[SARTRACKER] Load completed after plugin unload, ignoring results")
-            return
-
-        try:
-            # Reset refresh state
-            self._refresh_in_progress = False
-            self._current_refresh_task = None
-
-            # Hide loading state (check again before accessing)
-            self._clear_loading_state()
-
-            # Check if task was cancelled
-            if task.isCanceled():
-                info(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    "Load cancelled",
-                    duration=2
-                )
-                return
-
-            # Get and sanitize results from background task
-            if not task.results:
-                warning(
-                    self.iface.messageBar(),
-                    "No Data",
-                    "CSV file contains no valid tracking data",
-                    duration=3
-                )
-                return
-
-            sanitized, dropped = sanitize_provider_results(task.results)
-            current = sanitized.get('current', [])
-            breadcrumbs = sanitized.get('breadcrumbs', [])
-            devices = sanitized.get('devices', [])
-            breadcrumb_processing = sanitized.get('breadcrumb_processing')
-
-            # ============================================================
-            # ISSUE #1 FIX: Update cached device count for diagnostics
-            # This happens AFTER background task completes, never on UI thread
-            # ============================================================
-            try:
-                from datetime import datetime
-                self._cached_device_count = len(devices) if devices else 0
-                self._last_refresh_time = datetime.now().isoformat()
-            except Exception as cache_error:
-                print(f"[PLUGIN] Warning: Failed to update device count cache: {cache_error}")
-
-            # Update layers (main thread operation)
-            if current:
-                self.layers_controller.update_current_positions(current)
-
-            if breadcrumbs or breadcrumb_processing:
-                self.layers_controller.update_breadcrumbs(
-                    breadcrumbs,
-                    processed_segments=breadcrumb_processing
-                )
-
-            # Update device list in panel
-            if self.sar_panel:
-                self.sar_panel.update_devices(devices)
-
-            # Surface validation drops (non-fatal)
-            dropped_total = sum(dropped.values()) if isinstance(dropped, dict) else 0
-            if dropped_total:
-                try:
-                    print(f"[SARTRACKER] Dropped invalid CSV records - current:{dropped.get('current', 0)} breadcrumbs:{dropped.get('breadcrumbs', 0)} devices:{dropped.get('devices', 0)}")
-                except Exception:
-                    pass
-                warning(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"Ignored {dropped_total} invalid CSV tracking records (see log for details).",
-                    duration=4
-                )
-
-            # Show result
-            if not current and not breadcrumbs:
-                info(
-                    self.iface.messageBar(),
-                    "No Data",
-                    "CSV file contains no valid tracking data",
-                    duration=3
-                )
-            else:
-                success(
-                    self.iface.messageBar(),
-                    "SAR Tracker",
-                    f"Loaded {len(current)} device(s), {len(breadcrumbs)} points",
-                    duration=3
-                )
-
-        except Exception as e:
-            # Reset state on processing error
-            self._refresh_in_progress = False
-            self._clear_loading_state()
-
-            self._log_exception("_on_load_complete", e)
-
-            error(
-                self.iface.messageBar(),
-                "Error Loading CSV",
-                f"Error processing CSV data: {str(e)}",
-                duration=5
-            )
+    # Phase 3: _on_load_complete removed (~120 lines)
+    # CSV load completion now handled by ProviderController._on_refresh_task_complete
 
     # ============================================================================
     # Phase 1.6 Refactor V2: Legacy coordinate display handlers removed
@@ -4272,21 +3834,8 @@ class sartracker:
             )
             print(f"[SARTRACKER] ERROR repairing layer structure: {e}")
 
-    def _on_provider_config_error(self, error_message: str):
-        """
-        Handle provider configuration error from controller.
-
-        Args:
-            error_message: Error message to display
-
-        Qt5/Qt6 Compatible: Uses utils.notify.
-        """
-        error(
-            self.iface.messageBar(),
-            "Provider Configuration Error",
-            error_message,
-            duration=5
-        )
+    # Phase 3: _on_provider_config_error removed - ProviderController now shows errors directly
+    # via utils.notify.error() before emitting config_error signal (redundant handler removed)
 
     # ============================================================================
 
@@ -4368,7 +3917,7 @@ class sartracker:
             'provider_type': None,
             'devices_count': 0,
             'last_refresh': None,
-            'last_refresh_duration_ms': self._last_refresh_duration_ms,
+            'last_refresh_duration_ms': None,  # Phase 3: Populated from ProviderController
             'active_tasks_count': 0,  # Phase 0: Task manager health metric
             # NEW: Tool registry status (Issue #2 fix)
             'tool_registry_loaded': False,
@@ -4400,35 +3949,40 @@ class sartracker:
                     mission_name = self.sar_panel.mission_name_input.text().strip()
                     status['mission_name'] = mission_name if mission_name else None
 
-            # Safely read provider state
-            if self.provider:
-                status['provider_type'] = self.provider_name
+            # Safely read provider state from ProviderController
+            # Phase 3: All provider state now comes from controller
+            if self.provider_controller and self.provider_controller.provider:
+                status['provider_type'] = self.provider_controller.provider_name
 
                 # Get data source display string
-                if self.provider_name == 'csv' and self.provider_config:
-                    csv_path = self.provider_config.get('csv_path', '')
+                provider_name = self.provider_controller.provider_name
+                provider_config = self.provider_controller.provider_config or {}
+                if provider_name == 'csv':
+                    csv_path = provider_config.get('csv_path', '')
                     if csv_path:
                         status['data_source'] = f"CSV: {os.path.basename(csv_path)}"
-                elif self.provider_name == 'http_traccar':
+                elif provider_name == 'http_traccar':
                     status['data_source'] = "HTTP: Traccar Server"
-                elif self.provider_name == 'traccar_http':
-                    base_url = (self.provider_config or {}).get('base_url')
+                elif provider_name == 'traccar_http':
+                    base_url = provider_config.get('base_url')
                     status['data_source'] = f"HTTP: {base_url}" if base_url else "HTTP: Traccar Server"
                 else:
-                    status['data_source'] = self.provider_name
+                    status['data_source'] = provider_name
 
                 # ============================================================
-                # ISSUE #1 FIX: Use cached device count instead of querying provider
+                # Phase 3: Get cached stats from ProviderController.status_snapshot()
                 # Cache is updated by background refresh tasks, never blocks UI
                 # ============================================================
-                status['devices_count'] = self._cached_device_count
-                status['last_refresh'] = self._last_refresh_time
-                status['last_refresh_duration_ms'] = self._last_refresh_duration_ms
+                controller_snapshot = self.provider_controller.status_snapshot()
+                status['devices_count'] = controller_snapshot.get('devices_count', 0)
+                status['last_refresh'] = controller_snapshot.get('last_refresh')
+                status['last_refresh_duration_ms'] = controller_snapshot.get('last_refresh_duration_ms')
 
                 # Provider-specific diagnostics
-                if hasattr(self.provider, 'get_cache_stats'):
+                provider = self.provider_controller.provider
+                if hasattr(provider, 'get_cache_stats'):
                     try:
-                        status['provider_cache_stats'] = self.provider.get_cache_stats()
+                        status['provider_cache_stats'] = provider.get_cache_stats()
                     except Exception as cache_stats_err:
                         print(f"[SARTRACKER] Warning: Error reading provider cache stats: {cache_stats_err}")
 
@@ -4457,19 +4011,22 @@ class sartracker:
                     status['active_tasks_count'] = 0
 
             # ============================================================
-            # PHASE 3: Read provider controller status
+            # PHASE 3: Read additional provider controller status
+            # Note: Basic stats (devices_count, last_refresh) already read above
             # ============================================================
             if self.provider_controller:
                 try:
-                    controller_status = self.provider_controller.status_snapshot()
+                    # Reuse snapshot if already fetched above, otherwise fetch now
+                    if 'controller_snapshot' not in locals():
+                        controller_snapshot = self.provider_controller.status_snapshot()
                     # Merge controller status into plugin status
-                    status['provider_controller_state'] = controller_status.get('state', 'unknown')
-                    status['provider_poll_active'] = controller_status.get('poll_active', False)
-                    status['provider_poll_interval'] = controller_status.get('poll_interval', None)
-                    status['provider_base_url'] = controller_status.get('provider_base_url')
-                    status['provider_last_error'] = controller_status.get('last_error')
-                    status['provider_status_message'] = controller_status.get('message')
-                    status['provider_refresh_duration_ms'] = controller_status.get('last_refresh_duration_ms', self._last_refresh_duration_ms)
+                    status['provider_controller_state'] = controller_snapshot.get('state', 'unknown')
+                    status['provider_poll_active'] = controller_snapshot.get('poll_active', False)
+                    status['provider_poll_interval'] = controller_snapshot.get('poll_interval', None)
+                    status['provider_base_url'] = controller_snapshot.get('provider_base_url')
+                    status['provider_last_error'] = controller_snapshot.get('last_error')
+                    status['provider_status_message'] = controller_snapshot.get('message')
+                    status['provider_refresh_duration_ms'] = controller_snapshot.get('last_refresh_duration_ms')
                 except Exception as controller_error:
                     print(f"[SARTRACKER] Warning: Error reading provider controller status: {controller_error}")
             # ============================================================
