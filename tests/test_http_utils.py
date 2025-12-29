@@ -278,6 +278,23 @@ class TestHttpClientRequests(unittest.TestCase):
         self.assertTrue(ctx.exception.recoverable)
 
     @patch('utils.http.requests.Session.request')
+    def test_get_429_retries_and_raises_network_error(self, mock_request):
+        """Test GET request with 429 response retries and raises NetworkError."""
+        mock_response = Mock()
+        mock_response.status_code = 429
+        mock_response.headers = {'Retry-After': '0'}
+        mock_request.return_value = mock_response
+
+        session = self.client.create_session()
+
+        with self.assertRaises(ProviderNetworkError) as ctx:
+            self.client.get("/api/devices", session=session)
+
+        self.assertEqual(mock_request.call_count, 3)
+        self.assertIn("Request throttled/timeout", str(ctx.exception))
+        self.assertTrue(ctx.exception.recoverable)
+
+    @patch('utils.http.requests.Session.request')
     def test_get_timeout_retries_and_raises_network_error(self, mock_request):
         """Test GET request timeout retries and raises NetworkError."""
         mock_request.side_effect = requests.exceptions.Timeout("Connection timeout")
@@ -306,6 +323,23 @@ class TestHttpClientRequests(unittest.TestCase):
         self.assertEqual(mock_request.call_count, 3)
         self.assertIn("Connection failed", str(ctx.exception))
         self.assertTrue(ctx.exception.recoverable)
+
+    @patch('utils.http.requests.Session.request')
+    def test_get_400_raises_data_error(self, mock_request):
+        """Test GET request with 400 response raises ProviderDataError."""
+        mock_response = Mock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"message": "Bad request"}
+        mock_request.return_value = mock_response
+
+        session = self.client.create_session()
+
+        with self.assertRaises(ProviderDataError) as ctx:
+            self.client.get("/api/devices", session=session)
+
+        self.assertIn("Client error", str(ctx.exception))
+        self.assertIn("Bad request", str(ctx.exception))
+        self.assertFalse(ctx.exception.recoverable)
 
     @patch('utils.http.requests.Session.request')
     def test_get_invalid_json_raises_data_error(self, mock_request):

@@ -137,7 +137,7 @@ class SecureStore:
         Get the name of the active storage backend for diagnostics.
         
         Returns:
-            str: "System Keyring (<backend>)" or "Encrypted File (Fallback)"
+            str: "System Keyring (<backend>)" or "Obfuscated File (Fallback)"
         """
         if HAS_KEYRING:
             try:
@@ -146,7 +146,7 @@ class SecureStore:
                 return f"System Keyring ({type(backend).__name__})"
             except Exception:
                 return "System Keyring (Unknown Backend)"
-        return "Encrypted File (Fallback)"
+        return "Obfuscated File (Fallback)"
 
     @classmethod
     def is_secure(cls) -> bool:

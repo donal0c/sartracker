@@ -14,8 +14,9 @@ Qt5/Qt6 Compatible: Uses QGIS QgsTask API.
 
 from functools import partial
 from typing import Optional, Callable, Dict, Set, Any
+from weakref import WeakMethod
 from qgis.core import QgsTask, QgsApplication
-from qgis.PyQt.QtCore import QObject, QEventLoop, QTimer
+from qgis.PyQt.QtCore import QObject, QEventLoop
 import logging
 import time
 import traceback
@@ -52,8 +53,8 @@ class TaskManager(QObject):
         """Initialize task manager."""
         super().__init__()
         self._active_tasks: Dict[str, QgsTask] = {}
-        self._task_connections: Dict[str, Dict[str, Callable]] = {}
-        self._cancelled_tasks: Set[str] = set()
+        self._task_connections: Dict[str, Dict[int, Dict[str, Callable]]] = {}
+        self._cancelled_tasks: Dict[str, Set[int]] = {}
         # BUG-015 FIX: Track error states for comprehensive error handling
         self._task_errors: Dict[str, Dict[str, Any]] = {}
         self._shutting_down: bool = False
@@ -93,16 +94,26 @@ class TaskManager(QObject):
         if not task_id:
             task_id = f"task_{id(task)}"
 
+        # Cancel any existing task with the same ID to avoid overlap.
+        existing_task = self._active_tasks.get(task_id)
+        if existing_task and existing_task is not task:
+            logger.warning("Task ID %s already active; cancelling previous task", task_id)
+            self._cancel_task_instance(task_id, existing_task)
+
         # Store task reference
         self._active_tasks[task_id] = task
 
+        # Wrap callbacks with weakrefs to avoid retaining torn-down owners
+        wrapped_complete = self._wrap_callback(task_id, on_complete, "complete")
+        wrapped_error = self._wrap_callback(task_id, on_error, "error")
+
         # Connect signals with automatic cleanup
-        complete_slot = partial(self._handle_complete, task_id, task, on_complete)
-        error_slot = partial(self._handle_error, task_id, task, on_error)
+        complete_slot = partial(self._handle_complete, task_id, task, wrapped_complete)
+        error_slot = partial(self._handle_error, task_id, task, wrapped_error)
         task.taskCompleted.connect(complete_slot)
         task.taskTerminated.connect(error_slot)
 
-        self._task_connections[task_id] = {
+        self._task_connections.setdefault(task_id, {})[id(task)] = {
             "complete": complete_slot,
             "error": error_slot
         }
@@ -136,7 +147,7 @@ class TaskManager(QObject):
             if self._shutting_down:
                 logger.debug("Task %s completed but manager is shutting down - skipping callback", task_id)
                 return
-            if task_id in self._cancelled_tasks:
+            if self._is_task_cancelled(task_id, task):
                 logger.debug("Task %s completed but was already cancelled - skipping callback", task_id)
                 return
 
@@ -199,7 +210,7 @@ class TaskManager(QObject):
             if self._shutting_down:
                 logger.debug("Task %s errored but manager is shutting down - skipping callback", task_id)
                 return
-            if task_id in self._cancelled_tasks:
+            if self._is_task_cancelled(task_id, task):
                 logger.debug("Task %s errored but was already cancelled - skipping callback", task_id)
                 return
 
@@ -259,9 +270,10 @@ class TaskManager(QObject):
         """
         self._disconnect_task_signals(task_id, task)
 
-        # Remove bookkeeping for this task
-        self._active_tasks.pop(task_id, None)
-        self._cancelled_tasks.discard(task_id)
+        # Remove bookkeeping for this task if still current
+        if self._active_tasks.get(task_id) is task:
+            self._active_tasks.pop(task_id, None)
+        self._discard_cancelled(task_id, task)
 
     def cancel_task(self, task_id: str) -> bool:
         """
@@ -274,24 +286,16 @@ class TaskManager(QObject):
             True if task was found and cancelled, False otherwise
 
         Note:
-            Signals are disconnected BEFORE cancellation to prevent
-            handlers from firing during/after the cancel operation.
+            Cancellation marks the task as cancelled so any queued signals
+            will skip user callbacks. Signals remain connected to allow
+            cleanup in the normal completion/termination handlers.
         """
         task = self._active_tasks.get(task_id)
         if not task:
             return False
 
-        # Disconnect signals first (Issue #6: prevents handlers during cancel)
-        self._disconnect_task_signals(task_id, task)
+        self._cancel_task_instance(task_id, task)
 
-        try:
-            task.cancel()
-            self._cancelled_tasks.add(task_id)
-        except (RuntimeError, TypeError):
-            pass
-
-        # Remove from tracking
-        self._active_tasks.pop(task_id, None)
         return True
 
     def cancel_all(self, wait_timeout_ms: int = 5000):
@@ -337,6 +341,20 @@ class TaskManager(QObject):
 
         # BUG-015 FIX: Clear error tracking on shutdown
         self._task_errors.clear()
+
+        # Force cleanup of any tasks still tracked after timeout
+        if self._active_tasks:
+            remaining_ids = list(self._active_tasks.keys())
+            logger.warning(
+                "Forcing cleanup of %d task(s) still tracked after shutdown wait",
+                len(remaining_ids)
+            )
+            for remaining_id in remaining_ids:
+                task = self._active_tasks.get(remaining_id)
+                if task:
+                    self._disconnect_task_signals(remaining_id, task)
+                self._active_tasks.pop(remaining_id, None)
+                self._discard_cancelled(remaining_id, task)
 
         logger.info("All tasks cancelled and cleanup complete")
 
@@ -406,7 +424,11 @@ class TaskManager(QObject):
         """
         Disconnect stored signal handlers for a task without affecting other listeners.
         """
-        handlers = self._task_connections.pop(task_id, {})
+        task_handlers = self._task_connections.get(task_id, {})
+        handlers = task_handlers.pop(id(task), {})
+        if not task_handlers:
+            self._task_connections.pop(task_id, None)
+
         complete_handler = handlers.get("complete")
         error_handler = handlers.get("error")
 
@@ -415,12 +437,76 @@ class TaskManager(QObject):
                 task.taskCompleted.disconnect(complete_handler)
             except (RuntimeError, TypeError):
                 pass
-
         if error_handler:
             try:
                 task.taskTerminated.disconnect(error_handler)
             except (RuntimeError, TypeError):
                 pass
+
+    def _cancel_task_instance(self, task_id: str, task: QgsTask):
+        """
+        Cancel a specific task instance and mark it as cancelled.
+        """
+        self._cancelled_tasks.setdefault(task_id, set()).add(id(task))
+        try:
+            task.cancel()
+        except (RuntimeError, TypeError):
+            pass
+
+    def _is_task_cancelled(self, task_id: str, task: QgsTask) -> bool:
+        """
+        Check if a specific task instance has been cancelled.
+        """
+        return id(task) in self._cancelled_tasks.get(task_id, set())
+
+    def _discard_cancelled(self, task_id: str, task: Optional[QgsTask]):
+        """
+        Remove a task instance from cancelled tracking.
+        """
+        if not task:
+            return
+        cancelled_ids = self._cancelled_tasks.get(task_id)
+        if not cancelled_ids:
+            return
+        cancelled_ids.discard(id(task))
+        if not cancelled_ids:
+            self._cancelled_tasks.pop(task_id, None)
+
+    def _wrap_callback(
+        self,
+        task_id: str,
+        callback: Optional[Callable[[QgsTask], None]],
+        phase: str
+    ) -> Optional[Callable[[QgsTask], None]]:
+        """
+        Wrap callback with a weak reference to avoid retaining torn-down owners.
+
+        Returns:
+            Wrapped callback or None if no callback provided.
+        """
+        if callback is None:
+            return None
+
+        if not (hasattr(callback, "__self__") and callback.__self__ is not None):
+            return callback
+
+        try:
+            weak_cb = WeakMethod(callback)
+        except TypeError:
+            return callback
+
+        def _invoke(task: QgsTask):
+            strong_cb = weak_cb()
+            if strong_cb is None:
+                logger.debug(
+                    "Task %s %s callback target no longer available; skipping",
+                    task_id,
+                    phase
+                )
+                return
+            strong_cb(task)
+
+        return _invoke
 
     # ------------------------------------------------------------------
     # BUG-015 FIX: Error state retrieval methods

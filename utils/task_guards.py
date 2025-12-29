@@ -26,6 +26,34 @@ import traceback
 from typing import Callable, Optional, Tuple, Any
 
 
+def _is_qobject_alive(obj: Any) -> bool:
+    """
+    Check whether a Qt QObject/QWidget is still valid.
+
+    Uses sip.isdeleted when available; otherwise assumes alive.
+    """
+    if obj is None:
+        return False
+
+    try:
+        from qgis.PyQt.sip import isdeleted as sip_isdeleted
+    except Exception:
+        try:
+            import sip
+            sip_isdeleted = sip.isdeleted
+        except Exception:
+            return True
+
+    try:
+        return not sip_isdeleted(obj)
+    except TypeError:
+        # Non-Qt Python object; treat as alive.
+        return True
+    except Exception:
+        # Be conservative: unknown sip failure -> assume alive to avoid false negatives.
+        return True
+
+
 def log_exception(prefix: str, context: str, exc: Exception) -> None:
     """
     Log an exception with consistent formatting.
@@ -102,8 +130,8 @@ def require_components(*component_names: str, log_prefix: str = "[GUARD]") -> Ca
         def wrapper(self, *args, **kwargs):
             for name in component_names:
                 component = getattr(self, name, None)
-                if component is None:
-                    print(f"{log_prefix} {func.__name__}: Required component '{name}' is None, skipping")
+                if component is None or not _is_qobject_alive(component):
+                    print(f"{log_prefix} {func.__name__}: Required component '{name}' is missing/deleted, skipping")
                     return None
             return func(self, *args, **kwargs)
         return wrapper
@@ -136,15 +164,15 @@ def guard_ui_update(
         def wrapper(self, *args, **kwargs):
             # Check iface
             iface = getattr(self, iface_attr, None)
-            if iface is None:
-                print(f"{log_prefix} {func.__name__}: '{iface_attr}' is None (plugin unloaded?), skipping")
+            if iface is None or not _is_qobject_alive(iface):
+                print(f"{log_prefix} {func.__name__}: '{iface_attr}' missing/deleted (plugin unloaded?), skipping")
                 return None
 
             # Check panel if specified
             if panel_attr:
                 panel = getattr(self, panel_attr, None)
-                if panel is None:
-                    print(f"{log_prefix} {func.__name__}: '{panel_attr}' is None, skipping")
+                if panel is None or not _is_qobject_alive(panel):
+                    print(f"{log_prefix} {func.__name__}: '{panel_attr}' missing/deleted, skipping")
                     return None
 
             try:
@@ -197,7 +225,8 @@ class CallbackGuard:
 
     def __enter__(self):
         for attr in self.required_attrs:
-            if getattr(self.instance, attr, None) is None:
+            component = getattr(self.instance, attr, None)
+            if component is None or not _is_qobject_alive(component):
                 self._missing.append(attr)
 
         if self._missing:
@@ -228,7 +257,11 @@ def components_ready(instance: Any, *attr_names: str) -> bool:
     Returns:
         True if all attributes exist and are truthy
     """
-    return all(getattr(instance, name, None) is not None for name in attr_names)
+    return all(
+        getattr(instance, name, None) is not None
+        and _is_qobject_alive(getattr(instance, name, None))
+        for name in attr_names
+    )
 
 
 def notify_safe(
@@ -255,8 +288,8 @@ def notify_safe(
     Returns:
         True if notification was shown, False otherwise
     """
-    if message_bar is None:
-        print(f"{log_prefix} Cannot show notification (message_bar is None): {title}: {message}")
+    if message_bar is None or not _is_qobject_alive(message_bar):
+        print(f"{log_prefix} Cannot show notification (message_bar missing/deleted): {title}: {message}")
         return False
 
     try:

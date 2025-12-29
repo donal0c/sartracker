@@ -149,22 +149,30 @@ class CSVRefreshTask(ProviderRefreshTask):
                 return False
 
             # Parse current positions (uses file-level caching)
-            current = provider.get_current()
+            current = provider.get_current(cancel_cb=self.isCanceled)
 
             # Check for cancellation after each major operation
             if self.check_cancellation("CSV after get_current"):
                 return False
 
             # Parse breadcrumbs (historical trail)
-            breadcrumbs = provider.get_breadcrumbs(since_iso=self.since_iso)
+            breadcrumbs = provider.get_breadcrumbs(
+                since_iso=self.since_iso,
+                cancel_cb=self.isCanceled
+            )
 
             if self.check_cancellation("CSV after get_breadcrumbs"):
                 return False
 
             # Get device list
-            devices = provider.get_devices()
+            devices = provider.get_devices(cancel_cb=self.isCanceled)
 
             if self.check_cancellation("CSV after get_devices"):
+                return False
+
+            if self.check_cancellation("CSV finalize"):
+                self.error_message = "Task cancelled"
+                self.error_type = "cancelled"
                 return False
 
             # Store results for main thread retrieval
@@ -258,6 +266,10 @@ class ConnectionTestTask(QgsTask):
                 session = self.provider._create_session()
                 try:
                     self.success = self.provider.test_connection(session=session)
+                    if self.isCanceled():
+                        self.error_message = "Task cancelled"
+                        self.success = False
+                        return False
                     if not self.success:
                         _update_error_from_status()
                 finally:
@@ -279,6 +291,10 @@ class ConnectionTestTask(QgsTask):
             else:
                 # CSV or other provider without session support
                 self.success = self.provider.test_connection()
+                if self.isCanceled():
+                    self.error_message = "Task cancelled"
+                    self.success = False
+                    return False
                 if not self.success:
                     _update_error_from_status()
 
@@ -789,6 +805,11 @@ class TraccarRefreshTask(ProviderRefreshTask):
                     breadcrumb_failures = list(provider._last_breadcrumb_failures)
             except Exception:
                 pass  # Silently ignore if provider doesn't have this field
+
+            if self.check_cancellation("Traccar finalize"):
+                self.error_message = "Task cancelled"
+                self.error_type = "cancelled"
+                return False
 
             # Store results for main thread retrieval
             self.results = {

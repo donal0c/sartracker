@@ -7,7 +7,7 @@ Verifies input validation, device caching, last-good cache, and error handling.
 """
 import unittest
 from unittest.mock import Mock, patch, MagicMock
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import tempfile
 import os
 import json
@@ -368,7 +368,7 @@ class TestTraccarHttpProvider(unittest.TestCase):
             _create_traccar_http_provider(config)
         self.assertIn("timeout_s", str(cm.exception))
 
-    @patch('providers.traccar_http.TraccarHttpProvider._load_last_good_cache')
+    @patch('providers.traccar_http.TraccarHttpProvider._load_last_good_cache_with_metadata')
     @patch('providers.traccar_http.TraccarHttpProvider._load_devices')
     def test_get_current_network_error_uses_cache(self, mock_load_devices, mock_load_cache):
         """Ensure get_current falls back to cached payload when offline."""
@@ -393,10 +393,14 @@ class TestTraccarHttpProvider(unittest.TestCase):
                 'ts': '2025-11-15T12:00:00Z'
             }
         ]
-        mock_load_cache.return_value = cached_features
+        cache_timestamp = datetime.now(timezone.utc) - timedelta(minutes=5)
+        mock_load_cache.return_value = (cached_features, cache_timestamp)
 
         features = provider.get_current(session=Mock())
-        self.assertEqual(features, cached_features)
+        self.assertEqual(len(features), 1)
+        self.assertEqual(features[0]['device_id'], '1')
+        self.assertEqual(features[0]['data_origin'], 'cache')
+        self.assertIn('cache_age_seconds', features[0])
         mock_load_cache.assert_called_once()
 
     def test_last_good_cache_roundtrip(self):
@@ -424,6 +428,70 @@ class TestTraccarHttpProvider(unittest.TestCase):
                 provider._save_last_good_cache(cached_features)
                 loaded = provider._load_last_good_cache()
                 self.assertEqual(loaded, cached_features)
+
+    def test_last_good_cache_future_timestamp_purged(self):
+        """Future cache timestamps should be rejected to avoid negative age."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        future_ts = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        cache_payload = {
+            'timestamp': future_ts,
+            'features': [{
+                'device_id': '1',
+                'name': 'Device 1',
+                'lat': 53.0,
+                'lon': -6.0,
+                'ts': '2025-11-15T12:00:00Z'
+            }]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = os.path.join(tmpdir, "cache.json")
+            with patch('providers.traccar_http._CACHE_DIR', tmpdir), patch('providers.traccar_http._CACHE_FILE', cache_file):
+                with open(cache_file, 'w', encoding='utf-8') as fh:
+                    json.dump(cache_payload, fh)
+                loaded = provider._load_last_good_cache()
+                self.assertIsNone(loaded)
+                self.assertFalse(os.path.exists(cache_file))
+
+    def test_last_good_cache_filters_invalid_entries(self):
+        """Invalid cached coords/timestamps are filtered out."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        cache_payload = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'features': [
+                {'device_id': '1', 'name': 'Device 1', 'lat': 53.0, 'lon': -6.0, 'ts': '2025-11-15T12:00:00Z'},
+                {'device_id': '2', 'name': 'Device 2', 'lat': 999.0, 'lon': -6.0, 'ts': 'bad-ts'}
+            ],
+            'breadcrumbs': [
+                {'device_id': '1', 'name': 'Device 1', 'lat': 53.1, 'lon': -6.1, 'ts': '2025-11-15T12:05:00Z'},
+                {'device_id': '2', 'name': 'Device 2', 'lat': 0.0, 'lon': 0.0, 'ts': '2025-11-15T12:06:00Z'}
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = os.path.join(tmpdir, "cache.json")
+            with patch('providers.traccar_http._CACHE_DIR', tmpdir), patch('providers.traccar_http._CACHE_FILE', cache_file):
+                with open(cache_file, 'w', encoding='utf-8') as fh:
+                    json.dump(cache_payload, fh)
+                loaded_features = provider._load_last_good_cache()
+                loaded_breadcrumbs = provider._load_last_good_breadcrumbs()
+
+                self.assertEqual(len(loaded_features), 1)
+                self.assertEqual(loaded_features[0]['device_id'], '1')
+                self.assertEqual(len(loaded_breadcrumbs), 1)
+                self.assertEqual(loaded_breadcrumbs[0]['device_id'], '1')
 
     @patch('providers.traccar_http.TraccarHttpProvider._load_devices')
     def test_get_breadcrumbs_success(self, mock_load_devices):
@@ -532,7 +600,32 @@ class TestTraccarHttpProvider(unittest.TestCase):
         cached = [{'device_id': '1', 'name': 'Device 1', 'lat': 1.0, 'lon': 1.0, 'ts': '2025-11-15T10:00:00Z'}]
         with patch.object(provider, '_load_last_good_breadcrumbs', return_value=cached):
             breadcrumbs = provider.get_breadcrumbs(session=Mock())
-            self.assertEqual(breadcrumbs, cached)
+            self.assertEqual(len(breadcrumbs), 1)
+            self.assertEqual(breadcrumbs[0]['device_id'], '1')
+            self.assertEqual(breadcrumbs[0]['data_origin'], 'cache')
+
+    @patch('providers.traccar_http.TraccarHttpProvider._load_last_good_breadcrumbs')
+    @patch('providers.traccar_http.TraccarHttpProvider._load_devices')
+    def test_get_breadcrumbs_auth_error_raises(self, mock_load_devices, mock_load_cache):
+        """Auth failures must surface, not use cached breadcrumbs."""
+        provider = TraccarHttpProvider(
+            base_url=self.base_url,
+            auth_type="basic",
+            username=self.username,
+            password=self.password
+        )
+
+        mock_load_devices.return_value = {'1': 'Device 1'}
+        provider.http_client.get = Mock(side_effect=ProviderAuthError(
+            "unauthorized",
+            provider_name='http',
+            recoverable=True
+        ))
+
+        with self.assertRaises(ProviderAuthError):
+            provider.get_breadcrumbs(session=Mock())
+
+        mock_load_cache.assert_not_called()
 
     def test_bulk_breadcrumbs_path(self):
         """When enabled, bulk breadcrumb fetch should be attempted."""

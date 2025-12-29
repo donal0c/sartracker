@@ -5,6 +5,10 @@ Provider result validation and sanitization helpers.
 Keeps validation out of QGIS-bound code paths so it can be unit tested headlessly.
 """
 from typing import Any, Dict, List, Tuple
+from datetime import datetime, timezone
+
+from .exceptions import validate_coordinate_pair
+from .timeparse import parse_iso, format_iso
 
 
 def _coerce_float(value: Any) -> float:
@@ -12,6 +16,25 @@ def _coerce_float(value: Any) -> float:
     if value is None:
         raise ValueError("value is None")
     return float(value)
+
+
+def _coerce_timestamp(value: Any) -> str:
+    """Validate and normalize timestamps to ISO8601 with 'Z' suffix."""
+    if value is None:
+        raise ValueError("ts is None")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"invalid ts type: {type(value).__name__}")
+    value = value.strip()
+    if "T" not in value and " " not in value:
+        raise ValueError(f"invalid ts format: {value}")
+    try:
+        parsed = parse_iso(value)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"invalid ts format: {value}") from exc
+    return format_iso(parsed)
 
 
 def filter_positions(positions: Any) -> Tuple[List[Dict[str, Any]], int]:
@@ -37,7 +60,7 @@ def filter_positions(positions: Any) -> Tuple[List[Dict[str, Any]], int]:
 
             device_id = pos.get("device_id")
             name = pos.get("name")
-            ts = pos.get("ts")
+            ts = _coerce_timestamp(pos.get("ts"))
             lat = _coerce_float(pos.get("lat"))
             lon = _coerce_float(pos.get("lon"))
 
@@ -45,15 +68,10 @@ def filter_positions(positions: Any) -> Tuple[List[Dict[str, Any]], int]:
                 raise ValueError("invalid device_id")
             if not name or not isinstance(name, str):
                 raise ValueError("invalid name")
-            if not ts:
-                raise ValueError("missing ts")
-            if not (-90 <= lat <= 90):
-                raise ValueError("lat out of range")
-            if not (-180 <= lon <= 180):
-                raise ValueError("lon out of range")
+            lat, lon = validate_coordinate_pair(lat, lon)
 
             # Preserve original dict but ensure lat/lon are floats
-            cleaned.append({**pos, "lat": lat, "lon": lon})
+            cleaned.append({**pos, "lat": lat, "lon": lon, "ts": ts})
         except Exception:
             dropped += 1
             continue

@@ -33,6 +33,7 @@ from ..utils.exceptions import (
     ProviderError, ProviderAuthError, ProviderNetworkError, ProviderDataError,
     validate_coordinate_pair
 )
+from ..utils.provider_results import filter_positions
 
 logger = logging.getLogger(__name__)
 
@@ -736,6 +737,8 @@ class TraccarHttpProvider(Provider):
                                 "SAR-63m: Bulk breadcrumb response invalid (type=%s); falling back to per-device",
                                 type(bulk_data).__name__
                             )
+                    except ProviderAuthError:
+                        raise
                     except Exception as bulk_err:
                         # SAR-63m: Log but continue with per-device fallback
                         # Some Traccar versions don't support bulk time-range queries
@@ -801,6 +804,8 @@ class TraccarHttpProvider(Provider):
                                 params=params,
                                 expect_json=True
                             )
+                        except ProviderAuthError:
+                            raise
                         except Exception as http_err:
                             message = f"{device_name}: HTTP error {http_err}"
                             # BUG-PF-001 fix: Protect list access with lock
@@ -855,6 +860,8 @@ class TraccarHttpProvider(Provider):
                         return device_positions
 
                     except Exception as e:
+                        if isinstance(e, ProviderAuthError):
+                            raise
                         message = f"{device_name}: unexpected error {e}"
                         # BUG-PF-001 fix: Protect list access with lock
                         with self._cache_lock:
@@ -878,6 +885,8 @@ class TraccarHttpProvider(Provider):
                         try:
                             results = future.result()
                         except Exception as worker_exc:
+                            if isinstance(worker_exc, ProviderAuthError):
+                                raise
                             message = f"{device_name}: worker error {worker_exc}"
                             # BUG-PF-001 fix: Protect list access with lock
                             with self._cache_lock:
@@ -950,7 +959,10 @@ class TraccarHttpProvider(Provider):
                     except Exception as e:
                         logger.warning("Error closing session after breadcrumbs fetch: %s", e)
 
-        except (ProviderAuthError, ProviderNetworkError, ProviderDataError) as prov_err:
+        except ProviderAuthError:
+            # Auth errors must be surfaced to the operator immediately
+            raise
+        except (ProviderNetworkError, ProviderDataError) as prov_err:
             if self.enable_last_good_cache:
                 cached_breadcrumbs = self._load_last_good_breadcrumbs()
                 if cached_breadcrumbs:
@@ -1144,9 +1156,13 @@ class TraccarHttpProvider(Provider):
         if not timestamp:
             raise ValueError("Position missing timestamp (fixTime/serverTime/deviceTime)")
 
-        # VALIDATE timestamp format (basic check - parse_iso will validate fully if needed)
-        if not isinstance(timestamp, str) or len(timestamp) < 10:
+        # VALIDATE + NORMALIZE timestamp (strict parse, UTC normalization)
+        if not isinstance(timestamp, str) or ("T" not in timestamp and " " not in timestamp):
             raise ValueError(f"Invalid timestamp format: {timestamp}")
+        try:
+            timestamp = format_iso(parse_iso(timestamp))
+        except ValueError as exc:
+            raise ValueError(f"Invalid timestamp format: {timestamp}") from exc
 
         # EXTRACT optional attributes
         altitude = raw_pos.get('altitude')
@@ -1407,24 +1423,35 @@ class TraccarHttpProvider(Provider):
                 self._purge_cache_file("features not a list")
                 return None
 
-            # Validate each feature has minimum required fields
-            valid_features = []
-            for i, feat in enumerate(features):
-                if not isinstance(feat, dict):
-                    logger.debug("BUG-066: Cache feature %d is not a dict, skipping", i)
-                    continue
-                # Must have at least lat/lon to be useful
-                if 'lat' in feat and 'lon' in feat:
-                    valid_features.append(feat)
-                else:
-                    logger.debug("BUG-066: Cache feature %d missing lat/lon, skipping", i)
-
-            if len(valid_features) < len(features):
+            valid_features, dropped_features = filter_positions(features)
+            if dropped_features:
                 logger.warning(
-                    "BUG-066: Filtered %d invalid features from cache (%d -> %d valid)",
-                    len(features) - len(valid_features), len(features), len(valid_features)
+                    "BUG-066: Filtered %d invalid cached features (%d -> %d valid)",
+                    dropped_features, len(features), len(valid_features)
                 )
             cache_data['features'] = valid_features
+
+            breadcrumbs = cache_data.get('breadcrumbs')
+            if breadcrumbs is not None:
+                if not isinstance(breadcrumbs, list):
+                    logger.warning("BUG-066: Cache breadcrumbs is not a list, dropping breadcrumbs")
+                    cache_data.pop('breadcrumbs', None)
+                else:
+                    valid_breadcrumbs, dropped_breadcrumbs = filter_positions(breadcrumbs)
+                    if dropped_breadcrumbs:
+                        logger.warning(
+                            "BUG-066: Filtered %d invalid cached breadcrumbs (%d -> %d valid)",
+                            dropped_breadcrumbs, len(breadcrumbs), len(valid_breadcrumbs)
+                        )
+                    if valid_breadcrumbs:
+                        cache_data['breadcrumbs'] = valid_breadcrumbs
+                    else:
+                        cache_data.pop('breadcrumbs', None)
+
+            if not cache_data.get('features') and not cache_data.get('breadcrumbs'):
+                logger.warning("BUG-066: Cache contains no valid features or breadcrumbs, purging")
+                self._purge_cache_file("no valid features")
+                return None
 
             timestamp_str = cache_data.get('timestamp')
             try:
@@ -1438,6 +1465,11 @@ class TraccarHttpProvider(Provider):
                 cache_time = cache_time.replace(tzinfo=timezone.utc)
             now = datetime.now(timezone.utc)
             age = (now - cache_time).total_seconds()
+
+            if age < 0:
+                logger.warning("Cache timestamp is in the future (%ss), purging cache", age)
+                self._purge_cache_file("timestamp in future")
+                return None
 
             if max_age_s is not None and age > max_age_s:
                 logger.info(

@@ -388,6 +388,7 @@ When you, as an AI assistant, are asked to edit this codebase:
 7. **Update or add tests where appropriate**
 
    * Keep tests focused and practical; do not generate huge test suites without being asked.
+   * Use `.venv/bin/python -m pytest tests/` (create `.venv` with `python3 -m venv .venv` and install pytest if needed).
 8. **Document safety‑critical decisions briefly**
 
    * When making a choice that affects safety, add a short comment or note explaining why.

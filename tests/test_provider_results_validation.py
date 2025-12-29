@@ -33,11 +33,12 @@ def test_filter_positions_drops_invalid_records():
     positions = [
         {"device_id": "dev1", "name": "alpha", "ts": "2025-01-01T00:00:00Z", "lat": 95.0, "lon": 10.0},  # bad lat
         {"device_id": "", "name": "beta", "ts": "2025-01-01T00:01:00Z", "lat": 50.0, "lon": 10.0},       # missing id
+        {"device_id": "dev2", "name": "gamma", "ts": "not-a-ts", "lat": 50.0, "lon": 10.0},              # bad ts
         "not-a-dict",
     ]
     cleaned, dropped = filter_positions(positions)
     assert cleaned == []
-    assert dropped == 3
+    assert dropped == 4
 
 
 def test_filter_devices_drops_missing_ids():
@@ -52,14 +53,23 @@ def test_filter_devices_drops_missing_ids():
     assert dropped == 2
 
 
+def test_filter_positions_rejects_null_island():
+    positions = [
+        {"device_id": "dev1", "name": "alpha", "ts": "2025-01-01T00:00:00Z", "lat": 0.0, "lon": 0.0},
+    ]
+    cleaned, dropped = filter_positions(positions)
+    assert cleaned == []
+    assert dropped == 1
+
+
 def test_sanitize_provider_results_applies_filters_and_counts():
     results = {
         "current": [
-            {"device_id": "dev1", "name": "a", "ts": "t", "lat": 10.0, "lon": 20.0},
+            {"device_id": "dev1", "name": "a", "ts": "2025-01-01T00:00:00Z", "lat": 10.0, "lon": 20.0},
             {"device_id": "dev2", "name": "b", "ts": "t", "lat": 999, "lon": 20.0},  # invalid
         ],
         "breadcrumbs": [
-            {"device_id": "dev1", "name": "a", "ts": "t", "lat": 11.0, "lon": 21.0},
+            {"device_id": "dev1", "name": "a", "ts": "2025-01-01T00:00:00Z", "lat": 11.0, "lon": 21.0},
             {"device_id": "dev1", "name": "a", "ts": "t", "lat": None, "lon": 21.0},  # invalid
         ],
         "devices": [{"device_id": "dev1"}, {"name": "missing"}],
@@ -93,6 +103,7 @@ if __name__ == "__main__":
     test_filter_positions_keeps_valid_and_coerces_lat_lon()
     test_filter_positions_drops_invalid_records()
     test_filter_devices_drops_missing_ids()
+    test_filter_positions_rejects_null_island()
     test_sanitize_provider_results_applies_filters_and_counts()
     test_sanitize_provider_results_handles_none()
     print("test_provider_results_validation: PASS")

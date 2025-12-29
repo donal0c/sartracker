@@ -62,20 +62,20 @@ class CSVParseTask(QgsTask):
                 return False
 
             # Parse current positions
-            current = self.provider.get_current()
+            current = self.provider.get_current(cancel_cb=self.isCanceled)
 
             # Check for cancellation after each major operation
             if self.isCanceled():
                 return False
 
             # Parse breadcrumbs
-            breadcrumbs = self.provider.get_breadcrumbs()
+            breadcrumbs = self.provider.get_breadcrumbs(cancel_cb=self.isCanceled)
 
             if self.isCanceled():
                 return False
 
             # Get device list
-            devices = self.provider.get_devices()
+            devices = self.provider.get_devices(cancel_cb=self.isCanceled)
 
             if self.isCanceled():
                 return False

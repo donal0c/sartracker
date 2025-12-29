@@ -260,6 +260,31 @@ class HttpClient:
                         recoverable=True
                     )
 
+                # Check for retryable rate/timeout responses
+                if response.status_code in [408, 425, 429]:
+                    error_msg = f"Request throttled/timeout (HTTP {response.status_code})"
+                    retry_after = response.headers.get("Retry-After")
+                    logger.warning(f"{error_msg} - attempt {attempt + 1}/{self.max_retries + 1}")
+
+                    if attempt < self.max_retries:
+                        delay = None
+                        if retry_after:
+                            try:
+                                delay = float(retry_after)
+                            except ValueError:
+                                delay = None
+                        if delay is None:
+                            delay = self._get_retry_delay(attempt)
+                        logger.debug(f"Retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        raise ProviderNetworkError(
+                            f"{error_msg} after {self.max_retries + 1} attempts",
+                            provider_name='http',
+                            recoverable=True
+                        )
+
                 # Check for server errors that should be retried
                 if response.status_code >= 500:
                     error_msg = f"Server error (HTTP {response.status_code})"
@@ -278,7 +303,23 @@ class HttpClient:
                             recoverable=True
                         )
 
-                # Success or client error (4xx other than 401/403)
+                # Map other client errors to ProviderDataError
+                if 400 <= response.status_code < 500:
+                    error_msg = f"Client error (HTTP {response.status_code})"
+                    try:
+                        error_detail = response.json().get('message', '')
+                        if error_detail:
+                            error_msg += f": {error_detail}"
+                    except (ValueError, KeyError, AttributeError, TypeError):
+                        pass
+                    logger.warning(f"{error_msg} - URL: {url}")
+                    raise ProviderDataError(
+                        error_msg,
+                        provider_name='http',
+                        recoverable=False
+                    )
+
+                # Success or other non-error response
                 logger.debug(f"HTTP {method} {url} -> {response.status_code}")
                 return response
 

@@ -57,6 +57,8 @@ class ProviderController(QObject):
                 - devices_count: int (cached device count)
                 - poll_interval: int or None (seconds)
                 - poll_active: bool
+                - data_state: str ('live', 'cached', 'outage', 'unknown')
+                - cache_age_seconds: float or None
 
         config_error: Emitted when provider config validation fails
             Args: str (error message for UI)
@@ -139,6 +141,8 @@ class ProviderController(QObject):
         self._last_refresh_time: Optional[str] = None
         self._last_error_message: Optional[str] = None
         self._last_refresh_duration_ms: Optional[float] = None
+        self._last_data_state = 'unknown'  # live|cached|outage|unknown
+        self._last_cache_age_seconds: Optional[float] = None
         self._last_status_dict = self._build_status_dict('ok', 'No provider loaded')
 
         # ================================================================
@@ -382,6 +386,8 @@ class ProviderController(QObject):
 
             # Clear shadow state (commit complete)
             self._cleanup_shadow_state()
+            self._last_data_state = 'unknown'
+            self._last_cache_age_seconds = None
 
             print(f"[PROVIDER_CONTROLLER] Provider commit complete: {self.provider_name}")
 
@@ -588,6 +594,8 @@ class ProviderController(QObject):
         - poll_active: bool
         - devices_count: int
         - last_refresh: str or None (ISO timestamp)
+        - data_state: str ('live', 'cached', 'outage', 'unknown')
+        - cache_age_seconds: float or None
 
         Qt5/Qt6 Compatible: Pure Python dict.
         """
@@ -633,7 +641,9 @@ class ProviderController(QObject):
             'last_refresh': self._last_refresh_time,
             'provider_base_url': self._get_provider_base_url(),
             'last_error': self._last_error_message,
-            'last_refresh_duration_ms': self._last_refresh_duration_ms
+            'last_refresh_duration_ms': self._last_refresh_duration_ms,
+            'data_state': self._last_data_state,
+            'cache_age_seconds': self._last_cache_age_seconds
         }
         return status_dict
 
@@ -710,6 +720,8 @@ class ProviderController(QObject):
             self.provider = None
             self.provider_name = None
             self.provider_config = None
+            self._last_data_state = 'unknown'
+            self._last_cache_age_seconds = None
 
             # Clean up shadow state
             self._cleanup_shadow_state()
@@ -1056,6 +1068,12 @@ class ProviderController(QObject):
                 if cache_positions:
                     was_cached = True
                     cache_age_seconds = max(p.get('cache_age_seconds', 0) for p in cache_positions)
+            if was_cached:
+                self._last_data_state = 'cached'
+                self._last_cache_age_seconds = cache_age_seconds
+            else:
+                self._last_data_state = 'live'
+                self._last_cache_age_seconds = None
 
             # Build result dict for signal
             result = {
@@ -1197,6 +1215,8 @@ class ProviderController(QObject):
             self.refresh_error.emit(error_msg)
 
             # Update status
+            self._last_data_state = 'outage'
+            self._last_cache_age_seconds = None
             self._emit_status('error', f'Refresh failed: {error_msg}')
 
             # Show user notification
@@ -1308,6 +1328,14 @@ class ProviderController(QObject):
 
             if not config:
                 print(f"[PROVIDER_CONTROLLER] Incomplete config for {provider_name}, skipping auto-connect")
+                safe_warning(
+                    self.iface,
+                    "Provider Auto-Connect",
+                    f"Auto-connect skipped: saved {provider_name} config is incomplete. "
+                    "Open Settings to update credentials.",
+                    duration=6
+                )
+                self._emit_status('error', f'Auto-connect skipped: {provider_name} config incomplete')
                 return
 
             # Auto-connect to provider
@@ -1338,7 +1366,14 @@ class ProviderController(QObject):
             # Legacy HTTP provider - migrate to traccar_http
             server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, None)
             username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, None)
-            password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
+            password = None
+            if username:
+                password = SecureStore.get_credential('http_traccar', str(username))
+            if not password:
+                password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD, None)
+                if password and username:
+                    SecureStore.set_credential('http_traccar', str(username), str(password))
+                    ConfigStore.remove(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD)
             timeout = ConfigStore.get(
                 SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT,
                 SETTINGS_KEYS.PROVIDER_HTTP_TIMEOUT_DEFAULT,
@@ -1390,10 +1425,15 @@ class ProviderController(QObject):
                 if auth_type == 'basic':
                     username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_USERNAME, None)
                     # Try SecureStore first
-                    password = SecureStore.get_credential('traccar_http_basic', username)
+                    password = None
+                    if username:
+                        password = SecureStore.get_credential('traccar_http_basic', str(username))
                     if not password:
                         # Fallback to QSettings
                         password = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD, None)
+                        if password and username:
+                            SecureStore.set_credential('traccar_http_basic', str(username), str(password))
+                            ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD)
 
                     if username and password:
                         config['username'] = str(username)
@@ -1406,6 +1446,9 @@ class ProviderController(QObject):
                     token = SecureStore.get_credential('traccar_http_bearer', 'token')
                     if not token:
                         token = ConfigStore.get(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN, None)
+                        if token:
+                            SecureStore.set_credential('traccar_http_bearer', 'token', str(token))
+                            ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN)
 
                     if token:
                         config['token'] = str(token)
@@ -1479,6 +1522,11 @@ class ProviderController(QObject):
             token = config.get('token', '')
             # Save token to SecureStore
             SecureStore.set_credential('traccar_http_bearer', 'token', token)
+
+        # Remove any plaintext credentials that may exist in QSettings
+        ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_PASSWORD)
+        ConfigStore.remove(SETTINGS_KEYS.PROVIDER_TRACCAR_TOKEN)
+        ConfigStore.remove(SETTINGS_KEYS.PROVIDER_HTTP_PASSWORD)
 
     # ========================================================================
     # Phase 1.2: Signal Handler Wrappers for Settings Panel

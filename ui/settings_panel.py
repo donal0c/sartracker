@@ -847,7 +847,8 @@ class SettingsPanel(QDockWidget):
         """
         Handle provider save button click.
 
-        Validates provider configuration, saves to QSettings, and emits save signal.
+        Validates provider configuration and emits save signal.
+        Provider config is persisted after a successful connection.
         """
         try:
             provider_name, config = self._get_provider_config()
@@ -862,8 +863,9 @@ class SettingsPanel(QDockWidget):
                 )
                 return
 
-            # Save provider configuration to QSettings
-            self._save_provider_config(provider_name, config)
+            # Keep local copy so the current UI selection persists
+            self._pending_provider_name = provider_name
+            self._pending_provider_config = dict(config)
 
             # Emit save signal (plugin will handle connection)
             self.provider_save_requested.emit(provider_name, config)

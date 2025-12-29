@@ -16,8 +16,9 @@ import os
 import csv
 import glob
 import math
+import logging
 from typing import List, Dict, Optional, Any, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from .base import Provider, FeatureDict
 from ..utils.exceptions import ProviderDataError
 from ..utils.cache import LRUTTLCache
@@ -62,6 +63,22 @@ class FileCSVProvider(Provider):
     # MEMORY STABILITY: Limit to 50 files with 1 hour TTL to prevent unbounded growth
     CACHE_MAX_FILES = 50
     CACHE_TTL_SECONDS = 3600  # 1 hour
+    # MEMORY STABILITY: Guard cache size by estimated bytes (position-heavy files can be large)
+    CACHE_MAX_MEMORY_BYTES = 64 * 1024 * 1024  # 64 MB approx cap on cached CSV payloads
+
+    # CSV parsing constants
+    REQUIRED_HEADERS = ("Valid", "Time", "Latitude", "Longitude")
+    HEADER_SCAN_LIMIT = 50
+    HEADER_ALIASES = {
+        "valid": "Valid",
+        "time": "Time",
+        "latitude": "Latitude",
+        "longitude": "Longitude",
+        "altitude": "Altitude",
+        "speed": "Speed",
+        "address": "Address",
+        "attributes": "Attributes",
+    }
 
     def __init__(self, csv_path: str):
         """
@@ -83,6 +100,54 @@ class FileCSVProvider(Provider):
             max_size=self.CACHE_MAX_FILES,
             ttl_seconds=self.CACHE_TTL_SECONDS
         )
+
+    class _CSVDecodeError(Exception):
+        """Internal decode error to trigger encoding fallback."""
+
+    class _CSVParseCancelled(Exception):
+        """Internal cancellation signal for long CSV parses."""
+
+    @classmethod
+    def _normalize_header_field(cls, field: str) -> str:
+        """Normalize CSV header field to canonical form."""
+        if field is None:
+            return ""
+        cleaned = field.strip().lstrip('\ufeff')
+        if not cleaned:
+            return ""
+        return cls.HEADER_ALIASES.get(cleaned.lower(), cleaned)
+
+    @classmethod
+    def _has_required_headers(cls, fields: List[str]) -> bool:
+        """Check for required CSV headers after normalization."""
+        field_set = {f for f in fields if f}
+        return all(req in field_set for req in cls.REQUIRED_HEADERS)
+
+    @staticmethod
+    def _safe_parse_timestamp(ts_str: str) -> datetime:
+        """Parse timestamp to naive UTC for reliable ordering."""
+        ts_value = (ts_str or "").strip()
+        if not ts_value:
+            return datetime.min
+        try:
+            parsed = datetime.fromisoformat(ts_value.replace('Z', '+00:00'))
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+        except (ValueError, AttributeError, TypeError):
+            try:
+                return datetime.strptime(ts_value, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, AttributeError, TypeError):
+                return datetime.min
+
+    def _count_cached_positions(self) -> int:
+        """Count cached positions for cache memory estimation."""
+        total_positions = 0
+        for cache_entry in self._cache.values():
+            _timestamp, inner_tuple = cache_entry
+            _mtime, _device_name, positions = inner_tuple
+            total_positions += len(positions)
+        return total_positions
         
     def _parse_attributes(self, attr_string: str) -> Dict[str, Any]:
         """
@@ -118,7 +183,11 @@ class FileCSVProvider(Provider):
                     
         return attrs
     
-    def _parse_csv_file(self, filepath: str) -> Tuple[str, List[FeatureDict]]:
+    def _parse_csv_file(
+        self,
+        filepath: str,
+        cancel_cb: Optional[Any] = None
+    ) -> Tuple[str, List[FeatureDict]]:
         """
         Parse a single CSV file with caching.
 
@@ -137,21 +206,52 @@ class FileCSVProvider(Provider):
 
         # Check cache (LRUTTLCache returns None if not found or expired)
         cached = self._cache.get(filepath)
+        cached_positions_len = 0
         if cached is not None:
             cached_mtime, cached_name, cached_positions = cached
             if cached_mtime == mtime:
                 # Cache hit - file unchanged since last parse
+                self._cache.evict_expired()
                 return cached_name, cached_positions
+            cached_positions_len = len(cached_positions)
+
+        # TTL eviction is only enforced on access; clear expired entries to keep memory bounded
+        self._cache.evict_expired()
 
         # Cache miss or file modified - parse file
-        device_name, positions = self._parse_csv_file_impl(filepath)
+        device_name, positions = self._parse_csv_file_impl(filepath, cancel_cb=cancel_cb)
 
         # Update cache
-        self._cache.set(filepath, (mtime, device_name, positions))
+        current_positions = self._count_cached_positions()
+        current_files = self._cache.get_stats().get('size', len(self._cache))
+        if cached is not None:
+            current_positions = max(0, current_positions - cached_positions_len)
+        else:
+            current_files += 1
+
+        estimated_bytes = (
+            (current_positions + len(positions)) * self.BYTES_PER_POSITION +
+            (current_files * self.BYTES_PER_FILE)
+        )
+
+        if estimated_bytes <= self.CACHE_MAX_MEMORY_BYTES:
+            self._cache.set(filepath, (mtime, device_name, positions))
+        else:
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "CSV cache skip: %s positions in %s would exceed cache cap (%.1f MB).",
+                len(positions),
+                os.path.basename(filepath),
+                self.CACHE_MAX_MEMORY_BYTES / (1024 * 1024)
+            )
 
         return device_name, positions
 
-    def _parse_csv_file_impl(self, filepath: str) -> Tuple[str, List[FeatureDict]]:
+    def _parse_csv_file_impl(
+        self,
+        filepath: str,
+        cancel_cb: Optional[Any] = None
+    ) -> Tuple[str, List[FeatureDict]]:
         """
         Actual CSV parsing implementation (called only on cache miss).
 
@@ -181,90 +281,104 @@ class FileCSVProvider(Provider):
             ('utf-8', 'replace', 'UTF-8 with character replacement (data may be corrupted)')
         ]
 
-        f = None
-        encoding_used = None
+        try:
+            encoding_used = None
 
-        for encoding, errors, description in encodings_to_try:
-            try:
-                f = open(filepath, 'r', encoding=encoding, errors=errors)
-                encoding_used = (encoding, errors, description)
-                break  # Successfully opened
-            except (IOError, OSError) as e:
-                # File access error - don't try other encodings
+            for encoding, errors, description in encodings_to_try:
+                try:
+                    device_name, positions = self._parse_csv_with_encoding(
+                        filepath,
+                        device_name,
+                        encoding,
+                        errors,
+                        cancel_cb=cancel_cb
+                    )
+                    encoding_used = (encoding, errors, description)
+                    break
+                except self._CSVDecodeError:
+                    continue
+                except self._CSVParseCancelled:
+                    raise
+
+            if encoding_used is None:
                 raise ProviderDataError(
-                    f"Cannot access CSV file {filepath}: {str(e)}",
+                    f"Cannot decode CSV file {filepath}: tried UTF-8, Latin-1, Windows-1252",
                     provider_name='csv',
                     recoverable=True
                 )
-            except UnicodeDecodeError:
-                # Try next encoding
-                continue
 
-        if f is None:
+            # BUG-070 FIX: Warn if we had to use replacement encoding
+            logger = logging.getLogger(__name__)
+
+            if encoding_used[1] == 'replace':
+                logger.warning(
+                    f"BUG-070: CSV file {filepath} contains invalid UTF-8 characters. "
+                    f"Using replacement encoding - data may be corrupted. "
+                    f"Please re-export this file with proper UTF-8 encoding."
+                )
+
+            return device_name, positions
+
+        except ProviderDataError:
+            # Re-raise provider errors
+            raise
+        except self._CSVParseCancelled:
+            raise
+        except Exception as e:
+            # Wrap unexpected errors
             raise ProviderDataError(
-                f"Cannot decode CSV file {filepath}: tried UTF-8, Latin-1, Windows-1252",
+                f"Error parsing CSV file {filepath}: {str(e)}",
                 provider_name='csv',
-                recoverable=True
+                recoverable=False
             )
 
-        # BUG-070 FIX: Warn if we had to use replacement encoding
-        import logging
-        logger = logging.getLogger(__name__)
-
-        if encoding_used and encoding_used[1] == 'replace':
-            logger.warning(
-                f"BUG-070: CSV file {filepath} contains invalid UTF-8 characters. "
-                f"Using replacement encoding - data may be corrupted. "
-                f"Please re-export this file with proper UTF-8 encoding."
-            )
-
+    def _parse_csv_with_encoding(
+        self,
+        filepath: str,
+        device_name: str,
+        encoding: str,
+        errors: str,
+        cancel_cb: Optional[Any] = None
+    ) -> Tuple[str, List[FeatureDict]]:
+        """Parse CSV file using a specific encoding (may raise _CSVDecodeError)."""
         try:
-            with f:
-                # BUG-025 FIX: Use chunked reading to prevent memory exhaustion
-                # with large CSV files. Read header section first, then stream data.
-
+            with open(filepath, 'r', encoding=encoding, errors=errors) as f:
+                positions = []
                 # Phase 1: Read header section (first 50 lines max) to find structure
-                header_lines = []
-                header_idx = -1
+                header_fields = None
                 for i, line in enumerate(f):
-                    header_lines.append(line)
+                    if cancel_cb and cancel_cb():
+                        raise self._CSVParseCancelled()
 
-                    # Check for device name in first 10 lines
-                    if i < 10 and line.startswith('Device:'):
-                        parts = line.strip().split(',')
-                        if len(parts) > 1 and parts[1]:
-                            device_name = parts[1]
+                    if i < 10:
+                        device_line = line.lstrip('\ufeff').lstrip()
+                        if device_line.startswith('Device:'):
+                            parts = next(csv.reader([device_line]))
+                            if len(parts) > 1 and parts[1]:
+                                device_name = parts[1].strip()
 
-                    # Check for header row
-                    if 'Valid' in line and 'Time' in line and 'Latitude' in line:
-                        header_idx = i
+                    try:
+                        parts = next(csv.reader([line]))
+                    except csv.Error:
+                        parts = []
+
+                    normalized_fields = [self._normalize_header_field(field) for field in parts]
+                    if self._has_required_headers(normalized_fields):
+                        header_fields = normalized_fields
                         break
 
-                    # Safety limit - if we haven't found headers in 50 lines, stop
-                    if i >= 50:
+                    if i >= self.HEADER_SCAN_LIMIT:
                         break
 
-                if header_idx == -1:
+                if not header_fields:
                     raise ProviderDataError(
                         f"CSV file missing required headers (Valid, Time, Latitude, Longitude): {filepath}",
                         provider_name='csv',
                         recoverable=False
                     )
 
-                # BUG-025 FIX: Stream remaining data instead of loading all at once
-                # Build header row from the identified header line
-                import io
-                header_line = header_lines[header_idx]
-
-                # Create a streaming reader that starts from the header line
-                # and continues with remaining file content
-                def _streaming_lines():
-                    """Generator that yields header + remaining file lines."""
-                    yield header_line
-                    for line in f:
-                        yield line
-
-                reader = csv.DictReader(_streaming_lines())
+                # Stream remaining data instead of loading all at once
+                reader = csv.DictReader(f, fieldnames=header_fields)
 
                 # BUG-051 FIX: Track skipped rows for logging
                 skipped_invalid = 0
@@ -272,74 +386,83 @@ class FileCSVProvider(Provider):
                 skipped_no_timestamp = 0
                 skipped_bad_timestamp = 0
                 skipped_malformed = 0
+                invalid_altitude = 0
+                invalid_speed = 0
                 total_rows = 0
 
                 for row in reader:
+                    if cancel_cb and cancel_cb():
+                        raise self._CSVParseCancelled()
+
                     total_rows += 1
 
-                    # Skip invalid rows
-                    if row.get('Valid', '').strip().upper() not in ('TRUE', '1'):
+                    valid_value = (row.get('Valid') or '').strip().upper()
+                    if valid_value not in ('TRUE', '1'):
                         skipped_invalid += 1
                         continue
 
                     try:
-                        # Parse attributes
-                        attrs = self._parse_attributes(row.get('Attributes', ''))
+                        attrs = self._parse_attributes(row.get('Attributes') or '')
 
-                        # Parse and validate coordinates
                         lat = float(row['Latitude'])
                         lon = float(row['Longitude'])
 
-                        # LIFE-SAFETY CRITICAL: Reject NaN/Inf coordinates
-                        # NaN comparisons always return False, so NaN would pass range checks
                         if math.isnan(lat) or math.isnan(lon) or math.isinf(lat) or math.isinf(lon):
                             skipped_coord_range += 1
-                            continue  # Invalid NaN/Inf coordinate, skip row
-
-                        # Validate coordinate ranges (skip invalid positions)
-                        if not (-90 <= lat <= 90):
-                            skipped_coord_range += 1
-                            continue  # Invalid latitude, skip row
-                        if not (-180 <= lon <= 180):
-                            skipped_coord_range += 1
-                            continue  # Invalid longitude, skip row
-
-                        # LIFE-SAFETY CRITICAL: Reject Null Island (0,0) - common GPS failure indicator
-                        # Consistent with HTTP provider validation (BUG-FIX: consistency across providers)
-                        if abs(lat) < 0.0001 and abs(lon) < 0.0001:
-                            skipped_coord_range += 1
-                            logger.debug("Skipping Null Island position (0,0) - likely GPS failure")
                             continue
 
-                        # Validate timestamp format (BUG-041 fix)
-                        # CRITICAL: Invalid timestamps can cause wrong "latest" position
-                        timestamp_str = row.get('Time', '')
+                        if not (-90 <= lat <= 90):
+                            skipped_coord_range += 1
+                            continue
+                        if not (-180 <= lon <= 180):
+                            skipped_coord_range += 1
+                            continue
+
+                        if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+                            skipped_coord_range += 1
+                            logging.getLogger(__name__).debug(
+                                "Skipping Null Island position (0,0) - likely GPS failure"
+                            )
+                            continue
+
+                        timestamp_str = (row.get('Time') or '').strip()
                         if not timestamp_str:
                             skipped_no_timestamp += 1
-                            continue  # No timestamp, skip row
+                            continue
 
-                        # Validate timestamp is parseable
                         try:
-                            # Try ISO format first (most common)
                             datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
                         except (ValueError, AttributeError, TypeError):
                             try:
-                                # Fallback: try common format YYYY-MM-DD HH:MM:SS
                                 datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
                             except (ValueError, AttributeError, TypeError):
-                                # Invalid timestamp format, skip this row
                                 skipped_bad_timestamp += 1
                                 continue
 
-                        # Build position dict
+                        altitude = None
+                        altitude_value = row.get('Altitude')
+                        if altitude_value:
+                            try:
+                                altitude = float(str(altitude_value).replace(' m', '').strip())
+                            except (ValueError, TypeError):
+                                invalid_altitude += 1
+
+                        speed = None
+                        speed_value = row.get('Speed')
+                        if speed_value:
+                            try:
+                                speed = float(str(speed_value).replace(' kn', '').strip())
+                            except (ValueError, TypeError):
+                                invalid_speed += 1
+
                         position = {
                             'device_id': device_name,
                             'name': device_name,
                             'lat': lat,
                             'lon': lon,
-                            'ts': timestamp_str,  # Validated timestamp string
-                            'altitude': float(row['Altitude'].replace(' m', '')) if row.get('Altitude') else None,
-                            'speed': float(row['Speed'].replace(' kn', '')) if row.get('Speed') else None,
+                            'ts': timestamp_str,
+                            'altitude': altitude,
+                            'speed': speed,
                             'battery': attrs.get('batteryLevel'),
                             'motion': attrs.get('motion', True),
                             'distance': attrs.get('distance'),
@@ -348,13 +471,17 @@ class FileCSVProvider(Provider):
 
                         positions.append(position)
 
-                    except (ValueError, KeyError) as e:
-                        # Skip malformed rows (non-critical, some rows may be metadata)
+                    except (ValueError, KeyError, TypeError):
                         skipped_malformed += 1
                         continue
 
-                # BUG-051 FIX: Log summary of skipped rows if significant
-                total_skipped = skipped_invalid + skipped_coord_range + skipped_no_timestamp + skipped_bad_timestamp + skipped_malformed
+                total_skipped = (
+                    skipped_invalid +
+                    skipped_coord_range +
+                    skipped_no_timestamp +
+                    skipped_bad_timestamp +
+                    skipped_malformed
+                )
                 if total_skipped > 0:
                     print(f"[CSV_PROVIDER] BUG-051: Parsed {len(positions)}/{total_rows} rows from {filepath}")
                     if skipped_invalid > 0:
@@ -367,19 +494,14 @@ class FileCSVProvider(Provider):
                         print(f"[CSV_PROVIDER]   - Skipped {skipped_bad_timestamp} rows with unparseable timestamp")
                     if skipped_malformed > 0:
                         print(f"[CSV_PROVIDER]   - Skipped {skipped_malformed} malformed rows")
+                    if invalid_altitude > 0:
+                        print(f"[CSV_PROVIDER]   - {invalid_altitude} rows had invalid altitude (set to None)")
+                    if invalid_speed > 0:
+                        print(f"[CSV_PROVIDER]   - {invalid_speed} rows had invalid speed (set to None)")
 
                 return device_name, positions
-
-        except ProviderDataError:
-            # Re-raise provider errors
-            raise
-        except Exception as e:
-            # Wrap unexpected errors
-            raise ProviderDataError(
-                f"Error parsing CSV file {filepath}: {str(e)}",
-                provider_name='csv',
-                recoverable=False
-            )
+        except UnicodeDecodeError as exc:
+            raise self._CSVDecodeError() from exc
     
     # BUG-080 FIX: Limit maximum CSV files to prevent performance degradation
     # LIFE-SAFETY CRITICAL: Large directories could cause UI freezes during mission operations
@@ -398,7 +520,6 @@ class FileCSVProvider(Provider):
         Raises:
             ProviderDataError: If CSV path does not exist or is inaccessible
         """
-        import logging
         logger = logging.getLogger(__name__)
 
         # Validate path exists
@@ -441,7 +562,7 @@ class FileCSVProvider(Provider):
                 )
             return [self.csv_path]
     
-    def get_current(self) -> List[FeatureDict]:
+    def get_current(self, cancel_cb: Optional[Any] = None) -> List[FeatureDict]:
         """
         Get latest position per device from CSV files.
 
@@ -474,43 +595,43 @@ class FileCSVProvider(Provider):
         # Collect all positions per device (handles multiple files per device)
         device_positions = {}  # device_name -> list of candidate positions
 
-        csv_files = self._get_csv_files()
+        try:
+            csv_files = self._get_csv_files()
 
-        for csv_file in csv_files:
-            device_name, positions = self._parse_csv_file(csv_file)
+            for csv_file in csv_files:
+                if cancel_cb and cancel_cb():
+                    raise self._CSVParseCancelled()
 
-            if positions:
-                # Collect last position from this file
-                if device_name not in device_positions:
-                    device_positions[device_name] = []
+                device_name, positions = self._parse_csv_file(csv_file, cancel_cb=cancel_cb)
 
-                # Last position in file (within-file ordering assumed correct)
-                device_positions[device_name].append(positions[-1])
+                if positions:
+                    if device_name not in device_positions:
+                        device_positions[device_name] = []
 
-        # For each device, select position with maximum (newest) timestamp
-        # Use datetime parsing for reliable comparison (handles various formats)
-        def parse_timestamp(ts_str):
-            """Parse timestamp string to datetime for comparison."""
-            try:
-                # Try ISO format first (most common)
-                return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
-            except (ValueError, AttributeError):
-                try:
-                    # Fallback: try common format YYYY-MM-DD HH:MM:SS
-                    return datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
-                except (ValueError, AttributeError):
-                    # Last resort: return epoch (will sort to beginning)
-                    return datetime.min
+                    latest_in_file = max(
+                        positions,
+                        key=lambda x: self._safe_parse_timestamp(x.get('ts'))
+                    )
+                    device_positions[device_name].append(latest_in_file)
 
-        current_positions = []
-        for device_name, positions in device_positions.items():
-            latest = max(positions, key=lambda x: parse_timestamp(x['ts']))
-            current_positions.append(latest)
+            current_positions = []
+            for device_name, positions in device_positions.items():
+                latest = max(
+                    positions,
+                    key=lambda x: self._safe_parse_timestamp(x.get('ts'))
+                )
+                current_positions.append(latest)
 
-        return current_positions
+            return current_positions
+        except self._CSVParseCancelled:
+            return []
     
-    def get_breadcrumbs(self, since_iso: Optional[str] = None,
-                       mission_id: Optional[int] = None) -> List[FeatureDict]:
+    def get_breadcrumbs(
+        self,
+        since_iso: Optional[str] = None,
+        mission_id: Optional[int] = None,
+        cancel_cb: Optional[Any] = None
+    ) -> List[FeatureDict]:
         """
         Get all positions from CSV files.
 
@@ -527,39 +648,42 @@ class FileCSVProvider(Provider):
         THREAD-SAFETY:
         Safe to call from background threads (uses only local I/O).
         """
-        all_positions = []
-        
-        csv_files = self._get_csv_files()
-        
-        for csv_file in csv_files:
-            device_name, positions = self._parse_csv_file(csv_file)
-            
-            # Filter by time if specified
+        try:
+            all_positions = []
+
+            csv_files = self._get_csv_files()
+
+            since_dt = None
             if since_iso:
-                try:
-                    since_dt = datetime.fromisoformat(since_iso.replace('Z', '+00:00'))
+                parsed_since = self._safe_parse_timestamp(since_iso)
+                if parsed_since != datetime.min:
+                    since_dt = parsed_since
+
+            for csv_file in csv_files:
+                if cancel_cb and cancel_cb():
+                    raise self._CSVParseCancelled()
+
+                device_name, positions = self._parse_csv_file(csv_file, cancel_cb=cancel_cb)
+
+                if since_dt:
                     filtered_positions = []
                     for p in positions:
-                        try:
-                            p_ts = datetime.fromisoformat(p['ts'].replace('Z', '+00:00'))
-                            if p_ts >= since_dt:
-                                filtered_positions.append(p)
-                        except (ValueError, AttributeError):
-                            # Can't parse timestamp, include position to be safe
+                        p_ts = self._safe_parse_timestamp(p.get('ts'))
+                        if p_ts == datetime.min or p_ts >= since_dt:
                             filtered_positions.append(p)
                     positions = filtered_positions
-                except (ValueError, AttributeError):
-                    # Can't parse since_iso, skip filtering
-                    pass
-            
-            all_positions.extend(positions)
-        
-        # Sort by device then time
-        all_positions.sort(key=lambda x: (x['device_id'], x['ts']))
-        
-        return all_positions
+
+                all_positions.extend(positions)
+
+            all_positions.sort(
+                key=lambda x: (x.get('device_id'), self._safe_parse_timestamp(x.get('ts')))
+            )
+
+            return all_positions
+        except self._CSVParseCancelled:
+            return []
     
-    def get_devices(self) -> List[Dict[str, Any]]:
+    def get_devices(self, cancel_cb: Optional[Any] = None) -> List[Dict[str, Any]]:
         """
         Get list of devices from CSV files.
 
@@ -585,33 +709,42 @@ class FileCSVProvider(Provider):
         # Collect all positions per device (handles multiple files per device)
         device_positions = {}  # device_name -> list of candidate positions
 
-        csv_files = self._get_csv_files()
+        try:
+            csv_files = self._get_csv_files()
 
-        for csv_file in csv_files:
-            device_name, positions = self._parse_csv_file(csv_file)
+            for csv_file in csv_files:
+                if cancel_cb and cancel_cb():
+                    raise self._CSVParseCancelled()
 
-            if positions:
-                # Collect last position from this file
-                if device_name not in device_positions:
-                    device_positions[device_name] = []
+                device_name, positions = self._parse_csv_file(csv_file, cancel_cb=cancel_cb)
 
-                # Last position in file (within-file ordering assumed correct)
-                device_positions[device_name].append(positions[-1])
+                if positions:
+                    if device_name not in device_positions:
+                        device_positions[device_name] = []
 
-        # For each device, find position with maximum (newest) timestamp
-        # ISO timestamps (YYYY-MM-DD HH:MM:SS) compare correctly as strings
-        devices = []
-        for device_name, positions in device_positions.items():
-            latest_position = max(positions, key=lambda x: x['ts'])
+                    latest_in_file = max(
+                        positions,
+                        key=lambda x: self._safe_parse_timestamp(x.get('ts'))
+                    )
+                    device_positions[device_name].append(latest_in_file)
 
-            devices.append({
-                'device_id': device_name,
-                'name': device_name,
-                'status': 'online',  # Assume online for CSV data
-                'last_update': latest_position['ts']
-            })
+            devices = []
+            for device_name, positions in device_positions.items():
+                latest_position = max(
+                    positions,
+                    key=lambda x: self._safe_parse_timestamp(x.get('ts'))
+                )
 
-        return devices
+                devices.append({
+                    'device_id': device_name,
+                    'name': device_name,
+                    'status': 'online',
+                    'last_update': latest_position['ts']
+                })
+
+            return devices
+        except self._CSVParseCancelled:
+            return []
     
     def save_casualty(self, mission_id: int, name: str,
                      lat: float, lon: float,
@@ -649,7 +782,6 @@ class FileCSVProvider(Provider):
             True if CSV files found and readable, False with diagnostic logging if issues occur
         """
         try:
-            import logging
             logger = logging.getLogger(__name__)
 
             csv_files = self._get_csv_files()

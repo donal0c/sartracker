@@ -212,7 +212,11 @@ Before committing any changes:
 ./tools/check_compatibility.sh
 
 # Run tests
-python -m pytest tests/
+.venv/bin/python -m pytest tests/
+
+# Create local venv + pytest (if missing)
+python3 -m venv .venv
+.venv/bin/pip install pytest
 
 # Reload plugin (in QGIS Python console)
 from qgis.utils import reloadPlugin

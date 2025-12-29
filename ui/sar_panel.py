@@ -1395,15 +1395,17 @@ class SARPanel(QDockWidget):
         """
         Update provider status strip from controller.
 
-        Args:
-            status_dict: Status from ProviderController.status_snapshot() with keys:
-                - provider: str or None
-                - state: str ('ok', 'error', 'testing', 'connecting')
-                - message: str
-                - poll_interval: int or None
-                - poll_active: bool
-                - devices_count: int
-                - last_refresh: str or None
+            Args:
+                status_dict: Status from ProviderController.status_snapshot() with keys:
+                    - provider: str or None
+                    - state: str ('ok', 'error', 'testing', 'connecting')
+                    - message: str
+                    - poll_interval: int or None
+                    - poll_active: bool
+                    - devices_count: int
+                    - last_refresh: str or None
+                    - data_state: str ('live', 'cached', 'outage', 'unknown')
+                    - cache_age_seconds: float or None
 
         Qt5/Qt6 Compatible: Uses QLabel.setText().
         """
@@ -1419,6 +1421,8 @@ class SARPanel(QDockWidget):
             poll_active = status_dict.get('poll_active', False)
             poll_interval = status_dict.get('poll_interval')
             last_error = status_dict.get('last_error')
+            data_state = status_dict.get('data_state', 'unknown')
+            cache_age_seconds = status_dict.get('cache_age_seconds')
 
             # Format last refresh time
             if last_refresh and last_refresh != 'Never':
@@ -1427,6 +1431,16 @@ class SARPanel(QDockWidget):
                     last_refresh = last_refresh.split('T')[1][:8] if 'T' in last_refresh else last_refresh
                 except Exception:
                     pass
+            cache_age_display = None
+            if cache_age_seconds is not None:
+                try:
+                    age_minutes = cache_age_seconds / 60
+                    if age_minutes >= 60:
+                        cache_age_display = f"{age_minutes / 60:.1f}h"
+                    else:
+                        cache_age_display = f"{age_minutes:.0f}m"
+                except Exception:
+                    cache_age_display = None
 
             # Format status text
             status_parts = [f"Provider: {provider}"]
@@ -1440,14 +1454,23 @@ class SARPanel(QDockWidget):
                     status_parts.append("🔄 Polling")
 
             # Add state indicator
-            if state == 'ok':
-                status_parts.append("✓ Connected")
-            elif state == 'error':
-                status_parts.append("✗ Error")
-            elif state == 'testing':
+            if state == 'testing':
                 status_parts.append("⏳ Testing...")
             elif state == 'connecting':
                 status_parts.append("⏳ Connecting...")
+            elif state == 'refreshing':
+                status_parts.append("⏳ Refreshing...")
+            elif data_state == 'outage':
+                status_parts.append("✗ Offline")
+            elif data_state == 'cached':
+                if cache_age_display:
+                    status_parts.append(f"⚠ Cached ({cache_age_display})")
+                else:
+                    status_parts.append("⚠ Cached")
+            elif state == 'error':
+                status_parts.append("✗ Error")
+            elif state == 'ok':
+                status_parts.append("✓ Connected")
 
             if last_error and state == 'error':
                 status_parts.append(f"Last Error: {last_error}")
@@ -1462,10 +1485,14 @@ class SARPanel(QDockWidget):
                 bg_color = "#d4edda"  # Light green
             elif state == 'error':
                 bg_color = "#f8d7da"  # Light red
-            elif state in ('testing', 'connecting'):
+            elif state in ('testing', 'connecting', 'refreshing'):
                 bg_color = "#fff3cd"  # Light yellow
             else:
                 bg_color = "#f0f0f0"  # Light gray
+            if data_state == 'outage':
+                bg_color = "#f8d7da"
+            elif data_state == 'cached':
+                bg_color = "#fff3cd"
 
             self.provider_status_label.setStyleSheet(
                 f"QLabel {{ "
