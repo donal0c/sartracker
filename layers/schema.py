@@ -9,6 +9,7 @@ all mission artifacts are stored in a predictable, persistent structure.
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all Qt imports.
 """
 
+import json
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -20,8 +21,9 @@ logger = logging.getLogger(__name__)
 
 
 # Schema version - increment when structure changes
-# Version 4: Per-device tracking layers (SAR-nh9/SAR-0uy)
+# Version 4: Per-device tracking + per-item map tools layers
 #   - Each device gets its own Position and Trail layers under Tracking/{DeviceName}/
+#   - Each map tool item is stored in its own layer under Map Tools/{Type}/
 #   - Migration from shared Current Positions/Breadcrumbs layers
 SAR_LAYER_SCHEMA_VERSION = 4
 
@@ -75,6 +77,8 @@ class MigrationTracker:
 
     _instance: Optional['MigrationTracker'] = None
     _lock = threading.RLock()
+    _PROJECT_ENTRY_GROUP = "SARTracker"
+    _PROJECT_ENTRY_KEY = "sartracker:migrations"
 
     def __new__(cls):
         """Singleton pattern for global migration state."""
@@ -92,6 +96,116 @@ class MigrationTracker:
         self._migrations: Dict[str, MigrationRecord] = {}
         self._current_schema_version = SAR_LAYER_SCHEMA_VERSION
         self._initialized = True
+
+    def _serialize_record(self, record: MigrationRecord) -> Dict[str, Any]:
+        """Serialize a MigrationRecord for persistence."""
+        return {
+            "migration_id": record.migration_id,
+            "from_version": record.from_version,
+            "to_version": record.to_version,
+            "status": record.status.value,
+            "started_at": record.started_at,
+            "completed_at": record.completed_at,
+            "error_message": record.error_message,
+            "affected_layers": list(record.affected_layers or []),
+            "rollback_available": bool(record.rollback_available),
+        }
+
+    def _deserialize_record(self, payload: Dict[str, Any]) -> Optional[MigrationRecord]:
+        """Rehydrate a MigrationRecord from persisted data."""
+        if not isinstance(payload, dict):
+            return None
+        status_value = payload.get("status", MigrationStatus.PENDING.value)
+        try:
+            status = MigrationStatus(status_value)
+        except Exception:
+            status = MigrationStatus.PENDING
+        try:
+            from_version = int(payload.get("from_version") or 0)
+        except (TypeError, ValueError):
+            from_version = 0
+        try:
+            to_version = int(payload.get("to_version") or 0)
+        except (TypeError, ValueError):
+            to_version = 0
+        return MigrationRecord(
+            migration_id=str(payload.get("migration_id", "")),
+            from_version=from_version,
+            to_version=to_version,
+            status=status,
+            started_at=payload.get("started_at"),
+            completed_at=payload.get("completed_at"),
+            error_message=payload.get("error_message"),
+            affected_layers=list(payload.get("affected_layers", []) or []),
+            rollback_available=bool(payload.get("rollback_available", False)),
+        )
+
+    def _persist_to_project(self) -> None:
+        """Persist migration state to the current QGIS project (best effort)."""
+        project = None
+        try:
+            from qgis.core import QgsProject
+            project = QgsProject.instance()
+        except Exception:
+            project = None
+
+        if not project:
+            return
+
+        try:
+            data = {
+                migration_id: self._serialize_record(record)
+                for migration_id, record in self._migrations.items()
+            }
+            project.writeEntry(
+                self._PROJECT_ENTRY_GROUP,
+                self._PROJECT_ENTRY_KEY,
+                json.dumps(data)
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist migration state: %s", exc)
+
+    def load_from_project(self, project=None) -> None:
+        """Load persisted migration state from a QGIS project (best effort)."""
+        if project is None:
+            try:
+                from qgis.core import QgsProject
+                project = QgsProject.instance()
+            except Exception:
+                project = None
+
+        if not project:
+            return
+
+        with self._lock:
+            try:
+                payload = project.readEntry(
+                    self._PROJECT_ENTRY_GROUP,
+                    self._PROJECT_ENTRY_KEY
+                )[0]
+            except Exception as exc:
+                logger.warning("Failed to read migration state: %s", exc)
+                return
+
+            self._migrations.clear()
+
+            if not payload:
+                return
+
+            try:
+                data = json.loads(payload)
+            except Exception as exc:
+                logger.warning("Failed to parse migration state: %s", exc)
+                return
+
+            if not isinstance(data, dict):
+                logger.warning("Unexpected migration state payload type: %s", type(data).__name__)
+                return
+
+            for migration_id, record_payload in data.items():
+                record = self._deserialize_record(record_payload)
+                if record and record.migration_id:
+                    self._migrations[migration_id] = record
 
     def start_migration(
         self,
@@ -139,6 +253,7 @@ class MigrationTracker:
                 migration_id, from_version, to_version,
                 ", ".join(affected_layers or ["none"])
             )
+            self._persist_to_project()
             return record
 
     def complete_migration(self, migration_id: str, rollback_available: bool = False):
@@ -163,6 +278,7 @@ class MigrationTracker:
                 migration_id,
                 "available" if rollback_available else "not available"
             )
+            self._persist_to_project()
 
     def fail_migration(self, migration_id: str, error_message: str):
         """
@@ -185,6 +301,7 @@ class MigrationTracker:
                 "Migration %s FAILED: %s",
                 migration_id, error_message
             )
+            self._persist_to_project()
 
     def get_migration_status(self, migration_id: str) -> Optional[MigrationRecord]:
         """Get the status of a specific migration."""
@@ -226,6 +343,7 @@ class MigrationTracker:
         """Clear all migration records (for testing)."""
         with self._lock:
             self._migrations.clear()
+        self._persist_to_project()
 
 
 # Global migration tracker instance
@@ -284,7 +402,7 @@ class GroupNames:
     TRACKING = "Tracking"  # For future per-device tracking layers
     # Helicopters
     HELICOPTERS = "Helicopters"
-    # Mission Overlays (legacy - for sectors, text labels)
+    # Mission Overlays (legacy - retained for compatibility)
     MISSION_OVERLAYS = "Mission Overlays"
     # Map Tools - main group for all drawing/marker items (FR-3)
     MAP_TOOLS = "Map Tools"
@@ -294,9 +412,11 @@ class GroupNames:
     MAP_TOOLS_HAZARDS = "Hazards"
     MAP_TOOLS_CASUALTIES = "Casualties"
     MAP_TOOLS_SEARCH_AREAS = "Search Areas"
+    MAP_TOOLS_SEARCH_SECTORS = "Search Sectors"
     MAP_TOOLS_RANGE_RINGS = "Range Rings"
     MAP_TOOLS_BEARING_LINES = "Bearing Lines"
     MAP_TOOLS_LINES = "Lines"
+    MAP_TOOLS_TEXT_LABELS = "Text Labels"
 
 
 @dataclass
@@ -507,6 +627,7 @@ SEARCH_SECTOR_FIELDS = [
     {"name": "start_bearing", "type": "Double"},
     {"name": "end_bearing", "type": "Double"},
     {"name": "radius_m", "type": "Double"},
+    {"name": "arc_length_deg", "type": "Double"},
     {"name": "area_sqkm", "type": "Double"},
     {"name": "priority", "type": "String", "length": 20},
     {"name": "color", "type": "String", "length": 16},
@@ -545,51 +666,177 @@ def get_expected_structure() -> GroupDefinition:
         {"name": "timestamp", "type": "DateTime"}
     ]
 
+    map_tools_subgroups = [
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_IPP_LKP,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=0,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.MARKERS_IPP_LKP,
+                    name="IPP/LKP",
+                    geometry_type="Point",
+                    fields=IPP_LKP_FIELDS,
+                    metadata={"sartracker:type": "marker_ipp_lkp", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_CLUES,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=1,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.MARKERS_CLUES,
+                    name="Clues",
+                    geometry_type="Point",
+                    fields=CLUE_FIELDS,
+                    metadata={"sartracker:type": "marker_clue", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_HAZARDS,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=2,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.MARKERS_HAZARDS,
+                    name="Hazards",
+                    geometry_type="Point",
+                    fields=HAZARD_FIELDS,
+                    metadata={"sartracker:type": "marker_hazard", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_CASUALTIES,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=3,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.MARKERS_CASUALTIES,
+                    name="Casualties",
+                    geometry_type="Point",
+                    fields=CASUALTY_FIELDS,
+                    metadata={"sartracker:type": "marker_casualty", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_SEARCH_AREAS,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=4,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.SEARCH_AREAS,
+                    name="Search Areas",
+                    geometry_type="Polygon",
+                    fields=SEARCH_AREA_FIELDS,
+                    metadata={"sartracker:type": "search_area", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_SEARCH_SECTORS,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=5,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.SEARCH_SECTORS,
+                    name="Search Sectors",
+                    geometry_type="Polygon",
+                    fields=SEARCH_SECTOR_FIELDS,
+                    metadata={"sartracker:type": "search_sector", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_RANGE_RINGS,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=6,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.RANGE_RINGS,
+                    name="Range Rings",
+                    geometry_type="Polygon",
+                    fields=RANGE_RING_FIELDS,
+                    metadata={"sartracker:type": "range_ring", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_BEARING_LINES,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=7,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.BEARING_LINES,
+                    name="Bearing Lines",
+                    geometry_type="LineString",
+                    fields=BEARING_LINE_FIELDS,
+                    metadata={"sartracker:type": "bearing_line", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_LINES,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=8,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.LINES,
+                    name="Lines",
+                    geometry_type="LineString",
+                    fields=LINES_FIELDS,
+                    metadata={"sartracker:type": "line", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+        GroupDefinition(
+            name=GroupNames.MAP_TOOLS_TEXT_LABELS,
+            parent_path=[GroupNames.ROOT, GroupNames.MAP_TOOLS],
+            position=9,
+            layers=[
+                LayerDefinition(
+                    layer_id=LayerIds.TEXT_LABELS,
+                    name="Text Labels",
+                    geometry_type="Point",
+                    fields=TEXT_LABEL_FIELDS,
+                    metadata={"sartracker:type": "text_label", "sartracker:virtual": "true"},
+                    auto_create=False
+                )
+            ]
+        ),
+    ]
+
     # Define the complete structure
     root = GroupDefinition(
         name=GroupNames.ROOT,
         parent_path=None,
         metadata={"schema_version": str(SAR_LAYER_SCHEMA_VERSION)},
         subgroups=[
-            # Current Positions group
+            # Tracking group (per-device layers created dynamically)
             GroupDefinition(
-                name=GroupNames.CURRENT_POSITIONS,
+                name=GroupNames.TRACKING,
                 parent_path=[GroupNames.ROOT],
-                position=0,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.CURRENT_ACTIVE,
-                        name="Current – Active",
-                        geometry_type="Point",
-                        fields=CURRENT_POSITION_FIELDS,
-                        metadata={"sartracker:type": "current_position"},
-                        auto_create=True
-                    )
-                ]
-            ),
-
-            # Breadcrumbs group
-            GroupDefinition(
-                name=GroupNames.BREADCRUMBS,
-                parent_path=[GroupNames.ROOT],
-                position=1,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.BREADCRUMBS,
-                        name="Breadcrumbs",
-                        geometry_type="LineString",
-                        fields=BREADCRUMB_FIELDS,
-                        metadata={"sartracker:type": "breadcrumb"},
-                        auto_create=True
-                    )
-                ]
+                position=0
             ),
 
             # Helicopters group
             GroupDefinition(
                 name=GroupNames.HELICOPTERS,
                 parent_path=[GroupNames.ROOT],
-                position=2,
+                position=1,
                 layers=[
                     LayerDefinition(
                         layer_id=LayerIds.HELICOPTER_1,
@@ -626,100 +873,15 @@ def get_expected_structure() -> GroupDefinition:
                 ]
             ),
 
-            # Mission Overlays group
+            # Map Tools group (per-item layers only)
             GroupDefinition(
-                name=GroupNames.MISSION_OVERLAYS,
+                name=GroupNames.MAP_TOOLS,
                 parent_path=[GroupNames.ROOT],
-                position=3,
-                layers=[
-                    LayerDefinition(
-                        layer_id=LayerIds.SEARCH_AREAS,
-                        name="Search Areas",
-                        geometry_type="Polygon",
-                        fields=SEARCH_AREA_FIELDS,
-                        metadata={"sartracker:type": "search_area"},
-                        auto_create=False  # Phase 4: Search Areas now use per-item layers under Map Tools/Search Areas
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.SEARCH_SECTORS,
-                        name="Search Sectors",
-                        geometry_type="Polygon",
-                        fields=SEARCH_SECTOR_FIELDS,
-                        metadata={"sartracker:type": "search_sector"},
-                        auto_create=True
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.TEXT_LABELS,
-                        name="Text Labels",
-                        geometry_type="Point",
-                        fields=TEXT_LABEL_FIELDS,
-                        metadata={"sartracker:type": "text_label"},
-                        auto_create=True
-                    ),
-                    # Phase 4: Drawing layers kept for fallback compatibility
-                    # These are used when per-item factory is not available (no mission store)
-                    # auto_create=False since Phase 4 prefers per-item layers
-                    LayerDefinition(
-                        layer_id=LayerIds.LINES,
-                        name="Lines",
-                        geometry_type="LineString",
-                        fields=LINES_FIELDS,
-                        metadata={"sartracker:type": "line"},
-                        auto_create=False
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.RANGE_RINGS,
-                        name="Range Rings",
-                        geometry_type="Polygon",
-                        fields=RANGE_RING_FIELDS,
-                        metadata={"sartracker:type": "range_ring"},
-                        auto_create=False
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.BEARING_LINES,
-                        name="Bearing Lines",
-                        geometry_type="LineString",
-                        fields=BEARING_LINE_FIELDS,
-                        metadata={"sartracker:type": "bearing_line"},
-                        auto_create=False
-                    ),
-                    # Phase 4: Marker layers kept for fallback compatibility
-                    # These are used when per-item factory is not available (no mission store)
-                    # auto_create=False since Phase 4 prefers per-item layers
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_IPP_LKP,
-                        name="IPP/LKP",
-                        geometry_type="Point",
-                        fields=IPP_LKP_FIELDS,
-                        metadata={"sartracker:type": "marker_ipp_lkp"},
-                        auto_create=False
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_CLUES,
-                        name="Clues",
-                        geometry_type="Point",
-                        fields=CLUE_FIELDS,
-                        metadata={"sartracker:type": "marker_clue"},
-                        auto_create=False
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_HAZARDS,
-                        name="Hazards",
-                        geometry_type="Point",
-                        fields=HAZARD_FIELDS,
-                        metadata={"sartracker:type": "marker_hazard"},
-                        auto_create=False
-                    ),
-                    LayerDefinition(
-                        layer_id=LayerIds.MARKERS_CASUALTIES,
-                        name="Casualties",
-                        geometry_type="Point",
-                        fields=CASUALTY_FIELDS,
-                        metadata={"sartracker:type": "marker_casualty"},
-                        auto_create=False
-                    )
-                ]
-            )
+                position=2,
+                subgroups=map_tools_subgroups
+            ),
+
+            # Mission Overlays group removed from canonical schema (legacy only)
         ]
     )
 
@@ -775,8 +937,6 @@ def get_layer_by_id(layer_id: str) -> Optional[LayerDefinition]:
 
 # Artifact type to layer ID mapping
 ARTIFACT_LAYER_MAP = {
-    "current_position": LayerIds.CURRENT_ACTIVE,
-    "breadcrumb": LayerIds.BREADCRUMBS,
     "line": LayerIds.LINES,
     "bearing_line": LayerIds.BEARING_LINES,
     "range_ring": LayerIds.RANGE_RINGS,
@@ -790,7 +950,7 @@ ARTIFACT_LAYER_MAP = {
     "helicopter_4": LayerIds.HELICOPTER_4,
     "search_area": LayerIds.SEARCH_AREAS,
     "search_sector": LayerIds.SEARCH_SECTORS,
-    "text_label": LayerIds.TEXT_LABELS
+    "text_label": LayerIds.TEXT_LABELS,
 }
 
 
@@ -803,16 +963,18 @@ LEGACY_LAYER_NAMES = {
     "IPP / LKP": LayerIds.MARKERS_IPP_LKP,
     "Clues": LayerIds.MARKERS_CLUES,
     "Hazards": LayerIds.MARKERS_HAZARDS,
-    "Casualties": LayerIds.MARKERS_CASUALTIES
+    "Casualties": LayerIds.MARKERS_CASUALTIES,
+    "Search Areas": LayerIds.SEARCH_AREAS,
+    "Search Sectors": LayerIds.SEARCH_SECTORS,
+    "Bearing Lines": LayerIds.BEARING_LINES,
+    "Text Labels": LayerIds.TEXT_LABELS,
 }
 
 
 # Layer tree placement mapping (used during migrations and when inserting layers)
 # Phase 4: All drawing/marker items now use Map Tools hierarchy
 LAYER_GROUP_PATHS = {
-    # Tracking layers (not yet per-item)
-    "Current Positions": [GroupNames.ROOT, GroupNames.CURRENT_POSITIONS],
-    "Breadcrumbs": [GroupNames.ROOT, GroupNames.BREADCRUMBS],
+    # Legacy tracking layers (handled via migration; do not auto-create groups)
     # Map Tools - Drawing items (per-item layers)
     "Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_LINES],
     "Bearing Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_BEARING_LINES],
@@ -824,9 +986,9 @@ LAYER_GROUP_PATHS = {
     "Clues": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_CLUES],
     "Hazards": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_HAZARDS],
     "Casualties": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_CASUALTIES],
-    # Mission Overlays - legacy items (sectors, text labels still use shared layers)
-    "Search Sectors": [GroupNames.ROOT, GroupNames.MISSION_OVERLAYS],
-    "Text Labels": [GroupNames.ROOT, GroupNames.MISSION_OVERLAYS],
+    # Map Tools - legacy shared items (sectors, text labels)
+    "Search Sectors": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_SEARCH_SECTORS],
+    "Text Labels": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_TEXT_LABELS],
     # Helicopters
     "Helicopter 1": [GroupNames.ROOT, GroupNames.HELICOPTERS],
     "Helicopter 2": [GroupNames.ROOT, GroupNames.HELICOPTERS],
@@ -858,9 +1020,11 @@ def get_per_item_group_path(item_type: str) -> List[str]:
         "marker_hazard": GroupNames.MAP_TOOLS_HAZARDS,
         "marker_casualty": GroupNames.MAP_TOOLS_CASUALTIES,
         "search_area": GroupNames.MAP_TOOLS_SEARCH_AREAS,
+        "search_sector": GroupNames.MAP_TOOLS_SEARCH_SECTORS,
         "range_ring": GroupNames.MAP_TOOLS_RANGE_RINGS,
         "bearing_line": GroupNames.MAP_TOOLS_BEARING_LINES,
         "line": GroupNames.MAP_TOOLS_LINES,
+        "text_label": GroupNames.MAP_TOOLS_TEXT_LABELS,
     }
 
     subgroup = PER_ITEM_GROUP_MAP.get(item_type)
@@ -928,4 +1092,5 @@ LAYER_FIELD_CHECKS = {
     "Search Areas": ["team", "status", "priority"],
     "Search Sectors": ["start_bearing", "end_bearing"],
     "Text Labels": ["text", "font_size"],
+    "Bearing Lines": ["bearing", "origin_lat", "origin_lon"],
 }

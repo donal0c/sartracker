@@ -356,38 +356,6 @@ def test_ten_devices_performance():
     return True
 
 
-def test_fallback_to_shared():
-    """Test fallback to shared layer when factory unavailable."""
-    print("\n=== Test: Fallback to Shared Layer ===")
-    tm = get_tracking_manager()
-
-    # Temporarily disable per-device
-    original_flag = tm.USE_PER_DEVICE_POSITIONS
-    tm.USE_PER_DEVICE_POSITIONS = False
-
-    try:
-        device_id = "test_fallback_device"
-        device_name = "Test Fallback"
-        position = create_mock_position(device_id, device_name)
-
-        print("  With USE_PER_DEVICE_POSITIONS=False...")
-        tm.update_current_positions([position])
-
-        # Should NOT create a per-device layer
-        layer = find_device_position_layer(device_id)
-        if layer:
-            print(f"  [FAIL] Per-device layer created when flag is False")
-            return False
-        else:
-            print("  [PASS] No per-device layer created (fallback to shared)")
-
-        return True
-    finally:
-        # Restore flag
-        tm.USE_PER_DEVICE_POSITIONS = original_flag
-        print(f"  Restored USE_PER_DEVICE_POSITIONS={original_flag}")
-
-
 # =============================================================================
 # Trail Tests (Phase 2 - SAR-nj0)
 # =============================================================================

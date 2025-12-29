@@ -21,6 +21,7 @@ from collections import OrderedDict
 from pathlib import Path
 import uuid
 import logging
+import math
 from datetime import datetime, timezone
 
 # Set up logger for this module
@@ -121,6 +122,9 @@ class DrawingLayerManager(BaseLayerManager):
     # Maximum number of GPX file paths to track (prevents unbounded memory growth)
     MAX_GPX_IMPORT_HISTORY = 100
 
+    # Maximum text label length (GeoPackage/SQLite VARCHAR limit)
+    MAX_TEXT_LABEL_LENGTH = 255
+
     # Phase 4: Enable per-item layers for specific drawing types
     # When True, new drawings of these types create individual layers
     # When False, use legacy shared layers (backward compatibility)
@@ -129,8 +133,8 @@ class DrawingLayerManager(BaseLayerManager):
         "range_ring": True,     # Phase 4 Step 3: Range Rings use per-item layers
         "bearing_line": True,   # Phase 4 Step 3: Bearing Lines use per-item layers
         "line": True,           # Phase 4 Step 3: Lines use per-item layers
-        "sector": False,        # Keep legacy for now
-        "text_label": False,    # Keep legacy for now
+        "sector": True,         # Search sectors use per-item layers
+        "text_label": True,     # Text labels use per-item layers
     }
 
     def __init__(self, iface, shared_device_colors=None, layer_manager=None):
@@ -257,6 +261,8 @@ class DrawingLayerManager(BaseLayerManager):
             LayerIds.SEARCH_AREAS: ("search_area", ItemType.SEARCH_AREA),
             LayerIds.RANGE_RINGS: ("range_ring", ItemType.RANGE_RING),
             LayerIds.BEARING_LINES: ("bearing_line", ItemType.BEARING_LINE),
+            LayerIds.SEARCH_SECTORS: ("sector", ItemType.SEARCH_SECTOR),
+            LayerIds.TEXT_LABELS: ("text_label", ItemType.TEXT_LABEL),
         }
         mapping = layer_map.get(layer_id)
         if not mapping:
@@ -302,32 +308,19 @@ class DrawingLayerManager(BaseLayerManager):
                 exc
             )
 
-    def _get_per_item_factory(self) -> Optional[PerItemLayerFactory]:
+    def _get_per_item_factory(self) -> PerItemLayerFactory:
         """
         Get or create the PerItemLayerFactory for per-item layers.
 
-        Returns None if no mission store is configured (layers will be memory-only).
-
         Returns:
-            PerItemLayerFactory or None
+            PerItemLayerFactory
         """
         # Return cached factory if available
         if self._per_item_factory is not None:
             return self._per_item_factory
 
-        # Get mission store path from layer manager
-        if not self.layer_manager:
-            return None
-
-        layer_manager = self._require_layer_manager()
-        gpkg_path = layer_manager.get_mission_store()
-
-        if not gpkg_path:
-            logger.warning(
-                "Phase 4: No mission store configured - per-item layers will not persist. "
-                "Configure a mission store to enable persistent per-item layers."
-            )
-            return None
+        # Mission store required for per-item layers
+        gpkg_path = self._require_mission_store("Per-item drawing operations")
 
         # Create factory
         self._per_item_factory = PerItemLayerFactory(
@@ -553,6 +546,25 @@ class DrawingLayerManager(BaseLayerManager):
             details=f"Could not obtain or recreate layer '{layer_name}'. "
                     "Check GeoPackage file locks and project settings."
         )
+
+    def _get_shared_layer_if_exists(self, layer_id: str, layer_name: str) -> Optional[QgsVectorLayer]:
+        """
+        Return an existing shared layer without creating placeholders.
+
+        Used for legacy layers when per-item mode is enabled.
+        """
+        if self.layer_manager:
+            layer = self.layer_manager.get_layer(layer_id)
+            if layer and layer.isValid():
+                return layer
+
+        layers = self.project.mapLayersByName(layer_name)
+        if layers:
+            layer = layers[0]
+            if layer and layer.isValid():
+                return layer
+
+        return None
 
     def _notify_error(self, title: str, message: str):
         """Show a user-facing error if iface/messageBar is available.
@@ -2401,7 +2413,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
                    start_bearing: float, end_bearing: float, radius_m: float,
-                   priority: str = "Medium", color: str = "#FF6464") -> int:
+                   priority: str = "Medium", color: str = "#FF6464") -> Union[int, str]:
         """
         Add a sector/wedge feature.
 
@@ -2415,7 +2427,8 @@ class DrawingLayerManager(BaseLayerManager):
             color: Hex color string
 
         Returns:
-            int: Feature ID of added sector
+            int: Feature ID of added sector (shared layer)
+            str: item_id for per-item layer
         """
         try:
             validate_point(center_wgs84, "center_wgs84")
@@ -2427,7 +2440,46 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Sector Failed", str(exc))
             raise
 
-        layer = self._get_or_create_sectors_layer()
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("sector"):
+            return self._add_sector_per_item(
+                name=name,
+                center_wgs84=center_wgs84,
+                start_bearing=start_bearing,
+                end_bearing=end_bearing,
+                radius_m=radius_m,
+                priority=priority,
+                color=color
+            )
+
+        # Legacy path: shared layer
+        return self._add_sector_shared_layer(
+            name=name,
+            center_wgs84=center_wgs84,
+            start_bearing=start_bearing,
+            end_bearing=end_bearing,
+            radius_m=radius_m,
+            priority=priority,
+            color=color
+        )
+
+    def _add_sector_shared_layer(
+        self,
+        name: str,
+        center_wgs84: QgsPointXY,
+        start_bearing: float,
+        end_bearing: float,
+        radius_m: float,
+        priority: str,
+        color: str
+    ) -> int:
+        """Legacy implementation: Add search sector to shared layer."""
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Sectors layer not available")
 
         try:
             points_deg = geodesic_sector_points(
@@ -2522,31 +2574,204 @@ class DrawingLayerManager(BaseLayerManager):
         )
         return feature.id()
 
+    def _add_sector_per_item(
+        self,
+        name: str,
+        center_wgs84: QgsPointXY,
+        start_bearing: float,
+        end_bearing: float,
+        radius_m: float,
+        priority: str,
+        color: str
+    ) -> str:
+        """
+        Phase 4: Add search sector as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this sector,
+        placed under "SAR Tracker / Map Tools / Search Sectors /".
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            logger.warning("Phase 4: No factory available, falling back to shared layer for sector")
+            return self._add_sector_shared_layer(
+                name=name,
+                center_wgs84=center_wgs84,
+                start_bearing=start_bearing,
+                end_bearing=end_bearing,
+                radius_m=radius_m,
+                priority=priority,
+                color=color
+            )
+
+        target_group = self._ensure_per_item_group(ItemType.SEARCH_SECTOR)
+
+        sector_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "name", "type": "String", "length": 255},
+            {"name": "center_lat", "type": "Double"},
+            {"name": "center_lon", "type": "Double"},
+            {"name": "start_bearing", "type": "Double"},
+            {"name": "end_bearing", "type": "Double"},
+            {"name": "radius_m", "type": "Double"},
+            {"name": "arc_length_deg", "type": "Double"},
+            {"name": "area_sqkm", "type": "Double"},
+            {"name": "priority", "type": "String", "length": 50},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.SEARCH_SECTOR,
+                display_name=name,
+                fields=sector_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for sector '%s': %s", name, e)
+            raise RuntimeError(f"Failed to create per-item sector layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError(f"Per-item layer created but invalid for sector '{name}'")
+
+        try:
+            points_deg = geodesic_sector_points(
+                center_wgs84.x(),
+                center_wgs84.y(),
+                start_bearing,
+                end_bearing,
+                radius_m,
+                num_segments=36
+            )
+            points = [QgsPointXY(lon, lat) for lon, lat in points_deg]
+            sector_geom = QgsGeometry.fromPolygonXY([points])
+            self._assert_valid_sector_geometry(sector_geom, name)
+        except GeometryError as exc:
+            self._notify_error("Add Sector Failed", str(exc))
+            raise
+
+        arc_length_deg = calculate_sector_arc_length(start_bearing, end_bearing)
+
+        distance_calc = QgsDistanceArea()
+        distance_calc.setSourceCrs(layer.crs(), QgsProject.instance().transformContext())
+        distance_calc.setEllipsoid('WGS84')
+        area_sqm = distance_calc.measureArea(sector_geom)
+        area_sqkm = area_sqm / 1000000.0
+
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(sector_geom)
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,
+            "name": name,
+            "center_lat": float(center_wgs84.y()),
+            "center_lon": float(center_wgs84.x()),
+            "start_bearing": float(start_bearing),
+            "end_bearing": float(end_bearing),
+            "radius_m": float(radius_m),
+            "arc_length_deg": float(arc_length_deg),
+            "area_sqkm": float(area_sqkm),
+            "priority": priority,
+            "color": color,
+            "created": created_ts,
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item sector layer '{name}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "SECTORS", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "sector")
+            raise LayerTransactionError(
+                name,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        self._style_sectors_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item sector layer '%s' (item_id=%s) under Map Tools/Search Sectors",
+            name, item_id
+        )
+        return item_id
+
     # -------------------------------------------------------------------------
     # Sectors - Full CRUD (Phase 2)
     # -------------------------------------------------------------------------
 
     def list_sectors(self, filters: Optional[Dict] = None) -> List[Dict]:
         """List all search sector features."""
-        layer = self._get_or_create_sectors_layer()
-        if not layer or not layer.isValid():
-            return []
+        records: List[Dict[str, Any]] = []
 
-        request = self._build_filter_request(layer, filters)
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
 
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                rec = self._feature_to_record(feature, layer)
-                if rec:
-                    records.append(rec)
-        except Exception as exc:
-            logger.error("Error listing sectors: %s", exc, exc_info=True)
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
+
+            try:
+                for feature in layer.getFeatures(request):
+                    rec = self._feature_to_record(feature, layer)
+                    if rec:
+                        records.append(rec)
+            except Exception as exc:
+                logger.error("Error listing sectors: %s", exc, exc_info=True)
+
+        if self._uses_per_item_layers("sector"):
+            records.extend(self._list_per_item_records(ItemType.SEARCH_SECTOR))
+
         return self._sort_records_by_display_order(records)
 
-    def get_sector(self, feature_id: int) -> Optional[Dict]:
+    def get_sector(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """Get a single search sector by feature id."""
-        layer = self._get_or_create_sectors_layer()
+        if isinstance(feature_id, str) and self._uses_per_item_layers("sector") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.SEARCH_SECTOR, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
+        # Use same pattern as list_sectors() to avoid creating shared layer in per-item mode
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
         if not layer or not layer.isValid():
             return None
         feature = layer.getFeature(feature_id)
@@ -2554,14 +2779,37 @@ class DrawingLayerManager(BaseLayerManager):
             return None
         return self._feature_to_record(feature, layer)
 
-    def update_sector(self, feature_id: int, updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
+    def update_sector(self, feature_id: Union[int, str], updates: Dict[str, Any], updated_by: Optional[str] = None) -> bool:
         """Update a search sector feature."""
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("sector") and self._is_uuid(feature_id):
+            return self._update_sector_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
         if not isinstance(updates, dict) or not updates:
             raise ValueError("updates must be a non-empty dictionary")
 
-        layer = self._get_or_create_sectors_layer()
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
+
+        if not layer:
+            raise RuntimeError("Sectors layer not available")
+        return self._update_sector_feature(layer, feature_id, updates)
+
+    def _update_sector_feature(
+        self,
+        layer: QgsVectorLayer,
+        feature_id: int,
+        updates: Dict[str, Any]
+    ) -> bool:
+        """Update a search sector feature in the provided layer."""
         if not layer or not layer.isValid():
             raise RuntimeError("Sectors layer not available")
 
@@ -2690,12 +2938,48 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
-    def delete_sector(self, feature_id: int, updated_by: Optional[str] = None) -> bool:
+    def _update_sector_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item sector."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.SEARCH_SECTOR, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item sector '{item_id}' not found")
+
+        feature = self._get_single_feature(layer)
+        if not feature or not feature.isValid():
+            raise ValueError(f"Per-item sector '{item_id}' has no feature")
+
+        result = self._update_sector_feature(layer, feature.id(), updates)
+        if result and "name" in updates and updates["name"]:
+            factory = self._get_per_item_factory()
+            if factory:
+                factory.rename_item_layer(item_id, str(updates["name"]))
+        return result
+
+    def delete_sector(self, feature_id: Union[int, str], updated_by: Optional[str] = None) -> bool:
         """Delete a single search sector."""
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("sector") and self._is_uuid(feature_id):
+            return self._delete_sector_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
-        layer = self._get_or_create_sectors_layer()
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Sectors layer not available")
 
@@ -2731,15 +3015,67 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
-    def delete_sectors(self, feature_ids: List[int], updated_by: Optional[str] = None) -> int:
+    def _delete_sector_per_item(self, item_id: str, updated_by: Optional[str] = None) -> bool:
+        """Delete a per-item sector layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for sector deletion")
+
+        layer = self._get_per_item_layer(ItemType.SEARCH_SECTOR, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item sector '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item sector '{item_id}'")
+
+        return True
+
+    def delete_sectors(self, feature_ids: List[Union[int, str]], updated_by: Optional[str] = None) -> int:
         """Bulk delete search sectors."""
         if not feature_ids:
             return 0
 
-        if len(feature_ids) > self.MAX_SYNC_FEATURES:
-            logger.warning("Deleting %s sector features synchronously; consider background task", len(feature_ids))
+        deleted = 0
+        per_item_ids = [
+            fid for fid in feature_ids
+            if isinstance(fid, str) and self._uses_per_item_layers("sector") and self._is_uuid(fid)
+        ]
+        if per_item_ids:
+            for item_id in per_item_ids:
+                try:
+                    if self._delete_sector_per_item(item_id, updated_by):
+                        deleted += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to delete per-item sector '%s': %s",
+                        item_id, exc, exc_info=True
+                    )
+                    # Continue processing remaining items
 
-        layer = self._get_or_create_sectors_layer()
+        shared_ids: List[int] = []
+        for fid in feature_ids:
+            if isinstance(fid, str) and self._is_uuid(fid):
+                continue
+            try:
+                shared_ids.append(int(fid))
+            except (TypeError, ValueError):
+                continue
+
+        if not shared_ids:
+            return deleted
+
+        if len(shared_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s sector features synchronously; consider background task", len(shared_ids))
+
+        if self._uses_per_item_layers("sector"):
+            layer = self._get_shared_layer_if_exists(LayerIds.SEARCH_SECTORS, self.SECTORS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_sectors_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Sectors layer not available")
 
@@ -2754,8 +3090,7 @@ class DrawingLayerManager(BaseLayerManager):
             )
 
         try:
-            deleted = 0
-            for fid in feature_ids:
+            for fid in shared_ids:
                 if layer.deleteFeature(fid):
                     deleted += 1
 
@@ -2840,7 +3175,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def add_text_label(self, text: str, location_wgs84: QgsPointXY,
                        font_size: int = 12, color: str = "#000000",
-                       rotation: float = 0.0) -> int:
+                       rotation: float = 0.0) -> Union[int, str]:
         """
         Add a text label annotation.
 
@@ -2852,11 +3187,22 @@ class DrawingLayerManager(BaseLayerManager):
             rotation: Rotation angle in degrees
 
         Returns:
-            int: Feature ID of added label
+            int: Feature ID of added label (shared layer)
+            str: item_id for per-item layer
         """
         # Validate text is not empty or whitespace-only
         if not text or not text.strip():
             raise ValueError("Text label cannot be empty or whitespace-only")
+
+        # Use stripped text (remove leading/trailing whitespace)
+        text = text.strip()
+
+        # Validate text length (GeoPackage/SQLite VARCHAR limit)
+        if len(text) > self.MAX_TEXT_LABEL_LENGTH:
+            raise ValueError(
+                f"Text label must be {self.MAX_TEXT_LABEL_LENGTH} characters or less "
+                f"(got {len(text)})"
+            )
 
         try:
             validate_point(location_wgs84, "location_wgs84")
@@ -2866,10 +3212,49 @@ class DrawingLayerManager(BaseLayerManager):
             self._notify_error("Add Text Label Failed", str(exc))
             raise
 
-        # Use stripped text (remove leading/trailing whitespace)
-        text = text.strip()
+        # Validate rotation is a finite number and normalize to float
+        try:
+            rotation_val = float(rotation)
+            if not math.isfinite(rotation_val):
+                raise ValueError("rotation must be a finite number (not NaN or Inf)")
+        except (TypeError, ValueError) as exc:
+            self._notify_error("Add Text Label Failed", f"Invalid rotation: {exc}")
+            raise ValueError(f"Invalid rotation: {exc}") from exc
 
-        layer = self._get_or_create_text_labels_layer()
+        # Phase 4: Check if we should use per-item layers
+        if self._uses_per_item_layers("text_label"):
+            return self._add_text_label_per_item(
+                text=text,
+                location_wgs84=location_wgs84,
+                font_size=font_size,
+                color=color,
+                rotation=rotation_val  # Use validated/normalized value
+            )
+
+        # Legacy path: shared layer
+        return self._add_text_label_shared_layer(
+            text=text,
+            location_wgs84=location_wgs84,
+            font_size=font_size,
+            color=color,
+            rotation=rotation_val  # Use validated/normalized value
+        )
+
+    def _add_text_label_shared_layer(
+        self,
+        text: str,
+        location_wgs84: QgsPointXY,
+        font_size: int,
+        color: str,
+        rotation: float
+    ) -> int:
+        """Legacy implementation: Add text label to shared layer."""
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
+        if not layer or not layer.isValid():
+            raise RuntimeError("Text labels layer not available")
 
         # Create feature
         feature = QgsFeature(layer.fields())
@@ -2927,6 +3312,117 @@ class DrawingLayerManager(BaseLayerManager):
             rotation=rotation
         )
         return feature.id()
+
+    def _add_text_label_per_item(
+        self,
+        text: str,
+        location_wgs84: QgsPointXY,
+        font_size: int,
+        color: str,
+        rotation: float
+    ) -> str:
+        """
+        Phase 4: Add text label as a per-item layer.
+
+        Creates an individual GeoPackage-backed layer for this text label,
+        placed under "SAR Tracker / Map Tools / Text Labels /".
+
+        Returns:
+            str: item_id (which serves as the feature identifier)
+        """
+        factory = self._get_per_item_factory()
+        if not factory:
+            logger.warning("Phase 4: No factory available, falling back to shared layer for text label")
+            return self._add_text_label_shared_layer(
+                text=text,
+                location_wgs84=location_wgs84,
+                font_size=font_size,
+                color=color,
+                rotation=rotation
+            )
+
+        target_group = self._ensure_per_item_group(ItemType.TEXT_LABEL)
+
+        label_fields = [
+            {"name": "id", "type": "String", "length": 50},
+            {"name": "text", "type": "String", "length": 255},
+            {"name": "lat", "type": "Double"},
+            {"name": "lon", "type": "Double"},
+            {"name": "font_size", "type": "Int"},
+            {"name": "color", "type": "String", "length": 20},
+            {"name": "rotation", "type": "Double"},
+            {"name": "created", "type": "String", "length": 50},
+            {"name": "display_order", "type": "Int"},
+        ]
+
+        try:
+            item_info = factory.create_item_layer(
+                item_type=ItemType.TEXT_LABEL,
+                display_name=text,
+                fields=label_fields,
+                add_to_project=True,
+                target_group=target_group
+            )
+        except Exception as e:
+            logger.error("Phase 4: Failed to create per-item layer for text label '%s': %s", text, e)
+            raise RuntimeError(f"Failed to create per-item text label layer: {e}") from e
+
+        layer = item_info.layer
+        item_id = item_info.item_id
+
+        if not layer or not layer.isValid():
+            raise RuntimeError("Per-item text label layer created but invalid")
+
+        feature = QgsFeature(layer.fields())
+        feature.setGeometry(QgsGeometry.fromPointXY(location_wgs84))
+
+        created_ts = datetime.now(timezone.utc).isoformat()
+        attr_map = {
+            "id": item_id,
+            "text": text,
+            "lat": float(location_wgs84.y()),
+            "lon": float(location_wgs84.x()),
+            "font_size": int(font_size),
+            "color": color,
+            "rotation": float(rotation),
+            "created": created_ts,
+        }
+        fields = layer.fields()
+        for field_name, value in attr_map.items():
+            idx = fields.indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        layer.startEditing()
+        try:
+            if not layer.addFeature(feature):
+                layer.rollBack()
+                raise RuntimeError(f"Failed to add feature to per-item text label layer '{text}'")
+            self._set_display_order(layer, feature.id())
+            self._safe_commit(layer, "add", "TEXT_LABELS", {})
+        except Exception as e:
+            layer.rollBack()
+            self._cleanup_failed_per_item_layer(factory, item_id, "text label")
+            raise LayerTransactionError(
+                text,
+                "add feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer.isEditable():
+                layer.rollBack()
+
+        self._style_text_labels_layer(layer)
+
+        layer.triggerRepaint()
+        logger.info(
+            "Phase 4: Created per-item text label layer '%s' (item_id=%s) under Map Tools/Text Labels",
+            text, item_id
+        )
+        return item_id
 
     # =========================================================================
     # Phase 2: Full CRUD Operations for All Drawing Types
@@ -3203,7 +3699,7 @@ class DrawingLayerManager(BaseLayerManager):
             # Add audit trail if updated_by provided
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             # Apply each update
             for field_name, value in updates.items():
@@ -3319,7 +3815,7 @@ class DrawingLayerManager(BaseLayerManager):
 
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
@@ -3664,7 +4160,7 @@ class DrawingLayerManager(BaseLayerManager):
                     raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             # Validate range ring-specific fields
             if 'radius_m' in updates:
@@ -3749,7 +4245,7 @@ class DrawingLayerManager(BaseLayerManager):
 
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             if 'radius_m' in updates:
                 validate_positive_number(updates['radius_m'], "radius_m")
@@ -4079,7 +4575,7 @@ class DrawingLayerManager(BaseLayerManager):
                     raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             # Validate bearing line-specific fields
             if 'bearing' in updates:
@@ -4166,7 +4662,7 @@ class DrawingLayerManager(BaseLayerManager):
 
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
 
             if 'bearing' in updates:
                 validate_bearing(updates['bearing'], "bearing")
@@ -4386,24 +4882,29 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             List of feature dictionaries
         """
-        layer = self._get_or_create_text_labels_layer()
-        if not layer or not layer.isValid():
-            return []
+        records: List[Dict[str, Any]] = []
 
-        request = self._build_filter_request(layer, filters)
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
+        if layer and layer.isValid():
+            request = self._build_filter_request(layer, filters)
 
-        records = []
-        try:
-            for feature in layer.getFeatures(request):
-                record = self._feature_to_record(feature, layer)
-                if record:
-                    records.append(record)
-        except Exception as e:
-            logger.error(f"Error listing text labels: {e}", exc_info=True)
+            try:
+                for feature in layer.getFeatures(request):
+                    record = self._feature_to_record(feature, layer)
+                    if record:
+                        records.append(record)
+            except Exception as e:
+                logger.error(f"Error listing text labels: {e}", exc_info=True)
+
+        if self._uses_per_item_layers("text_label"):
+            records.extend(self._list_per_item_records(ItemType.TEXT_LABEL))
 
         return self._sort_records_by_display_order(records)
 
-    def get_text_label(self, feature_id: int) -> Optional[Dict]:
+    def get_text_label(self, feature_id: Union[int, str]) -> Optional[Dict]:
         """
         Get single text label by feature ID.
 
@@ -4413,7 +4914,25 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             Feature dictionary or None if not found
         """
-        layer = self._get_or_create_text_labels_layer()
+        if isinstance(feature_id, str) and self._uses_per_item_layers("text_label") and self._is_uuid(feature_id):
+            layer = self._get_per_item_layer(ItemType.TEXT_LABEL, feature_id)
+            if not layer:
+                return None
+            feature = self._get_single_feature(layer)
+            if not feature or not feature.isValid():
+                return None
+            return self._feature_to_record(feature, layer)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                return None
+
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
         if not layer or not layer.isValid():
             return None
 
@@ -4425,7 +4944,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def update_text_label(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updates: Dict[str, Any],
         updated_by: Optional[str] = None
     ) -> bool:
@@ -4440,13 +4959,24 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             True on success
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("text_label") and self._is_uuid(feature_id):
+            return self._update_text_label_per_item(feature_id, updates, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
         if not isinstance(updates, dict) or not updates:
             raise ValueError("updates must be a non-empty dictionary")
 
-        layer = self._get_or_create_text_labels_layer()
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Text labels layer not available")
 
@@ -4472,7 +5002,30 @@ class DrawingLayerManager(BaseLayerManager):
                     raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
             if updated_by:
                 updates['updated_by'] = updated_by
-                updates['updated_at'] = datetime.now().isoformat()
+                updates['updated_at'] = self._current_timestamp()
+
+            if 'text' in updates:
+                new_text = str(updates['text']).strip() if updates['text'] is not None else ""
+                if not new_text:
+                    raise ValueError("Text label cannot be empty or whitespace-only")
+                if len(new_text) > self.MAX_TEXT_LABEL_LENGTH:
+                    raise ValueError(
+                        f"Text label must be {self.MAX_TEXT_LABEL_LENGTH} characters or less "
+                        f"(got {len(new_text)})"
+                    )
+                updates['text'] = new_text
+            if 'font_size' in updates:
+                validate_font_size(updates['font_size'], "font_size")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'rotation' in updates:
+                try:
+                    rotation_val = float(updates['rotation'])
+                    if not math.isfinite(rotation_val):
+                        raise ValueError("rotation must be a finite number (not NaN or Inf)")
+                    updates['rotation'] = rotation_val  # Normalize to float
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid rotation: {exc}") from exc
 
             for field_name, value in updates.items():
                 field_index = layer.fields().indexFromName(field_name)
@@ -4487,19 +5040,107 @@ class DrawingLayerManager(BaseLayerManager):
 
             layer.triggerRepaint()
             logger.debug(f"Updated text label {feature_id}")
-
             return True
 
         except Exception as e:
             layer.rollBack()
             if isinstance(e, LayerTransactionError):
                 raise
-            else:
-                raise LayerTransactionError(
-                    layer_name=layer.name(),
-                    operation="update feature",
-                    details=str(e)
-                ) from e
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(e)
+            ) from e
+        finally:
+            if layer and layer.isValid() and layer.isEditable():
+                try:
+                    layer.rollBack()
+                except RuntimeError:
+                    pass
+
+    def _update_text_label_per_item(
+        self,
+        item_id: str,
+        updates: Dict[str, Any],
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Update attributes of a per-item text label."""
+        if not isinstance(updates, dict) or not updates:
+            raise ValueError("updates must be a non-empty dictionary")
+
+        layer = self._get_per_item_layer(ItemType.TEXT_LABEL, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item text label '{item_id}' not found")
+
+        feature = self._get_single_feature(layer)
+        if not feature or not feature.isValid():
+            raise ValueError(f"Per-item text label '{item_id}' has no feature")
+
+        if layer.isEditable():
+            raise LayerLockError(layer.name())
+
+        if not layer.startEditing():
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="start editing",
+                details="startEditing() returned False"
+            )
+
+        try:
+            field_names = [field.name() for field in layer.fields()]
+            for field_name in updates.keys():
+                if field_name not in field_names:
+                    raise ValueError(f"Invalid field: {field_name}. Valid fields: {field_names}")
+
+            if 'text' in updates:
+                new_text = str(updates['text']).strip() if updates['text'] is not None else ""
+                if not new_text:
+                    raise ValueError("Text label cannot be empty or whitespace-only")
+                if len(new_text) > self.MAX_TEXT_LABEL_LENGTH:
+                    raise ValueError(
+                        f"Text label must be {self.MAX_TEXT_LABEL_LENGTH} characters or less "
+                        f"(got {len(new_text)})"
+                    )
+                updates['text'] = new_text
+            if 'font_size' in updates:
+                validate_font_size(updates['font_size'], "font_size")
+            if 'color' in updates:
+                validate_color_hex(updates['color'], "color")
+            if 'rotation' in updates:
+                try:
+                    rotation_val = float(updates['rotation'])
+                    if not math.isfinite(rotation_val):
+                        raise ValueError("rotation must be a finite number (not NaN or Inf)")
+                    updates['rotation'] = rotation_val  # Normalize to float
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Invalid rotation: {exc}") from exc
+
+            for field_name, value in updates.items():
+                field_index = layer.fields().indexFromName(field_name)
+                if field_index == -1:
+                    continue
+                if not layer.changeAttributeValue(feature.id(), field_index, value):
+                    raise RuntimeError(f"Failed to update {field_name}")
+
+            self._safe_commit(layer, "update", "TEXT_LABELS", {"item_id": item_id, "feature_id": feature.id()})
+
+            if "text" in updates and updates["text"]:
+                factory = self._get_per_item_factory()
+                if factory:
+                    factory.rename_item_layer(item_id, str(updates["text"]))
+
+            layer.triggerRepaint()
+            return True
+
+        except Exception as e:
+            layer.rollBack()
+            if isinstance(e, LayerTransactionError):
+                raise
+            raise LayerTransactionError(
+                layer_name=layer.name(),
+                operation="update feature",
+                details=str(e)
+            ) from e
         finally:
             if layer and layer.isValid() and layer.isEditable():
                 try:
@@ -4509,7 +5150,7 @@ class DrawingLayerManager(BaseLayerManager):
 
     def delete_text_label(
         self,
-        feature_id: int,
+        feature_id: Union[int, str],
         updated_by: Optional[str] = None
     ) -> bool:
         """
@@ -4522,10 +5163,21 @@ class DrawingLayerManager(BaseLayerManager):
         Returns:
             True on success
         """
-        if not isinstance(feature_id, int) or feature_id <= 0:
+        if isinstance(feature_id, str) and self._uses_per_item_layers("text_label") and self._is_uuid(feature_id):
+            return self._delete_text_label_per_item(feature_id, updated_by)
+
+        if not isinstance(feature_id, int):
+            try:
+                feature_id = int(feature_id)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid feature_id: {feature_id}")
+        if feature_id <= 0:
             raise ValueError(f"Invalid feature_id: {feature_id}")
 
-        layer = self._get_or_create_text_labels_layer()
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Text labels layer not available")
 
@@ -4570,9 +5222,33 @@ class DrawingLayerManager(BaseLayerManager):
                 except RuntimeError:
                     pass
 
+    def _delete_text_label_per_item(
+        self,
+        item_id: str,
+        updated_by: Optional[str] = None
+    ) -> bool:
+        """Delete a per-item text label layer."""
+        factory = self._get_per_item_factory()
+        if not factory:
+            raise RuntimeError("Per-item factory unavailable for text label deletion")
+
+        layer = self._get_per_item_layer(ItemType.TEXT_LABEL, item_id)
+        if not layer or not layer.isValid():
+            raise ValueError(f"Per-item text label '{item_id}' not found")
+
+        success = factory.delete_item_layer(
+            item_id=item_id,
+            remove_table=False,
+            hard_delete=False
+        )
+        if not success:
+            raise RuntimeError(f"Failed to delete per-item text label '{item_id}'")
+
+        return True
+
     def delete_text_labels(
         self,
-        feature_ids: List[int],
+        feature_ids: List[Union[int, str]],
         updated_by: Optional[str] = None
     ) -> int:
         """
@@ -4588,10 +5264,42 @@ class DrawingLayerManager(BaseLayerManager):
         if not feature_ids:
             return 0
 
-        if len(feature_ids) > self.MAX_SYNC_FEATURES:
-            logger.warning("Deleting %s text label features synchronously; consider background task", len(feature_ids))
+        deleted = 0
+        per_item_ids = [
+            fid for fid in feature_ids
+            if isinstance(fid, str) and self._uses_per_item_layers("text_label") and self._is_uuid(fid)
+        ]
+        if per_item_ids:
+            for item_id in per_item_ids:
+                try:
+                    if self._delete_text_label_per_item(item_id, updated_by):
+                        deleted += 1
+                except Exception as exc:
+                    logger.error(
+                        "Failed to delete per-item text label '%s': %s",
+                        item_id, exc, exc_info=True
+                    )
+                    # Continue processing remaining items
 
-        layer = self._get_or_create_text_labels_layer()
+        shared_ids: List[int] = []
+        for fid in feature_ids:
+            if isinstance(fid, str) and self._is_uuid(fid):
+                continue
+            try:
+                shared_ids.append(int(fid))
+            except (TypeError, ValueError):
+                continue
+
+        if not shared_ids:
+            return deleted
+
+        if len(shared_ids) > self.MAX_SYNC_FEATURES:
+            logger.warning("Deleting %s text label features synchronously; consider background task", len(shared_ids))
+
+        if self._uses_per_item_layers("text_label"):
+            layer = self._get_shared_layer_if_exists(LayerIds.TEXT_LABELS, self.TEXT_LABELS_LAYER_NAME)
+        else:
+            layer = self._get_or_create_text_labels_layer()
         if not layer or not layer.isValid():
             raise RuntimeError("Text labels layer not available")
 
@@ -4607,8 +5315,7 @@ class DrawingLayerManager(BaseLayerManager):
             )
 
         try:
-            deleted = 0
-            for feature_id in feature_ids:
+            for feature_id in shared_ids:
                 if layer.deleteFeature(feature_id):
                     deleted += 1
 

@@ -56,6 +56,7 @@ class ItemType:
     MARKER_IPP_LKP = "marker_ipp_lkp"
     MARKER_CASUALTY = "marker_casualty"
     SEARCH_AREA = "search_area"
+    SEARCH_SECTOR = "search_sector"
     RANGE_RING = "range_ring"
     BEARING_LINE = "bearing_line"
     LINE = "line"
@@ -72,6 +73,7 @@ ITEM_GEOMETRY_TYPES = {
     ItemType.MARKER_IPP_LKP: "Point",
     ItemType.MARKER_CASUALTY: "Point",
     ItemType.SEARCH_AREA: "Polygon",
+    ItemType.SEARCH_SECTOR: "Polygon",
     ItemType.RANGE_RING: "Polygon",
     ItemType.BEARING_LINE: "LineString",
     ItemType.LINE: "LineString",
@@ -126,6 +128,7 @@ ITEM_NAME_PREFIXES = {
     ItemType.MARKER_IPP_LKP: "IPP",
     ItemType.MARKER_CASUALTY: "CAS",
     ItemType.SEARCH_AREA: "SAR",
+    ItemType.SEARCH_SECTOR: "SEC",
     ItemType.RANGE_RING: "RNG",
     ItemType.BEARING_LINE: "BRG",
     ItemType.LINE: "LNE",
@@ -180,10 +183,10 @@ def enable_wal_mode(gpkg_path: Path) -> bool:
     Returns:
         True if WAL mode enabled successfully
     """
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         result = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-        conn.close()
 
         success = result and result[0].upper() == "WAL"
         if success:
@@ -195,6 +198,9 @@ def enable_wal_mode(gpkg_path: Path) -> bool:
     except sqlite3.Error as e:
         logger.error("SQLite error enabling WAL mode for %s: %s", gpkg_path, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def checkpoint_wal(gpkg_path: Path) -> bool:
@@ -209,16 +215,19 @@ def checkpoint_wal(gpkg_path: Path) -> bool:
     Returns:
         True if checkpoint successful
     """
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        conn.close()
         logger.debug("WAL checkpoint completed for %s", gpkg_path.name)
         return True
 
     except sqlite3.Error as e:
         logger.error("SQLite error during WAL checkpoint for %s: %s", gpkg_path, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_gpkg_tables(gpkg_path: Path) -> List[str]:
@@ -231,18 +240,21 @@ def get_gpkg_tables(gpkg_path: Path) -> List[str]:
     Returns:
         List of table names (excluding gpkg_* system tables)
     """
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         cursor = conn.execute(
             "SELECT table_name FROM gpkg_contents WHERE data_type = 'features'"
         )
         tables = [row[0] for row in cursor.fetchall()]
-        conn.close()
         return tables
 
     except sqlite3.Error as e:
         logger.error("Error listing GeoPackage tables: %s", e)
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 # =============================================================================
@@ -266,18 +278,21 @@ def ensure_registry_table(gpkg_path: Path) -> bool:
         logger.debug("GeoPackage does not exist yet: %s", gpkg_path)
         return False
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         # Execute the CREATE statements (safe to run multiple times with IF NOT EXISTS)
         conn.executescript(REGISTRY_CREATE_SQL)
         conn.commit()
-        conn.close()
         logger.debug("Registry table ensured for %s", gpkg_path.name)
         return True
 
     except sqlite3.Error as e:
         logger.error("Failed to create registry table in %s: %s", gpkg_path, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_add_item(
@@ -308,6 +323,7 @@ def registry_add_item(
     """
     import json
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.execute(
@@ -329,7 +345,6 @@ def registry_add_item(
             )
         )
         conn.commit()
-        conn.close()
         logger.debug("Added item %s to registry", item_id)
         return True
 
@@ -339,6 +354,9 @@ def registry_add_item(
     except sqlite3.Error as e:
         logger.error("Failed to add item %s to registry: %s", item_id, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_update_item(
@@ -379,6 +397,7 @@ def registry_update_item(
     params.append(datetime.now(timezone.utc).isoformat())
     params.append(item_id)
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.execute(
@@ -386,12 +405,14 @@ def registry_update_item(
             params
         )
         conn.commit()
-        conn.close()
         return True
 
     except sqlite3.Error as e:
         logger.error("Failed to update item %s in registry: %s", item_id, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_soft_delete_item(gpkg_path: Path, item_id: str) -> bool:
@@ -405,6 +426,7 @@ def registry_soft_delete_item(gpkg_path: Path, item_id: str) -> bool:
     Returns:
         True if item was marked as deleted
     """
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.execute(
@@ -416,13 +438,15 @@ def registry_soft_delete_item(gpkg_path: Path, item_id: str) -> bool:
             (datetime.now(timezone.utc).isoformat(), item_id)
         )
         conn.commit()
-        conn.close()
         logger.debug("Soft-deleted item %s in registry", item_id)
         return True
 
     except sqlite3.Error as e:
         logger.error("Failed to soft-delete item %s: %s", item_id, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_hard_delete_item(gpkg_path: Path, item_id: str) -> bool:
@@ -436,6 +460,7 @@ def registry_hard_delete_item(gpkg_path: Path, item_id: str) -> bool:
     Returns:
         True if item was removed
     """
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.execute(
@@ -443,13 +468,15 @@ def registry_hard_delete_item(gpkg_path: Path, item_id: str) -> bool:
             (item_id,)
         )
         conn.commit()
-        conn.close()
         logger.debug("Hard-deleted item %s from registry", item_id)
         return True
 
     except sqlite3.Error as e:
         logger.error("Failed to hard-delete item %s: %s", item_id, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_exists(gpkg_path: Path) -> bool:
@@ -465,6 +492,7 @@ def registry_exists(gpkg_path: Path) -> bool:
     if not gpkg_path.exists():
         return False
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         cursor = conn.execute(
@@ -472,11 +500,13 @@ def registry_exists(gpkg_path: Path) -> bool:
             (REGISTRY_TABLE_NAME,)
         )
         exists = cursor.fetchone() is not None
-        conn.close()
         return exists
 
     except sqlite3.Error:
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 # =============================================================================
@@ -500,6 +530,7 @@ def ensure_spatial_index(gpkg_path: Path, table_name: str) -> bool:
     if not gpkg_path.exists():
         return False
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
 
@@ -510,7 +541,6 @@ def ensure_spatial_index(gpkg_path: Path, table_name: str) -> bool:
         )
         row = cursor.fetchone()
         if not row:
-            conn.close()
             logger.debug("Table %s has no registered geometry column", table_name)
             return False
 
@@ -523,7 +553,6 @@ def ensure_spatial_index(gpkg_path: Path, table_name: str) -> bool:
             (index_table,)
         )
         if cursor.fetchone():
-            conn.close()
             logger.debug("Spatial index already exists for %s", table_name)
             return True
 
@@ -555,13 +584,15 @@ def ensure_spatial_index(gpkg_path: Path, table_name: str) -> bool:
             """)
 
         conn.commit()
-        conn.close()
         logger.info("Created spatial index for %s.%s", table_name, geom_column)
         return True
 
     except sqlite3.Error as e:
         logger.error("Failed to create spatial index for %s: %s", table_name, e)
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def get_spatial_index_status(gpkg_path: Path) -> Dict[str, Any]:
@@ -574,6 +605,7 @@ def get_spatial_index_status(gpkg_path: Path) -> Dict[str, Any]:
     if not gpkg_path.exists():
         return {"indexed": 0, "not_indexed": 0, "total": 0, "tables": []}
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
 
@@ -597,8 +629,6 @@ def get_spatial_index_status(gpkg_path: Path) -> Dict[str, Any]:
             else:
                 not_indexed.append(table_name)
 
-        conn.close()
-
         return {
             "indexed": len(indexed),
             "not_indexed": len(not_indexed),
@@ -610,6 +640,9 @@ def get_spatial_index_status(gpkg_path: Path) -> Dict[str, Any]:
     except sqlite3.Error as e:
         logger.error("Failed to get spatial index status: %s", e)
         return {"indexed": 0, "not_indexed": 0, "total": 0, "error": str(e)}
+    finally:
+        if conn:
+            conn.close()
 
 
 # Performance mode presets
@@ -625,6 +658,7 @@ class PerformanceMode:
         ItemType.MARKER_CASUALTY: 0,      # Always visible (critical)
         ItemType.TEXT_LABEL: 25000,       # Labels hidden early
         ItemType.SEARCH_AREA: 500000,     # Areas visible at regional scale
+        ItemType.SEARCH_SECTOR: 500000,   # Sectors visible at regional scale
         ItemType.RANGE_RING: 250000,
         ItemType.BEARING_LINE: 100000,
         ItemType.LINE: 100000,
@@ -687,6 +721,7 @@ def registry_get_all_items(
     if not registry_exists(gpkg_path):
         return []
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.row_factory = sqlite3.Row
@@ -705,7 +740,6 @@ def registry_get_all_items(
 
         cursor = conn.execute(query, params)
         rows = cursor.fetchall()
-        conn.close()
 
         items = []
         for row in rows:
@@ -734,6 +768,9 @@ def registry_get_all_items(
     except sqlite3.Error as e:
         logger.error("Failed to read registry from %s: %s", gpkg_path, e)
         return []
+    finally:
+        if conn:
+            conn.close()
 
 
 def registry_get_item(gpkg_path: Path, item_id: str) -> Optional[ItemLayerInfo]:
@@ -756,6 +793,7 @@ def registry_get_item(gpkg_path: Path, item_id: str) -> Optional[ItemLayerInfo]:
     if not registry_exists(gpkg_path):
         return None
 
+    conn = None
     try:
         conn = sqlite3.connect(str(gpkg_path))
         conn.row_factory = sqlite3.Row
@@ -764,7 +802,6 @@ def registry_get_item(gpkg_path: Path, item_id: str) -> Optional[ItemLayerInfo]:
             (item_id,)
         )
         row = cursor.fetchone()
-        conn.close()
 
         if not row:
             return None
@@ -792,6 +829,9 @@ def registry_get_item(gpkg_path: Path, item_id: str) -> Optional[ItemLayerInfo]:
     except sqlite3.Error as e:
         logger.error("Failed to get item %s from registry: %s", item_id, e)
         return None
+    finally:
+        if conn:
+            conn.close()
 
 
 # =============================================================================
@@ -917,7 +957,7 @@ class PerItemLayerFactory:
 
         # Sync to registry (Phase 3)
         self._ensure_registry()
-        registry_add_item(
+        registry_success = registry_add_item(
             gpkg_path=self.gpkg_path,
             item_id=item_id,
             item_type=item_type,
@@ -926,6 +966,52 @@ class PerItemLayerFactory:
             geometry_type=geometry_type,
             created_at=created_at
         )
+
+        if not registry_success:
+            # Rollback: registry failed, so remove layer from project and GeoPackage
+            # Each rollback step is wrapped to ensure all steps are attempted
+            logger.error(
+                "Registry add failed for item %s - rolling back layer creation",
+                item_id
+            )
+            rollback_complete = True
+
+            # Step 1: Remove from project (if added)
+            # Note: Don't gate on layer.isValid() - layer was added regardless of
+            # current validity state, and QGIS can have invalid layers in project
+            try:
+                if add_to_project and layer:
+                    project = QgsProject.instance()
+                    project.removeMapLayer(layer.id())
+            except Exception as exc:
+                logger.warning(
+                    "Rollback: failed to remove layer from project for item %s: %s",
+                    item_id, exc
+                )
+                rollback_complete = False
+
+            # Step 2: Remove from cache (safe - never raises)
+            self._layer_cache.pop(item_id, None)
+
+            # Step 3: Drop GeoPackage table
+            try:
+                if not self._drop_gpkg_table(table_name):
+                    logger.warning(
+                        "Rollback incomplete: failed to drop GeoPackage table '%s' for item %s",
+                        table_name, item_id
+                    )
+                    rollback_complete = False
+            except Exception as exc:
+                logger.warning(
+                    "Rollback: exception dropping GeoPackage table '%s' for item %s: %s",
+                    table_name, item_id, exc
+                )
+                rollback_complete = False
+
+            rollback_status = "rolled back" if rollback_complete else "rollback incomplete"
+            raise RuntimeError(
+                f"Failed to register item {item_id} in registry - {rollback_status}"
+            )
 
         logger.info(
             "Created per-item layer: %s (type=%s, table=%s)",
@@ -2173,6 +2259,7 @@ class PerItemLayerFactory:
         Returns:
             True if removal successful
         """
+        conn = None
         try:
             conn = sqlite3.connect(str(self.gpkg_path))
 
@@ -2200,7 +2287,6 @@ class PerItemLayerFactory:
                 conn.execute(f'DROP TABLE IF EXISTS "{row[0]}"')
 
             conn.commit()
-            conn.close()
 
             logger.debug("Dropped GeoPackage table: %s", table_name)
             return True
@@ -2208,6 +2294,9 @@ class PerItemLayerFactory:
         except sqlite3.Error as e:
             logger.error("Error dropping GeoPackage table %s: %s", table_name, e)
             return False
+        finally:
+            if conn:
+                conn.close()
 
 
 # =============================================================================

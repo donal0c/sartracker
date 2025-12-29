@@ -19,7 +19,7 @@ def test_schema_import():
     """Test that schema module can be imported."""
     try:
         from layers import schema
-        assert schema.SAR_LAYER_SCHEMA_VERSION == 3
+        assert schema.SAR_LAYER_SCHEMA_VERSION == 4
         assert schema.ROOT_GROUP_NAME == "SAR Tracker"
         print("✓ Schema module imported successfully")
         return True
@@ -74,14 +74,19 @@ def test_group_names_constants():
 
         required_groups = [
             'ROOT',
-            'CURRENT_POSITIONS',
-            'BREADCRUMBS',
-            'LINES',
-            'RINGS',
-            'MARKERS',
-            'CLUES',
+            'TRACKING',
             'HELICOPTERS',
-            'MISSION_OVERLAYS'
+            'MAP_TOOLS',
+            'MAP_TOOLS_IPP_LKP',
+            'MAP_TOOLS_CLUES',
+            'MAP_TOOLS_HAZARDS',
+            'MAP_TOOLS_CASUALTIES',
+            'MAP_TOOLS_SEARCH_AREAS',
+            'MAP_TOOLS_SEARCH_SECTORS',
+            'MAP_TOOLS_RANGE_RINGS',
+            'MAP_TOOLS_BEARING_LINES',
+            'MAP_TOOLS_LINES',
+            'MAP_TOOLS_TEXT_LABELS'
         ]
 
         for group_name in required_groups:
@@ -104,13 +109,23 @@ def test_expected_structure():
         assert structure is not None
         assert structure.name == GroupNames.ROOT
         assert structure.subgroups is not None
-        assert len(structure.subgroups) >= 8, f"Expected at least 8 subgroups, got {len(structure.subgroups)}"
+        assert len(structure.subgroups) >= 3, f"Expected at least 3 subgroups, got {len(structure.subgroups)}"
 
         # Verify key groups exist
         group_names = [g.name for g in structure.subgroups]
-        assert GroupNames.CURRENT_POSITIONS in group_names
+        assert GroupNames.TRACKING in group_names
+        assert GroupNames.MAP_TOOLS in group_names
         assert GroupNames.HELICOPTERS in group_names
-        assert GroupNames.MISSION_OVERLAYS in group_names
+        map_tools_group = None
+        for group in structure.subgroups:
+            if group.name == GroupNames.MAP_TOOLS:
+                map_tools_group = group
+                break
+
+        assert map_tools_group is not None, "Map Tools group not found"
+        map_tools_subgroups = [g.name for g in map_tools_group.subgroups or []]
+        assert GroupNames.MAP_TOOLS_SEARCH_SECTORS in map_tools_subgroups
+        assert GroupNames.MAP_TOOLS_TEXT_LABELS in map_tools_subgroups
 
         print(f"✓ Expected structure generated with {len(structure.subgroups)} groups")
         return True
@@ -206,12 +221,6 @@ def test_tracking_and_drawing_layer_fields():
         from layers.schema import get_layer_by_id, LayerIds
 
         expectations = {
-            LayerIds.CURRENT_ACTIVE: [
-                "device_id", "name", "timestamp", "altitude", "speed", "battery"
-            ],
-            LayerIds.BREADCRUMBS: [
-                "device_id", "name"
-            ],
             LayerIds.LINES: [
                 "id", "name", "description", "color", "width",
                 "distance_m", "created", "temporary_measure"
@@ -227,7 +236,7 @@ def test_tracking_and_drawing_layer_fields():
             ],
             LayerIds.SEARCH_SECTORS: [
                 "id", "name", "center_lat", "center_lon",
-                "start_bearing", "end_bearing", "radius_m",
+                "start_bearing", "end_bearing", "radius_m", "arc_length_deg",
                 "area_sqkm", "priority", "color", "created"
             ],
             LayerIds.TEXT_LABELS: [
@@ -294,9 +303,6 @@ def test_artifact_layer_map():
 
         assert 'helicopter_1' in ARTIFACT_LAYER_MAP
         assert ARTIFACT_LAYER_MAP['helicopter_1'] == LayerIds.HELICOPTER_1
-
-        assert 'current_position' in ARTIFACT_LAYER_MAP
-        assert ARTIFACT_LAYER_MAP['current_position'] == LayerIds.CURRENT_ACTIVE
 
         print(f"✓ Artifact layer map contains {len(ARTIFACT_LAYER_MAP)} mappings")
         return True

@@ -14,7 +14,7 @@ actual layer management to specialized manager classes:
 Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
-from typing import List, Dict, Optional, Any, Callable
+from typing import List, Dict, Optional, Any, Callable, Union
 import logging
 from qgis.core import QgsProject, QgsPointXY, QgsLayerTreeGroup
 
@@ -487,6 +487,15 @@ class LayersController:
         # BUG-071 FIX: Track operation context for better diagnostics
         operation_start = time.time()
         last_exc = None
+        use_sleep = True
+
+        try:
+            from qgis.PyQt.QtCore import QCoreApplication, QThread
+            app = QCoreApplication.instance()
+            if app:
+                use_sleep = QThread.currentThread() != app.thread()
+        except Exception:
+            use_sleep = True
 
         for attempt in range(1, attempts + 1):
             try:
@@ -523,7 +532,15 @@ class LayersController:
                     )
 
                     # BUG-071 FIX: Sleep before retry (exponential backoff)
-                    time.sleep(backoff_seconds)
+                    if use_sleep:
+                        time.sleep(backoff_seconds)
+                    else:
+                        logger.warning(
+                            "BUG-071: Backoff sleep skipped on UI thread for '%s' (attempt %d/%d)",
+                            operation,
+                            attempt,
+                            attempts
+                        )
                 else:
                     # Final failure
                     elapsed = time.time() - operation_start
@@ -959,7 +976,7 @@ class LayersController:
 
     def add_sector(self, name: str, center_wgs84: QgsPointXY,
                    start_bearing: float, end_bearing: float, radius_m: float,
-                   priority: str = "Medium", color: str = "#FF6464") -> int:
+                   priority: str = "Medium", color: str = "#FF6464") -> Union[int, str]:
         """
         Add a search sector (wedge/pie-slice).
 
@@ -973,7 +990,8 @@ class LayersController:
             color: Hex color string
 
         Returns:
-            int: Feature ID of added sector
+            int: Feature ID of added sector (shared layer)
+            str: item_id for per-item layer
         """
         self._assert_not_read_only("add sector")
         sector_id = self._execute_manager_call(
@@ -987,7 +1005,7 @@ class LayersController:
 
     def add_text_label(self, text: str, location_wgs84: QgsPointXY,
                        font_size: int = 12, color: str = "#000000",
-                       rotation: float = 0.0) -> int:
+                       rotation: float = 0.0) -> Union[int, str]:
         """
         Add a text label annotation.
 
@@ -999,7 +1017,8 @@ class LayersController:
             rotation: Rotation angle in degrees
 
         Returns:
-            int: Feature ID of added label
+            int: Feature ID of added label (shared layer)
+            str: item_id for per-item layer
         """
         self._assert_not_read_only("add text label")
         label_id = self._execute_manager_call(

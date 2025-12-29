@@ -26,6 +26,7 @@ from ...layers import (
     get_layer_by_id,
     LayerManager as SchemaLayerManager
 )
+from ...utils.exceptions import LayerError
 
 
 LAYER_DIAGNOSTICS_ENV = "SARTRACKER_LAYER_DIAGNOSTICS"
@@ -328,6 +329,30 @@ class BaseLayerManager(ABC):
             return self.layer_manager
         self.layer_manager = SchemaLayerManager(self.iface)
         return self.layer_manager
+
+    def _require_mission_store(self, operation: str) -> str:
+        """
+        Ensure mission store is configured for persistent per-item/per-device layers.
+
+        Args:
+            operation: Human-friendly operation label for error context
+
+        Returns:
+            Mission store path
+
+        Raises:
+            LayerError: If no mission store is configured
+        """
+        layer_manager = self._require_layer_manager()
+        store_path = layer_manager.get_mission_store()
+        if store_path:
+            return store_path
+
+        message = (
+            f"{operation} requires a configured mission store. "
+            "Please set a mission store before adding mission data."
+        )
+        raise LayerError(message, title="Mission Store Required")
 
     def _ensure_schema_layer(self, layer_id: str, fallback_name: Optional[str] = None, style_factory=None) -> QgsVectorLayer:
         """Ensure a schema-defined layer exists (memory or mission store)."""

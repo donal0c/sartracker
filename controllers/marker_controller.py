@@ -41,9 +41,53 @@ class MarkerController:
     # Public API
     # ------------------------------------------------------------------#
     def handle_new_marker(self, marker_type: str, lat: float, lon: float, easting: float, northing: float):
-        """Show dialog and create marker."""
-        dialog = MarkerDialog(lat, lon, easting, northing, self.iface.mainWindow())
-        self._preselect_type(dialog, marker_type)
+        """
+        Show dialog and create marker.
+
+        BUG-080 FIX: Added early validation and exception handling for coordinate
+        validation errors. Invalid coordinates are caught before dialog display
+        to provide clear user feedback.
+
+        Args:
+            marker_type: Type of marker to create
+            lat: WGS84 latitude
+            lon: WGS84 longitude
+            easting: Irish Grid easting (can be None)
+            northing: Irish Grid northing (can be None)
+        """
+        import math
+
+        # BUG-080 FIX: Early validation before dialog creation
+        # This provides a clearer error path and prevents invalid coordinates
+        # from reaching downstream processing
+        try:
+            # Validate required WGS84 coordinates
+            if lat is None or lon is None:
+                raise ValueError("Coordinates cannot be None")
+
+            if math.isnan(lat) or math.isinf(lat):
+                raise ValueError(f"Invalid latitude: {lat} (NaN/Infinity not allowed)")
+            if math.isnan(lon) or math.isinf(lon):
+                raise ValueError(f"Invalid longitude: {lon} (NaN/Infinity not allowed)")
+
+            if not (-90 <= lat <= 90):
+                raise ValueError(f"Latitude {lat} out of valid range [-90, 90]")
+            if not (-180 <= lon <= 180):
+                raise ValueError(f"Longitude {lon} out of valid range [-180, 180]")
+
+            # Create and show dialog (MarkerDialog also validates, defense-in-depth)
+            dialog = MarkerDialog(lat, lon, easting, northing, self.iface.mainWindow())
+            self._preselect_type(dialog, marker_type)
+
+        except ValueError as val_err:
+            # BUG-080: Coordinate validation failed - show clear error
+            error(
+                self.iface.messageBar(),
+                "Invalid Coordinates",
+                f"Cannot create marker: {val_err}",
+                duration=6
+            )
+            return
 
         if dialog_exec(dialog) != DialogAccepted:
             return
@@ -408,16 +452,28 @@ class MarkerController:
                     "BUG-073: Failed to extract coordinates from geometry: %s", str(e)
                 )
 
-        # BUG-073 & BUG-077 FIX: NEVER return zero coordinates silently
-        # This is LIFE-SAFETY CRITICAL - zero coordinates could send rescuers to wrong location
-        if lat is None or lon is None or lat == 0.0 or lon == 0.0:
-            # Only allow (0, 0) if it's an explicit value in both fields
-            if not (lat == 0.0 and lon == 0.0 and
-                    feature["lat"] is not None and feature["lon"] is not None):
+        # BUG-073 & BUG-077 FIX: NEVER return None coordinates silently
+        # This is LIFE-SAFETY CRITICAL - missing coordinates could cause failures
+        if lat is None or lon is None:
+            raise ValueError(
+                f"Invalid or missing coordinates: lat={lat}, lon={lon}. "
+                f"Cannot load marker with invalid location data."
+            )
+
+        # BUG-084 FIX: Only reject (0,0) Null Island if not explicitly set
+        # Valid single-zero coordinates (on Prime Meridian or Equator) are allowed
+        # Note: Kerry, Ireland is ~52°N, ~-10°W so (0,0) would be Atlantic Ocean
+        if lat == 0.0 and lon == 0.0:
+            # Only allow explicit (0, 0) - reject if fields were None/missing
+            if feature["lat"] is None or feature["lon"] is None:
                 raise ValueError(
-                    f"Invalid or missing coordinates: lat={lat}, lon={lon}. "
-                    f"Cannot load marker with invalid location data."
+                    "Invalid coordinates: (0, 0) detected but fields were not "
+                    "explicitly set. This location (Null Island) is likely an error."
                 )
+            # Log warning for explicit (0,0) as it's unusual for Irish SAR
+            logger.warning(
+                "BUG-084: Marker has explicit (0,0) coordinates - verify this is intentional"
+            )
 
         # Validate coordinate ranges
         if not (-90 <= lat <= 90):

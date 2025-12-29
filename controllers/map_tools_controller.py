@@ -692,52 +692,102 @@ class MapToolsController(QObject):
 
     def _extract_marker_coordinates(self, feature) -> tuple:
         """
-        Return (lat, lon, easting, northing) with fallbacks.
+        Return (lat, lon, easting, northing) with validation.
 
-        CRITICAL FIX: Validates feature before accessing fields to prevent
-        crashes when feature is None, invalid, or has missing fields.
+        BUG-078 FIX: Changed from returning Null Island (0,0) fallback to raising
+        ValueError. Silent fallback to (0,0) is LIFE-SAFETY CRITICAL as it could
+        direct rescue teams to the wrong continent.
 
         Args:
             feature: QgsFeature to extract coordinates from
 
         Returns:
-            tuple: (lat, lon, easting, northing) - returns (0.0, 0.0, 0.0, 0.0)
-                   if feature is invalid (with warning logged)
+            tuple: (lat, lon, easting, northing)
+
+        Raises:
+            ValueError: If feature is None, invalid, or has missing/invalid coordinates
         """
-        # CRITICAL: Validate feature exists and is valid
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # BUG-078 FIX: Raise instead of returning Null Island coordinates
         if feature is None:
-            print("[MapToolsController] WARNING: _extract_marker_coordinates called with None feature")
-            return 0.0, 0.0, 0.0, 0.0
+            logger.error("BUG-078: _extract_marker_coordinates called with None feature")
+            raise ValueError("Cannot extract coordinates: feature is None")
 
         try:
             if not feature.isValid():
-                print("[MapToolsController] WARNING: _extract_marker_coordinates called with invalid feature")
-                return 0.0, 0.0, 0.0, 0.0
-        except Exception:
-            # isValid() might fail on some feature types
+                logger.error("BUG-078: _extract_marker_coordinates called with invalid feature")
+                raise ValueError("Cannot extract coordinates: feature is invalid")
+        except AttributeError:
+            # isValid() might not exist on some feature types - continue with extraction
             pass
 
-        # Safely extract field values with fallbacks
+        # Safely extract field values
+        lat = None
+        lon = None
+        easting = None
+        northing = None
+
         try:
             lat = feature["lat"]
             lon = feature["lon"]
             easting = feature["irish_grid_e"]
             northing = feature["irish_grid_n"]
         except (KeyError, TypeError) as field_err:
-            print(f"[MapToolsController] WARNING: Could not extract marker fields: {field_err}")
-            lat = lon = easting = northing = None
+            logger.warning("BUG-078: Could not extract marker fields: %s", field_err)
 
         # Fallback to geometry if coordinate fields are missing
         if (lat is None or lon is None) and feature.geometry() and not feature.geometry().isEmpty():
             try:
                 point = feature.geometry().asPoint()
                 if point:
-                    lat = lat or point.y()
-                    lon = lon or point.x()
-            except Exception:
-                pass
+                    extracted_lat = point.y()
+                    extracted_lon = point.x()
+                    # Validate extracted coordinates are in reasonable range
+                    if -90 <= extracted_lat <= 90 and -180 <= extracted_lon <= 180:
+                        lat = lat if lat is not None else extracted_lat
+                        lon = lon if lon is not None else extracted_lon
+                        logger.info(
+                            "BUG-078: Extracted coordinates from geometry: lat=%.6f, lon=%.6f",
+                            lat, lon
+                        )
+                    else:
+                        logger.warning(
+                            "BUG-078: Geometry coordinates out of range: lat=%.6f, lon=%.6f",
+                            extracted_lat, extracted_lon
+                        )
+            except Exception as geom_err:
+                logger.warning("BUG-078: Failed to extract from geometry: %s", geom_err)
 
-        return lat or 0.0, lon or 0.0, easting or 0.0, northing or 0.0
+        # BUG-078 FIX: NEVER return Null Island (0,0) silently
+        # This is LIFE-SAFETY CRITICAL - could send rescuers to wrong location
+        if lat is None or lon is None:
+            raise ValueError(
+                "Cannot extract coordinates: lat/lon fields are missing and "
+                "geometry extraction failed"
+            )
+
+        # Validate coordinate ranges
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Latitude {lat} out of valid range [-90, 90]")
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Longitude {lon} out of valid range [-180, 180]")
+
+        # Check for explicit (0,0) which is valid only if explicitly set
+        if lat == 0.0 and lon == 0.0:
+            # Only allow if these were explicitly stored values (not None fallbacks)
+            if feature["lat"] is None or feature["lon"] is None:
+                raise ValueError(
+                    "Invalid coordinates: (0, 0) detected but fields were not "
+                    "explicitly set. This may indicate data corruption."
+                )
+            logger.warning(
+                "BUG-078: Marker has explicit (0,0) coordinates - verify this is intentional"
+            )
+
+        # Irish Grid can be None (optional), return as-is
+        return lat, lon, easting, northing
 
     def _build_marker_dialog_payload(self, feature, marker_type: str) -> Dict[str, Any]:
         """Build payload passed to MarkerDialog for edit mode."""
@@ -818,14 +868,58 @@ class MapToolsController(QObject):
         point = QgsPointXY(lon, lat)
         canvas_crs = self.iface.mapCanvas().mapSettings().destinationCrs()
 
-        # Transform point to canvas CRS if needed
+        # BUG-082 FIX: Transform point to canvas CRS with proper exception handling
+        # CRS transforms can fail for invalid CRS combinations or edge coordinates
         if canvas_crs.authid() != "EPSG:4326":
-            transform = QgsCoordinateTransform(
-                self.wgs84,
-                canvas_crs,
-                QgsProject.instance()
-            )
-            point = transform.transform(point)
+            try:
+                transform = QgsCoordinateTransform(
+                    self.wgs84,
+                    canvas_crs,
+                    QgsProject.instance()
+                )
+
+                # Validate transform is usable
+                if not transform.isValid():
+                    warning(
+                        self.iface.messageBar(),
+                        "Navigation",
+                        f"Cannot transform to project CRS ({canvas_crs.authid()}). "
+                        "Check project coordinate system settings.",
+                        duration=5
+                    )
+                    return
+
+                point = transform.transform(point)
+
+                # BUG-082: Verify transformed point is valid (not NaN/Inf)
+                import math
+                if math.isnan(point.x()) or math.isnan(point.y()):
+                    warning(
+                        self.iface.messageBar(),
+                        "Navigation",
+                        "Coordinate transform produced invalid result (NaN). "
+                        "Coordinates may be outside valid projection bounds.",
+                        duration=5
+                    )
+                    return
+                if math.isinf(point.x()) or math.isinf(point.y()):
+                    warning(
+                        self.iface.messageBar(),
+                        "Navigation",
+                        "Coordinate transform produced invalid result (Infinity). "
+                        "Coordinates may be outside valid projection bounds.",
+                        duration=5
+                    )
+                    return
+
+            except Exception as transform_err:
+                warning(
+                    self.iface.messageBar(),
+                    "Navigation",
+                    f"CRS transform failed: {transform_err}",
+                    duration=5
+                )
+                return
 
         # Create extent (about 500m radius in map units)
         extent_size = 500  # meters

@@ -29,7 +29,14 @@ from qgis.PyQt.QtWidgets import QMessageBox, QInputDialog
 
 from qgis.core import QgsProject
 
-from ..utils.mission_storage import MissionPaths, MissionSessionState, MissionStorageHelper
+from ..utils.mission_storage import (
+    MissionPaths,
+    MissionSessionState,
+    MissionStorageHelper,
+    check_uncommitted_edits,
+    format_uncommitted_edits,
+    validate_archive,
+)
 from ..utils.notify import info, warning, error, success
 from ..utils.qt_compat import (
     dialog_exec, DialogAccepted, ISODate,
@@ -1308,6 +1315,22 @@ class MissionLifecycleController(QObject):
     # P2.5: Backup/Autosave (SAR-vwz)
     # ==========================================================================
 
+    def _warn_uncommitted_edits(self, operation: str) -> list:
+        """
+        Check for uncommitted edits and warn on the main thread.
+
+        Args:
+            operation: Operation name ("backup" or "archive")
+
+        Returns:
+            List of uncommitted layer names (may be empty)
+        """
+        uncommitted = check_uncommitted_edits()
+        msg = format_uncommitted_edits(uncommitted, operation)
+        if msg and not self._is_shutting_down:
+            warning(self.iface.messageBar(), "Uncommitted Edits", msg, duration=8)
+        return uncommitted
+
     def sync_backup(self, async_run: bool = False) -> bool:
         """
         Mirror GeoPackage (and attachments if present) to backup root.
@@ -1331,20 +1354,29 @@ class MissionLifecycleController(QObject):
         if not paths:
             return True  # No paths configured is not an error
 
+        uncommitted_layers = self._warn_uncommitted_edits("backup")
+
         if async_run:
             # Use MissionStorageController if available (preferred path)
             if self.mission_storage_controller:
-                self.mission_storage_controller.start_backup_task(paths)
+                self.mission_storage_controller.start_backup_task(
+                    paths,
+                    uncommitted_layers=uncommitted_layers
+                )
                 return True
             # Fallback: use task_manager directly
             elif self.task_manager:
-                self._start_backup_task_inline(paths)
+                self._start_backup_task_inline(paths, uncommitted_layers=uncommitted_layers)
                 return True
             # No async capability - fall through to sync
 
         # Synchronous backup
         try:
-            result = self.mission_storage.sync_backup(paths)
+            result = self.mission_storage.sync_backup(
+                paths,
+                uncommitted_layers=uncommitted_layers,
+                warn_uncommitted=False
+            )
             if not self._is_shutting_down:
                 self.backup_completed.emit(result)
             return result
@@ -1361,7 +1393,12 @@ class MissionLifecycleController(QObject):
                 self.backup_completed.emit(False)
             return False
 
-    def _start_backup_task_inline(self, paths: MissionPaths) -> None:
+    def _start_backup_task_inline(
+        self,
+        paths: MissionPaths,
+        *,
+        uncommitted_layers: Optional[list] = None
+    ) -> None:
         """
         Run backup sync in background using inline QgsTask (fallback path).
 
@@ -1389,15 +1426,28 @@ class MissionLifecycleController(QObject):
         controller_weak = weakref.ref(self)
 
         class BackupTask(QgsTask):
-            def __init__(self, mission_paths: MissionPaths, storage: MissionStorageHelper):
+            def __init__(
+                self,
+                mission_paths: MissionPaths,
+                storage: MissionStorageHelper,
+                uncommitted_layers: Optional[list] = None
+            ):
                 super().__init__("Sync mission backup", QgsTask.CanCancel)
                 self.paths = mission_paths
                 self.storage = storage
+                self.uncommitted_layers = uncommitted_layers or []
                 self.error_message = None
 
             def run(self) -> bool:
                 try:
-                    return bool(self.storage.sync_backup(self.paths))
+                    return bool(
+                        self.storage.sync_backup(
+                            self.paths,
+                            uncommitted_layers=self.uncommitted_layers,
+                            warn_uncommitted=False,
+                            warn_on_error=False
+                        )
+                    )
                 except Exception as exc:
                     self.error_message = str(exc)
                     return False
@@ -1444,7 +1494,11 @@ class MissionLifecycleController(QObject):
             if not controller._is_shutting_down:
                 controller.backup_completed.emit(False)
 
-        task = BackupTask(paths, self.mission_storage)
+        task = BackupTask(
+            paths,
+            self.mission_storage,
+            uncommitted_layers=uncommitted_layers
+        )
         self.task_manager.start_task(
             task=task,
             on_complete=on_complete,
@@ -1558,6 +1612,24 @@ class MissionLifecycleController(QObject):
             )
             return False
 
+        # Safety: Do not finalize while mission is active/paused
+        if self.mission_controller and self.mission_controller.is_active():
+            info(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "Mission is still active. End the mission before finalizing.",
+                duration=5
+            )
+            return False
+        if not self.mission_controller and self._session_state.is_active:
+            info(
+                self.iface.messageBar(),
+                "Finalize Mission",
+                "Mission is still active. End the mission before finalizing.",
+                duration=5
+            )
+            return False
+
         # Check if already finalized
         if self.check_finalized():
             info(
@@ -1596,8 +1668,14 @@ class MissionLifecycleController(QObject):
 
             project_path = Path(project.fileName()) if project.fileName() else None
 
+            uncommitted_layers = self._warn_uncommitted_edits("archive")
+
             # Run archive in background
-            return self.start_archive_task(paths, project_path)
+            return self.start_archive_task(
+                paths,
+                project_path,
+                uncommitted_layers=uncommitted_layers
+            )
 
         except Exception as exc:
             self._set_is_finalizing(False)
@@ -1614,7 +1692,9 @@ class MissionLifecycleController(QObject):
     def start_archive_task(
         self,
         paths: MissionPaths,
-        project_path: Optional[Path]
+        project_path: Optional[Path],
+        *,
+        uncommitted_layers: Optional[list] = None
     ) -> bool:
         """
         Start background task to create mission archive.
@@ -1622,6 +1702,7 @@ class MissionLifecycleController(QObject):
         Args:
             paths: MissionPaths with current mission directories
             project_path: Optional path to QGIS project file to include
+            uncommitted_layers: Precomputed uncommitted edit list (optional)
 
         Returns:
             True if archive task was started, False otherwise
@@ -1636,7 +1717,8 @@ class MissionLifecycleController(QObject):
             started = self.mission_storage_controller.start_archive_task(
                 paths=paths,
                 project_path=project_path,
-                mark_finalized=True
+                mark_finalized=True,
+                uncommitted_layers=uncommitted_layers
             )
             if not started:
                 self._set_is_finalizing(False)
@@ -1652,7 +1734,12 @@ class MissionLifecycleController(QObject):
         # Fallback: no controller available, use synchronous method
         try:
             if self.mission_storage:
-                archive_path = self.mission_storage.create_archive(paths, project_path)
+                archive_path = self.mission_storage.create_archive(
+                    paths,
+                    project_path,
+                    uncommitted_layers=uncommitted_layers,
+                    warn_uncommitted=False
+                )
             else:
                 error(
                     self.iface.messageBar(),
@@ -1661,6 +1748,18 @@ class MissionLifecycleController(QObject):
                     duration=5
                 )
                 self._set_is_finalizing(False)
+                return False
+
+            validation_error = validate_archive(archive_path, paths)
+            if validation_error:
+                warning(
+                    self.iface.messageBar(),
+                    "Mission Archive",
+                    f"Archive validation failed: {validation_error}",
+                    duration=8
+                )
+                if not self._is_shutting_down:
+                    self.archive_failed.emit(str(validation_error))
                 return False
 
             # Mark as finalized
@@ -1734,6 +1833,18 @@ class MissionLifecycleController(QObject):
                 duration=8
             )
             return
+
+        current_paths = self.get_current_paths()
+        if current_paths:
+            validation_error = validate_archive(archive_file, current_paths)
+            if validation_error:
+                warning(
+                    self.iface.messageBar(),
+                    "Mission Finalize",
+                    f"Archive validation failed: {validation_error}. Mission NOT marked as finalized.",
+                    duration=8
+                )
+                return
 
         # Update state - only after validation passes
         self._update_session_state(is_finalized=True)

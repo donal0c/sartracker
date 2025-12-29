@@ -46,7 +46,7 @@ from ...layers.schema import (
 )
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 from ...utils.notify import warning as notify_warning
-from ..per_item_layer_factory import ItemType, PerItemLayerFactory
+from ..per_item_layer_factory import ItemType, PerItemLayerFactory, SAR_ITEM_TYPE, SAR_ITEM_ID
 
 
 logger = logging.getLogger(__name__)
@@ -123,14 +123,15 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Per-device factory instance (created on first use when mission store exists)
         self._per_device_factory: Optional[PerItemLayerFactory] = None
+        self._per_device_migration_checked = False
 
         # Phase SAR-nj0: Per-device generation tracking for async safety
         # Each device has its own generation counter to detect stale async data
         self._device_generations: Dict[str, int] = {}
 
     def get_managed_layer_names(self):
-        """Return list of layer names this manager handles."""
-        return [self.CURRENT_LAYER_NAME, self.BREADCRUMBS_LAYER_NAME]
+        """Return list of fixed layer names this manager handles (legacy only)."""
+        return []
 
     def reset_state(self):
         """Reset manager state (called after clearing layers)."""
@@ -146,6 +147,7 @@ class TrackingLayerManager(BaseLayerManager):
         self._device_position_layers.clear()
         self._device_trail_layers.clear()
         self._per_device_factory = None
+        self._per_device_migration_checked = False
         # Phase SAR-nj0: Clear per-device generations
         self._device_generations.clear()
 
@@ -482,22 +484,40 @@ class TrackingLayerManager(BaseLayerManager):
                 )
                 return
 
+            if not self.USE_PER_DEVICE_TRAILS:
+                logger.warning("Breadcrumb task complete but per-device trails disabled")
+                return
+
             segments = task.property("sartracker:segments") or []
             total_inputs = task.property("sartracker:total_inputs") or len(segments)
             invalid_count = task.property("sartracker:invalid_count") or 0
             last_error = task.property("sartracker:last_error") or None
-            layer = self._get_or_create_breadcrumbs_layer()
-            if not layer or not layer.isValid():
-                logger.warning("Breadcrumb task complete but layer unavailable")
-                return
-            # SAR-hi3 FIX: Pass expected generation to close race window
-            self._apply_breadcrumb_results(
-                layer,
-                segments,
+            gap_minutes = task.property("sartracker:gap_minutes") or 5.0
+
+            self._ensure_per_device_ready()
+            self._report_validation_warning(
+                "Breadcrumbs",
                 total_inputs,
                 invalid_count,
-                last_error,
-                expected_generation=task_generation
+                last_error
+            )
+
+            processed_segments = {
+                "segments": segments,
+                "time_gap_minutes": float(gap_minutes),
+            }
+            self._update_breadcrumbs_per_device(
+                [],
+                float(gap_minutes),
+                processed_segments=processed_segments
+            )
+
+            self._log_tracking_event(
+                None,
+                "BREADCRUMBS_PER_DEVICE",
+                "update",
+                payload_items=total_inputs,
+                device_count=len({seg.get("device_id") for seg in segments if seg.get("device_id")})
             )
         except Exception as exc:  # pragma: no cover - defensive
             logger.error("Breadcrumb task completion failed: %s", exc)
@@ -537,22 +557,38 @@ class TrackingLayerManager(BaseLayerManager):
         if isinstance(payload, list):
             try:
                 sanitized_positions = sanitize_breadcrumb_positions(payload)
+                gap_value = float(gap_minutes or 5.0)
                 segments = build_segments_from_positions(
                     sanitized_positions.valid,
-                    float(gap_minutes or 5.0)
+                    gap_value
                 )
-                layer = self._get_or_create_breadcrumbs_layer()
-                if not layer or not layer.isValid():
-                    logger.warning("Breadcrumb fallback: layer unavailable")
+
+                if not self.USE_PER_DEVICE_TRAILS:
+                    logger.warning("Breadcrumb fallback skipped (per-device trails disabled)")
                     return
-                # SAR-hi3 FIX: Pass expected generation to close race window
-                self._apply_breadcrumb_results(
-                    layer,
-                    segments,
+
+                self._ensure_per_device_ready()
+                self._report_validation_warning(
+                    "Breadcrumbs",
                     len(payload),
                     sanitized_positions.invalid_count,
-                    sanitized_positions.last_error,
-                    expected_generation=task_generation
+                    sanitized_positions.last_error
+                )
+                processed_segments = {
+                    "segments": segments,
+                    "time_gap_minutes": gap_value,
+                }
+                self._update_breadcrumbs_per_device(
+                    sanitized_positions.valid,
+                    gap_value,
+                    processed_segments=processed_segments
+                )
+                self._log_tracking_event(
+                    None,
+                    "BREADCRUMBS_PER_DEVICE",
+                    "update",
+                    payload_items=len(payload),
+                    device_count=len({seg.get("device_id") for seg in segments if seg.get("device_id")})
                 )
                 return
             except Exception as exc:
@@ -675,133 +711,32 @@ class TrackingLayerManager(BaseLayerManager):
             sanitized.last_error
         )
 
-        # Phase SAR-nh9: Route to per-device or shared layer implementation
+        # Phase SAR-nh9: Per-device architecture only
         if self.USE_PER_DEVICE_POSITIONS:
-            # Try per-device architecture first
-            factory = self._get_per_device_factory()
-            if factory:
-                try:
-                    self._update_positions_per_device(valid_positions)
-
-                    # Zoom to extent ONLY on first load
-                    if self.first_load and valid_positions:
-                        # Find a device layer to get extent from
-                        for device_id in self._device_position_layers:
-                            layer = self._device_position_layers[device_id]
-                            if layer and layer.isValid() and layer.featureCount() > 0:
-                                self.iface.mapCanvas().setExtent(layer.extent())
-                                self.iface.mapCanvas().refresh()
-                                self.first_load = False
-                                break
-
-                    self._log_tracking_event(
-                        None,  # No single layer
-                        "CURRENT_PER_DEVICE",
-                        "update",
-                        payload_items=len(valid_positions),
-                        device_count=len(set(p.get('device_id') for p in valid_positions if p.get('device_id')))
-                    )
-                    return  # Successfully updated via per-device layers
-                except Exception as e:
-                    logger.warning(
-                        "SAR-nh9: Per-device update failed, falling back to shared layer: %s", e
-                    )
-                    # Fall through to shared layer implementation
-            else:
-                logger.debug("SAR-nh9: No factory available, using shared layer")
-
-        # Shared layer implementation (legacy or fallback)
-        # Get or create layer
-        layer = self._get_or_create_current_layer()
-
-        # BUG-027 FIX: Acquire global lock to prevent concurrent position updates
-        # SAR-z4t FIX: Retry with exponential backoff to prevent dropped updates
-        max_retries = 3
-        base_timeout = 5.0
-        lock_acquired = False
-        total_wait_time = 0.0
-
-        for attempt in range(max_retries):
-            # Scale timeout based on data size: more positions = longer timeout
-            position_factor = 1.0 + (len(valid_positions) / 50.0)  # +1s per 50 positions
-            timeout = min(base_timeout * (2 ** attempt) * position_factor, 30.0)  # Cap at 30s
-
-            lock_start = time.monotonic()
-            lock_acquired = self.acquire_layer_edit_lock(timeout=timeout)
-            lock_duration = time.monotonic() - lock_start
-            total_wait_time += lock_duration
-
-            if lock_acquired:
-                if attempt > 0 or lock_duration > 1.0:
-                    logger.info(
-                        "SAR-z4t: Layer lock acquired after %.2fs (attempt %d/%d, %d positions)",
-                        total_wait_time, attempt + 1, max_retries, len(valid_positions)
-                    )
-                break
-
-            logger.warning(
-                "SAR-z4t: Lock attempt %d/%d failed after %.1fs, retrying...",
-                attempt + 1, max_retries, lock_duration
-            )
-
-        if not lock_acquired:
-            raise LayerLockError(
-                f"{self.CURRENT_LAYER_NAME} - concurrent update in progress after {max_retries} attempts "
-                f"({total_wait_time:.1f}s total). Please wait for the current operation to complete."
-            )
-
-        try:
-            # SAR-lc6 FIX: Delta update pattern - update in place, add new, remove stale
-            # This significantly reduces map flicker and renderer recalculation
-            updated_count, added_count, removed_count = self._delta_update_current_positions(
-                layer, valid_positions
-            )
-
-            # Apply styling (outside transaction - failures here don't affect data)
-            # Defer by 1 event loop tick to reduce re-entrancy with layer-tree UI edits.
-            try:
-                layer_id = layer.id()
-
-                def _apply_style_deferred(qgis_layer_id=layer_id):
-                    if getattr(getattr(self, "layer_manager", None), "_application_closing", False):
-                        return
-                    if not getattr(self, "project", None):
-                        return
-                    try:
-                        refreshed_layer = self.project.mapLayer(qgis_layer_id)
-                    except Exception:
-                        refreshed_layer = None
-                    if not refreshed_layer:
-                        return
-                    try:
-                        if not refreshed_layer.isValid():
-                            return
-                    except RuntimeError:
-                        return
-                    self._apply_current_positions_style(refreshed_layer)
-
-                QTimer.singleShot(0, _apply_style_deferred)
-            except Exception as e:
-                logger.warning("Failed to schedule styling for %s: %s", self.CURRENT_LAYER_NAME, e)
+            self._ensure_per_device_ready()
+            self._update_positions_per_device(valid_positions)
 
             # Zoom to extent ONLY on first load
             if self.first_load and valid_positions:
-                self.iface.mapCanvas().setExtent(layer.extent())
-                self.iface.mapCanvas().refresh()
-                self.first_load = False
-            else:
-                # Just repaint the layer, not the whole canvas
-                layer.triggerRepaint()
+                # Find a device layer to get extent from
+                for device_id in self._device_position_layers:
+                    layer = self._device_position_layers[device_id]
+                    if layer and layer.isValid() and layer.featureCount() > 0:
+                        self.iface.mapCanvas().setExtent(layer.extent())
+                        self.iface.mapCanvas().refresh()
+                        self.first_load = False
+                        break
 
             self._log_tracking_event(
-                layer,
-                "CURRENT",
+                None,  # No single layer
+                "CURRENT_PER_DEVICE",
                 "update",
-                payload_items=len(valid_positions)
+                payload_items=len(valid_positions),
+                device_count=len(set(p.get('device_id') for p in valid_positions if p.get('device_id')))
             )
-        finally:
-            # BUG-027 FIX: Always release lock, even on error
-            self.release_layer_edit_lock()
+            return
+
+        raise LayerError("Per-device tracking is disabled for current positions.", title="Tracking Disabled")
 
     def _delta_update_current_positions(
         self,
@@ -1134,32 +1069,43 @@ class TrackingLayerManager(BaseLayerManager):
     # Phase SAR-nh9: Per-Device Position Layers
     # =========================================================================
 
-    def _get_per_device_factory(self) -> Optional[PerItemLayerFactory]:
+    def _get_per_device_factory(self) -> PerItemLayerFactory:
         """
         Get the per-device layer factory, creating if necessary.
 
         Returns:
-            PerItemLayerFactory or None if mission store not available
+            PerItemLayerFactory
         """
         if self._per_device_factory is not None:
             return self._per_device_factory
 
-        # Try to get the mission GeoPackage path from layer_manager
-        layer_manager = getattr(self, 'layer_manager', None)
-        if not layer_manager:
-            logger.debug("Per-device factory: no layer_manager available")
-            return None
-
-        # Use get_mission_store() method (same pattern as marker_manager)
-        gpkg_path = layer_manager.get_mission_store()
-        if not gpkg_path:
-            logger.debug("Per-device factory: no mission store configured")
-            return None
+        # Mission store required for per-device tracking
+        gpkg_path = self._require_mission_store("Per-device tracking")
 
         from pathlib import Path
         self._per_device_factory = PerItemLayerFactory(Path(gpkg_path))
         logger.info("SAR-nh9: PerItemLayerFactory initialized for per-device tracking: %s", gpkg_path)
         return self._per_device_factory
+
+    def _ensure_per_device_ready(self) -> PerItemLayerFactory:
+        """
+        Ensure per-device tracking is ready (mission store + migrations).
+
+        Returns:
+            PerItemLayerFactory
+        """
+        factory = self._get_per_device_factory()
+
+        if not self._per_device_migration_checked:
+            migrated = self.migrate_to_per_device_layers()
+            self._per_device_migration_checked = True
+            if not migrated:
+                raise LayerError(
+                    "Per-device migration failed; tracking layers were not upgraded.",
+                    title="Tracking Migration Failed"
+                )
+
+        return factory
 
     def _ensure_tracking_group(self) -> Optional[QgsLayerTreeGroup]:
         """
@@ -1206,6 +1152,29 @@ class TrackingLayerManager(BaseLayerManager):
 
         return device_group
 
+    def _get_tracking_group(self) -> Optional[QgsLayerTreeGroup]:
+        """Return the Tracking group if it exists (without creating)."""
+        root = QgsProject.instance().layerTreeRoot()
+        if not root:
+            return None
+        sar_root = root.findGroup(GroupNames.ROOT)
+        if not sar_root:
+            return None
+        return sar_root.findGroup(GroupNames.TRACKING)
+
+    def _remove_device_group_if_empty(self, device_name: Optional[str]) -> None:
+        """Remove empty device group under Tracking (if present)."""
+        if not device_name:
+            return
+        tracking_group = self._get_tracking_group()
+        if not tracking_group:
+            return
+        device_group = tracking_group.findGroup(device_name)
+        if not device_group:
+            return
+        if not device_group.children():
+            tracking_group.removeChildNode(device_group)
+
     def _get_device_layers_by_property(self, device_id: str) -> Dict[str, Optional[QgsVectorLayer]]:
         """
         Find position and trail layers by stable device_id custom property.
@@ -1230,13 +1199,41 @@ class TrackingLayerManager(BaseLayerManager):
             if layer_device_id != device_id:
                 continue
 
-            item_type = layer.customProperty("sartracker:item_type")
+            item_type = layer.customProperty(SAR_ITEM_TYPE)
             if item_type == ItemType.DEVICE_POSITION:
                 result['position'] = layer
             elif item_type == ItemType.DEVICE_TRAIL:
                 result['trail'] = layer
 
         return result
+
+    def _get_existing_device_position_layer(self, device_id: str) -> Optional[QgsVectorLayer]:
+        """Return existing per-device position layer without creating new ones."""
+        cached = self._device_position_layers.get(device_id)
+        if cached and cached.isValid():
+            return cached
+
+        existing = self._get_device_layers_by_property(device_id)
+        layer = existing.get('position')
+        if layer and layer.isValid():
+            self._device_position_layers[device_id] = layer
+            return layer
+
+        return None
+
+    def _get_existing_device_trail_layer(self, device_id: str) -> Optional[QgsVectorLayer]:
+        """Return existing per-device trail layer without creating new ones."""
+        cached = self._device_trail_layers.get(device_id)
+        if cached and cached.isValid():
+            return cached
+
+        existing = self._get_device_layers_by_property(device_id)
+        layer = existing.get('trail')
+        if layer and layer.isValid():
+            self._device_trail_layers[device_id] = layer
+            return layer
+
+        return None
 
     def _ensure_device_position_layer(
         self,
@@ -1272,12 +1269,6 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Create new layer via factory
         factory = self._get_per_device_factory()
-        if not factory:
-            logger.warning(
-                "Cannot create per-device position layer: no factory available. "
-                "Falling back to shared layer."
-            )
-            return None
 
         # Get device name for display
         device_name = sample_position.get('name') or f"Device {device_id[:8]}"
@@ -1477,7 +1468,7 @@ class TrackingLayerManager(BaseLayerManager):
             canvas.freeze(False)
             canvas.refresh()
 
-        # CRITICAL FIX: If ANY device failed, raise exception to trigger fallback
+        # CRITICAL FIX: If ANY device failed, raise exception to signal data loss risk
         # This ensures no position data is silently lost
         if failed_devices:
             logger.warning(
@@ -1485,8 +1476,7 @@ class TrackingLayerManager(BaseLayerManager):
                 len(failed_devices), ", ".join(failed_devices[:5])  # Log first 5
             )
             raise RuntimeError(
-                f"Per-device layer creation failed for {len(failed_devices)} device(s). "
-                "Falling back to shared layer."
+                f"Per-device layer creation failed for {len(failed_devices)} device(s)."
             )
 
         logger.debug(
@@ -1565,12 +1555,6 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Create new layer via factory
         factory = self._get_per_device_factory()
-        if not factory:
-            logger.warning(
-                "Cannot create per-device trail layer: no factory available. "
-                "Falling back to shared layer."
-            )
-            return None
 
         # Get device name for display
         device_name = sample_position.get('name') or f"Device {device_id[:8]}"
@@ -1814,6 +1798,7 @@ class TrackingLayerManager(BaseLayerManager):
         root = project.layerTreeRoot()
         root.blockSignals(True)
 
+        failed_devices = []
         try:
             for device_id, device_segments in segments_by_device.items():
                 # Get sample position for device name
@@ -1822,12 +1807,19 @@ class TrackingLayerManager(BaseLayerManager):
                     # Extract name from segment if no positions
                     sample_pos = {'name': device_segments[0].get('name', device_id)}
 
-                layer = self._ensure_device_trail_layer(device_id, sample_pos)
-                if layer:
-                    self._update_device_trail(layer, device_segments, device_id)
-                else:
-                    # Per-device layer creation failed - logged in _ensure_device_trail_layer
-                    pass
+                try:
+                    layer = self._ensure_device_trail_layer(device_id, sample_pos)
+                    if layer:
+                        self._update_device_trail(layer, device_segments, device_id)
+                    else:
+                        failed_devices.append(device_id)
+                except Exception as exc:
+                    failed_devices.append(device_id)
+                    logger.warning(
+                        "SAR-nj0: Trail update failed for device %s: %s",
+                        device_id,
+                        exc
+                    )
         finally:
             root.blockSignals(False)
             canvas.freeze(False)
@@ -1837,6 +1829,11 @@ class TrackingLayerManager(BaseLayerManager):
             "SAR-nj0: Updated per-device trails for %d devices",
             len(segments_by_device)
         )
+
+        if failed_devices:
+            raise RuntimeError(
+                f"Trail updates failed for {len(failed_devices)} device(s)."
+            )
 
     # =========================================================================
     # Phase SAR-0uy: Migration from Shared to Per-Device Layers
@@ -1882,10 +1879,11 @@ class TrackingLayerManager(BaseLayerManager):
             return True
 
         # Check if factory is available (requires mission store)
-        factory = self._get_per_device_factory()
-        if not factory:
-            logger.debug("SAR-0uy: No factory available, skipping migration")
-            return True
+        try:
+            self._get_per_device_factory()
+        except LayerError as exc:
+            logger.error("SAR-0uy: Migration aborted - %s", exc)
+            return False
 
         # Find shared layers
         shared_current = self._find_shared_current_layer()
@@ -2612,87 +2610,43 @@ class TrackingLayerManager(BaseLayerManager):
 
         gap_minutes = float(time_gap_minutes)
 
-        # Phase SAR-nj0: Route to per-device or shared layer implementation
-        if self.USE_PER_DEVICE_TRAILS:
-            # Try per-device architecture first
-            factory = self._get_per_device_factory()
-            if factory:
-                try:
-                    # Sanitize positions first
-                    total_inputs = len(positions) if positions else 0
-                    invalid_count = 0
-                    last_error = None
+        if not self.USE_PER_DEVICE_TRAILS:
+            raise LayerError("Per-device tracking is disabled for breadcrumbs.", title="Tracking Disabled")
 
-                    if positions:
-                        sanitized = sanitize_breadcrumb_positions(positions)
-                        valid_positions = sanitized.valid
-                        invalid_count = sanitized.invalid_count
-                        last_error = sanitized.last_error
-                    else:
-                        valid_positions = []
-
-                    # HIGH FIX: Report validation warnings (was missing in per-device path)
-                    self._report_validation_warning(
-                        "Breadcrumbs",
-                        total_inputs,
-                        invalid_count,
-                        last_error
-                    )
-
-                    self._update_breadcrumbs_per_device(
-                        valid_positions,
-                        gap_minutes,
-                        processed_segments
-                    )
-
-                    self._log_tracking_event(
-                        None,  # No single layer
-                        "BREADCRUMBS_PER_DEVICE",
-                        "update",
-                        payload_items=total_inputs,
-                        device_count=len(set(p.get('device_id') for p in (positions or []) if p.get('device_id')))
-                    )
-                    return  # Successfully updated via per-device layers
-                except Exception as e:
-                    logger.warning(
-                        "SAR-nj0: Per-device breadcrumb update failed, falling back to shared layer: %s", e
-                    )
-                    # Fall through to shared layer implementation
-            else:
-                logger.debug("SAR-nj0: No factory available, using shared breadcrumbs layer")
-
-        # Shared layer implementation (legacy or fallback)
-        layer = self._get_or_create_breadcrumbs_layer()
+        self._ensure_per_device_ready()
 
         total_inputs = len(positions) if isinstance(positions, list) else 0
-        segments = validate_processed_segments(processed_segments, gap_minutes)
-        invalid_count = 0
-        last_error = None
+        if self._maybe_schedule_breadcrumb_task(positions, gap_minutes, total_inputs, processed_segments):
+            return
 
-        if segments is None:
-            if self._maybe_schedule_breadcrumb_task(positions, gap_minutes, total_inputs, processed_segments):
-                return
-
-            sanitized_positions = sanitize_breadcrumb_positions(positions)
-            invalid_count = sanitized_positions.invalid_count
-            last_error = sanitized_positions.last_error
-            segments = build_segments_from_positions(sanitized_positions.valid, gap_minutes)
-        elif not segments and positions:
-            # Robust fallback: provider preprocessing can yield zero LineString segments even when
-            # multiple points exist (e.g., update interval exceeds time_gap_minutes). Since we render
-            # breadcrumbs as LineStrings, "no segments" becomes "no breadcrumbs". Rebuild locally.
-            sanitized_positions = sanitize_breadcrumb_positions(positions)
-            invalid_count = sanitized_positions.invalid_count
-            last_error = sanitized_positions.last_error
-            if len(sanitized_positions.valid) >= 2:
-                segments = build_segments_from_positions(sanitized_positions.valid, gap_minutes)
-
-        self._apply_breadcrumb_results(
-            layer,
-            segments or [],
+        validated_segments = validate_processed_segments(processed_segments, gap_minutes)
+        sanitized_positions = sanitize_breadcrumb_positions(positions)
+        self._report_validation_warning(
+            "Breadcrumbs",
             total_inputs,
-            invalid_count,
-            last_error
+            sanitized_positions.invalid_count,
+            sanitized_positions.last_error
+        )
+
+        processed_payload = None
+        if validated_segments is not None:
+            processed_payload = {
+                "segments": validated_segments,
+                "time_gap_minutes": gap_minutes,
+            }
+
+        self._update_breadcrumbs_per_device(
+            sanitized_positions.valid,
+            gap_minutes,
+            processed_segments=processed_payload
+        )
+
+        self._log_tracking_event(
+            None,  # No single layer
+            "BREADCRUMBS_PER_DEVICE",
+            "update",
+            payload_items=total_inputs,
+            device_count=len(set(p.get('device_id') for p in (positions or []) if p.get('device_id')))
         )
 
     def _replace_breadcrumb_layer_features(self, layer: QgsVectorLayer, segments: List[Dict[str, Any]]):
@@ -2885,7 +2839,7 @@ class TrackingLayerManager(BaseLayerManager):
         updated_by: Optional[str] = None
     ) -> int:
         """
-        Delete all current positions for given device IDs.
+        Delete all current positions for given device IDs and remove position layers.
 
         Args:
             device_ids: List of device IDs to remove
@@ -2902,32 +2856,46 @@ class TrackingLayerManager(BaseLayerManager):
         if not isinstance(device_ids, list) or not device_ids:
             raise ValueError("device_ids must be a non-empty list")
 
-        layer = self._get_or_create_current_layer()
+        self._ensure_per_device_ready()
+        factory = self._get_per_device_factory()
 
-        # Find features to delete
-        device_id_field_idx = layer.fields().indexFromName('device_id')
-        if device_id_field_idx == -1:
-            raise RuntimeError("device_id field not found")
+        deleted = 0
+        for device_id in device_ids:
+            layer = self._get_existing_device_position_layer(device_id)
+            if not layer or not layer.isValid():
+                continue
 
-        feature_ids_to_delete = []
-        for feature in layer.getFeatures(QgsFeatureRequest()):
-            if feature.attribute(device_id_field_idx) in device_ids:
-                feature_ids_to_delete.append(feature.id())
+            device_name = layer.customProperty(self.DEVICE_NAME_PROP)
+            if not device_name:
+                root = QgsProject.instance().layerTreeRoot()
+                node = root.findLayer(layer.id()) if root else None
+                parent = node.parent() if node else None
+                if isinstance(parent, QgsLayerTreeGroup):
+                    device_name = parent.name()
 
-        if not feature_ids_to_delete:
-            return 0
+            count = layer.featureCount()
+            if count:
+                with self._layer_transaction(layer, layer.name(), "delete device positions") as edit_layer:
+                    self._clear_layer_features(edit_layer, layer.name())
+                layer.triggerRepaint()
+                deleted += count
 
-        with self._layer_transaction(layer, self.CURRENT_LAYER_NAME, "delete device positions") as edit_layer:
-            if not edit_layer.deleteFeatures(feature_ids_to_delete):
-                raise RuntimeError("Failed to delete features")
+            item_id = layer.customProperty(SAR_ITEM_ID)
+            if item_id:
+                if not factory.delete_item_layer(item_id, remove_table=True, hard_delete=True):
+                    raise RuntimeError(f"Failed to delete position layer for device {device_id}")
+            else:
+                QgsProject.instance().removeMapLayer(layer.id())
 
-        layer.triggerRepaint()
+            self._device_position_layers.pop(device_id, None)
+            self._remove_device_group_if_empty(device_name)
+
         logger.info(
-            "[TrackingManager] Deleted %s positions for %s devices",
-            len(feature_ids_to_delete),
+            "[TrackingManager] Deleted %s position(s) across %s device(s)",
+            deleted,
             len(device_ids)
         )
-        return len(feature_ids_to_delete)
+        return deleted
 
     def delete_device_breadcrumbs(
         self,
@@ -2935,7 +2903,7 @@ class TrackingLayerManager(BaseLayerManager):
         updated_by: Optional[str] = None
     ) -> int:
         """
-        Delete breadcrumbs for given device IDs.
+        Delete breadcrumbs for given device IDs and remove trail layers.
 
         Args:
             device_ids: List of device IDs to remove
@@ -2947,31 +2915,46 @@ class TrackingLayerManager(BaseLayerManager):
         if not isinstance(device_ids, list) or not device_ids:
             raise ValueError("device_ids must be a non-empty list")
 
-        layer = self._get_or_create_breadcrumbs_layer()
+        self._ensure_per_device_ready()
+        factory = self._get_per_device_factory()
 
-        device_id_field_idx = layer.fields().indexFromName('device_id')
-        if device_id_field_idx == -1:
-            raise RuntimeError("device_id field not found")
+        deleted = 0
+        for device_id in device_ids:
+            layer = self._get_existing_device_trail_layer(device_id)
+            if not layer or not layer.isValid():
+                continue
 
-        feature_ids_to_delete = []
-        for feature in layer.getFeatures(QgsFeatureRequest()):
-            if feature.attribute(device_id_field_idx) in device_ids:
-                feature_ids_to_delete.append(feature.id())
+            device_name = layer.customProperty(self.DEVICE_NAME_PROP)
+            if not device_name:
+                root = QgsProject.instance().layerTreeRoot()
+                node = root.findLayer(layer.id()) if root else None
+                parent = node.parent() if node else None
+                if isinstance(parent, QgsLayerTreeGroup):
+                    device_name = parent.name()
 
-        if not feature_ids_to_delete:
-            return 0
+            count = layer.featureCount()
+            if count:
+                with self._layer_transaction(layer, layer.name(), "delete device breadcrumbs") as edit_layer:
+                    self._clear_layer_features(edit_layer, layer.name())
+                layer.triggerRepaint()
+                deleted += count
 
-        with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "delete device breadcrumbs") as edit_layer:
-            if not edit_layer.deleteFeatures(feature_ids_to_delete):
-                raise RuntimeError("Failed to delete breadcrumbs")
+            item_id = layer.customProperty(SAR_ITEM_ID)
+            if item_id:
+                if not factory.delete_item_layer(item_id, remove_table=True, hard_delete=True):
+                    raise RuntimeError(f"Failed to delete trail layer for device {device_id}")
+            else:
+                QgsProject.instance().removeMapLayer(layer.id())
 
-        layer.triggerRepaint()
+            self._device_trail_layers.pop(device_id, None)
+            self._remove_device_group_if_empty(device_name)
+
         logger.info(
-            "[TrackingManager] Deleted %s breadcrumb segments for %s devices",
-            len(feature_ids_to_delete),
+            "[TrackingManager] Deleted %s breadcrumb segment(s) across %s device(s)",
+            deleted,
             len(device_ids)
         )
-        return len(feature_ids_to_delete)
+        return deleted
 
     def prune_old_breadcrumbs(
         self,
@@ -2993,46 +2976,63 @@ class TrackingLayerManager(BaseLayerManager):
         if not isinstance(older_than_hours, (int, float)) or older_than_hours <= 0:
             raise ValueError(f"older_than_hours must be positive number, got: {older_than_hours}")
 
-        layer = self._get_or_create_breadcrumbs_layer()
-        if not layer or not layer.isValid():
-            return 0
+        self._ensure_per_device_ready()
 
-        ts_idx = layer.fields().indexFromName("timestamp")
-        if ts_idx == -1:
-            logger.warning("Breadcrumbs layer missing timestamp field; cannot prune")
+        trail_layers: Dict[str, QgsVectorLayer] = {}
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            if layer.customProperty(SAR_ITEM_TYPE) != ItemType.DEVICE_TRAIL:
+                continue
+            if layer.isValid():
+                trail_layers[layer.id()] = layer
+
+        if not trail_layers:
             return 0
 
         # Use timezone-aware datetime to prevent Python 3.9+ comparison crashes
         threshold = datetime.now(timezone.utc) - timedelta(hours=float(older_than_hours))
-        feature_ids = []
-        for feature in layer.getFeatures(QgsFeatureRequest()):
-            ts_val = feature.attribute(ts_idx)
-            if not ts_val:
+        total_deleted = 0
+
+        for layer in trail_layers.values():
+            end_idx = layer.fields().indexFromName("end_time")
+            start_idx = layer.fields().indexFromName("start_time")
+            if end_idx == -1 and start_idx == -1:
+                logger.warning("Trail layer %s missing time fields; cannot prune", layer.name())
                 continue
-            try:
-                ts = parse_iso_timestamp(str(ts_val))
-                # Make ts timezone-aware if it's naive (defensive safety)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except Exception:
+
+            feature_ids = []
+            for feature in layer.getFeatures(QgsFeatureRequest()):
+                ts_val = feature.attribute(end_idx) if end_idx != -1 else feature.attribute(start_idx)
+                if not ts_val:
+                    continue
+                try:
+                    ts = parse_iso_timestamp(str(ts_val))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                except Exception:
+                    continue
+                if ts < threshold:
+                    feature_ids.append(feature.id())
+
+            if not feature_ids:
                 continue
-            if ts < threshold:
-                feature_ids.append(feature.id())
 
-        if not feature_ids:
-            return 0
+            with self._layer_transaction(layer, layer.name(), "prune breadcrumbs") as edit_layer:
+                if not edit_layer.deleteFeatures(feature_ids):
+                    raise RuntimeError("Failed to delete old breadcrumbs")
 
-        with self._layer_transaction(layer, self.BREADCRUMBS_LAYER_NAME, "prune breadcrumbs") as edit_layer:
-            if not edit_layer.deleteFeatures(feature_ids):
-                raise RuntimeError("Failed to delete old breadcrumbs")
+            layer.triggerRepaint()
+            total_deleted += len(feature_ids)
 
-        layer.triggerRepaint()
-        logger.info(
-            "[TrackingManager] Pruned %s breadcrumb segments older than %sh",
-            len(feature_ids),
-            older_than_hours
-        )
-        return len(feature_ids)
+        if total_deleted:
+            logger.info(
+                "[TrackingManager] Pruned %s breadcrumb segment(s) older than %sh",
+                total_deleted,
+                older_than_hours
+            )
+
+        return total_deleted
 
     def export_device_track(
         self,
@@ -3054,38 +3054,12 @@ class TrackingLayerManager(BaseLayerManager):
         if format.lower() != "geojson":
             raise ValueError("Only GeoJSON export is supported currently")
 
-        layer = self._get_or_create_breadcrumbs_layer()
+        self._ensure_per_device_ready()
+        layer = self._get_existing_device_trail_layer(device_id)
         if not layer or not layer.isValid():
-            raise RuntimeError("Breadcrumbs layer not available")
+            raise RuntimeError("Device trail layer not available")
 
-        # Filter features for device
-        device_field_idx = layer.fields().indexFromName("device_id")
-        if device_field_idx == -1:
-            raise RuntimeError("Breadcrumbs layer missing device_id field")
-
-        export_layer = QgsVectorLayer(f"LineString?crs={layer.crs().authid()}", f"{device_id}_track", "memory")
-        export_layer.dataProvider().addAttributes(layer.fields())
-        export_layer.updateFields()
-
-        for feature in layer.getFeatures(QgsFeatureRequest()):
-            if feature.attribute(device_field_idx) != device_id:
-                continue
-            new_feature = QgsFeature(export_layer.fields())
-            new_feature.setGeometry(feature.geometry())
-            # IMPORTANT: Copy attributes by field name (not positional list).
-            # Source layers may have provider-managed fields (e.g. fid) that
-            # don't exist in the memory export layer, causing field count mismatch.
-            source_fields = layer.fields()
-            dest_fields = export_layer.fields()
-            for i in range(source_fields.count()):
-                field_name = source_fields.at(i).name()
-                dest_idx = dest_fields.indexFromName(field_name)
-                if dest_idx != -1:
-                    new_feature.setAttribute(dest_idx, feature.attribute(i))
-            if not export_layer.dataProvider().addFeature(new_feature):
-                raise RuntimeError(f"Failed to copy feature {feature.id()} for export")
-
-        if export_layer.featureCount() == 0:
+        if layer.featureCount() == 0:
             raise ValueError(f"No breadcrumbs found for device {device_id}")
 
         temp_dir = tempfile.mkdtemp(prefix="sartracker_export_")
@@ -3097,7 +3071,7 @@ class TrackingLayerManager(BaseLayerManager):
             options = QgsVectorFileWriter.SaveVectorOptions()
             options.driverName = "GeoJSON"
             result, error_message = QgsVectorFileWriter.writeAsVectorFormatV2(
-                export_layer,
+                layer,
                 path,
                 QgsCoordinateTransformContext(),
                 options

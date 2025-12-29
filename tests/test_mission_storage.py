@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-from sartracker.utils.mission_storage import MissionStorageHelper, MissionPaths
+from sartracker.utils.mission_storage import MissionStorageHelper, MissionPaths, validate_archive
 
 
 class FakeLayerManager:
@@ -87,6 +87,22 @@ def test_handle_resume_uses_existing_store_and_creates_backup():
         assert paths.backup_dir.exists()
 
 
+def test_handle_resume_missing_store_raises():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        primary = Path(tmpdir) / "primary"
+        backup = Path(tmpdir) / "backup"
+        mission_dir = primary / "missionA"
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        gpkg = mission_dir / "missionA.gpkg"
+
+        config = FakeConfigStore(primary, backup)
+        lm = FakeLayerManager()
+        helper = MissionStorageHelper(layer_manager=lm, config_store=config)
+
+        with pytest.raises(FileNotFoundError):
+            helper.handle_resume(gpkg)
+
+
 def test_ingest_attachment_copies_file_and_returns_relative():
     with tempfile.TemporaryDirectory() as tmpdir:
         primary = Path(tmpdir) / "primary"
@@ -147,6 +163,7 @@ def test_create_archive_includes_gpkg_project_and_attachments():
 
         archive_path = helper.create_archive(paths, project_file)
         assert archive_path.exists()
+        assert validate_archive(archive_path, paths) is None
 
         import zipfile
         with zipfile.ZipFile(archive_path, 'r') as zipf:

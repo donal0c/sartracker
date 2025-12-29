@@ -336,6 +336,28 @@ def _backup_with_connection_api(source_path: Path, dest_path: Path) -> bool:
                     pass
 
 
+def format_uncommitted_edits(uncommitted: list, operation: str) -> Optional[str]:
+    """
+    Format a warning message for layers with uncommitted edits.
+
+    Args:
+        uncommitted: List of layer names with uncommitted edits
+        operation: Operation name (e.g., "backup", "archive")
+
+    Returns:
+        Warning message string or None if no edits
+    """
+    if not uncommitted:
+        return None
+    layer_list = ", ".join(uncommitted[:3])
+    if len(uncommitted) > 3:
+        layer_list += f" (+{len(uncommitted) - 3} more)"
+    return (
+        f"Layers with unsaved changes: {layer_list}. "
+        f"These changes may not be included in {operation}."
+    )
+
+
 def check_uncommitted_edits(project=None) -> list:
     """
     Check for layers with uncommitted edits in the current project.
@@ -415,6 +437,42 @@ def create_safe_snapshot(source_path: Path, dest_path: Path) -> bool:
         return _backup_with_vacuum_into(source_path, dest_path)
     else:
         return _backup_with_connection_api(source_path, dest_path)
+
+
+def validate_archive(archive_path: Path, mission_paths: MissionPaths) -> Optional[str]:
+    """
+    Validate that an archive exists and contains the mission GeoPackage entry.
+
+    Args:
+        archive_path: Path to archive zip file
+        mission_paths: MissionPaths for expected entry names
+
+    Returns:
+        None if valid, otherwise error message string
+    """
+    if not archive_path:
+        return "Archive path is missing"
+    if not archive_path.exists():
+        return f"Archive file not found: {archive_path}"
+    try:
+        if archive_path.stat().st_size <= 0:
+            return "Archive file is empty"
+    except Exception as exc:
+        return f"Archive file not accessible: {exc}"
+
+    if not zipfile.is_zipfile(str(archive_path)):
+        return "Archive file is not a valid zip"
+
+    expected_entry = f"{mission_paths.name}/{mission_paths.gpkg_path.name}"
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zipf:
+            names = set(zipf.namelist())
+            if expected_entry not in names:
+                return f"Archive is missing GeoPackage entry: {expected_entry}"
+    except Exception as exc:
+        return f"Archive validation failed: {exc}"
+
+    return None
 
 
 # =============================================================================
@@ -513,6 +571,8 @@ class MissionStorageHelper:
             raise RuntimeError("Layer manager is not initialized")
 
         gpkg_path = Path(store_path)
+        if not gpkg_path.exists():
+            raise FileNotFoundError(f"Mission GeoPackage not found at {gpkg_path}")
         sanitized_name = gpkg_path.parent.name
         mission_dir = gpkg_path.parent
         attachments_dir = mission_dir / "attachments"
@@ -584,7 +644,14 @@ class MissionStorageHelper:
         except ValueError:
             return str(destination)
 
-    def sync_backup(self, mission_paths: MissionPaths) -> bool:
+    def sync_backup(
+        self,
+        mission_paths: MissionPaths,
+        *,
+        uncommitted_layers: Optional[list] = None,
+        warn_uncommitted: bool = True,
+        warn_on_error: bool = True
+    ) -> bool:
         """
         Mirror GeoPackage (and attachments if present) to backup root.
 
@@ -592,6 +659,12 @@ class MissionStorageHelper:
         connection.backup()) to create consistent GeoPackage snapshot, preventing
         data loss during active tracking sessions. Warns users if layers have
         uncommitted edits that won't be included in the backup.
+
+        Args:
+            mission_paths: Mission paths for backup
+            uncommitted_layers: Precomputed uncommitted edit list (optional)
+            warn_uncommitted: Whether to warn about uncommitted edits
+            warn_on_error: Whether to emit warnings on backup failure
         """
         if not mission_paths or not mission_paths.backup_dir:
             return True  # Backup optional or not configured
@@ -602,51 +675,97 @@ class MissionStorageHelper:
             return False
 
         # DATA INTEGRITY: Check for uncommitted edits before backup
-        uncommitted = check_uncommitted_edits()
-        if uncommitted:
-            layer_list = ", ".join(uncommitted[:3])  # Show first 3
-            if len(uncommitted) > 3:
-                layer_list += f" (+{len(uncommitted) - 3} more)"
-            self.warn(
-                "Uncommitted Edits",
-                f"Layers with unsaved changes: {layer_list}. These changes may not be included in backup.",
-                duration=8
-            )
-            logger.warning(f"Backup proceeding with uncommitted edits in: {uncommitted}")
+        if uncommitted_layers is None:
+            uncommitted_layers = check_uncommitted_edits()
+        if uncommitted_layers:
+            msg = format_uncommitted_edits(uncommitted_layers, "backup")
+            if msg and warn_uncommitted:
+                self.warn("Uncommitted Edits", msg, duration=8)
+            logger.warning(f"Backup proceeding with uncommitted edits in: {uncommitted_layers}")
 
         try:
             backup_dir.mkdir(parents=True, exist_ok=True)
 
-            # Use safe snapshot instead of shutil.copy2
+            # Use safe snapshot into a temp file, then atomically replace
             backup_gpkg = backup_dir / gpkg_path.name
-            if backup_gpkg.exists():
-                backup_gpkg.unlink()  # Remove old backup before creating new one
+            temp_gpkg = backup_dir / f".{gpkg_path.name}.tmp"
+            if temp_gpkg.exists():
+                temp_gpkg.unlink()
 
-            create_safe_snapshot(gpkg_path, backup_gpkg)
+            create_safe_snapshot(gpkg_path, temp_gpkg)
+            temp_gpkg.replace(backup_gpkg)
 
             # Copy attachments (regular files, safe to copy directly)
             attachments_src = mission_paths.attachments_dir
             if attachments_src and attachments_src.exists():
                 attachments_dst = backup_dir / "attachments"
-                attachments_dst.mkdir(parents=True, exist_ok=True)
+                attachments_tmp = backup_dir / ".attachments_tmp"
+                attachments_old = backup_dir / ".attachments_old"
+
+                if attachments_tmp.exists():
+                    shutil.rmtree(attachments_tmp, ignore_errors=True)
+                attachments_tmp.mkdir(parents=True, exist_ok=True)
+
                 for child in attachments_src.iterdir():
-                    target = attachments_dst / child.name
+                    target = attachments_tmp / child.name
                     if child.is_file():
                         shutil.copy2(child, target)
                     elif child.is_dir():
                         shutil.copytree(child, target, dirs_exist_ok=True)
+
+                if attachments_dst.exists():
+                    if attachments_old.exists():
+                        shutil.rmtree(attachments_old, ignore_errors=True)
+                    attachments_dst.rename(attachments_old)
+
+                try:
+                    attachments_tmp.rename(attachments_dst)
+                except Exception:
+                    if attachments_old.exists() and not attachments_dst.exists():
+                        attachments_old.rename(attachments_dst)
+                    raise
+                finally:
+                    if attachments_old.exists():
+                        shutil.rmtree(attachments_old, ignore_errors=True)
             return True
         except Exception as exc:
-            self.warn("Mission Backup", f"Failed to sync mission backup: {exc}", duration=5)
+            try:
+                temp_gpkg = backup_dir / f".{gpkg_path.name}.tmp"
+                if temp_gpkg.exists():
+                    temp_gpkg.unlink()
+            except Exception:
+                pass
+            try:
+                attachments_tmp = backup_dir / ".attachments_tmp"
+                if attachments_tmp.exists():
+                    shutil.rmtree(attachments_tmp, ignore_errors=True)
+            except Exception:
+                pass
+            if warn_on_error:
+                self.warn("Mission Backup", f"Failed to sync mission backup: {exc}", duration=5)
+            logger.warning("Mission backup failed: %s", exc)
             return False
 
-    def create_archive(self, mission_paths: MissionPaths, project_path: Optional[Path]) -> Path:
+    def create_archive(
+        self,
+        mission_paths: MissionPaths,
+        project_path: Optional[Path],
+        *,
+        uncommitted_layers: Optional[list] = None,
+        warn_uncommitted: bool = True
+    ) -> Path:
         """
         Create a zip archive of the mission GeoPackage, project, and attachments.
 
         DATA INTEGRITY: Creates a consistent GeoPackage snapshot using SQLite-native
         backup before archiving, preventing data loss during active tracking sessions.
         Warns users if layers have uncommitted edits.
+
+        Args:
+            mission_paths: Mission paths for archive
+            project_path: Optional QGIS project file path
+            uncommitted_layers: Precomputed uncommitted edit list (optional)
+            warn_uncommitted: Whether to warn about uncommitted edits
 
         Returns:
             Path to created archive
@@ -660,17 +779,13 @@ class MissionStorageHelper:
             raise RuntimeError(f"Mission GeoPackage not found at {mission_paths.gpkg_path}")
 
         # DATA INTEGRITY: Check for uncommitted edits before archive
-        uncommitted = check_uncommitted_edits()
-        if uncommitted:
-            layer_list = ", ".join(uncommitted[:3])  # Show first 3
-            if len(uncommitted) > 3:
-                layer_list += f" (+{len(uncommitted) - 3} more)"
-            self.warn(
-                "Uncommitted Edits",
-                f"Layers with unsaved changes: {layer_list}. These changes may not be included in archive.",
-                duration=8
-            )
-            logger.warning(f"Archive proceeding with uncommitted edits in: {uncommitted}")
+        if uncommitted_layers is None:
+            uncommitted_layers = check_uncommitted_edits()
+        if uncommitted_layers:
+            msg = format_uncommitted_edits(uncommitted_layers, "archive")
+            if msg and warn_uncommitted:
+                self.warn("Uncommitted Edits", msg, duration=8)
+            logger.warning(f"Archive proceeding with uncommitted edits in: {uncommitted_layers}")
 
         # Create temporary snapshot for consistent archive
         temp_dir = Path(tempfile.mkdtemp(prefix="sartracker_archive_"))

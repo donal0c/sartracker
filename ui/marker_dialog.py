@@ -28,6 +28,54 @@ class MarkerDialog(BaseDialog):
     """
 
     def __init__(self, lat, lon, easting, northing, parent=None, existing_data=None):
+        """
+        Initialize marker dialog.
+
+        BUG-079 FIX: Added coordinate validation to prevent NaN/Infinity values
+        from reaching the UI. Invalid coordinates could result in markers being
+        placed at incorrect locations during SAR operations.
+
+        Args:
+            lat: Latitude in WGS84 decimal degrees
+            lon: Longitude in WGS84 decimal degrees
+            easting: Irish Grid (ITM) easting (can be None)
+            northing: Irish Grid (ITM) northing (can be None)
+            parent: Parent widget
+            existing_data: Existing marker data for edit mode
+
+        Raises:
+            ValueError: If lat/lon are NaN, Infinity, or out of range
+        """
+        import math
+
+        # BUG-079 FIX: Validate coordinates before storing
+        # LIFE-SAFETY CRITICAL: Invalid coordinates could misdirect rescue teams
+        if lat is None or lon is None:
+            raise ValueError("Coordinates cannot be None")
+
+        if math.isnan(lat) or math.isinf(lat):
+            raise ValueError(f"Invalid latitude: {lat} (NaN/Infinity not allowed)")
+        if math.isnan(lon) or math.isinf(lon):
+            raise ValueError(f"Invalid longitude: {lon} (NaN/Infinity not allowed)")
+
+        if not (-90 <= lat <= 90):
+            raise ValueError(f"Latitude {lat} out of valid range [-90, 90]")
+        if not (-180 <= lon <= 180):
+            raise ValueError(f"Longitude {lon} out of valid range [-180, 180]")
+
+        # Validate Irish Grid coordinates if provided (optional fields)
+        if easting is not None:
+            if math.isnan(easting) or math.isinf(easting):
+                raise ValueError(f"Invalid easting: {easting} (NaN/Infinity not allowed)")
+            if not (0 <= easting <= 1000000):
+                raise ValueError(f"Easting {easting} out of valid Irish Grid range [0, 1000000]")
+
+        if northing is not None:
+            if math.isnan(northing) or math.isinf(northing):
+                raise ValueError(f"Invalid northing: {northing} (NaN/Infinity not allowed)")
+            if not (0 <= northing <= 1500000):
+                raise ValueError(f"Northing {northing} out of valid Irish Grid range [0, 1500000]")
+
         super().__init__(parent)
 
         self.lat = lat
@@ -108,8 +156,13 @@ class MarkerDialog(BaseDialog):
         wgs84_label = QLabel(f"<b>{self.lat:.6f}°N, {self.lon:.6f}°E</b>")
         coords_layout.addRow("WGS84:", wgs84_label)
         
-        # Irish Grid (ITM)
-        itm_label = QLabel(f"<b>E: {self.easting:,.0f}  N: {self.northing:,.0f}</b>")
+        # Irish Grid (ITM) - BUG-083 FIX: Handle None values gracefully
+        # Easting/northing can be None when coordinates are outside Ireland
+        # or when Irish Grid data is not available
+        if self.easting is not None and self.northing is not None:
+            itm_label = QLabel(f"<b>E: {self.easting:,.0f}  N: {self.northing:,.0f}</b>")
+        else:
+            itm_label = QLabel("<i>Not available</i>")
         coords_layout.addRow("Irish Grid (ITM):", itm_label)
         
         coords_group.setLayout(coords_layout)

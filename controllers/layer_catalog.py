@@ -24,7 +24,7 @@ from qgis.core import (
 )
 
 from ..layers import LayerManager, LayerIds, GroupNames, get_layer_by_id
-from ..layers.schema import get_expected_structure, LAYER_NAME_TO_ID
+from ..layers.schema import get_expected_structure, LAYER_NAME_TO_ID, GroupDefinition
 from .per_item_layer_factory import PerItemLayerFactory, ItemType, SAR_ITEM_TYPE
 from ..utils.notify import info as notify_info, warning as notify_warning, error as notify_error
 from ..utils.task_manager import TaskManager
@@ -40,11 +40,14 @@ PER_ITEM_LAYER_TYPES = {
     LayerIds.MARKERS_CASUALTIES: ItemType.MARKER_CASUALTY,
     LayerIds.LINES: ItemType.LINE,
     LayerIds.SEARCH_AREAS: ItemType.SEARCH_AREA,
+    LayerIds.SEARCH_SECTORS: ItemType.SEARCH_SECTOR,
     LayerIds.RANGE_RINGS: ItemType.RANGE_RING,
     LayerIds.BEARING_LINES: ItemType.BEARING_LINE,
+    LayerIds.TEXT_LABELS: ItemType.TEXT_LABEL,
 }
 
 PER_ITEM_TYPE_TO_LAYER_ID = {value: key for key, value in PER_ITEM_LAYER_TYPES.items()}
+VIRTUAL_LAYER_PREFIX = "virtual::"
 
 
 # ============================================================================
@@ -487,6 +490,12 @@ class LayerCatalogService(QObject):
     group_updated = pyqtSignal(str)                  # group_id changed
     feature_count_changed = pyqtSignal(str, int)     # layer_id, new_count
 
+    # Lock retry policy for GeoPackage refreshes
+    LOCK_RETRY_LIMIT = 5
+    LOCK_RETRY_BASE_DELAY_MS = 1000
+    LOCK_RETRY_MAX_DELAY_MS = 10000
+    LOCK_RETRY_WINDOW_SECONDS = 30
+
     def __init__(
         self,
         iface,
@@ -536,6 +545,8 @@ class LayerCatalogService(QObject):
         # Cleanup flag (CRITICAL FIX: Prevents handlers from firing during cleanup)
         self._cleanup_in_progress = False
         self._layer_lock_alerts: Dict[str, datetime] = {}
+        self._layer_lock_retries: Dict[str, Dict[str, Any]] = {}
+        self._ui_task_timers: Dict[str, QTimer] = {}
 
         # Build initial cache
         try:
@@ -612,6 +623,55 @@ class LayerCatalogService(QObject):
     # Background Task Helpers
     # ========================================================================
 
+    def _start_console_model_ui_task(
+        self,
+        include_features: bool,
+        feature_limit: int,
+        show_hidden: bool,
+        filter_favorites_only: bool,
+        on_complete: Optional[Callable[[Dict[str, Any]], None]],
+        on_error: Optional[Callable[[Exception], None]],
+        task_id: Optional[str]
+    ) -> str:
+        """Schedule console model generation on the UI thread."""
+        task_key = task_id or "catalog_fetch"
+
+        # Cancel any existing task with the same ID
+        existing_timer = self._ui_task_timers.pop(task_key, None)
+        if existing_timer:
+            try:
+                if existing_timer.isActive():
+                    existing_timer.stop()
+                existing_timer.deleteLater()
+            except Exception:
+                pass
+
+        def _runner():
+            self._ui_task_timers.pop(task_key, None)
+            if self._cleanup_in_progress:
+                return
+            try:
+                payload = self.get_console_model(
+                    include_features=include_features,
+                    feature_limit=feature_limit,
+                    show_hidden=show_hidden,
+                    filter_favorites_only=filter_favorites_only
+                )
+                if on_complete:
+                    on_complete(payload)
+            except Exception as exc:
+                if on_error:
+                    on_error(exc)
+                else:
+                    self._notify_error("Layer Catalog", str(exc))
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(_runner)
+        self._ui_task_timers[task_key] = timer
+        timer.start(0)
+        return task_key
+
     def start_console_model_task(
         self,
         include_features: bool = True,
@@ -622,7 +682,23 @@ class LayerCatalogService(QObject):
         on_error: Optional[Callable[[Exception], None]] = None,
         task_id: Optional[str] = None
     ) -> str:
-        """Run get_console_model() in background via TaskManager."""
+        """
+        Run get_console_model() asynchronously.
+
+        NOTE: Feature enumeration touches QGIS layer APIs and must run on the UI
+        thread. When include_features=True, schedule work on the UI thread.
+        """
+        if include_features:
+            return self._start_console_model_ui_task(
+                include_features=include_features,
+                feature_limit=feature_limit,
+                show_hidden=show_hidden,
+                filter_favorites_only=filter_favorites_only,
+                on_complete=on_complete,
+                on_error=on_error,
+                task_id=task_id
+            )
+
         task_manager = getattr(self, "_task_manager", None)
         if not task_manager:
             raise RuntimeError("Task manager not available")
@@ -656,6 +732,15 @@ class LayerCatalogService(QObject):
 
     def cancel_task(self, task_id: str) -> bool:
         """Cancel a background catalog task."""
+        timer = self._ui_task_timers.pop(task_id, None)
+        if timer:
+            try:
+                if timer.isActive():
+                    timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+            return True
         task_manager = getattr(self, "_task_manager", None)
         if not task_manager:
             return False
@@ -1268,9 +1353,141 @@ class LayerCatalogService(QObject):
     # CACHE MANAGEMENT
     # ========================================================================
 
+    def _is_virtual_layer_info(self, layer_info: LayerInfo) -> bool:
+        """Return True if the layer info represents a virtual (per-item-only) entry."""
+        return bool(layer_info.qgis_layer_id.startswith(VIRTUAL_LAYER_PREFIX))
+
+    def _resolve_group_id_for_layer(self, layer_id: str) -> Optional[str]:
+        """Resolve group_id for a layer_id using the schema definitions."""
+        structure = get_expected_structure()
+
+        def _walk(group: GroupDefinition, parent_id: Optional[str]) -> Optional[str]:
+            if parent_id is None and group.name == GroupNames.ROOT:
+                group_id = GroupNames.ROOT
+            elif parent_id:
+                group_id = f"{parent_id}/{group.name}"
+            else:
+                group_id = group.name
+
+            if group.layers:
+                for layer_def in group.layers:
+                    if layer_def.layer_id == layer_id:
+                        return group_id
+
+            if group.subgroups:
+                for subgroup in group.subgroups:
+                    found = _walk(subgroup, group_id)
+                    if found:
+                        return found
+
+            return None
+
+        return _walk(structure, None)
+
+    def _build_virtual_layer_info(
+        self,
+        layer_id: str,
+        layer_def,
+        per_item_layers: List[QgsVectorLayer]
+    ) -> Optional[LayerInfo]:
+        """Build a LayerInfo entry for per-item layers without a canonical layer."""
+        if not layer_def:
+            return None
+
+        group_id = self._resolve_group_id_for_layer(layer_id)
+        if not group_id:
+            return None
+
+        try:
+            metadata = self.layer_manager.get_layer_metadata(layer_id) or {}
+        except Exception as exc:
+            logger.warning("Failed to get metadata for virtual %s: %s", layer_id, exc, exc_info=True)
+            metadata = {}
+
+        provider = "ogr"
+        schema_fields: List[str] = []
+        visible = True
+        data_source_uri = ""
+
+        if per_item_layers:
+            sample = per_item_layers[0]
+            try:
+                provider = sample.dataProvider().name() if sample.dataProvider() else provider
+            except Exception:
+                provider = "unknown"
+            try:
+                schema_fields = [field.name() for field in sample.fields()]
+            except Exception:
+                schema_fields = []
+            try:
+                layer_tree_root = self.project.layerTreeRoot()
+                if layer_tree_root:
+                    node = layer_tree_root.findLayer(sample.id())
+                    if node:
+                        visible = node.isVisible()
+            except Exception:
+                visible = True
+            try:
+                data_source_uri = sample.source() or ""
+            except Exception:
+                data_source_uri = ""
+
+        last_updated = None
+        timestamp = metadata.get('updated_at')
+        if timestamp:
+            try:
+                last_updated = datetime.fromisoformat(timestamp)
+            except Exception:
+                last_updated = None
+
+        try:
+            return LayerInfo(
+                id=layer_id,
+                canonical_name=layer_def.name,
+                group_id=group_id,
+                qgis_layer_id=f"{VIRTUAL_LAYER_PREFIX}{layer_id}",
+                alias=metadata.get('alias'),
+                order=metadata.get('display_order', layer_def.position),
+                visible=visible,
+                provider=provider,
+                feature_count=len(per_item_layers),
+                last_updated=last_updated,
+                favorite=metadata.get('favorite', False),
+                schema_fields=schema_fields,
+                layer_type=layer_id.split('_')[0] if '_' in layer_id else '',
+                geometry_type=layer_def.geometry_type,
+                editable=True,
+                data_source_uri=data_source_uri
+            )
+        except Exception as exc:
+            logger.exception("Failed to create virtual LayerInfo for %s", layer_id)
+            return None
+
+    def _ensure_virtual_layer_entries(self) -> None:
+        """Ensure virtual entries exist for per-item layers without canonical layers."""
+        for layer_id in PER_ITEM_LAYER_TYPES.keys():
+            if layer_id in self._layers:
+                continue
+
+            per_item_layers = self._get_per_item_layers_for_layer(layer_id)
+            if not per_item_layers:
+                continue
+
+            layer_def = get_layer_by_id(layer_id)
+            layer_info = self._build_virtual_layer_info(layer_id, layer_def, per_item_layers)
+            if not layer_info:
+                continue
+
+            self._layers[layer_id] = layer_info
+            group_info = self._groups.get(layer_info.group_id)
+            if group_info and layer_id not in group_info.children:
+                group_info.children.append(layer_id)
+
     def _augment_per_item_feature_counts(self) -> None:
         """Add per-item layer counts to cached feature counts."""
         for layer_id, layer_info in self._layers.items():
+            if self._is_virtual_layer_info(layer_info):
+                continue
             per_item_count = self._get_per_item_layer_count(layer_id)
             if per_item_count:
                 layer_info.feature_count += per_item_count
@@ -1342,6 +1559,7 @@ class LayerCatalogService(QObject):
 
         # Disconnect existing per-layer signal hooks before rebuilding cache
         self._disconnect_all_layer_signals()
+        self._layer_lock_retries.clear()
 
         builder = _CatalogCacheBuilder(
             layer_manager=self.layer_manager,
@@ -1359,6 +1577,7 @@ class LayerCatalogService(QObject):
         self._layers.update(result.layers)
         self._per_item_layer_ids.clear()
 
+        self._ensure_virtual_layer_entries()
         self._augment_per_item_feature_counts()
 
         # Rewire per-layer signals now that cache is rebuilt
@@ -1436,10 +1655,44 @@ class LayerCatalogService(QObject):
             return
 
         if layer_id not in self._layers:
-            logger.warning("Attempted refresh of unknown layer %s", layer_id)
+            per_item_layers = self._get_per_item_layers_for_layer(layer_id)
+            if not per_item_layers:
+                logger.warning("Attempted refresh of unknown layer %s", layer_id)
+                return
+
+            layer_def = get_layer_by_id(layer_id)
+            layer_info = self._build_virtual_layer_info(layer_id, layer_def, per_item_layers)
+            if not layer_info:
+                logger.warning("Failed to create virtual entry for %s", layer_id)
+                return
+
+            self._layers[layer_id] = layer_info
+            group_info = self._groups.get(layer_info.group_id)
+            if group_info and layer_id not in group_info.children:
+                group_info.children.append(layer_id)
+
+            if hasattr(self, 'layer_updated'):
+                self.layer_updated.emit(layer_id)
             return
 
         try:
+            existing_info = self._layers.get(layer_id)
+            if existing_info and self._is_virtual_layer_info(existing_info):
+                per_item_layers = self._get_per_item_layers_for_layer(layer_id)
+                if not per_item_layers:
+                    group_info = self._groups.get(existing_info.group_id)
+                    if group_info and layer_id in group_info.children:
+                        group_info.children.remove(layer_id)
+                    self._layers.pop(layer_id, None)
+                    if hasattr(self, 'layer_updated'):
+                        self.layer_updated.emit(layer_id)
+                    return
+
+                existing_info.feature_count = len(per_item_layers)
+                if hasattr(self, 'layer_updated'):
+                    self.layer_updated.emit(layer_id)
+                return
+
             # Get layer from manager
             layer = self.layer_manager.get_layer(layer_id)
             if not layer or not layer.isValid():
@@ -1612,6 +1865,8 @@ class LayerCatalogService(QObject):
                     if info.qgis_layer_id == qgis_layer_id:
                         del self._layers[catalog_id]
                         self._disconnect_layer_signals(catalog_id)
+                        self._layer_lock_alerts.pop(catalog_id, None)
+                        self._layer_lock_retries.pop(catalog_id, None)
                         removed_count += 1
                         logger.info("Removed %s from catalog cache", catalog_id)
                         self.layer_updated.emit(catalog_id)
@@ -1749,6 +2004,7 @@ class LayerCatalogService(QObject):
                 "BUG-034: Layer %s not found in layer_manager - may have been deleted",
                 layer_id
             )
+            self._layer_lock_retries.pop(layer_id, None)
             return
 
         if not layer.isValid():
@@ -1756,6 +2012,7 @@ class LayerCatalogService(QObject):
                 "BUG-034: Layer %s exists but is invalid (corrupted or source unavailable)",
                 layer_id
             )
+            self._layer_lock_retries.pop(layer_id, None)
             return
 
         # BUG-034 FIX: Additional check - verify layer still registered with project
@@ -1765,12 +2022,15 @@ class LayerCatalogService(QObject):
                 "BUG-034: Layer %s exists and is valid but not registered with current project",
                 layer_id
             )
+            self._layer_lock_retries.pop(layer_id, None)
             return
 
         lock_info = self._detect_geopackage_lock(layer_id, layer)
         if lock_info:
             self._handle_locked_layer(layer_id, layer, lock_info)
             return
+
+        self._layer_lock_retries.pop(layer_id, None)
 
         self._schedule_refresh([(layer_id, layer)])
 
@@ -1884,6 +2144,31 @@ class LayerCatalogService(QObject):
         layer_manager = getattr(self, "layer_manager", None)
         if self._cleanup_in_progress or getattr(layer_manager, "_application_closing", False):
             return
+
+        now = datetime.now(timezone.utc)
+        retry_state = self._layer_lock_retries.get(layer_id)
+        if not retry_state:
+            retry_state = {"count": 0, "first_seen": now}
+
+        elapsed = (now - retry_state["first_seen"]).total_seconds()
+        if retry_state["count"] >= self.LOCK_RETRY_LIMIT or elapsed >= self.LOCK_RETRY_WINDOW_SECONDS:
+            logger.warning(
+                "Lock retry limit reached for %s (count=%d, elapsed=%.1fs)",
+                layer_id,
+                retry_state["count"],
+                elapsed
+            )
+            self._layer_lock_retries.pop(layer_id, None)
+            return
+
+        retry_state["count"] += 1
+        self._layer_lock_retries[layer_id] = retry_state
+
+        base_delay = delay_ms or self.LOCK_RETRY_BASE_DELAY_MS
+        delay_ms = min(
+            int(base_delay * (2 ** (retry_state["count"] - 1))),
+            self.LOCK_RETRY_MAX_DELAY_MS
+        )
 
         def _retry():
             if self._cleanup_in_progress:
@@ -2112,10 +2397,21 @@ class LayerCatalogService(QObject):
             finally:
                 self._refresh_timer = None
 
+        for task_id, timer in list(self._ui_task_timers.items()):
+            try:
+                if timer.isActive():
+                    timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+            self._ui_task_timers.pop(task_id, None)
+
         # Clear cache (in-place to break external references)
         self._groups.clear()
         self._layers.clear()
         self._pending_refresh_layers.clear()
+        self._layer_lock_alerts.clear()
+        self._layer_lock_retries.clear()
 
         task_manager = getattr(self, "_task_manager", None)
         if task_manager:

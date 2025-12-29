@@ -23,7 +23,13 @@ from typing import Optional, TYPE_CHECKING
 from qgis.PyQt.QtCore import QObject, pyqtSignal
 from qgis.core import QgsTask
 
-from ..utils.mission_storage import MissionPaths, MissionStorageHelper
+from ..utils.mission_storage import (
+    MissionPaths,
+    MissionStorageHelper,
+    check_uncommitted_edits,
+    format_uncommitted_edits,
+    validate_archive,
+)
 from ..utils.task_manager import TaskManager
 
 if TYPE_CHECKING:
@@ -100,7 +106,9 @@ class MissionStorageController(QObject):
         self,
         paths: MissionPaths,
         project_path: Optional[Path],
-        mark_finalized: bool = True
+        mark_finalized: bool = True,
+        *,
+        uncommitted_layers: Optional[list] = None
     ) -> bool:
         """
         Start background task to create mission archive.
@@ -113,6 +121,7 @@ class MissionStorageController(QObject):
             paths: MissionPaths with current mission directories
             project_path: Optional path to QGIS project file to include
             mark_finalized: Whether to mark mission as finalized on success
+            uncommitted_layers: Precomputed uncommitted edit list (optional)
 
         Returns:
             True if task was started, False if archive already in progress
@@ -130,6 +139,9 @@ class MissionStorageController(QObject):
             self.archive_failed.emit("Mission paths not configured")
             return False
 
+        if uncommitted_layers is None:
+            uncommitted_layers = self._warn_uncommitted_edits("archive")
+
         self._archive_in_progress = True
         self.archive_started.emit()
 
@@ -138,7 +150,8 @@ class MissionStorageController(QObject):
             paths=paths,
             project_path=project_path,
             storage=self.mission_storage,
-            mark_finalized=mark_finalized
+            mark_finalized=mark_finalized,
+            uncommitted_layers=uncommitted_layers
         )
 
         # Start via TaskManager with callbacks
@@ -162,6 +175,20 @@ class MissionStorageController(QObject):
 
         archive_path = getattr(task, "archive_path", None)
         mark_finalized = getattr(task, "mark_finalized", True)
+        task_paths = getattr(task, "paths", None)
+
+        if archive_path and task_paths:
+            validation_error = validate_archive(Path(archive_path), task_paths)
+            if validation_error:
+                error_msg = f"Archive validation failed: {validation_error}"
+                print(f"[MissionStorageController] Archive error: {error_msg}")
+                self.archive_failed.emit(error_msg)
+                return
+        elif archive_path and not task_paths:
+            error_msg = "Archive completed but mission paths were unavailable for validation"
+            print(f"[MissionStorageController] Archive error: {error_msg}")
+            self.archive_failed.emit(error_msg)
+            return
 
         if archive_path:
             print(f"[MissionStorageController] Archive created: {archive_path}")
@@ -170,9 +197,14 @@ class MissionStorageController(QObject):
             if mark_finalized and self.layer_manager:
                 try:
                     self.layer_manager.set_mission_finalized(True)
+                    if not self.layer_manager.is_mission_finalized():
+                        raise RuntimeError("Finalization flag did not persist")
                     print("[MissionStorageController] Mission marked as finalized")
                 except Exception as exc:
-                    print(f"[MissionStorageController] Warning: Failed to mark finalized: {exc}")
+                    error_msg = f"Failed to mark mission as finalized: {exc}"
+                    print(f"[MissionStorageController] {error_msg}")
+                    self.archive_failed.emit(error_msg)
+                    return
 
             self.archive_completed.emit(str(archive_path))
         else:
@@ -197,12 +229,18 @@ class MissionStorageController(QObject):
     # Backup Operations
     # ------------------------------------------------------------------
 
-    def start_backup_task(self, paths: MissionPaths) -> bool:
+    def start_backup_task(
+        self,
+        paths: MissionPaths,
+        *,
+        uncommitted_layers: Optional[list] = None
+    ) -> bool:
         """
         Start background task to sync mission backup.
 
         Args:
             paths: MissionPaths with current mission directories
+            uncommitted_layers: Precomputed uncommitted edit list (optional)
 
         Returns:
             True if task was started
@@ -212,8 +250,13 @@ class MissionStorageController(QObject):
 
         if not paths:
             return False
-
-        task = BackupTask(paths=paths, storage=self.mission_storage)
+        if uncommitted_layers is None:
+            uncommitted_layers = self._warn_uncommitted_edits("backup")
+        task = BackupTask(
+            paths=paths,
+            storage=self.mission_storage,
+            uncommitted_layers=uncommitted_layers
+        )
 
         self.task_manager.start_task(
             task=task,
@@ -223,6 +266,28 @@ class MissionStorageController(QObject):
         )
 
         return True
+
+    def _warn_uncommitted_edits(self, operation: str) -> list:
+        """
+        Check for uncommitted edits and warn on the main thread.
+
+        Args:
+            operation: Operation name ("backup" or "archive")
+
+        Returns:
+            List of uncommitted layer names (may be empty)
+        """
+        if self._is_shutting_down:
+            return []
+        uncommitted = check_uncommitted_edits()
+        msg = format_uncommitted_edits(uncommitted, operation)
+        if msg:
+            try:
+                from ..utils.notify import warning as notify_warning
+                notify_warning(self.iface.messageBar(), "Uncommitted Edits", msg, duration=8)
+            except Exception:
+                print(f"[MissionStorageController] Warning: {msg}")
+        return uncommitted
 
     def _on_backup_complete(self, task: "BackupTask"):
         """Handle successful backup completion."""
@@ -322,13 +387,15 @@ class ArchiveTask(QgsTask):
         paths: MissionPaths,
         project_path: Optional[Path],
         storage: MissionStorageHelper,
-        mark_finalized: bool = True
+        mark_finalized: bool = True,
+        uncommitted_layers: Optional[list] = None
     ):
         super().__init__("Creating mission archive", QgsTask.CanCancel)
         self.paths = paths
         self.project_path = project_path
         self.storage = storage
         self.mark_finalized = mark_finalized
+        self.uncommitted_layers = uncommitted_layers or []
 
         # Results (set during run())
         self.archive_path: Optional[Path] = None
@@ -347,7 +414,9 @@ class ArchiveTask(QgsTask):
 
             self.archive_path = self.storage.create_archive(
                 mission_paths=self.paths,
-                project_path=self.project_path
+                project_path=self.project_path,
+                uncommitted_layers=self.uncommitted_layers,
+                warn_uncommitted=False
             )
 
             return self.archive_path is not None
@@ -367,10 +436,16 @@ class BackupTask(QgsTask):
     snapshots of the GeoPackage.
     """
 
-    def __init__(self, paths: MissionPaths, storage: MissionStorageHelper):
+    def __init__(
+        self,
+        paths: MissionPaths,
+        storage: MissionStorageHelper,
+        uncommitted_layers: Optional[list] = None
+    ):
         super().__init__("Sync mission backup", QgsTask.CanCancel)
         self.paths = paths
         self.storage = storage
+        self.uncommitted_layers = uncommitted_layers or []
         self.error_message: Optional[str] = None
 
     def run(self) -> bool:
@@ -379,7 +454,14 @@ class BackupTask(QgsTask):
             if self.isCanceled():
                 return False
 
-            return bool(self.storage.sync_backup(self.paths))
+            return bool(
+                self.storage.sync_backup(
+                    self.paths,
+                    uncommitted_layers=self.uncommitted_layers,
+                    warn_uncommitted=False,
+                    warn_on_error=False
+                )
+            )
 
         except Exception as exc:
             self.error_message = str(exc)

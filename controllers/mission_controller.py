@@ -293,14 +293,14 @@ class MissionController(QObject):
         pause_started = settings.value(self.SETTINGS_KEY_PAUSE_STARTED, None)
 
         if not mission_name or not start_time_str:
-            self._clear_saved_state()
+            self.clear_saved_state()
             return None
 
         # BUG-046 FIX: Validate mission name
         mission_name_clean = str(mission_name).strip()
         if not mission_name_clean or len(mission_name_clean) > 500:
             print(f"[MissionController] BUG-046: Invalid mission name, clearing state")
-            self._clear_saved_state()
+            self.clear_saved_state()
             return None
 
         # BUG-046 FIX: Validate start_time is a valid ISO timestamp
@@ -310,11 +310,11 @@ class MissionController(QObject):
             # Sanity check: start time should not be in the future
             if parsed_start > _utcnow():
                 print(f"[MissionController] BUG-046: Start time in future, clearing state")
-                self._clear_saved_state()
+                self.clear_saved_state()
                 return None
         except (TypeError, ValueError) as e:
             print(f"[MissionController] BUG-046: Invalid start_time format: {e}")
-            self._clear_saved_state()
+            self.clear_saved_state()
             return None
 
         # BUG-046 FIX: Validate paused_seconds is non-negative
@@ -542,4 +542,3 @@ class MissionController(QObject):
         settings = QSettings()
         settings.setValue(self.SETTINGS_KEY_RESUME_STATE, state_value)
         settings.sync()
-

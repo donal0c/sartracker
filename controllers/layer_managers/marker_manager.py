@@ -184,29 +184,19 @@ class MarkerLayerManager(BaseLayerManager):
     # Phase 4: Per-Item Layer Support
     # =========================================================================
 
-    def _get_per_item_factory(self) -> Optional[PerItemLayerFactory]:
+    def _get_per_item_factory(self) -> PerItemLayerFactory:
         """
         Get or create the PerItemLayerFactory for per-item layers.
 
-        Returns None if no mission store is configured (layers will be memory-only).
-
         Returns:
-            PerItemLayerFactory or None
+            PerItemLayerFactory
         """
         # Return cached factory if available
         if self._per_item_factory is not None:
             return self._per_item_factory
 
-        # Get mission store path from layer manager
-        layer_manager = self._require_layer_manager()
-        gpkg_path = layer_manager.get_mission_store()
-
-        if not gpkg_path:
-            logger.warning(
-                "Phase 4: No mission store configured - per-item layers will not persist. "
-                "Configure a mission store to enable persistent per-item layers."
-            )
-            return None
+        # Mission store required for per-item layers
+        gpkg_path = self._require_mission_store("Per-item marker operations")
 
         # Create factory
         self._per_item_factory = PerItemLayerFactory(

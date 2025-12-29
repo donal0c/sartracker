@@ -825,7 +825,7 @@ def test_ensure_structure_async_falls_back_without_task(monkeypatch):
     assert called.get("complete") is True
 
 
-def test_repair_structure_async_runs_task(monkeypatch):
+def test_repair_structure_async_runs_on_ui_thread(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
 
@@ -861,7 +861,7 @@ def test_repair_structure_async_runs_task(monkeypatch):
     assert result is True
     assert called["repair"] == 1
     assert called.get("complete") is True
-    assert task_manager.tasks, "task should be submitted"
+    assert not task_manager.tasks, "no background task should be submitted"
 
 
 def test_set_mission_finalized_uses_helper(monkeypatch):

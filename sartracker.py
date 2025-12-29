@@ -84,7 +84,13 @@ from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
 from .utils.dependency_guard import ensure_requests_charset_modules, get_charset_guard_status
 from .config.keys import ConfigStore
-from .utils.mission_storage import MissionStorageHelper, MissionPaths
+from .utils.mission_storage import (
+    MissionStorageHelper,
+    MissionPaths,
+    check_uncommitted_edits,
+    format_uncommitted_edits,
+    validate_archive,
+)
 from .ui.mission_metadata_dialog import MissionMetadataDialog
 
 # Import Phase 3 extracted dialogs with error tracking
@@ -2804,6 +2810,10 @@ class sartracker:
             self._notify("error", "Finalize Mission", "No active mission store to finalize.", duration=5)
             return
 
+        if self.mission_controller and self.mission_controller.is_active():
+            self._notify("info", "Finalize Mission", "Mission is still active. End the mission before finalizing.", duration=5)
+            return
+
         # Check if already finalized
         if self._check_mission_finalized():
             self._notify("info", "Finalize Mission", "Mission is already finalized.", duration=3)
@@ -2825,8 +2835,10 @@ class sartracker:
             if not paths:
                 raise RuntimeError("Mission storage paths are not set")
 
+            uncommitted_layers = self._warn_uncommitted_edits("archive")
+
             # Run archive in background
-            self._start_archive_task(paths, project_path)
+            self._start_archive_task(paths, project_path, uncommitted_layers=uncommitted_layers)
             return
 
         except Exception as exc:
@@ -2837,7 +2849,13 @@ class sartracker:
         finally:
             self._is_finalizing = False
 
-    def _start_archive_task(self, paths: MissionPaths, project_path: Optional[Path]):
+    def _start_archive_task(
+        self,
+        paths: MissionPaths,
+        project_path: Optional[Path],
+        *,
+        uncommitted_layers: Optional[list] = None
+    ):
         """
         Start background task to create mission archive.
 
@@ -2853,7 +2871,8 @@ class sartracker:
             started = self.mission_storage_controller.start_archive_task(
                 paths=paths,
                 project_path=project_path,
-                mark_finalized=True
+                mark_finalized=True,
+                uncommitted_layers=uncommitted_layers
             )
             if not started:
                 self._is_finalizing = False
@@ -2866,10 +2885,20 @@ class sartracker:
                 if self.mission_storage:
                     paths = self._current_mission_paths()
                     project_path = Path(QgsProject.instance().fileName()) if QgsProject.instance().fileName() else None
-                    archive_path = self.mission_storage.create_archive(paths, project_path)
+                    archive_path = self.mission_storage.create_archive(
+                        paths,
+                        project_path,
+                        uncommitted_layers=uncommitted_layers,
+                        warn_uncommitted=False
+                    )
                 else:
                     # Last resort: legacy method (NOT SQLite-safe during active writes)
                     archive_path = self._create_mission_archive()
+                validation_error = validate_archive(archive_path, paths)
+                if validation_error:
+                    self._notify("warning", "Mission Archive", f"Archive validation failed: {validation_error}", duration=8)
+                    return
+
                 self._mark_mission_finalized()
                 archive_name = archive_path.name if hasattr(archive_path, 'name') else str(archive_path)
                 self._notify("success", "Mission Finalized", f"Archive created: {archive_name}", duration=6)
@@ -3750,6 +3779,24 @@ class sartracker:
                     duration=6)
             return attachment_path
 
+    def _warn_uncommitted_edits(self, operation: str) -> list:
+        """
+        Check for uncommitted edits and warn on the main thread.
+
+        Args:
+            operation: Operation name ("backup" or "archive")
+
+        Returns:
+            List of uncommitted layer names (may be empty)
+        """
+        if self._is_unloading or self._app_is_quitting:
+            return []
+        uncommitted = check_uncommitted_edits()
+        msg = format_uncommitted_edits(uncommitted, operation)
+        if msg:
+            warning(self.iface.messageBar(), "Uncommitted Edits", msg, duration=8)
+        return uncommitted
+
     def _sync_mission_backup(self, async_run: bool = False) -> bool:
         """Mirror GeoPackage (and attachments if present) to backup root."""
         if not self.mission_storage:
@@ -3759,12 +3806,18 @@ class sartracker:
         if not paths:
             return True
 
+        uncommitted_layers = self._warn_uncommitted_edits("backup")
+
         if async_run and self.task_manager:
-            self._start_backup_task(paths)
+            self._start_backup_task(paths, uncommitted_layers=uncommitted_layers)
             return True
 
         try:
-            return self.mission_storage.sync_backup(paths)
+            return self.mission_storage.sync_backup(
+                paths,
+                uncommitted_layers=uncommitted_layers,
+                warn_uncommitted=False
+            )
         except Exception as exc:
             self._log_exception("_sync_mission_backup", exc)
             warning(
@@ -3775,7 +3828,7 @@ class sartracker:
             )
             return False
 
-    def _start_backup_task(self, paths: MissionPaths):
+    def _start_backup_task(self, paths: MissionPaths, *, uncommitted_layers: Optional[list] = None):
         """
         Run backup sync in background to avoid UI blocking.
 
@@ -3783,26 +3836,46 @@ class sartracker:
         """
         if self.mission_storage_controller:
             # Use controller - signals handle notifications
-            self.mission_storage_controller.start_backup_task(paths)
+            self.mission_storage_controller.start_backup_task(
+                paths,
+                uncommitted_layers=uncommitted_layers
+            )
         else:
             # Fallback: inline task (legacy path)
             from qgis.core import QgsTask
 
             class BackupTask(QgsTask):
-                def __init__(self, mission_paths: MissionPaths, storage: MissionStorageHelper):
+                def __init__(
+                    self,
+                    mission_paths: MissionPaths,
+                    storage: MissionStorageHelper,
+                    uncommitted_layers: Optional[list] = None
+                ):
                     super().__init__("Sync mission backup", QgsTask.CanCancel)
                     self.paths = mission_paths
                     self.storage = storage
+                    self.uncommitted_layers = uncommitted_layers or []
                     self.error_message = None
 
                 def run(self) -> bool:
                     try:
-                        return bool(self.storage.sync_backup(self.paths))
+                        return bool(
+                            self.storage.sync_backup(
+                                self.paths,
+                                uncommitted_layers=self.uncommitted_layers,
+                                warn_uncommitted=False,
+                                warn_on_error=False
+                            )
+                        )
                     except Exception as exc:
                         self.error_message = str(exc)
                         return False
 
-            task = BackupTask(paths, self.mission_storage)
+            task = BackupTask(
+                paths,
+                self.mission_storage,
+                uncommitted_layers=uncommitted_layers
+            )
             self.task_manager.start_task(
                 task=task,
                 on_complete=lambda t: self._on_backup_complete(t),

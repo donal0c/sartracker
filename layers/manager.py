@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Callable, Any
 from threading import RLock
 
 logger = logging.getLogger(__name__)
-from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal, QCoreApplication, QEvent
+from qgis.PyQt.QtCore import QVariant, QObject, pyqtSignal, QCoreApplication, QEvent, QTimer
 from qgis.core import (
     QgsProject,
     QgsVectorLayer,
@@ -47,7 +47,8 @@ from .schema import (
     get_layer_by_id,
     LAYER_GROUP_PATHS,
     LAYER_NAME_TO_ID,
-    LAYER_FIELD_CHECKS
+    LAYER_FIELD_CHECKS,
+    migration_tracker
 )
 from ..utils.notify import info, warning, error
 
@@ -173,6 +174,7 @@ class LayerManager(QObject):
         self._layer_provider_uris: Dict[str, str] = {}
         self._metadata_lock = RLock()  # Thread-safety for metadata operations
         self._metadata_migration_in_progress = False
+        self._load_migration_state()
 
         # Track QGIS shutdown so we can skip rebuilds during app exit
         app = QCoreApplication.instance()
@@ -235,6 +237,7 @@ class LayerManager(QObject):
             self._group_cache.clear()
         self._layer_provider_uris.clear()
         self._refresh_mission_store_path(emit_signal=True)
+        self._load_migration_state()
 
     def is_sar_project(self) -> bool:
         """
@@ -268,6 +271,13 @@ class LayerManager(QObject):
             pass
 
         return False
+
+    def _load_migration_state(self):
+        """Load persisted migration state for the current project."""
+        try:
+            migration_tracker.load_from_project(self.project)
+        except Exception as exc:
+            self._log("WARN", f"Failed to load migration state: {exc}")
 
     def _log(self, level: str, message: str):
         """Consistent logging helper for LayerManager."""
@@ -799,8 +809,12 @@ class LayerManager(QObject):
         if not getattr(group_def, 'auto_create', True):
             return
 
-        # Create the group
-        group = self.ensure_group(get_group_path(group_def.name), position=group_def.position)
+        # Create the group using explicit parent path (supports nested groups)
+        if group_def.parent_path:
+            group_path = list(group_def.parent_path) + [group_def.name]
+        else:
+            group_path = [group_def.name]
+        group = self.ensure_group(group_path, position=group_def.position)
 
         # Set group metadata
         if group_def.metadata:
@@ -813,7 +827,7 @@ class LayerManager(QObject):
                 if layer_def.auto_create:
                     self.ensure_vector_layer(
                         layer_def=layer_def,
-                        group_path=get_group_path(group_def.name)
+                        group_path=group_path
                     )
 
         # Create subgroups recursively
@@ -1402,10 +1416,9 @@ class LayerManager(QObject):
 
         Falls back to synchronous execution if tasks are unavailable.
         """
-        return self._run_task_or_sync(
+        return self._run_on_ui_thread(
             description="Ensure SAR Tracker layer structure",
             func=lambda: self.ensure_structure(auto_migrate=auto_migrate),
-            task_manager=task_manager,
             on_complete=on_complete,
             on_error=on_error
         )
@@ -1421,13 +1434,44 @@ class LayerManager(QObject):
 
         Falls back to synchronous execution if tasks are unavailable.
         """
-        return self._run_task_or_sync(
+        return self._run_on_ui_thread(
             description="Repair SAR Tracker layer structure",
             func=self.repair_structure,
-            task_manager=task_manager,
             on_complete=on_complete,
             on_error=on_error
         )
+
+    def _run_on_ui_thread(
+        self,
+        description: str,
+        func: Callable[[], bool],
+        on_complete: Optional[Callable[[bool], None]],
+        on_error: Optional[Callable[[Exception], None]]
+    ):
+        """
+        Schedule a layer operation on the UI thread (QGIS layer API requirement).
+        """
+        def _runner():
+            if getattr(self, "_application_closing", False):
+                return False
+            try:
+                result = func()
+                if on_complete:
+                    on_complete(result)
+                return result
+            except Exception as exc:
+                if on_error:
+                    on_error(exc)
+                else:
+                    self._log("WARN", f"{description} failed: {exc}")
+                return False
+
+        try:
+            QTimer.singleShot(0, _runner)
+            return True
+        except Exception as exc:
+            self._log("WARN", f"Failed to schedule '{description}' on UI thread: {exc}")
+            return _runner()
 
     def _run_task_or_sync(
         self,
@@ -1769,6 +1813,21 @@ class LayerManager(QObject):
                         if not parse_warning_emitted:
                             self._notify_metadata_warning(f"Project metadata for {layer_id} is corrupt.")
                             parse_warning_emitted = True
+
+            # Repair missing layer/node metadata from project fallback when possible
+            if project_metadata and not layer_metadata:
+                metadata_json = json.dumps(project_metadata)
+                if node:
+                    try:
+                        node.setCustomProperty('sartracker:catalog_meta', metadata_json)
+                    except Exception as migrate_exc:
+                        print(f"[LayerManager] Warning: Could not write metadata to layer tree: {migrate_exc}")
+                if layer:
+                    try:
+                        layer.setCustomProperty('sartracker:catalog_meta', metadata_json)
+                    except Exception as migrate_exc:
+                        print(f"[LayerManager] Warning: Could not write metadata to layer: {migrate_exc}")
+                layer_metadata = project_metadata
 
             # CRITICAL FIX: Check for sync drift and repair
             if layer_metadata and project_metadata:
