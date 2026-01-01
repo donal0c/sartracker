@@ -220,15 +220,12 @@ class CoordinateConverter:
 
             return lat, lon
 
-        except QgsCsException as e:
-            error_msg = f"Coordinate transform failed during {context}: {e}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg) from e
         except (TypeError, ValueError):
             # Re-raise validation errors as-is
             raise
         except Exception as e:
-            error_msg = f"Unexpected error during {context}: {e}"
+            # Catch all transform errors (QgsCsException included)
+            error_msg = f"Coordinate transform failed during {context}: {e}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
 
@@ -288,15 +285,12 @@ class CoordinateConverter:
 
             return easting, northing
 
-        except QgsCsException as e:
-            error_msg = f"Coordinate transform failed during {context}: {e}"
-            logger.error(error_msg)
-            raise RuntimeError(error_msg) from e
         except (TypeError, ValueError):
             # Re-raise validation errors as-is
             raise
         except Exception as e:
-            error_msg = f"Unexpected error during {context}: {e}"
+            # Catch all transform errors (QgsCsException included)
+            error_msg = f"Coordinate transform failed during {context}: {e}"
             logger.error(error_msg)
             raise RuntimeError(error_msg) from e
 
