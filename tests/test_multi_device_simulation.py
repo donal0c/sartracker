@@ -254,8 +254,8 @@ class TestMultiDeviceCurrentPositions:
         csv2 = generate_device_csv(1, 5, now - timedelta(hours=2), temp_csv_dir)
 
         provider = SimpleMultiDeviceProvider()
-        provider.load_csv_file(str(csv1))
-        provider.load_csv_file(str(csv2))
+        positions = load_csv_positions(csv1); provider.add_device_positions("device_0", positions)
+        positions = load_csv_positions(csv2); provider.add_device_positions("device_1", positions)
 
         positions = provider.get_current_positions()
 
@@ -292,9 +292,9 @@ class TestMultiDeviceBreadcrumbs:
         csv3 = generate_device_csv(2, 15, start_time, temp_csv_dir)
 
         provider = SimpleMultiDeviceProvider()
-        provider.load_csv_file(str(csv1))
-        provider.load_csv_file(str(csv2))
-        provider.load_csv_file(str(csv3))
+        positions = load_csv_positions(csv1); provider.add_device_positions("device_0", positions)
+        positions = load_csv_positions(csv2); provider.add_device_positions("device_1", positions)
+        positions = load_csv_positions(csv3); provider.add_device_positions("device_2", positions)
 
         # Get breadcrumbs for device 0
         breadcrumbs_0 = provider.get_breadcrumbs('device_0')
@@ -321,7 +321,7 @@ class TestMultiDeviceBreadcrumbs:
 
         provider = SimpleMultiDeviceProvider()
         positions = load_csv_positions(csv_file)
-        provider.add_device_positions(f'device_{device_id}', positions)
+        provider.add_device_positions('device_0', positions)
 
         breadcrumbs = provider.get_breadcrumbs('device_0')
 
@@ -354,15 +354,15 @@ class TestDeviceLifecycle:
         # Initially 2 devices
         csv1 = generate_device_csv(0, 5, start_time, temp_csv_dir)
         csv2 = generate_device_csv(1, 5, start_time, temp_csv_dir)
-        provider.load_csv_file(str(csv1))
-        provider.load_csv_file(str(csv2))
+        positions = load_csv_positions(csv1); provider.add_device_positions("device_0", positions)
+        positions = load_csv_positions(csv2); provider.add_device_positions("device_1", positions)
 
         positions = provider.get_current_positions()
         assert len(positions) == 2
 
         # Add third device
         csv3 = generate_device_csv(2, 5, start_time, temp_csv_dir)
-        provider.load_csv_file(str(csv3))
+        positions = load_csv_positions(csv3); provider.add_device_positions("device_2", positions)
 
         positions = provider.get_current_positions()
         assert len(positions) == 3
@@ -391,7 +391,7 @@ class TestPerformanceBaselines:
         for device_id in range(10):
             csv_file = generate_device_csv(device_id, 5, start_time, temp_csv_dir)
             positions = load_csv_positions(csv_file)
-        provider.add_device_positions(f'device_{device_id}', positions)
+            provider.add_device_positions(f'device_{device_id}', positions)
 
         # Warm up
         provider.get_current_positions()
@@ -416,7 +416,7 @@ class TestPerformanceBaselines:
         for device_id in range(50):
             csv_file = generate_device_csv(device_id, 3, start_time, temp_csv_dir)
             positions = load_csv_positions(csv_file)
-        provider.add_device_positions(f'device_{device_id}', positions)
+            provider.add_device_positions(f'device_{device_id}', positions)
 
         # Warm up
         provider.get_current_positions()
