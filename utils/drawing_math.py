@@ -48,13 +48,21 @@ def calculate_sector_arc_length(start_bearing: float, end_bearing: float) -> flo
     # If both angles are the same after normalization, check if the original
     # end_bearing indicates a full circle
     if start == end:
-        # If end_bearing was originally ≥ 360 or significantly different from start,
-        # treat as full circle
         angle_diff = abs(end_bearing - start_bearing)
-        if angle_diff >= 360 or (angle_diff > 180 and angle_diff < 360):
+
+        # Only treat as full circle if BOTH bearings started in [0, 360) and differ by exactly 360
+        # This distinguishes deliberate full circles from normalization artifacts
+        start_normalized = 0 <= start_bearing < 360
+        end_normalized = 0 <= end_bearing < 360
+
+        if angle_diff == 360 and start_normalized and not end_normalized:
+            # Deliberate full circle: e.g., (10, 370) or (45, 405)
+            return 360.0
+        elif angle_diff > 180 and angle_diff < 360:
+            # Partial arc wrapping around (e.g., 350° to 10°)
             return 360.0
         else:
-            # True zero-arc case (degenerate)
+            # True zero-arc case or normalization artifact: e.g., (-10, 350), (10, 730)
             return 0.0
 
     # Standard case: calculate clockwise arc

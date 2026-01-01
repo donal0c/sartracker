@@ -108,7 +108,7 @@ class TestRequireComponents:
 
         captured = capsys.readouterr()
         assert "controller" in captured.out
-        assert "None" in captured.out
+        assert "missing/deleted" in captured.out
 
     def test_skips_when_component_not_defined(self, capsys):
         class TestClass:
@@ -286,7 +286,7 @@ class TestNotifySafe:
         notify_func.assert_not_called()
 
         captured = capsys.readouterr()
-        assert "message_bar is None" in captured.out
+        assert "message_bar missing/deleted" in captured.out
 
     def test_handles_notify_exception(self, capsys):
         message_bar = Mock()

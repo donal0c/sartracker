@@ -69,13 +69,13 @@ def test_calculate_sector_arc_length_edge_cases():
 
 def test_calculate_sector_arc_length_normalization():
     """Test that angles outside [0, 360) are normalized correctly."""
-    # 370° normalizes to 10°
-    assert dm.calculate_sector_arc_length(10, 370) == pytest.approx(0.0)  # Same angle
+    # 370° = 10° + 360° → full circle (consistent with edge_cases test)
+    assert dm.calculate_sector_arc_length(10, 370) == pytest.approx(360.0)
 
-    # Large angles
-    assert dm.calculate_sector_arc_length(10, 730) == pytest.approx(0.0)  # 730 % 360 = 10
+    # 730° = 10° + 720° → two full circles, normalizes to same angle (zero arc)
+    assert dm.calculate_sector_arc_length(10, 730) == pytest.approx(0.0)  # 720 % 360 != 360
 
-    # Negative angles
+    # Negative angles normalize: -10° → 350°, so 350° to 350° = zero arc
     assert dm.calculate_sector_arc_length(-10, 350) == pytest.approx(0.0)  # -10 % 360 = 350
 
 
