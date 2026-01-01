@@ -68,9 +68,7 @@ except ImportError:  # pragma: no cover - fallback for PyQt versions without qgi
     except Exception:
         def sip_isdeleted(_obj):
             return False
-from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsProject, QgsApplication
-)
+from qgis.core import QgsProject, QgsApplication
 
 # Initialize Qt resources from file resources.py
 from .resources import *
@@ -124,7 +122,6 @@ ensure_requests_charset_modules()
 # Import Provider Registry and trigger provider self-registration
 try:
     from .providers.registry import registry as provider_registry
-    from .providers.base import Provider
     # Trigger provider registration by importing them.
     # CSV provider is considered core; HTTP provider is optional (dependency/SSL variance).
     from .providers import csv  # noqa: F401
@@ -137,7 +134,6 @@ try:
     # Note: provider_registry now contains registered providers (csv + any optional providers that loaded)
 except Exception as e:
     provider_registry = track_import_error(_import_report, 'providers', e)
-    Provider = None
 
 # Import LayersController
 try:
@@ -244,37 +240,9 @@ except Exception as e:
         _import_report, 'ui.settings_panel.SettingsPanel', e
     )
 
-# Import MarkerMapTool
-try:
-    from .maptools.marker_tool import MarkerMapTool
-except Exception as e:
-    MarkerMapTool = track_import_error(
-        _import_report, 'maptools.marker_tool.MarkerMapTool', e
-    )
-
-# Import MeasureTool
-try:
-    from .maptools.measure_tool import MeasureTool
-except Exception as e:
-    MeasureTool = track_import_error(
-        _import_report, 'maptools.measure_tool.MeasureTool', e
-    )
-
-# Import MarkerDialog
-try:
-    from .ui.marker_dialog import MarkerDialog
-except Exception as e:
-    MarkerDialog = track_import_error(
-        _import_report, 'ui.marker_dialog.MarkerDialog', e
-    )
-
-# Import CoordinateConverterDialog
-try:
-    from .ui.coordinate_converter_dialog import CoordinateConverterDialog
-except Exception as e:
-    CoordinateConverterDialog = track_import_error(
-        _import_report, 'ui.coordinate_converter_dialog.CoordinateConverterDialog', e
-    )
+# Note: MarkerMapTool, MeasureTool, MarkerDialog, CoordinateConverterDialog
+# are now imported by their respective controllers (MapToolsController, MarkerController)
+# which handle their own import error tracking.
 
 # Store import report for diagnostics access
 set_import_report(_import_report)

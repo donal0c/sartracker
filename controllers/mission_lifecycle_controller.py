@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Callable, List, TYPE_CHECKING
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
 from qgis.PyQt.QtWidgets import QMessageBox, QInputDialog
 
 from qgis.core import QgsProject
@@ -197,6 +197,12 @@ class MissionLifecycleController(QObject):
         # Protected by _state_lock for thread safety
         self._is_finalizing: bool = False
 
+        # Finalization watchdog timer (SAR-bc2)
+        # Resets _is_finalizing if archive callback signals are never delivered
+        # Default timeout: 30 minutes (1800000 ms)
+        self._finalization_watchdog: Optional[QTimer] = None
+        self._FINALIZATION_TIMEOUT_MS = 30 * 60 * 1000  # 30 minutes
+
         # Thread-safe lock for state access (protects _session_state AND _is_finalizing)
         # Required because background task callbacks may access state from worker threads
         self._state_lock = threading.RLock()
@@ -330,6 +336,69 @@ class MissionLifecycleController(QObject):
                 return False
             self._is_finalizing = True
             return True
+
+    # ------------------------------------------------------------------
+    # Finalization Watchdog (SAR-bc2)
+    # ------------------------------------------------------------------
+
+    def _start_finalization_watchdog(self) -> None:
+        """
+        Start the finalization timeout watchdog timer.
+
+        If archive callback signals (archive_succeeded/archive_failed) are not
+        delivered within the timeout period, the watchdog resets _is_finalizing
+        to allow future finalization attempts.
+
+        SAFETY: Single-shot timer, created with self as parent for lifecycle.
+        """
+        self._stop_finalization_watchdog()  # Ensure no duplicate timers
+
+        self._finalization_watchdog = QTimer(self)
+        self._finalization_watchdog.setSingleShot(True)
+        self._finalization_watchdog.timeout.connect(self._on_finalization_timeout)
+        self._finalization_watchdog.start(self._FINALIZATION_TIMEOUT_MS)
+
+    def _stop_finalization_watchdog(self) -> None:
+        """
+        Stop the finalization watchdog timer if running.
+
+        Called when finalization completes normally (success or failure).
+        """
+        if self._finalization_watchdog is not None:
+            try:
+                self._finalization_watchdog.stop()
+                self._finalization_watchdog.deleteLater()
+            except RuntimeError:
+                pass  # Timer already deleted
+            self._finalization_watchdog = None
+
+    def _on_finalization_timeout(self) -> None:
+        """
+        Handle finalization watchdog timeout.
+
+        Resets _is_finalizing flag and warns user that archive callback
+        was not received. This prevents permanent lockout of finalization.
+
+        LIFE-SAFETY: Allows recovery from signal delivery failures.
+        """
+        was_finalizing = self._get_is_finalizing()
+        self._set_is_finalizing(False)
+        self._finalization_watchdog = None
+
+        if was_finalizing and not self._is_shutting_down:
+            warning(
+                self.iface.messageBar(),
+                "Mission Finalize",
+                "Finalization timed out after 30 minutes. Archive status unknown. "
+                "Please check mission folder manually and retry if needed.",
+                duration=15
+            )
+            # Log for diagnostics
+            if self._log_exception:
+                self._log_exception(
+                    "finalization_watchdog",
+                    Exception("Finalization watchdog timeout - callback not received")
+                )
 
     # ------------------------------------------------------------------
     # Session State Updates (Internal Methods)
@@ -625,6 +694,8 @@ class MissionLifecycleController(QObject):
         callbacks from accessing destroyed objects. Idempotent.
         """
         self._is_shutting_down = True
+        # SAR-bc2: Stop finalization watchdog if running
+        self._stop_finalization_watchdog()
         # Don't clear state - may be needed for diagnostics during shutdown
         # Just prevent further updates
 
@@ -1729,6 +1800,9 @@ class MissionLifecycleController(QObject):
                     duration=5
                 )
                 return False
+            # SAR-bc2: Start watchdog for async archive task
+            # Watchdog resets _is_finalizing if callbacks are never delivered
+            self._start_finalization_watchdog()
             return True
 
         # Fallback: no controller available, use synchronous method
@@ -1811,6 +1885,7 @@ class MissionLifecycleController(QObject):
 
         LIFE-SAFETY CRITICAL: Validates archive exists before marking mission finalized.
         """
+        self._stop_finalization_watchdog()  # SAR-bc2: Cancel watchdog on callback
         self._set_is_finalizing(False)
 
         # BUG-FIX: Validate archive path before marking as finalized
@@ -1873,6 +1948,7 @@ class MissionLifecycleController(QObject):
         Args:
             error_message: Error description
         """
+        self._stop_finalization_watchdog()  # SAR-bc2: Cancel watchdog on callback
         self._set_is_finalizing(False)
 
         if not self._is_shutting_down:
