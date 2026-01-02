@@ -133,37 +133,45 @@ When editing code, prefer **extending existing controllers/managers/tools** over
 
 These workflows are **mandatory** for Claude when making non‑trivial changes.
 
+> **TDD IS THE STANDARD**: This project uses Test-Driven Development. All code changes MUST follow the TDD cycle: **Red → Green → Refactor**. Write failing tests first, then implement. No exceptions for production code.
+
 ### 1. Bug Fix Workflow (CRITICAL)
 
 1. **Understand the bug**
 
    * Read the issue description and any references to `docs/incident_log.md` or `issues_to_address.md`.
    * Locate the relevant modules in `controllers/`, `providers/`, `maptools/`, or `ui/`.
-2. **Reproduce safely**
 
-   * Reproduce the bug in a controlled environment if possible (non‑live, test data).
-   * Note QGIS version and Qt version if relevant.
-3. **Propose a minimal fix**
+2. **Write a failing test FIRST (TDD Red Phase)**
 
-   * Outline a short plan in bullets: *what to change, why it is safe, and which tests to run*.
-   * Highlight any impact on coordinates, mission state, or background tasks.
-4. **Implement incrementally**
+   * Create a test that reproduces the bug - it MUST fail.
+   * Name it `test_regression_BUG_XXX_description` if a bug ID exists.
+   * This test becomes the permanent regression test.
+   * Run the test to confirm it fails for the RIGHT reason.
 
-   * Make small, localized changes following the patterns in `docs/AI_CODE_REFERENCE.md`.
+3. **Implement the fix (TDD Green Phase)**
+
+   * Make the minimal change to make the test pass.
+   * Follow patterns in `docs/AI_CODE_REFERENCE.md`.
    * Keep safety and compatibility checks in place.
-5. **Test**
 
-   * Run the relevant automated checks (see **Testing & Commands** below).
+4. **Refactor if needed (TDD Refactor Phase)**
+
+   * Clean up while keeping tests green.
+   * Do **not** perform large refactors as part of a bug fix.
+
+5. **Verify**
+
+   * Run full test suite: `python -m pytest tests/`
    * Manually confirm no regressions in basic workflows.
+   * Test in both Qt5 and Qt6 if relevant.
+
 6. **Summarize**
 
-   * Provide a concise description of:
-
-     * Root cause
-     * Fix implemented
-     * Tests run and results
-
-Do **not** perform large refactors as part of a bug fix.
+   * Root cause
+   * Failing test added (with name)
+   * Fix implemented
+   * All tests passing
 
 ### 2. New Feature / Enhancement Workflow
 
@@ -171,23 +179,33 @@ Do **not** perform large refactors as part of a bug fix.
 
    * Confirm feature scope, especially around safety, offline use, and performance.
    * Identify which layers, providers, and UI panels are involved.
+
 2. **Consult design docs**
 
    * Read the relevant sections of `docs/architecture.md` and `docs/AI_CODE_REFERENCE.md`.
-3. **Plan first**
 
-   * Draft a short plan: data flow, UI changes, failure modes, tests.
-   * Explicitly call out how you will preserve safety and compatibility.
-4. **Implement in small steps**
+3. **Write acceptance tests FIRST (TDD Red Phase)**
 
-   * Start with data and background tasks.
-   * Then wire UI and interaction patterns.
-   * Use existing patterns for dialogs, tasks, and validation; do not invent new ones casually.
-5. **Test thoroughly**
+   * Define the feature's expected behavior as failing tests.
+   * Cover the happy path and key edge cases.
+   * Tests serve as the executable specification.
+   * Run tests to confirm they fail (feature doesn't exist yet).
 
-   * Run automated checks.
+4. **Implement incrementally (TDD Green Phase)**
+
+   * Start with the simplest test, make it pass.
+   * Add one test at a time, implement to pass.
+   * Use existing patterns for dialogs, tasks, and validation.
+
+5. **Refactor (TDD Refactor Phase)**
+
+   * Clean up implementation while keeping tests green.
+   * Extract common patterns if appropriate.
+
+6. **Test thoroughly**
+
+   * All unit tests pass.
    * Exercise the feature under:
-
      * Poor/no connectivity
      * Plugin reloads
      * Invalid inputs
@@ -195,16 +213,24 @@ Do **not** perform large refactors as part of a bug fix.
 ### 3. Refactor / Cleanup Workflow
 
 1. **Only refactor when necessary** and when there is time to test properly.
-2. **Maintain behaviour** – refactors must not change:
+
+2. **Ensure test coverage FIRST**
+
+   * If the code being refactored lacks tests, add them BEFORE refactoring.
+   * Tests must pass before AND after the refactor.
+
+3. **Maintain behaviour** – refactors must not change:
 
    * Coordinate conversions
    * Validation rules
    * Background task lifecycle
-3. **Work in small steps**
+
+4. **Work in small steps**
 
    * Refactor one module or concern at a time.
    * Run tests between each logical step.
-4. **Document why**
+
+5. **Document why**
 
    * Add small comments where a refactor clarifies safety or lifecycle logic.
 
@@ -302,6 +328,104 @@ If you see any of the above in existing code, treat it as **technical debt with 
 
 ---
 
+## TEST-DRIVEN DEVELOPMENT (TDD)
+
+**TDD is the established standard for this project.** All production code changes require tests written first.
+
+### The TDD Cycle
+
+```
+1. RED    → Write a failing test that defines expected behavior
+2. GREEN  → Write the minimal code to make the test pass
+3. REFACTOR → Clean up while keeping tests green
+```
+
+### When TDD is MANDATORY
+
+- **All bug fixes**: Write test that reproduces bug BEFORE fixing
+- **All new features**: Write acceptance tests BEFORE implementing
+- **All refactoring**: Ensure tests exist BEFORE refactoring
+- **All code touching safety-critical paths**: Coordinates, mission state, data persistence
+
+### When TDD Can Be Skipped
+
+- Pure documentation changes
+- Configuration-only changes (pytest.ini, .gitignore)
+- Exploratory spikes (but delete and rewrite with TDD after)
+
+### Test Categories
+
+The test suite is organized into categories with pytest markers:
+
+| Category | Marker | Description |
+|----------|--------|-------------|
+| **Unit** | (default) | Fast tests, no QGIS required |
+| **Integration** | `@pytest.mark.qgis_required` | Require real QGIS environment |
+| **E2E** | in `test_e2e_scenarios.py` | End-to-end workflows |
+| **Performance** | `@pytest.mark.slow` | Performance/load tests |
+
+### Test Naming Convention
+
+```python
+def test_<unit>_<scenario>_<expected_result>():
+    """Docstring explaining the test."""
+    pass
+
+# Examples:
+def test_validate_latitude_with_nan_raises_value_error():
+def test_mission_start_from_idle_succeeds():
+def test_regression_BUG_081_null_island_rejected():
+```
+
+### Test Structure (Arrange-Act-Assert)
+
+```python
+def test_example():
+    # Arrange - set up test data
+    lat = float('nan')
+
+    # Act & Assert
+    with pytest.raises(ValueError, match='NaN'):
+        validate_latitude(lat)
+```
+
+### Running Tests
+
+```bash
+# Run all tests (with QGIS environment - RECOMMENDED)
+./run_tests.sh
+
+# Run all tests (basic)
+python -m pytest tests/
+
+# Run with verbose output
+./run_tests.sh -v
+
+# Run specific test file
+./run_tests.sh tests/test_e2e_scenarios.py -v
+
+# Run tests matching pattern
+./run_tests.sh -k 'validation'
+
+# Run only fast tests (no QGIS required)
+./run_tests.sh -m 'not qgis_required'
+
+# Run only QGIS integration tests
+./run_tests.sh -m 'qgis_required'
+
+# Run with coverage
+./run_tests.sh --cov=. --cov-report=html
+```
+
+### Test Infrastructure
+
+- **pytest.ini**: Test configuration and markers
+- **run_tests.sh**: Sets up QGIS environment for macOS
+- **conftest.py**: Fixtures, QGIS mocking, pytest-qgis integration
+- **benchmark_150_layers.py**: QGIS console performance benchmarks
+
+---
+
 ## TESTING & COMMANDS
 
 ### Pre‑Commit Checklist
@@ -396,15 +520,18 @@ When you, as an AI assistant, are asked to edit this codebase:
 ### Priority Order (Non‑Negotiable)
 
 1. **Safety** – Human life and rescuer safety
-2. **Compatibility** – Supported QGIS versions and Qt5/Qt6
-3. **Security** – Credentials and sensitive data
-4. **Performance & UX** – Responsive UI, appropriate polling intervals
-5. **New Features** – Only after the above are satisfied
+2. **Test Coverage** – All new code must have tests (TDD)
+3. **Compatibility** – Supported QGIS versions and Qt5/Qt6
+4. **Security** – Credentials and sensitive data
+5. **Performance & UX** – Responsive UI, appropriate polling intervals
+6. **New Features** – Only after the above are satisfied
 
 ### Code Review Self‑Check
 
 Before finalizing a change, ask yourself:
 
+* **Did I write tests first?** (TDD requirement for new code)
+* **Do all tests pass?** Run `python -m pytest tests/`
 * Does this work in both Qt5 and Qt6 environments?
 * What happens if the network fails or is slow?
 * How is invalid input handled at each entry point?
@@ -529,8 +656,8 @@ When ending a work session, complete ALL steps:
 
 ---
 
-**Document Version:** 1.2 (added beads integration)
+**Document Version:** 1.3 (TDD fully adopted)
 
-**Last Updated:** 2025‑12‑18
+**Last Updated:** 2026‑01‑02
 
 **For Detailed Patterns & Examples:** See `docs/AI_CODE_REFERENCE.md`.

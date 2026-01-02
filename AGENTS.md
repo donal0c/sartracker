@@ -56,6 +56,31 @@ sartracker/
 
 ## Critical Development Guidelines
 
+> **TDD IS THE STANDARD**: This project uses Test-Driven Development for all production code.
+> All changes MUST follow: **Write failing test → Implement → Refactor**. No exceptions.
+
+### 0. Test-Driven Development (MANDATORY)
+
+**All production code changes require TDD.** The test suite includes:
+- **Unit tests**: Fast, no QGIS required
+- **Integration tests**: Require real QGIS (`@pytest.mark.qgis_required`)
+- **E2E tests**: End-to-end scenarios in `test_e2e_scenarios.py`
+- **Performance tests**: Load and resilience in `test_performance_resilience.py`
+
+```python
+# 1. RED: Write a failing test first
+def test_validate_latitude_rejects_nan():
+    with pytest.raises(ValueError):
+        validate_latitude(float('nan'))
+
+# 2. GREEN: Write minimal code to pass
+# 3. REFACTOR: Clean up while tests stay green
+```
+
+**Bug fixes**: Write test that reproduces the bug BEFORE fixing it.
+**New features**: Write acceptance tests BEFORE implementing.
+**Safety-critical code**: Extra scrutiny on coordinates, mission state, data persistence.
+
 ### 1. Qt Compatibility (MANDATORY)
 This plugin MUST work with both Qt5 (QGIS 3.28-3.38) and Qt6 (QGIS 3.40+).
 
@@ -135,36 +160,44 @@ self.task_manager.start_task(
 
 Before committing any changes:
 
-1. **Compatibility Testing**
+1. **TDD Compliance**
+   - Did you write failing tests BEFORE implementing? (mandatory)
+   - Do all tests pass? `python -m pytest tests/`
+   - Is there a regression test for bug fixes?
+
+2. **Compatibility Testing**
    - Test in QGIS 3.28 (Qt5)
    - Test in QGIS 3.40+ (Qt6)
 
-2. **Functional Testing**
+3. **Functional Testing**
    - Test all modified features
    - Test error conditions
    - Test offline mode
 
-3. **Safety Testing**
+4. **Safety Testing**
    - Verify coordinate accuracy
    - Confirm error messages are clear
    - Ensure no data loss on errors
 
 ## Common Tasks
 
-### Adding a New Feature
+### Adding a New Feature (TDD Required)
 1. Review existing similar features
-2. Follow established patterns
-3. Add comprehensive error handling
-4. Validate all inputs
-5. Test in both Qt versions
-6. Update documentation
+2. **Write acceptance tests FIRST that define expected behavior**
+3. Implement incrementally, making one test pass at a time
+4. Follow established patterns
+5. Add comprehensive error handling
+6. Validate all inputs
+7. Test in both Qt versions
+8. Update documentation
 
-### Fixing a Bug
+### Fixing a Bug (TDD Required)
 1. Understand root cause
-2. Check for similar issues elsewhere
-3. Add regression test
-4. Verify fix in both Qt versions
-5. Document the fix
+2. **Write a failing test that reproduces the bug FIRST**
+3. Implement the minimal fix to make the test pass
+4. Check for similar issues elsewhere
+5. Verify fix in both Qt versions
+6. Document the fix (include test name in summary)
 
 ### Refactoring Code
 1. Understand current behavior completely
@@ -208,15 +241,24 @@ Before committing any changes:
 ## Quick Commands
 
 ```bash
+# Run tests (RECOMMENDED - sets up QGIS environment)
+./run_tests.sh
+
+# Run tests with verbose output
+./run_tests.sh -v
+
+# Run specific test file
+./run_tests.sh tests/test_e2e_scenarios.py -v
+
+# Run only fast tests (no QGIS)
+./run_tests.sh -m 'not qgis_required'
+
 # Check compatibility
 ./tools/check_compatibility.sh
 
-# Run tests
-.venv/bin/python -m pytest tests/
-
 # Create local venv + pytest (if missing)
-python3 -m venv .venv
-.venv/bin/pip install pytest
+python3 -m venv .venv --system-site-packages
+.venv/bin/pip install pytest pytest-qgis
 
 # Reload plugin (in QGIS Python console)
 from qgis.utils import reloadPlugin
@@ -225,8 +267,8 @@ reloadPlugin('sartracker')
 
 ---
 
-**Document Version:** 1.0
-**Last Updated:** 2025-11-22
+**Document Version:** 1.1 (TDD fully adopted)
+**Last Updated:** 2026-01-02
 **For Claude-specific patterns:** See [CLAUDE.md](./CLAUDE.md)
 
 ## Landing the Plane (Session Completion)
