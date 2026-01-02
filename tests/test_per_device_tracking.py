@@ -10,6 +10,9 @@ Validates the per-device current position layer implementation:
 - Feature flag routing works
 - Plugin reload preserves layers
 
+**NOTE:** These are QGIS Console tests - designed to run inside QGIS
+with the SAR Tracker plugin loaded. They are NOT pytest unit tests.
+
 Run in QGIS Python Console:
     from sartracker.tests.test_per_device_tracking import run_tests
     run_tests()
@@ -18,6 +21,13 @@ Or run individual tests:
     from sartracker.tests.test_per_device_tracking import test_single_device
     test_single_device()
 """
+import pytest
+
+# Skip all tests in this module when running via pytest
+# These tests require full QGIS with SAR Tracker plugin loaded
+pytestmark = pytest.mark.skip(
+    reason="QGIS Console tests - require plugin loaded in QGIS. Run via QGIS Python Console."
+)
 
 import time
 import traceback

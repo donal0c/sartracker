@@ -11,6 +11,23 @@ from pathlib import Path
 import pytest
 
 
+def _has_real_qgis():
+    """Check if real QGIS is loaded (not stubs)."""
+    try:
+        from qgis.core import QgsProject
+        # Real QGIS has certain methods stubs don't have
+        return hasattr(QgsProject, 'read')
+    except ImportError:
+        return False
+
+
+# Skip decorator for tests that need stub control (can't mock real QGIS singletons)
+requires_stubs = pytest.mark.skipif(
+    _has_real_qgis(),
+    reason="Test requires stub environment - cannot mock real QGIS singletons"
+)
+
+
 def _install_qgis_stubs():
     """Install minimal qgis stubs if QGIS is not available."""
     if importlib.util.find_spec("qgis") is not None:
@@ -520,6 +537,7 @@ def _load_manager_module():
     return manager
 
 
+@pytest.mark.qgis_required
 def test_set_mission_store_directory_failure(monkeypatch, tmp_path):
     _ensure_qgis(monkeypatch)
 
@@ -536,6 +554,9 @@ def test_set_mission_store_directory_failure(monkeypatch, tmp_path):
         def messageBar(self):
             return "bar"
 
+        def mainWindow(self):
+            return None
+
     mgr = manager.LayerManager(FakeIface())
     bad_path = tmp_path / "nested" / "store" / "mission.gpkg"
 
@@ -551,6 +572,7 @@ def test_set_mission_store_directory_failure(monkeypatch, tmp_path):
     assert "Failed to prepare mission store directory" in messages[0][1]
 
 
+@pytest.mark.qgis_required
 def test_get_mission_store_refreshes_from_project(monkeypatch, tmp_path):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
@@ -597,12 +619,15 @@ def test_project_cleared_does_not_rebuild_structure(monkeypatch):
     assert calls["ensure_structure"] == 0
 
 
+@pytest.mark.qgis_required
 def test_metadata_migration_sets_guard_and_resets(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
+    from threading import RLock
 
     mgr = manager.LayerManager.__new__(manager.LayerManager)
     mgr._metadata_migration_in_progress = False
+    mgr._metadata_lock = RLock()  # Required by _migrate_datetime_timezone
     mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
     mgr._log = lambda *_args, **_kwargs: None
 
@@ -621,12 +646,15 @@ def test_metadata_migration_sets_guard_and_resets(monkeypatch):
     assert mgr._metadata_migration_in_progress is False
 
 
+@pytest.mark.qgis_required
 def test_metadata_migration_guard_prevents_reentry(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
+    from threading import RLock
 
     mgr = manager.LayerManager.__new__(manager.LayerManager)
     mgr._metadata_migration_in_progress = True
+    mgr._metadata_lock = RLock()  # Required by _migrate_datetime_timezone
     mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
     mgr.set_layer_metadata = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("should not run"))
     mgr._log = lambda *_args, **_kwargs: None
@@ -637,6 +665,7 @@ def test_metadata_migration_guard_prevents_reentry(monkeypatch):
     assert result["updated_at"] == "2024-01-01T10:00:00"
 
 
+@pytest.mark.qgis_required
 def test_validate_persistence_reports_layer_ids(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
@@ -645,6 +674,8 @@ def test_validate_persistence_reports_layer_ids(monkeypatch):
     mgr._mission_store_path = "/tmp/mission.gpkg"
     mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
     mgr._log = lambda *_args, **_kwargs: None
+    # Mock mission store check to avoid needing full init
+    mgr._mission_store_enabled = lambda: True
 
     defs = [
         manager.LayerDefinition(layer_id="layer_missing", name="Missing", geometry_type="Point"),
@@ -684,6 +715,7 @@ def test_validate_persistence_reports_layer_ids(monkeypatch):
     assert "layer_memory" in messages[0][1]
 
 
+@pytest.mark.qgis_required
 def test_create_vector_layer_falls_back_to_memory(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
@@ -692,6 +724,8 @@ def test_create_vector_layer_falls_back_to_memory(monkeypatch):
     mgr._mission_store_path = "/tmp/mission.gpkg"
     mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
     mgr._log = lambda *_args, **_kwargs: None
+    # Mock mission store check to avoid needing full init
+    mgr._mission_store_enabled = lambda: True
 
     layer_def = manager.LayerDefinition(layer_id="layer_x", name="Layer X", geometry_type="Point")
 
@@ -764,6 +798,8 @@ def test_route_feature_surfaces_error(monkeypatch):
     assert "Add Feature Failed" in errors[0][0]
 
 
+@requires_stubs
+@pytest.mark.qgis_required
 def test_connect_signals_warns_on_failure(monkeypatch):
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
@@ -797,7 +833,12 @@ def test_connect_signals_warns_on_failure(monkeypatch):
     assert "Could not connect project signals" in warnings[0][1]
 
 
+@requires_stubs
 def test_ensure_structure_async_falls_back_without_task(monkeypatch):
+    """Test async fallback when no task_manager provided.
+
+    VALUE: MEDIUM - tests graceful degradation in async infrastructure.
+    """
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
 
@@ -825,7 +866,12 @@ def test_ensure_structure_async_falls_back_without_task(monkeypatch):
     assert called.get("complete") is True
 
 
+@requires_stubs
 def test_repair_structure_async_runs_on_ui_thread(monkeypatch):
+    """Test that repair runs on UI thread (not background).
+
+    VALUE: MEDIUM - tests thread safety for UI operations.
+    """
     _ensure_qgis(monkeypatch)
     manager = _load_manager_module()
 

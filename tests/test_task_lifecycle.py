@@ -1,25 +1,50 @@
 # -*- coding: utf-8 -*-
+"""Task lifecycle and TaskManager unit tests.
+
+Tests marked with @requires_stubs need controlled signal behavior that
+isn't possible with real QGIS signals. They run when QGIS is not loaded.
+"""
 import sys
 import types
+import pytest
+
+
+def _has_real_qgis():
+    """Check if real QGIS is loaded (pytest-qgis environment)."""
+    try:
+        from qgis.core import QgsTask
+        return hasattr(QgsTask, 'taskCompleted')
+    except ImportError:
+        return False
+
+
+# Skip decorator for tests that need stub signal control
+requires_stubs = pytest.mark.skipif(
+    _has_real_qgis(),
+    reason="Test requires stub signals - cannot emit real QGIS signals"
+)
 
 
 
 def _install_qgis_task_stubs(monkeypatch=None):
-    """Install minimal qgis stubs for task-related imports."""
-    # First, clear any existing mocks from conftest to avoid conflicts
+    """Install minimal qgis stubs for task-related imports.
+
+    When real QGIS is available (pytest-qgis), we use real QGIS objects.
+    Stubs are only installed when running without QGIS.
+    """
+    # Check if real QGIS is properly loaded (pytest-qgis environment)
+    try:
+        from qgis.core import QgsTask, QgsApplication
+        # Real QGIS available - verify it's functional
+        if hasattr(QgsTask, 'taskCompleted') and hasattr(QgsApplication, 'taskManager'):
+            return  # Use real QGIS, no stubs needed
+    except (ImportError, AttributeError):
+        pass  # Real QGIS not available, install stubs
+
+    # Only clear modules if we're installing stubs (no real QGIS)
     for mod_name in ['qgis', 'qgis.core', 'qgis.PyQt', 'qgis.PyQt.QtCore']:
         if mod_name in sys.modules:
-            if monkeypatch:
-                # Save for cleanup, but remove immediately
-                sys.modules.pop(mod_name, None)
-            else:
-                sys.modules.pop(mod_name, None)
-
-    try:
-        import qgis  # noqa: F401
-        return
-    except ImportError:
-        pass
+            sys.modules.pop(mod_name, None)
 
     qgis_mod = types.ModuleType("qgis")
     pyqt_mod = types.ModuleType("qgis.PyQt")
@@ -117,7 +142,13 @@ def _install_qgis_task_stubs(monkeypatch=None):
         sys.modules["qgis.core"] = core_mod
 
 
+@requires_stubs
 def test_task_manager_cancel_skips_callbacks(monkeypatch):
+    """Test that cancelled tasks don't trigger completion callbacks.
+
+    VALUE: CRITICAL - prevents crashes from accessing destroyed UI components
+    when completion signals arrive after cancellation.
+    """
     _install_qgis_task_stubs(monkeypatch)
     from qgis.core import QgsTask
     from sartracker.utils.task_manager import TaskManager
@@ -142,7 +173,12 @@ def test_task_manager_cancel_skips_callbacks(monkeypatch):
     assert not getattr(manager, "_cancelled_tasks")
 
 
+@requires_stubs
 def test_task_manager_cancel_all_forces_cleanup(monkeypatch):
+    """Test that cancel_all() properly cleans up all tracked tasks.
+
+    VALUE: CRITICAL - ensures clean plugin unload without dangling callbacks.
+    """
     _install_qgis_task_stubs(monkeypatch)
     from qgis.core import QgsTask
     from sartracker.utils.task_manager import TaskManager
@@ -157,7 +193,12 @@ def test_task_manager_cancel_all_forces_cleanup(monkeypatch):
     assert not getattr(manager, "_active_tasks")
 
 
+@requires_stubs
 def test_task_id_reuse_keeps_new_task(monkeypatch):
+    """Test that reusing a task ID replaces the old task tracking.
+
+    VALUE: HIGH - prevents stale callback issues when polling tasks restart.
+    """
     _install_qgis_task_stubs(monkeypatch)
     from qgis.core import QgsTask
     from sartracker.utils.task_manager import TaskManager
@@ -181,7 +222,13 @@ def test_task_id_reuse_keeps_new_task(monkeypatch):
     assert manager.get_active_count() == 0
 
 
+@requires_stubs
 def test_task_overlap_skips_old_callbacks(monkeypatch):
+    """Test that overlapping tasks with same ID ignore old task callbacks.
+
+    VALUE: HIGH - ensures only the current task's callbacks fire, preventing
+    race conditions with stale data.
+    """
     _install_qgis_task_stubs(monkeypatch)
     from qgis.core import QgsTask
     from sartracker.utils.task_manager import TaskManager
