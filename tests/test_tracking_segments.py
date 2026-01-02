@@ -117,6 +117,35 @@ def test_validate_processed_segments_filters_invalid_entries():
     assert validated[0]["device_id"] == "ok"
 
 
+def test_validate_processed_segments_rejects_null_island():
+    payload = {
+        "time_gap_minutes": 5,
+        "segments": [
+            {
+                "device_id": "bad",
+                "name": "Bad",
+                "points": [
+                    {"lat": 0, "lon": 0},
+                    {"lat": 0.0, "lon": 0.0},
+                ],
+            },
+            {
+                "device_id": "ok",
+                "name": "OK",
+                "points": [
+                    {"lat": 51.0, "lon": -9.0},
+                    {"lat": 51.1, "lon": -9.1},
+                ],
+            },
+        ],
+    }
+
+    validated = validate_processed_segments(payload, requested_gap_minutes=5)
+
+    assert len(validated) == 1
+    assert validated[0]["device_id"] == "ok"
+
+
 def test_parse_iso_timestamp_handles_z_suffix():
     dt = parse_iso_timestamp("2024-01-01T00:00:00Z")
     assert dt.tzinfo is not None

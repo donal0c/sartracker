@@ -335,6 +335,9 @@ def validate_processed_segments(
             if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
                 valid_segment = False
                 break
+            if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+                valid_segment = False
+                break
 
             processed_points.append({"lat": lat, "lon": lon, "ts": point.get("ts")})
 

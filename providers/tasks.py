@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Default line-break threshold (minutes) for breadcrumb segmentation.
 # Mirrors TrackingLayerManager.update_breadcrumbs default to keep UI behavior consistent.
 DEFAULT_BREADCRUMB_GAP_MINUTES = 5.0
+MAX_BREADCRUMB_POSITIONS = 100000
 
 
 class ProviderRefreshTask(QgsTask):
@@ -371,6 +372,16 @@ def prepare_breadcrumb_segments(
     """
     if not raw_positions:
         return None
+    raw_count = len(raw_positions)
+    truncated = 0
+    if raw_count > MAX_BREADCRUMB_POSITIONS:
+        truncated = raw_count - MAX_BREADCRUMB_POSITIONS
+        logger.warning(
+            "Breadcrumb preprocessing memory guard: truncating %d positions to %d (keeping most recent)",
+            raw_count,
+            MAX_BREADCRUMB_POSITIONS
+        )
+        raw_positions = raw_positions[-MAX_BREADCRUMB_POSITIONS:]
 
     def _check_cancel() -> bool:
         return bool(cancel_check and cancel_check())
@@ -382,11 +393,13 @@ def prepare_breadcrumb_segments(
         raise ValueError("time_gap_minutes must be greater than zero")
 
     stats = {
-        'input_points': len(raw_positions),
+        'input_points': raw_count,
         'valid_points': 0,
         'skipped_points': 0,
         'segments': 0
     }
+    if truncated:
+        stats['truncated_points'] = truncated
 
     device_positions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
 
@@ -404,11 +417,11 @@ def prepare_breadcrumb_segments(
             name = pos.get('name') or f"Device {device_id}"
             lat = _validate_coordinate(pos.get('lat'), -90.0, 90.0, 'latitude')
             lon = _validate_coordinate(pos.get('lon'), -180.0, 180.0, 'longitude')
+            if abs(lat) < 0.0001 and abs(lon) < 0.0001:
+                raise ValueError("Null Island (0,0) rejected")
             timestamp = pos.get('ts')
             ts_dt = _normalize_iso_timestamp(timestamp)
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.warning(f"Skipping point for device {device_id if 'device_id' in locals() else 'unknown'}: {str(e)}")
             stats['skipped_points'] += 1
             continue
@@ -430,6 +443,7 @@ def prepare_breadcrumb_segments(
             return None
         points.sort(key=lambda p: p['ts_dt'])
         current_segment: List[Dict[str, Any]] = []
+        device_segments: List[Dict[str, Any]] = []
 
         for idx, point in enumerate(points):
             if _check_cancel():
@@ -443,15 +457,22 @@ def prepare_breadcrumb_segments(
 
             if gap_minutes > time_gap_minutes:
                 if len(current_segment) > 1:
-                    segments.append(_build_segment_payload(current_segment))
+                    device_segments.append(_build_segment_payload(current_segment))
                     stats['segments'] += 1
                 current_segment = [point]
             else:
                 current_segment.append(point)
 
         if len(current_segment) > 1:
-            segments.append(_build_segment_payload(current_segment))
+            device_segments.append(_build_segment_payload(current_segment))
             stats['segments'] += 1
+
+        if not device_segments and len(points) >= 2:
+            for idx in range(1, len(points)):
+                device_segments.append(_build_segment_payload([points[idx - 1], points[idx]]))
+            stats['segments'] += len(device_segments)
+
+        segments.extend(device_segments)
 
     return {
         'segments': segments,
