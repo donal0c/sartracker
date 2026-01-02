@@ -68,6 +68,21 @@ class MetadataStubLayerManager:
 def _make_service(layer_catalog, layer_manager):
     svc = layer_catalog.LayerCatalogService.__new__(layer_catalog.LayerCatalogService)
     svc.layer_manager = layer_manager
+
+    # Initialize all attributes that __init__ would set (to avoid AttributeErrors)
+    svc._per_item_layer_ids = {}
+    svc._ui_task_timers = {}
+    svc._refresh_pending = False
+    svc._refresh_timer = None
+    svc._pending_refresh_layers = set()
+    svc._signal_connections = []
+    svc._layer_signal_connections = {}
+    svc._cleanup_in_progress = False
+    svc._layer_lock_alerts = {}
+    svc._layer_lock_retries = {}
+    svc._task_manager = None
+    svc._owned_task_manager = False
+
     svc._layers = {
         "LAYER_ALPHA": layer_catalog.LayerInfo(
             id="LAYER_ALPHA",
@@ -143,6 +158,10 @@ class StubTaskManager:
         self.cancelled.append(task_id)
         return True
 
+    def cancel_all(self, wait_timeout_ms=5000):
+        """Cancel all active tasks."""
+        self.cancel_all_called = True
+
 
 class StubCacheLayerManager:
     """LayerManager stub focused on _build_cache startup gating behavior."""
@@ -163,6 +182,10 @@ class StubCacheLayerManager:
 
     def get_layer_metadata(self, _layer_id):
         return {}
+
+    def get_mission_store(self):
+        """Return None for mission store - not relevant for these tests."""
+        return None
 
 
 def test_catalog_build_cache_does_not_ensure_structure_for_non_sar_project(monkeypatch):
@@ -197,8 +220,6 @@ def test_catalog_build_cache_ensures_structure_for_sar_project(monkeypatch):
 
     assert mgr.ensure_calls == 1
     assert isinstance(svc._groups, dict)
-    def cancel_all(self):
-        self.cancel_all_called = True
 
 
 def test_catalog_cache_builder_builds_expected_structure(monkeypatch):
@@ -256,7 +277,12 @@ def test_catalog_cache_builder_builds_expected_structure(monkeypatch):
                 "updated_at": "2024-01-01T12:00:00",
             }
 
-    project = layer_catalog.QgsProject.instance()
+    # Use stub project to avoid MagicMock boolean issues with layerTreeRoot()
+    class StubProjectLocal:
+        def layerTreeRoot(self):
+            return None
+
+    project = StubProjectLocal()
     builder = layer_catalog._CatalogCacheBuilder(FakeLayerManager(), project, layer_catalog.logger)
 
     result = builder.build()
@@ -308,8 +334,13 @@ def test_build_layer_info_handles_provider_failures(monkeypatch):
         def get_layer_metadata(self, _layer_id):
             raise RuntimeError("metadata failure")
 
+    class StubProject:
+        """Stub project that returns None for layerTreeRoot to avoid MagicMock boolean issues."""
+        def layerTreeRoot(self):
+            return None
+
     layer_def = types.SimpleNamespace(name="Faulty", position=5)
-    project = layer_catalog.QgsProject.instance()
+    project = StubProject()
     info = layer_catalog.build_layer_info(
         layer_manager=FaultyLayerManager(),
         project=project,

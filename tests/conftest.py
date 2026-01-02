@@ -1,11 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 Test bootstrap to avoid importing full QGIS plugin while enabling package-relative imports.
+
+This module sets up the test environment for SAR Tracker plugin testing.
+
+Test modes:
+1. Unit tests (QGIS not available): Uses mock QGIS classes
+2. Integration tests (QGIS available): Uses real QGIS via pytest-qgis
+
+To run integration tests with pytest-qgis:
+    - Ensure QGIS is installed
+    - Install pytest-qgis: pip install pytest-qgis
+    - Run with QGIS Python or with --system-site-packages venv
+
+To skip integration tests:
+    pytest -m 'not qgis_required'
 """
 import os
 import sys
 import types
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -129,3 +145,100 @@ if not _qgis_available:
     print("Warning: QGIS not available - using mocked QGIS classes for unit testing")
 else:
     print("QGIS available - using real QGIS for integration testing")
+
+
+# ====================================================================
+# pytest-qgis Integration
+# ====================================================================
+
+# Check if pytest-qgis is available
+_pytest_qgis_available = False
+try:
+    import pytest_qgis
+    _pytest_qgis_available = True
+except ImportError:
+    pass
+
+
+def pytest_configure(config):
+    """Configure pytest with custom markers."""
+    config.addinivalue_line(
+        "markers", "qgis_required: mark test as requiring real QGIS environment"
+    )
+    config.addinivalue_line(
+        "markers", "slow: mark test as slow-running"
+    )
+    config.addinivalue_line(
+        "markers", "integration: mark test as integration test"
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Auto-skip qgis_required tests when QGIS is not available."""
+    if _qgis_available:
+        # QGIS is available, don't skip anything
+        return
+
+    skip_qgis = pytest.mark.skip(reason="QGIS not available - install QGIS and pytest-qgis for integration tests")
+    for item in items:
+        if "qgis_required" in item.keywords:
+            item.add_marker(skip_qgis)
+
+
+# ====================================================================
+# Common Test Fixtures
+# ====================================================================
+
+@pytest.fixture
+def temp_gpkg(tmp_path):
+    """Create a temporary GeoPackage file path."""
+    return tmp_path / "test.gpkg"
+
+
+@pytest.fixture
+def mock_iface():
+    """Return a minimal mock iface for unit tests."""
+    from unittest.mock import MagicMock
+
+    iface = MagicMock()
+    iface.messageBar.return_value = MagicMock()
+    iface.mainWindow.return_value = None
+    return iface
+
+
+@pytest.fixture
+def sample_coordinates():
+    """Return sample valid coordinates for testing."""
+    return {
+        "wgs84": {"lat": 52.1409, "lon": -9.6938},  # Kerry, Ireland
+        "itm": {"easting": 451234.5, "northing": 598765.4},
+        "invalid_lat": {"lat": 91.0, "lon": -9.6938},
+        "invalid_lon": {"lat": 52.1409, "lon": 181.0},
+    }
+
+
+# ====================================================================
+# pytest-qgis Fixture Wrappers (when available)
+# ====================================================================
+
+if _pytest_qgis_available and _qgis_available:
+    # Re-export pytest-qgis fixtures for convenience
+    # These will be available when running with real QGIS
+
+    @pytest.fixture
+    def sar_qgis_project(qgis_new_project):
+        """
+        Provide a clean QGIS project for SAR testing.
+
+        Uses pytest-qgis qgis_new_project to ensure clean state.
+        """
+        return qgis_new_project
+
+    @pytest.fixture
+    def sar_iface(qgis_iface):
+        """
+        Provide a QGIS iface for SAR testing.
+
+        Uses pytest-qgis qgis_iface which provides a stubbed QgisInterface.
+        """
+        return qgis_iface
