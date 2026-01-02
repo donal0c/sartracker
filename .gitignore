@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual environments
 venv/
+.venv/
 ENV/
 env/
 
@@ -68,6 +69,10 @@ plugin_upload.py
 *.bak
 *.swp
 .cache/
+
+# Test output files
+test_results.txt
+test_summary.txt
 
 # Build artifacts
 VERSION.txt
