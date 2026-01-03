@@ -142,15 +142,27 @@ def refresh_layer_tree_view(iface) -> bool:
     Returns:
         True if a refresh was requested, False if no view was available.
     """
+    did_refresh = False
     try:
-        view = iface.layerTreeView()
-        if not view:
-            return False
-        model = view.model()
-        if model:
-            model.layoutChanged.emit()
-        view.viewport().update()
-        return True
+        try:
+            root = QgsProject.instance().layerTreeRoot()
+            if root and hasattr(root, "checkedLayers"):
+                visible_layers = list(root.checkedLayers())
+                canvas = iface.mapCanvas() if hasattr(iface, "mapCanvas") else None
+                if canvas:
+                    canvas.setLayers(visible_layers)
+                    canvas.refresh()
+                    did_refresh = True
+        except Exception:
+            pass
+        view = iface.layerTreeView() if hasattr(iface, "layerTreeView") else None
+        if view:
+            model = view.model()
+            if model:
+                model.layoutChanged.emit()
+            view.viewport().update()
+            did_refresh = True
+        return did_refresh
     except Exception:
         return False
 
