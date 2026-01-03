@@ -104,13 +104,15 @@ def mock_pyqtSignal(*args):
     return MockSignal()
 
 # Only set up mocks if QGIS is not already available
-# Check if we can actually import QGIS
+# Check if we can actually import QGIS (allow force-mock override)
 _qgis_available = False
-try:
-    import qgis.core
-    _qgis_available = True
-except ImportError:
-    pass
+_force_mock_qgis = os.environ.get("SARTRACKER_FORCE_MOCK_QGIS") == "1"
+if not _force_mock_qgis:
+    try:
+        import qgis.core
+        _qgis_available = True
+    except ImportError:
+        pass
 
 if not _qgis_available:
     from unittest.mock import MagicMock

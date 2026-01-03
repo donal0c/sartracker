@@ -844,9 +844,10 @@ class ProviderController(QObject):
                 except Exception as e:
                     print(f"[PROVIDER_CONTROLLER] Warning: Could not set panel loading state: {e}")
 
-            # Get mission start time for breadcrumb filtering
+            # Get mission start time for breadcrumb filtering (skip for CSV by default)
             effective_since = since_iso
-            if effective_since is None and self._mission_start_getter:
+            use_mission_start = self.provider_name != 'csv'
+            if effective_since is None and self._mission_start_getter and use_mission_start:
                 try:
                     effective_since = self._mission_start_getter()
                 except Exception as e:

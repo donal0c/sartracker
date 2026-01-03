@@ -9,6 +9,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt for all imports.
 """
 
 import logging
+import hashlib
 import time
 from contextlib import contextmanager
 from typing import List, Dict, Optional, Any
@@ -44,6 +45,7 @@ from ...layers.schema import (
     GroupNames,
     get_per_device_group_path,
 )
+from ...layers.utilities import refresh_layer_tree_view
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 from ...utils.notify import warning as notify_warning
 from ..per_item_layer_factory import ItemType, PerItemLayerFactory, SAR_ITEM_TYPE, SAR_ITEM_ID
@@ -103,6 +105,57 @@ class TrackingLayerManager(BaseLayerManager):
     DEVICE_ID_PROP = "sartracker:device_id"
     DEVICE_NAME_PROP = "sartracker:device_name"
     DEVICE_COLOR_PROP = "sartracker:device_color"
+
+    @staticmethod
+    def _hash_device_id(device_id: str) -> str:
+        """Return a stable, ASCII-only hash for device identifiers."""
+        return hashlib.md5(device_id.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _candidate_device_item_ids(cls, prefix: str, device_id: str) -> tuple:
+        """Return legacy + safe per-device item IDs."""
+        legacy_id = f"{prefix}_{device_id}"
+        safe_id = f"{prefix}_{cls._hash_device_id(device_id)}"
+        return legacy_id, safe_id
+
+    @staticmethod
+    def _get_or_rebuild_device_layer(factory, item_id: str, target_group: QgsLayerTreeGroup):
+        """
+        Return a loaded layer if present, otherwise rebuild from registry.
+        """
+        try:
+            layer = factory.get_layer_by_item_id(item_id)
+        except Exception:
+            layer = None
+
+        if layer and layer.isValid():
+            return layer
+
+        try:
+            return factory.rebuild_missing_layer(item_id, add_to_project=True, target_group=target_group)
+        except Exception:
+            return None
+
+    def _apply_device_layer_identity(
+        self,
+        layer: QgsVectorLayer,
+        device_id: str,
+        device_name: str,
+        is_trail: bool
+    ) -> None:
+        """
+        Ensure per-device layers have stable identification and styling.
+        """
+        layer.setCustomProperty(self.DEVICE_ID_PROP, device_id)
+        layer.setCustomProperty(self.DEVICE_NAME_PROP, device_name)
+
+        if layer.customProperty(self.DEVICE_COLOR_PROP, None) is None:
+            color = self._get_device_color(device_id)
+            layer.setCustomProperty(self.DEVICE_COLOR_PROP, color.name())
+            if is_trail:
+                self._apply_device_trail_style(layer, color)
+            else:
+                self._apply_device_position_style(layer, color)
 
     def __init__(self, iface, shared_device_colors=None, layer_manager=None, task_manager=None):
         """Initialize tracking layer manager."""
@@ -713,7 +766,15 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Phase SAR-nh9: Per-device architecture only
         if self.USE_PER_DEVICE_POSITIONS:
-            self._ensure_per_device_ready()
+            try:
+                self._ensure_per_device_ready()
+            except LayerError as exc:
+                logger.warning(
+                    "Per-device tracking unavailable (%s); falling back to shared current layer",
+                    exc
+                )
+                return self._update_current_positions_shared(valid_positions)
+
             self._update_positions_per_device(valid_positions)
 
             # Zoom to extent ONLY on first load
@@ -737,6 +798,30 @@ class TrackingLayerManager(BaseLayerManager):
             return
 
         raise LayerError("Per-device tracking is disabled for current positions.", title="Tracking Disabled")
+
+    def _update_current_positions_shared(self, positions: List[Dict]) -> None:
+        """Update the legacy shared Current Positions layer."""
+        if not positions:
+            return
+
+        layer = self._get_or_create_current_layer()
+        updated, added, removed = self._delta_update_current_positions(layer, positions)
+
+        try:
+            self._apply_current_positions_style(layer)
+        except Exception as exc:
+            logger.warning("Failed to apply current positions styling: %s", exc)
+
+        layer.triggerRepaint()
+        self._log_tracking_event(
+            layer,
+            "CURRENT",
+            "update",
+            updated=updated,
+            added=added,
+            removed=removed,
+            devices=len(positions)
+        )
 
     def _delta_update_current_positions(
         self,
@@ -1279,30 +1364,31 @@ class TrackingLayerManager(BaseLayerManager):
             logger.warning("Failed to create device group for %s", device_name)
             return None
 
-        try:
-            # Create the layer via PerItemLayerFactory
-            item_info = factory.create_item_layer(
-                item_type=ItemType.DEVICE_POSITION,
-                display_name="Position",
-                item_id=f"pos_{device_id}",
-                fields=DEVICE_POSITION_FIELDS,
-                add_to_project=True,
-                target_group=device_group
-            )
+        legacy_item_id, safe_item_id = self._candidate_device_item_ids("pos", device_id)
 
-            layer = item_info.layer
+        try:
+            # Try legacy item id first (existing missions), then safe hash id.
+            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, device_group)
+            if not layer and safe_item_id != legacy_item_id:
+                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, device_group)
+
+            if not layer:
+                # Create the layer via PerItemLayerFactory
+                item_info = factory.create_item_layer(
+                    item_type=ItemType.DEVICE_POSITION,
+                    display_name="Position",
+                    item_id=safe_item_id,
+                    fields=DEVICE_POSITION_FIELDS,
+                    add_to_project=True,
+                    target_group=device_group
+                )
+                layer = item_info.layer
+
             if not layer or not layer.isValid():
                 logger.error("Failed to create position layer for device %s", device_id)
                 return None
 
-            # Set device identification properties (survives rename)
-            layer.setCustomProperty(self.DEVICE_ID_PROP, device_id)
-            layer.setCustomProperty(self.DEVICE_NAME_PROP, device_name)
-
-            # Apply device-specific styling
-            color = self._get_device_color(device_id)
-            layer.setCustomProperty(self.DEVICE_COLOR_PROP, color.name())
-            self._apply_device_position_style(layer, color)
+            self._apply_device_layer_identity(layer, device_id, device_name, is_trail=False)
 
             # Cache and return
             self._device_position_layers[device_id] = layer
@@ -1467,6 +1553,7 @@ class TrackingLayerManager(BaseLayerManager):
             root.blockSignals(False)
             canvas.freeze(False)
             canvas.refresh()
+            refresh_layer_tree_view(self.iface)
 
         # CRITICAL FIX: If ANY device failed, raise exception to signal data loss risk
         # This ensures no position data is silently lost
@@ -1565,30 +1652,31 @@ class TrackingLayerManager(BaseLayerManager):
             logger.warning("Failed to create device group for %s", device_name)
             return None
 
-        try:
-            # Create the layer via PerItemLayerFactory
-            item_info = factory.create_item_layer(
-                item_type=ItemType.DEVICE_TRAIL,
-                display_name="Trail",
-                item_id=f"trail_{device_id}",
-                fields=DEVICE_TRAIL_FIELDS,
-                add_to_project=True,
-                target_group=device_group
-            )
+        legacy_item_id, safe_item_id = self._candidate_device_item_ids("trail", device_id)
 
-            layer = item_info.layer
+        try:
+            # Try legacy item id first (existing missions), then safe hash id.
+            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, device_group)
+            if not layer and safe_item_id != legacy_item_id:
+                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, device_group)
+
+            if not layer:
+                # Create the layer via PerItemLayerFactory
+                item_info = factory.create_item_layer(
+                    item_type=ItemType.DEVICE_TRAIL,
+                    display_name="Trail",
+                    item_id=safe_item_id,
+                    fields=DEVICE_TRAIL_FIELDS,
+                    add_to_project=True,
+                    target_group=device_group
+                )
+                layer = item_info.layer
+
             if not layer or not layer.isValid():
                 logger.error("Failed to create trail layer for device %s", device_id)
                 return None
 
-            # Set device identification properties (survives rename)
-            layer.setCustomProperty(self.DEVICE_ID_PROP, device_id)
-            layer.setCustomProperty(self.DEVICE_NAME_PROP, device_name)
-
-            # Apply device-specific styling
-            color = self._get_device_color(device_id)
-            layer.setCustomProperty(self.DEVICE_COLOR_PROP, color.name())
-            self._apply_device_trail_style(layer, color)
+            self._apply_device_layer_identity(layer, device_id, device_name, is_trail=True)
 
             # Cache and return
             self._device_trail_layers[device_id] = layer
@@ -1824,6 +1912,7 @@ class TrackingLayerManager(BaseLayerManager):
             root.blockSignals(False)
             canvas.freeze(False)
             canvas.refresh()
+            refresh_layer_tree_view(self.iface)
 
         logger.debug(
             "SAR-nj0: Updated per-device trails for %d devices",

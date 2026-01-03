@@ -135,6 +135,26 @@ def set_active_layer(iface, layer: QgsVectorLayer) -> bool:
         return False
 
 
+def refresh_layer_tree_view(iface) -> bool:
+    """
+    Force the QGIS layer tree view to refresh.
+
+    Returns:
+        True if a refresh was requested, False if no view was available.
+    """
+    try:
+        view = iface.layerTreeView()
+        if not view:
+            return False
+        model = view.model()
+        if model:
+            model.layoutChanged.emit()
+        view.viewport().update()
+        return True
+    except Exception:
+        return False
+
+
 def zoom_to_layer(iface, layer: QgsVectorLayer) -> bool:
     """
     Zoom the map canvas to show a layer's extent.
