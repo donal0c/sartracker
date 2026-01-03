@@ -76,7 +76,7 @@ from .resources import *
 # Import Qt5/Qt6 compatible constants and functions
 from .utils.qt_compat import (
     RightDockWidgetArea, LeftDockWidgetArea, dialog_exec, DialogAccepted,
-    ISODate, MessageBoxQuestion, AcceptRole, RejectRole
+    ISODate, MessageBoxQuestion, AcceptRole, RejectRole, VectorLayerType
 )
 from .utils.notify import info, warning, error, success
 from .utils.error_handler import ErrorHandler
@@ -993,6 +993,24 @@ class sartracker:
         except Exception as e:
             print(f"[SARTRACKER] ERROR adding Smoke Test menu: {e}")
 
+        # Add Edit Marker Properties context menu action for Layer Panel (SAR-1xn)
+        try:
+            self._edit_marker_action = QAction(
+                "Edit Marker Properties...",
+                self.iface.mainWindow()
+            )
+            self._edit_marker_action.triggered.connect(self._on_edit_marker_from_layer_tree)
+            self.iface.addCustomActionForLayerType(
+                self._edit_marker_action,
+                "",  # Empty string = all layer groups
+                VectorLayerType,
+                True  # allLayers=True, show for all vector layers
+            )
+            print("[SARTRACKER] Added Edit Marker Properties context menu action")
+        except Exception as e:
+            print(f"[SARTRACKER] ERROR adding Edit Marker action: {e}")
+            self._edit_marker_action = None
+
     def _init_task_manager(self):
         """Initialize TaskManager for background operations.
 
@@ -1739,6 +1757,67 @@ class sartracker:
             # Controller unavailable - use safe-mode block
             self._safe_mode_block("Mission Logs")
 
+    def _on_edit_marker_from_layer_tree(self):
+        """
+        Handle Edit Marker Properties action from Layer Panel context menu.
+
+        SAR-1xn: Allows users to edit marker properties by right-clicking
+        on a marker layer in the QGIS Layers Panel.
+
+        Only functions for SAR marker layers (clues, hazards, IPP/LKP, casualties).
+        Non-SAR layers are silently ignored.
+        """
+        # Guard against action during unload
+        if self._is_unloading or self._app_is_quitting:
+            return
+
+        # Get the currently selected layer
+        layer = self.iface.activeLayer()
+        if not layer:
+            return
+
+        # Check if this is a SAR marker layer using custom properties
+        item_type = layer.customProperty('sartracker:item_type')
+        item_id = layer.customProperty('sartracker:item_id')
+
+        if not item_type or not item_id:
+            # Not a SAR layer - silently return
+            return
+
+        # Map item_type to marker_type for the controller
+        ITEM_TYPE_TO_MARKER_TYPE = {
+            'marker_clue': 'clue',
+            'marker_hazard': 'hazard',
+            'marker_ipp_lkp': 'ipp_lkp',
+            'marker_casualty': 'casualty',
+        }
+
+        marker_type = ITEM_TYPE_TO_MARKER_TYPE.get(item_type)
+        if not marker_type:
+            # Not a marker layer (could be search area, line, tracking, etc.)
+            return
+
+        # Verify marker controller is available
+        if not self.marker_controller:
+            warning(
+                self.iface.messageBar(),
+                "Edit Marker",
+                "Marker editing is not available in safe mode.",
+                duration=3
+            )
+            return
+
+        # Call existing edit handler
+        try:
+            self.marker_controller.handle_edit(marker_type, item_id)
+        except Exception as e:
+            error(
+                self.iface.messageBar(),
+                "Edit Marker",
+                f"Failed to edit marker: {e}",
+                duration=5
+            )
+
     # ========================================================================
     # Phase 1.5 Refactor V2: Legacy mission logs info method removed
     # _get_mission_logs_info is now handled by MissionLogsController.get_mission_info()
@@ -2129,6 +2208,15 @@ class sartracker:
                 self.iface.removeToolBarIcon(action)
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to remove toolbar icon: {exc}")
+
+        # Remove Edit Marker Properties context menu action (SAR-1xn)
+        if hasattr(self, '_edit_marker_action') and self._edit_marker_action:
+            try:
+                self.iface.removeCustomActionForLayerType(self._edit_marker_action)
+                print("[SARTRACKER] Removed Edit Marker Properties context menu action")
+            except Exception as exc:
+                print(f"[SARTRACKER] Warning: Failed to remove Edit Marker action: {exc}")
+            self._edit_marker_action = None
 
     def _unload_controllers(self):
         """Clean up all controllers in reverse dependency order.

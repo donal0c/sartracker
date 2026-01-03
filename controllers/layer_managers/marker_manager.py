@@ -22,7 +22,8 @@ from qgis.core import (
     QgsPointXY, QgsMarkerSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
     QgsFeatureRequest, QgsCoordinateReferenceSystem, QgsCoordinateTransform,
-    QgsProject, QgsLayerTreeGroup
+    QgsProject, QgsLayerTreeGroup,
+    QgsDropShadowEffect, QgsEffectStack, QgsDrawSourceEffect
 )
 from qgis.PyQt.QtGui import QColor
 
@@ -615,6 +616,21 @@ class MarkerLayerManager(BaseLayerManager):
             'outline_color': 'black',
             'outline_width': '0.8'
         })
+        # Add drop shadow effect for visual prominence (life-safety critical marker)
+        shadow = QgsDropShadowEffect()
+        shadow.setEnabled(True)
+        shadow.setBlurLevel(2.0)
+        shadow.setOffsetDistance(2.0)
+        shadow.setOffsetAngle(135)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        # Create effect stack with source effect + shadow
+        effect_stack = QgsEffectStack()
+        effect_stack.appendEffect(shadow)
+        source = QgsDrawSourceEffect()
+        source.setEnabled(True)
+        effect_stack.appendEffect(source)
+        effect_stack.setEnabled(True)
+        symbol.symbolLayer(0).setPaintEffect(effect_stack)
         layer.renderer().setSymbol(symbol)
         self._apply_marker_labels(layer, QColor('#8B0000'))
 

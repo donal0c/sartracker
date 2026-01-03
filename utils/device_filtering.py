@@ -100,8 +100,12 @@ def filter_devices(
     """
     Filter device list to show only active devices.
 
-    This implements FR-6: SAR Panel shows only active devices.
-    The Layer Console (left panel) continues to show all devices.
+    FR-6 (SAR-5c6) CORRECTED SPEC:
+    - Layer Console (left panel): Shows only ACTIVE device tracking layers
+    - SAR Panel devices_list (right panel): Shows ALL devices (no filtering)
+
+    This function provides the filtering logic used by provider_controller
+    to determine which device positions should be sent to the layer manager.
 
     Args:
         devices: List of device dicts from provider

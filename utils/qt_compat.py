@@ -719,6 +719,30 @@ else:
 
 
 # =============================================================================
+# QGIS Layer Type compatibility (QGIS 3.30+ vs older versions)
+# =============================================================================
+# In QGIS 3.30+, QgsMapLayerType was deprecated in favor of Qgis.LayerType
+# We provide a compatible VectorLayerType constant that works across versions
+try:
+    from qgis.core import Qgis
+    if hasattr(Qgis, 'LayerType'):
+        # QGIS 3.30+ uses Qgis.LayerType
+        VectorLayerType = Qgis.LayerType.VectorLayer
+    else:
+        # Older QGIS uses QgsMapLayerType
+        from qgis.core import QgsMapLayerType
+        VectorLayerType = QgsMapLayerType.VectorLayer
+except (ImportError, AttributeError):
+    # Fallback: try QgsMapLayer.VectorLayer (very old QGIS)
+    try:
+        from qgis.core import QgsMapLayer
+        VectorLayerType = QgsMapLayer.VectorLayer
+    except (ImportError, AttributeError):
+        # Last resort fallback - integer value for VectorLayer type
+        VectorLayerType = 0
+
+
+# =============================================================================
 # Export all compatibility constants
 # =============================================================================
 __all__ = [
@@ -866,4 +890,6 @@ __all__ = [
     # EventLoop
     'AllEvents',
     'ExcludeUserInputEvents',
+    # QGIS Layer Type
+    'VectorLayerType',
 ]

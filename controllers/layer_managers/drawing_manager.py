@@ -74,7 +74,10 @@ class BoundedSet:
 from qgis.core import (
     QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
     QgsPointXY, QgsDistanceArea, QgsProject, QgsLineSymbol,
-    QgsMarkerSymbol, QgsFeatureRequest, QgsWkbTypes
+    QgsMarkerSymbol, QgsFeatureRequest, QgsWkbTypes,
+    QgsFillSymbol, QgsPointPatternFillSymbolLayer,
+    QgsSimpleMarkerSymbolLayer, QgsSimpleLineSymbolLayer,
+    QgsSimpleFillSymbolLayer, QgsUnitTypes
 )
 from qgis.PyQt.QtCore import QVariant
 from qgis.core import NULL
@@ -396,10 +399,69 @@ class DrawingLayerManager(BaseLayerManager):
         symbol.symbolLayer(0).setStrokeWidth(2)
 
     def _style_range_rings_layer(self, layer: QgsVectorLayer):
-        symbol = layer.renderer().symbol()
-        symbol.setColor(QColor(255, 165, 0, 40))
-        symbol.symbolLayer(0).setStrokeColor(QColor(255, 165, 0))
-        symbol.symbolLayer(0).setStrokeWidth(1.5)
+        """Style range rings with 'zelda' triangle pattern at 15% opacity.
+
+        Pattern structure:
+        - Simple Fill (transparent background)
+        - Point Pattern Fill with triangle markers (4.8mm grid, 1.2mm displacement)
+        - Simple Line (orange outline)
+
+        Triangle markers: 4.6mm, orange fill and stroke
+        Layer opacity: 15%
+        """
+        orange = QColor(255, 165, 0)
+
+        # Create fresh fill symbol
+        symbol = QgsFillSymbol()
+        symbol.deleteSymbolLayer(0)  # Remove default
+
+        # 1. Simple Fill - transparent background (no stroke)
+        simple_fill = QgsSimpleFillSymbolLayer()
+        simple_fill.setColor(QColor(0, 0, 0, 0))  # Transparent
+        simple_fill.setStrokeWidth(0)  # No stroke
+        symbol.appendSymbolLayer(simple_fill)
+
+        # 2. Point Pattern Fill with triangle markers
+        point_pattern = QgsPointPatternFillSymbolLayer()
+        point_pattern.setDistanceX(4.8)
+        point_pattern.setDistanceY(4.8)
+        point_pattern.setDisplacementX(1.2)
+        point_pattern.setDisplacementY(0.0)
+        point_pattern.setDistanceXUnit(QgsUnitTypes.RenderMillimeters)
+        point_pattern.setDistanceYUnit(QgsUnitTypes.RenderMillimeters)
+        point_pattern.setDisplacementXUnit(QgsUnitTypes.RenderMillimeters)
+        point_pattern.setDisplacementYUnit(QgsUnitTypes.RenderMillimeters)
+
+        # Create triangle marker
+        triangle_marker = QgsSimpleMarkerSymbolLayer()
+        triangle_marker.setShape(QgsSimpleMarkerSymbolLayer.Triangle)
+        triangle_marker.setSize(4.6)
+        triangle_marker.setSizeUnit(QgsUnitTypes.RenderMillimeters)
+        triangle_marker.setColor(orange)
+        triangle_marker.setStrokeColor(orange)
+        triangle_marker.setStrokeWidth(0.2)
+        triangle_marker.setStrokeWidthUnit(QgsUnitTypes.RenderMillimeters)
+
+        # Create marker symbol and set as sub-symbol
+        marker_symbol = QgsMarkerSymbol()
+        marker_symbol.deleteSymbolLayer(0)
+        marker_symbol.appendSymbolLayer(triangle_marker)
+        point_pattern.setSubSymbol(marker_symbol)
+
+        symbol.appendSymbolLayer(point_pattern)
+
+        # 3. Simple Line - orange outline
+        simple_line = QgsSimpleLineSymbolLayer()
+        simple_line.setColor(orange)
+        simple_line.setWidth(1.5)
+        simple_line.setWidthUnit(QgsUnitTypes.RenderMillimeters)
+        symbol.appendSymbolLayer(simple_line)
+
+        # Apply symbol to layer
+        layer.renderer().setSymbol(symbol)
+
+        # Set layer opacity to 15%
+        layer.setOpacity(0.15)
 
     def _style_bearing_lines_layer(self, layer: QgsVectorLayer):
         symbol = QgsLineSymbol.createSimple({'color': 'purple', 'width': '2'})

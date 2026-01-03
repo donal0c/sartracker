@@ -32,6 +32,8 @@ from ..utils.notify import (
 from ..utils.provider_results import sanitize_provider_results
 from ..config.keys import ConfigStore, SETTINGS_KEYS
 from ..utils.secure_store import SecureStore
+from ..utils.device_filtering import should_show_device
+from ..config.settings import ACTIVE_DEVICE_STALE_THRESHOLD_SECONDS
 
 
 class ProviderController(QObject):
@@ -1018,15 +1020,60 @@ class ProviderController(QObject):
                 )
                 print(f"[PROVIDER_CONTROLLER] SAR-nzf: Breadcrumb failures: {failed_devices}")
 
+            # =================================================================
+            # FR-6 (SAR-5c6): Filter positions to ACTIVE devices only
+            # Layer Console (left panel) shows only active tracking layers.
+            # SAR Panel devices_list (right panel) shows ALL devices (no filtering).
+            #
+            # Active device definition (SAR-qvn):
+            # - 'online' = always show in layers
+            # - 'unknown' within threshold (1 hour) = show (patchy connection grace)
+            # - 'unknown' beyond threshold = DO NOT create layer
+            # - 'offline' = DO NOT create layer
+            # =================================================================
+            active_device_ids = set()
+            if devices:
+                for device in devices:
+                    if should_show_device(device, ACTIVE_DEVICE_STALE_THRESHOLD_SECONDS):
+                        device_id = device.get('device_id')
+                        if device_id:
+                            active_device_ids.add(device_id)
+
+            # Filter positions to active devices only
+            filtered_current = []
+            if current:
+                filtered_current = [
+                    pos for pos in current
+                    if pos.get('device_id') in active_device_ids
+                ]
+                filtered_out_count = len(current) - len(filtered_current)
+                if filtered_out_count > 0:
+                    print(f"[PROVIDER_CONTROLLER] FR-6: Filtered {filtered_out_count} position(s) from inactive devices")
+
+            # Filter breadcrumbs to active devices only
+            filtered_breadcrumbs = []
+            if breadcrumbs:
+                filtered_breadcrumbs = [
+                    bc for bc in breadcrumbs
+                    if bc.get('device_id') in active_device_ids
+                ]
+                filtered_out_bc = len(breadcrumbs) - len(filtered_breadcrumbs)
+                if filtered_out_bc > 0:
+                    print(f"[PROVIDER_CONTROLLER] FR-6: Filtered {filtered_out_bc} breadcrumb(s) from inactive devices")
+
             # Update layers if controller available
             # BUG-FIX: Only update layers when we have data to prevent clearing
             # existing positions during network glitches. This is LIFE-SAFETY CRITICAL
             # as losing team positions during a rescue could be dangerous.
             if self._layers_controller:
                 try:
-                    if current:
-                        # Only update when we have data
-                        self._layers_controller.update_current_positions(current)
+                    if filtered_current:
+                        # Only update when we have active device data
+                        self._layers_controller.update_current_positions(filtered_current)
+                    elif current:
+                        # Had positions but all were filtered (all inactive devices)
+                        # SAFETY: Do NOT clear - preserves last known positions
+                        print("[PROVIDER_CONTROLLER] All positions filtered (no active devices) - PRESERVING existing layer data")
                     else:
                         # SAFETY: Do NOT clear existing positions on empty response
                         # This preserves last known positions during network issues
@@ -1037,12 +1084,16 @@ class ProviderController(QObject):
                     traceback.print_exc()
 
                 try:
-                    if breadcrumbs:
-                        # Only update when we have data
+                    if filtered_breadcrumbs:
+                        # Only update when we have active device data
                         self._layers_controller.update_breadcrumbs(
-                            breadcrumbs,
+                            filtered_breadcrumbs,
                             processed_segments=breadcrumb_processing
                         )
+                    elif breadcrumbs:
+                        # Had breadcrumbs but all were filtered (all inactive devices)
+                        # SAFETY: Do NOT clear - preserves last known data
+                        print("[PROVIDER_CONTROLLER] All breadcrumbs filtered (no active devices) - PRESERVING existing layer data")
                     else:
                         # SAFETY: Do NOT clear existing breadcrumbs on empty response
                         print("[PROVIDER_CONTROLLER] Breadcrumb payload empty - PRESERVING existing layer data (network glitch protection)")
@@ -1093,8 +1144,13 @@ class ProviderController(QObject):
             # Emit refresh_complete signal for any additional handlers
             self.refresh_complete.emit(result)
 
-            # Update status
-            self._emit_status('ok', f'Last refresh: {len(devices)} devices')
+            # Update status - show active/total devices for clarity
+            active_count = len(active_device_ids)
+            total_count = len(devices) if devices else 0
+            if active_count < total_count:
+                self._emit_status('ok', f'Last refresh: {active_count}/{total_count} active devices')
+            else:
+                self._emit_status('ok', f'Last refresh: {total_count} devices')
 
             # Show user feedback based on cache/outage state
             if was_cached and cache_age_seconds:
@@ -1133,11 +1189,12 @@ class ProviderController(QObject):
                 )
                 print(f"[PROVIDER_CONTROLLER] SAR-la0: Connection restored after {outage_display}")
 
-            elif current or breadcrumbs:
+            elif filtered_current or filtered_breadcrumbs:
+                # Show active device count in user notification
                 safe_success(
                     self.iface,
                     "SAR Tracker",
-                    f"Refreshed: {len(current)} devices, {len(breadcrumbs)} points",
+                    f"Refreshed: {len(filtered_current)} active devices, {len(filtered_breadcrumbs)} trail points",
                     duration=2
                 )
             else:
