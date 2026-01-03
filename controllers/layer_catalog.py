@@ -1492,6 +1492,118 @@ class LayerCatalogService(QObject):
             if per_item_count:
                 layer_info.feature_count += per_item_count
 
+    def _discover_tracking_layers(self) -> None:
+        """
+        Discover per-device tracking layers and add them to the catalog.
+
+        Per-device tracking layers (SAR-nh9, SAR-nj0) are created dynamically
+        and aren't defined in the schema. This method scans the project for
+        layers with sartracker:item_type = device_position or device_trail
+        and adds them to the catalog under the Tracking group.
+
+        This fixes the regression where tracking layers stopped appearing
+        in the Layer Console after the per-device migration.
+        """
+        if not self.project:
+            return
+
+        # Ensure Tracking group exists in catalog
+        tracking_group_id = f"{GroupNames.ROOT}/{GroupNames.TRACKING}"
+        if tracking_group_id not in self._groups:
+            self._groups[tracking_group_id] = LayerGroupInfo(
+                id=tracking_group_id,
+                name=GroupNames.TRACKING,
+                order=0,
+                parent_id=GroupNames.ROOT,
+                visible=True,
+                expanded=True
+            )
+            # Add to root's subgroups if not present
+            root_info = self._groups.get(GroupNames.ROOT)
+            if root_info and tracking_group_id not in root_info.subgroups:
+                root_info.subgroups.insert(0, tracking_group_id)
+
+        # Scan all layers for per-device tracking layers
+        discovered_count = 0
+        for layer in self.project.mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+
+            item_type = layer.customProperty(SAR_ITEM_TYPE)
+            if item_type not in (ItemType.DEVICE_POSITION, ItemType.DEVICE_TRAIL):
+                continue
+
+            # Get device info from custom properties
+            device_id = layer.customProperty("sartracker:device_id") or ""
+            device_name = layer.customProperty("sartracker:device_name") or "Unknown"
+
+            # Create unique layer_id for catalog
+            layer_id = layer.customProperty("sartracker:item_id") or layer.id()
+
+            # Skip if already in catalog
+            if layer_id in self._layers:
+                continue
+
+            # Determine group path: Tracking/{DeviceName}
+            device_group_id = f"{tracking_group_id}/{device_name}"
+
+            # Ensure device group exists
+            if device_group_id not in self._groups:
+                self._groups[device_group_id] = LayerGroupInfo(
+                    id=device_group_id,
+                    name=device_name,
+                    order=len([g for g in self._groups if g.startswith(tracking_group_id + "/")]),
+                    parent_id=tracking_group_id,
+                    visible=True,
+                    expanded=True
+                )
+                # Add to Tracking group's subgroups
+                tracking_info = self._groups.get(tracking_group_id)
+                if tracking_info and device_group_id not in tracking_info.subgroups:
+                    tracking_info.subgroups.append(device_group_id)
+
+            # Determine layer display name and geometry type
+            if item_type == ItemType.DEVICE_POSITION:
+                display_name = "Position"
+                geometry_type = "Point"
+            else:
+                display_name = "Trail"
+                geometry_type = "LineString"
+
+            # Create LayerInfo for this tracking layer
+            try:
+                feature_count = layer.featureCount() if layer.isValid() else 0
+            except Exception:
+                feature_count = 0
+
+            layer_info = LayerInfo(
+                id=layer_id,
+                canonical_name=layer.name(),
+                display_name=display_name,
+                group_id=device_group_id,
+                geometry_type=geometry_type,
+                feature_count=feature_count,
+                visible=True,
+                editable=False,
+                favorite=False,
+                provider="ogr",
+                last_updated=None,
+                fields=[f.name() for f in layer.fields()] if layer.isValid() else [],
+                data_source_uri=layer.source() if layer.isValid() else ""
+            )
+
+            self._layers[layer_id] = layer_info
+
+            # Add to device group's children
+            device_group_info = self._groups.get(device_group_id)
+            if device_group_info and layer_id not in device_group_info.children:
+                device_group_info.children.append(layer_id)
+
+            discovered_count += 1
+
+        if discovered_count > 0:
+            logger.info("Discovered %d per-device tracking layers", discovered_count)
+
     def _build_cache(self) -> None:
         """
         Build full catalog cache from LayerManager.
@@ -1579,6 +1691,7 @@ class LayerCatalogService(QObject):
 
         self._ensure_virtual_layer_entries()
         self._augment_per_item_feature_counts()
+        self._discover_tracking_layers()  # SAR-nh9/SAR-nj0: Per-device tracking layers
 
         # Rewire per-layer signals now that cache is rebuilt
         for layer_id, layer in result.layer_refs.items():

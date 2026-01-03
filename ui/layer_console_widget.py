@@ -2234,9 +2234,27 @@ class LayerConsoleWidget(QWidget):
         if filter_value == "text_labels":
             return layer_id in TEXT_LABEL_LAYER_IDS
         if filter_value == "positions":
-            return layer_id in POSITION_LAYER_IDS
+            # Support both legacy shared layer and per-device layers (SAR-nh9)
+            if layer_id in POSITION_LAYER_IDS:
+                return True
+            # Per-device position layers have IDs like "pos_{device_id}"
+            if layer_id.startswith("pos_"):
+                return True
+            # Also check display_name for catalog-discovered layers
+            if layer.get("display_name") == "Position":
+                return True
+            return False
         if filter_value == "breadcrumbs":
-            return layer_id in TRACK_LAYER_IDS
+            # Support both legacy shared layer and per-device layers (SAR-nj0)
+            if layer_id in TRACK_LAYER_IDS:
+                return True
+            # Per-device trail layers have IDs like "trail_{device_id}"
+            if layer_id.startswith("trail_"):
+                return True
+            # Also check display_name for catalog-discovered layers
+            if layer.get("display_name") == "Trail":
+                return True
+            return False
         return True
 
     @staticmethod
