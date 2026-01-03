@@ -406,17 +406,9 @@ class SARPanel(QDockWidget):
         # NOTE: Layer Console and Marker Log have been moved to the Mission Logs window
         # Access via menu: SAR Tracker > Mission Logs...
 
-        # Devices Section
-        devices_group = QGroupBox("Devices")
-        devices_layout = QVBoxLayout()
-        
-        self.devices_list = QListWidget()
-        self.devices_list.setMaximumHeight(150)
-        devices_layout.addWidget(self.devices_list)
-        
-        devices_group.setLayout(devices_layout)
-        layout.addWidget(devices_group)
-        
+        # NOTE: Devices section has been moved to standalone Devices window
+        # Access via the Devices toolbar icon
+
         # Data Refresh Section (status + manual button)
         refresh_group = QGroupBox("Data Refresh")
         refresh_layout = QVBoxLayout()
@@ -1085,56 +1077,9 @@ class SARPanel(QDockWidget):
 
         if file_path:
             self.csv_load_requested.emit(file_path)
-    
-    def update_devices(self, devices: List[Dict]):
-        """
-        Update device list.
-        
-        Args:
-            devices: List of device dicts from provider
-        """
-        self.devices_list.clear()
-        try:
-            if devices is None:
-                return
-            if not isinstance(devices, list):
-                raise ValueError("Device payload must be a list")
 
-            invalid = 0
-            for device in devices:
-                if not isinstance(device, dict):
-                    invalid += 1
-                    continue
+    # NOTE: update_devices() method removed - Devices moved to standalone Devices window
 
-                device_id = device.get('device_id') or device.get('id') or 'Unknown'
-                # FR-5: Show device name with device_id fallback
-                device_name = device.get('name') or device_id
-                status = device.get('status', 'unknown')
-                last_update = device.get('last_update', 'Never')
-
-                # Format display text - show name prominently
-                text = f"{device_name}"
-                if status == 'online':
-                    text = f"🟢 {text}"
-                elif status == 'offline':
-                    text = f"🔴 {text}"
-                else:
-                    text = f"⚪ {text}"
-                
-                text += f"\n  Last: {last_update}"
-                
-                item = QListWidgetItem(text)
-                self.devices_list.addItem(item)
-
-            if invalid and not getattr(self, "_devices_warning_logged", False):
-                self._notify(warning, "Devices", f"Ignored {invalid} malformed device entries")
-                self._devices_warning_logged = True
-        except Exception as exc:
-            self.devices_list.clear()
-            if not getattr(self, "_devices_warning_logged", False):
-                self._notify(warning, "Devices", f"Could not display devices: {exc}")
-                self._devices_warning_logged = True
-    
     def set_data_source(self, source_info: str):
         """
         Update data source label.

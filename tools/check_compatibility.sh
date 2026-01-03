@@ -47,6 +47,7 @@ PYQT_IMPORTS=$(grep -r "from PyQt[56]" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null || true)
@@ -55,6 +56,7 @@ PYQT_IMPORTS2=$(grep -r "import PyQt[56]" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null || true)
@@ -88,6 +90,7 @@ QT_ENUMS=$(grep -rE "([ \t=!(,\[]|^)Qt\.[A-Z]" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null | grep -v "utils/qt_compat.py" | grep -v "from qgis.PyQt" | grep -v "import" | grep -v "^[[:space:]]*#" | grep -v "    - " || true)
@@ -118,6 +121,7 @@ QDIALOG_SUBCLASSES=$(grep -r "class.*QDialog)" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null | grep -v "utils/dialog_utils.py" | grep -v "class SafeQDialog" | grep -v "class DelayedShowDialog" || true)
@@ -149,6 +153,7 @@ DIRECT_EXEC=$(grep -r "\.exec_\?()" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null | grep -v "utils/qt_compat.py" | grep -v "utils/dialog_utils.py" | grep -v "def dialog_exec" | grep -v "# " || true)
@@ -179,6 +184,7 @@ DIRECT_NOTIFY=$(grep -r "\.pushMessage\(" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir=".venv" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     2>/dev/null | grep -v "utils/notify.py" | grep -v "utils/qt_compat.py" | grep -v "^[[:space:]]*#" || true)

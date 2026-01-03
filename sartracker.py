@@ -200,6 +200,14 @@ except Exception as e:
         _import_report, 'controllers.mission_logs_controller.MissionLogsController', e
     )
 
+# Import DevicesController (devices window management)
+try:
+    from .controllers.devices_controller import DevicesController
+except Exception as e:
+    DevicesController = track_import_error(
+        _import_report, 'controllers.devices_controller.DevicesController', e
+    )
+
 # Import MissionLifecycleController (Phase 2 - mission lifecycle extraction)
 try:
     from .controllers.mission_lifecycle_controller import MissionLifecycleController
@@ -346,6 +354,7 @@ class sartracker:
         self.mission_storage = None
         self.mission_storage_controller = None  # Phase 6: Archive + backup controller
         self.mission_logs_controller = None  # Phase 4: Mission logs window controller
+        self.devices_controller = None  # Devices window controller
         self.coordinates_controller = None  # Phase 5: Status bar coordinates controller
         self.map_tools_controller = None  # Phase 7: Map tools controller
         self.mission_controller = None  # Phase N3: Mission timing controller
@@ -948,6 +957,15 @@ class sartracker:
             callback=self.run,
             parent=self.iface.mainWindow())
 
+        # Add Devices Window toolbar icon (immediately after main icon)
+        devices_icon_path = os.path.join(self.plugin_dir, 'icon_devices.png')
+        self.add_action(
+            devices_icon_path,
+            text=self.tr(u'Devices'),
+            callback=self._toggle_devices_window,
+            status_tip=self.tr(u'Show/hide connected tracking devices'),
+            parent=self.iface.mainWindow())
+
         # Add separator for visual grouping
         separator = QAction(self.iface.mainWindow())
         separator.setSeparator(True)
@@ -1183,6 +1201,28 @@ class sartracker:
                 self.mission_logs_controller = None
         else:
             print("[SARTRACKER] MissionLogsController not available (import failed)")
+
+    def _init_devices_controller(self):
+        """Initialize DevicesController for devices window.
+
+        Called after provider_controller is wired to enable signal connections.
+        """
+        if DevicesController is not None:
+            try:
+                self.devices_controller = DevicesController(
+                    iface=self.iface,
+                    provider_controller=self.provider_controller,
+                    is_unloading=lambda: self._is_unloading or self._app_is_quitting,
+                    parent=self.iface.mainWindow()
+                )
+                self.devices_controller.set_safe_mode_block(self._safe_mode_block)
+                print("[SARTRACKER] DevicesController initialized")
+            except Exception as e:
+                print(f"[SARTRACKER] ERROR initializing DevicesController: {e}")
+                traceback.print_exc()
+                self.devices_controller = None
+        else:
+            print("[SARTRACKER] DevicesController not available (import failed)")
 
     def _init_marker_controller(self):
         """Initialize MarkerController for marker CRUD.
@@ -1447,6 +1487,9 @@ class sartracker:
         # Wire Provider Controller signals and DI
         if self.provider_controller:
             self._wire_provider_controller()
+
+        # Initialize Devices Controller (needs provider_controller to be wired)
+        self._init_devices_controller()
 
         # Connect project lifecycle signals
         try:
@@ -1756,6 +1799,17 @@ class sartracker:
         else:
             # Controller unavailable - use safe-mode block
             self._safe_mode_block("Mission Logs")
+
+    def _toggle_devices_window(self):
+        """Toggle the Devices window visibility.
+
+        Called from the Devices toolbar icon.
+        """
+        if self.devices_controller:
+            self.devices_controller.toggle_window()
+        else:
+            # Controller unavailable - use safe-mode block
+            self._safe_mode_block("Devices")
 
     def _on_edit_marker_from_layer_tree(self):
         """
@@ -2246,6 +2300,9 @@ class sartracker:
         # Clean up Mission Logs Controller
         self._unload_mission_logs_controller()
 
+        # Clean up Devices Controller
+        self._unload_devices_controller()
+
         # Nullify task manager reference (already cancelled in _unload_cancel_tasks)
         if self.task_manager:
             self.task_manager = None
@@ -2512,6 +2569,29 @@ class sartracker:
         elif self.mission_logs_controller:
             # Controller exists but is deleted - just null the reference
             self.mission_logs_controller = None
+
+    def _unload_devices_controller(self):
+        """Clean up Devices Controller.
+
+        Sub-helper for _unload_controllers.
+        """
+        if self.devices_controller and not self._is_qt_deleted(self.devices_controller):
+            try:
+                print("[SARTRACKER] Cleaning up DevicesController...")
+                if hasattr(self.devices_controller, "cleanup"):
+                    self.devices_controller.cleanup()
+                try:
+                    if not self._is_qt_deleted(self.devices_controller):
+                        self.devices_controller.deleteLater()
+                except Exception:
+                    pass
+                self.devices_controller = None
+            except Exception as e:
+                print(f"[SARTRACKER] Warning: DevicesController cleanup error: {e}")
+                self.devices_controller = None
+        elif self.devices_controller:
+            # Controller exists but is deleted - just null the reference
+            self.devices_controller = None
 
     def _unload_panels(self):
         """Clean up UI panels.

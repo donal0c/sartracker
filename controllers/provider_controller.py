@@ -1102,14 +1102,8 @@ class ProviderController(QObject):
                     import traceback
                     traceback.print_exc()
 
-            # Update device list in panel if available
-            if self._sar_panel:
-                try:
-                    self._sar_panel.update_devices(devices)
-                except Exception as panel_err:
-                    print(f"[PROVIDER_CONTROLLER] ERROR update_devices: {panel_err}")
-                    import traceback
-                    traceback.print_exc()
+            # NOTE: Device list updates now handled by DevicesController
+            # which subscribes to the refresh_complete signal directly
 
             # Detect cached data for warning
             was_cached = False
