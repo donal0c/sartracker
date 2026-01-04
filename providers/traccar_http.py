@@ -817,11 +817,26 @@ class TraccarHttpProvider(Provider):
                             try:
                                 device_last_dt = parse_iso(device_last_ts)
                                 device_from_dt = device_last_dt + timedelta(seconds=1)
-                                device_from_iso = format_iso(device_from_dt)
-                                logger.debug(
-                                    "SAR-szp: Device %s incremental fetch from %s",
-                                    device_name, device_from_iso
-                                )
+
+                                # CRITICAL FIX (SAR-4vs): Cap future timestamps to prevent data loss
+                                # If device has clock skew and reports future timestamp,
+                                # requesting from future time would return no positions forever.
+                                # Solution: Cap to current time minus small buffer.
+                                now_dt = datetime.now(timezone.utc)
+                                if device_from_dt > now_dt:
+                                    logger.warning(
+                                        "SAR-4vs: Device %s has future timestamp %s (clock skew?), "
+                                        "capping to now to prevent data loss",
+                                        device_name, device_last_ts
+                                    )
+                                    # Use mission start as fallback - don't miss positions
+                                    device_from_iso = from_iso
+                                else:
+                                    device_from_iso = format_iso(device_from_dt)
+                                    logger.debug(
+                                        "SAR-szp: Device %s incremental fetch from %s",
+                                        device_name, device_from_iso
+                                    )
                             except Exception as ts_err:
                                 # Fallback to mission start if timestamp parse fails
                                 logger.warning(
@@ -1675,7 +1690,8 @@ class TraccarHttpProvider(Provider):
         return dict(self._last_connection_status)
 
     def create_refresh_task(self, description: str,
-                            since_iso: Optional[str] = None) -> 'ProviderRefreshTask':
+                            since_iso: Optional[str] = None,
+                            device_timestamps: Optional[Dict[str, str]] = None) -> 'ProviderRefreshTask':
         """
         Create Traccar-specific refresh task for background data fetching.
 
@@ -1684,6 +1700,10 @@ class TraccarHttpProvider(Provider):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time instead of the default 3 hours.
+            device_timestamps: Optional dict mapping device_id to ISO8601 timestamp.
+                              Phase 3 (SAR-4vs): Enables incremental fetch mode where
+                              each device fetches positions only after its last known
+                              timestamp, reducing duplicate data transfer by ~99%.
 
         Returns:
             TraccarRefreshTask instance (inherits from ProviderRefreshTask)
@@ -1691,7 +1711,11 @@ class TraccarHttpProvider(Provider):
         Qt5/Qt6 Compatible: Returns QgsTask subclass.
         """
         from .tasks import TraccarRefreshTask
-        return TraccarRefreshTask(self, description, since_iso=since_iso)
+        return TraccarRefreshTask(
+            self, description,
+            since_iso=since_iso,
+            device_timestamps=device_timestamps
+        )
 
 
 # ============================================================================

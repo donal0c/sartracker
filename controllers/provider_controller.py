@@ -20,7 +20,10 @@ LIFE-SAFETY CRITICAL: All async handlers use defensive guards (Pattern 9).
 
 from datetime import datetime
 from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer, QSettings
-from typing import Optional, Dict, Any, Callable, List
+from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..utils.breadcrumb_accumulator import BreadcrumbAccumulator
 
 from ..providers.registry import registry as provider_registry
 from ..providers.base import Provider
@@ -162,6 +165,12 @@ class ProviderController(QObject):
         self._layers_controller = None
         self._sar_panel = None
         self._mission_start_getter: Optional[Callable[[], Optional[str]]] = None
+
+        # ================================================================
+        # Phase 3 (SAR-4vs): Incremental breadcrumb state (session-scoped)
+        # ================================================================
+        self._breadcrumb_accumulator: Optional['BreadcrumbAccumulator'] = None
+        self._incremental_breadcrumbs_enabled = True  # Feature flag
 
     def set_provider(self, provider_name: str, config: Dict[str, Any], test_only: bool = False):
         """
@@ -390,6 +399,10 @@ class ProviderController(QObject):
             self._cleanup_shadow_state()
             self._last_data_state = 'unknown'
             self._last_cache_age_seconds = None
+
+            # Phase 3 (SAR-4vs): Reset breadcrumb accumulator on provider change
+            print('[PROVIDER_CONTROLLER] Provider changed - resetting breadcrumb accumulator')
+            self._init_breadcrumb_accumulator()
 
             print(f"[PROVIDER_CONTROLLER] Provider commit complete: {self.provider_name}")
 
@@ -741,6 +754,14 @@ class ProviderController(QObject):
             self._sar_panel = None
             self._mission_start_getter = None
 
+            # Phase 3 (SAR-4vs): Clear breadcrumb accumulator to release memory
+            if self._breadcrumb_accumulator:
+                try:
+                    self._breadcrumb_accumulator.clear()
+                except Exception:
+                    pass
+                self._breadcrumb_accumulator = None
+
             print("[PROVIDER_CONTROLLER] Cleanup complete")
 
         except Exception as e:
@@ -785,6 +806,94 @@ class ProviderController(QObject):
         Qt5/Qt6 Compatible: Pure Python callback.
         """
         self._mission_start_getter = getter
+
+    # ========================================================================
+    # Phase 3 (SAR-4vs): Incremental Breadcrumb Accumulation
+    # ========================================================================
+
+    def _init_breadcrumb_accumulator(self):
+        """
+        Initialize or reset the breadcrumb accumulator.
+
+        Creates a fresh BreadcrumbAccumulator instance, discarding any
+        previously accumulated positions. Called on:
+        - First refresh with breadcrumb data
+        - New mission start (idle/finished -> active)
+        - Provider change commit
+
+        Qt5/Qt6 Compatible: Pure Python.
+        """
+        from ..utils.breadcrumb_accumulator import BreadcrumbAccumulator
+        self._breadcrumb_accumulator = BreadcrumbAccumulator(
+            max_positions=100_000  # Match existing limit in tasks.py
+        )
+        print('[PROVIDER_CONTROLLER] Breadcrumb accumulator initialized')
+
+    def _on_mission_state_changed(self, old_state: str, new_state: str):
+        """
+        Handle mission state transitions for accumulator lifecycle.
+
+        Called by MissionController when mission state changes. Manages
+        breadcrumb accumulator reset/preserve based on transition type.
+
+        Args:
+            old_state: Previous mission state ('idle', 'active', 'paused', 'finished')
+            new_state: New mission state
+
+        Transition handling:
+        - idle/finished -> active: Reset accumulator (new mission)
+        - paused -> active: Keep accumulator (resume)
+        - Any other: No action
+
+        Qt5/Qt6 Compatible: Pure Python.
+        """
+        # Reset accumulator on new mission start
+        if old_state in ('idle', 'finished') and new_state == 'active':
+            print('[PROVIDER_CONTROLLER] New mission - resetting breadcrumb accumulator')
+            self._init_breadcrumb_accumulator()
+            return
+
+        # Preserve accumulator on resume from pause
+        if old_state == 'paused' and new_state == 'active':
+            print('[PROVIDER_CONTROLLER] Mission resumed - keeping breadcrumb accumulator')
+            # No reset - continue accumulating
+            return
+
+    def get_breadcrumb_stats(self) -> Dict[str, Any]:
+        """
+        Get breadcrumb accumulator statistics for diagnostics.
+
+        Returns:
+            Dict containing:
+                - enabled: bool - Whether accumulator is active
+                - total_positions: int - Total accumulated positions
+                - device_count: int - Number of tracked devices
+                - memory_usage_pct: float - Percentage of max capacity used
+                - per_device: dict - Per-device position counts
+
+        Qt5/Qt6 Compatible: Pure Python dict.
+        Thread Safety: Captures local reference to prevent race condition.
+        """
+        # Capture local reference to prevent race condition between
+        # null check and method call (accumulator could be reset by another thread)
+        accumulator = self._breadcrumb_accumulator
+        if not accumulator:
+            return {'enabled': False}
+
+        try:
+            stats = accumulator.stats()
+            max_positions = stats.get('max_positions', 100_000)
+            return {
+                'enabled': True,
+                'total_positions': stats['total_positions'],
+                'device_count': stats['device_count'],
+                'memory_usage_pct': (stats['total_positions'] / max_positions * 100) if max_positions > 0 else 0,
+                'per_device': stats.get('positions_per_device', {})
+            }
+        except Exception as e:
+            # Defensive: if accumulator was cleared between capture and use
+            print(f'[PROVIDER_CONTROLLER] Warning: get_breadcrumb_stats error: {e}')
+            return {'enabled': False, 'error': str(e)}
 
     # ========================================================================
     # Phase 8: Refresh Workflow (Consolidated)
@@ -855,10 +964,18 @@ class ProviderController(QObject):
                 except Exception as e:
                     print(f"[PROVIDER_CONTROLLER] Warning: Could not get mission start time: {e}")
 
+            # Phase 3 (SAR-4vs): Get device timestamps for incremental fetch
+            device_timestamps = None
+            if self._incremental_breadcrumbs_enabled and self._breadcrumb_accumulator:
+                device_timestamps = self._breadcrumb_accumulator.get_latest_timestamps()
+                if device_timestamps:
+                    print(f'[PROVIDER_CONTROLLER] Incremental fetch for {len(device_timestamps)} devices')
+
             # Create provider-specific background task
             task = self.provider.create_refresh_task(
                 "Refreshing tracking data",
-                since_iso=effective_since
+                since_iso=effective_since,
+                device_timestamps=device_timestamps  # Phase 3: incremental fetch
             )
 
             # Start task with managed lifecycle
@@ -1061,6 +1178,38 @@ class ProviderController(QObject):
                 if filtered_out_bc > 0:
                     print(f"[PROVIDER_CONTROLLER] FR-6: Filtered {filtered_out_bc} breadcrumb(s) from inactive devices")
 
+            # =================================================================
+            # Phase 3 (SAR-4vs): Accumulate filtered breadcrumbs
+            # Initialize accumulator on first refresh with breadcrumb data
+            # CRITICAL FIX: Wrap in try/except to prevent refresh failure
+            # =================================================================
+            all_breadcrumbs = filtered_breadcrumbs  # Default: use filtered directly
+            if filtered_breadcrumbs:
+                try:
+                    # Initialize accumulator if needed (lazy initialization)
+                    if self._breadcrumb_accumulator is None:
+                        self._init_breadcrumb_accumulator()
+
+                    # Accumulate new breadcrumbs
+                    new_count = self._breadcrumb_accumulator.add(filtered_breadcrumbs)
+                    print(f'[PROVIDER_CONTROLLER] Added {new_count} new breadcrumb positions')
+
+                    # Use accumulated positions for layer update
+                    all_breadcrumbs = self._breadcrumb_accumulator.get_all()
+
+                    # Log stats periodically
+                    stats = self._breadcrumb_accumulator.stats()
+                    print(f'[PROVIDER_CONTROLLER] Accumulator: {stats["total_positions"]} total, '
+                          f'{stats["device_count"]} devices')
+                except Exception as accum_err:
+                    # CRITICAL FIX (SAR-4vs): Don't let accumulator errors fail entire refresh
+                    # Fall back to using filtered_breadcrumbs directly - layers still get data
+                    print(f'[PROVIDER_CONTROLLER] WARNING: Accumulator error ({accum_err}), '
+                          f'using filtered breadcrumbs directly')
+                    all_breadcrumbs = filtered_breadcrumbs
+                    import traceback
+                    traceback.print_exc()
+
             # Update layers if controller available
             # BUG-FIX: Only update layers when we have data to prevent clearing
             # existing positions during network glitches. This is LIFE-SAFETY CRITICAL
@@ -1084,10 +1233,11 @@ class ProviderController(QObject):
                     traceback.print_exc()
 
                 try:
-                    if filtered_breadcrumbs:
-                        # Only update when we have active device data
+                    if all_breadcrumbs:
+                        # Phase 3: Send ALL accumulated breadcrumbs to layers
+                        # (not just new ones - accumulator holds full session history)
                         self._layers_controller.update_breadcrumbs(
-                            filtered_breadcrumbs,
+                            all_breadcrumbs,
                             processed_segments=breadcrumb_processing
                         )
                     elif breadcrumbs:

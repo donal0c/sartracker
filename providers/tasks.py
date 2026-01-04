@@ -612,11 +612,16 @@ class TraccarRefreshTask(ProviderRefreshTask):
     - Last-good cache provides offline resilience
     - Full error handling with ProviderError hierarchy
 
+    Phase 3 (SAR-4vs) Addition:
+    - device_timestamps parameter for incremental breadcrumb fetching
+    - Reduces duplicate position fetching across refresh cycles
+
     Qt5/Qt6 Compatible: Uses QgsTask API.
     """
 
     def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data",
-                 since_iso: Optional[str] = None):
+                 since_iso: Optional[str] = None,
+                 device_timestamps: Optional[Dict[str, str]] = None):
         """
         Initialize Traccar refresh task.
 
@@ -626,9 +631,14 @@ class TraccarRefreshTask(ProviderRefreshTask):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time instead of the default 3 hours.
+            device_timestamps: Optional dict mapping device_id to ISO8601 timestamp.
+                              When provided, enables incremental fetch mode where
+                              each device fetches positions only after its last known
+                              timestamp, reducing duplicate data transfer.
         """
         super().__init__(provider, description)
         self.since_iso = since_iso
+        self._device_timestamps = device_timestamps
 
     def run(self) -> bool:
         """
@@ -748,8 +758,10 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 self.setProgress(start + (end - start) * fraction_val)
 
             try:
+                # Phase 3 (SAR-4vs): Pass device_timestamps for incremental fetch
                 breadcrumbs = provider.get_breadcrumbs(
                     since_iso=self.since_iso,
+                    device_timestamps=self._device_timestamps,  # Incremental fetch
                     session=session,
                     cancel_check=self.isCanceled,
                     progress_callback=_breadcrumb_progress
