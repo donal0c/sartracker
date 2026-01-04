@@ -83,6 +83,15 @@ WindowModality (3 constants):
 WidgetAttribute (1 constant):
     WA_DeleteOnClose
 
+WindowState (5 constants) - Focus Mode Plus:
+    WindowNoState, WindowMinimized, WindowMaximized, WindowFullScreen, WindowActive
+
+ShortcutContext (4 constants) - Focus Mode Plus:
+    WidgetShortcut, WidgetWithChildrenShortcut, WindowShortcut, ApplicationShortcut
+
+DockWidgetFeature (4 constants) - Focus Mode Plus:
+    DockWidgetClosable, DockWidgetMovable, DockWidgetFloatable, NoDockWidgetFeatures
+
 ToolButtonStyle (5 constants):
     ToolButtonIconOnly, ToolButtonTextOnly, ToolButtonTextBesideIcon,
     ToolButtonTextUnderIcon, ToolButtonFollowStyle
@@ -98,7 +107,7 @@ Functions (2 functions):
     dialog_exec(dialog) - Execute dialog in Qt5/Qt6 compatible way
     push_message(bar, title, msg, level, duration) - Push message to QGIS message bar
 
-Total: 89 exported symbols for Qt5/Qt6 compatibility
+Total: 102 exported symbols for Qt5/Qt6 compatibility
 """
 
 from qgis.PyQt import QtCore
@@ -426,16 +435,92 @@ else:  # Qt5
 
 
 # =============================================================================
+# WindowState enums (Focus Mode Plus - fullscreen handling)
+# =============================================================================
+if QT_VERSION == 6:
+    try:
+        WindowNoState = Qt.WindowState.WindowNoState
+        WindowMinimized = Qt.WindowState.WindowMinimized
+        WindowMaximized = Qt.WindowState.WindowMaximized
+        WindowFullScreen = Qt.WindowState.WindowFullScreen
+        WindowActive = Qt.WindowState.WindowActive
+    except AttributeError:
+        # Fallback if WindowState not scoped
+        WindowNoState = Qt.WindowNoState
+        WindowMinimized = Qt.WindowMinimized
+        WindowMaximized = Qt.WindowMaximized
+        WindowFullScreen = Qt.WindowFullScreen
+        WindowActive = Qt.WindowActive
+else:  # Qt5
+    WindowNoState = Qt.WindowNoState
+    WindowMinimized = Qt.WindowMinimized
+    WindowMaximized = Qt.WindowMaximized
+    WindowFullScreen = Qt.WindowFullScreen
+    WindowActive = Qt.WindowActive
+
+
+# =============================================================================
+# ShortcutContext enums (Focus Mode Plus - escape key handling)
+# =============================================================================
+if QT_VERSION == 6:
+    try:
+        WidgetShortcut = Qt.ShortcutContext.WidgetShortcut
+        WidgetWithChildrenShortcut = Qt.ShortcutContext.WidgetWithChildrenShortcut
+        WindowShortcut = Qt.ShortcutContext.WindowShortcut
+        ApplicationShortcut = Qt.ShortcutContext.ApplicationShortcut
+    except AttributeError:
+        # Fallback if ShortcutContext not scoped
+        WidgetShortcut = Qt.WidgetShortcut
+        WidgetWithChildrenShortcut = Qt.WidgetWithChildrenShortcut
+        WindowShortcut = Qt.WindowShortcut
+        ApplicationShortcut = Qt.ApplicationShortcut
+else:  # Qt5
+    WidgetShortcut = Qt.WidgetShortcut
+    WidgetWithChildrenShortcut = Qt.WidgetWithChildrenShortcut
+    WindowShortcut = Qt.WindowShortcut
+    ApplicationShortcut = Qt.ApplicationShortcut
+
+
+# =============================================================================
+# DockWidgetFeature enums (Focus Mode Plus - dock protection)
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QDockWidget as _QDockWidget
+    if QT_VERSION == 6:
+        try:
+            DockWidgetClosable = _QDockWidget.DockWidgetFeature.DockWidgetClosable
+            DockWidgetMovable = _QDockWidget.DockWidgetFeature.DockWidgetMovable
+            DockWidgetFloatable = _QDockWidget.DockWidgetFeature.DockWidgetFloatable
+            NoDockWidgetFeatures = _QDockWidget.DockWidgetFeature.NoDockWidgetFeatures
+        except AttributeError:
+            # Fallback if DockWidgetFeature not scoped
+            DockWidgetClosable = _QDockWidget.DockWidgetClosable
+            DockWidgetMovable = _QDockWidget.DockWidgetMovable
+            DockWidgetFloatable = _QDockWidget.DockWidgetFloatable
+            NoDockWidgetFeatures = _QDockWidget.NoDockWidgetFeatures
+    else:  # Qt5
+        DockWidgetClosable = _QDockWidget.DockWidgetClosable
+        DockWidgetMovable = _QDockWidget.DockWidgetMovable
+        DockWidgetFloatable = _QDockWidget.DockWidgetFloatable
+        NoDockWidgetFeatures = _QDockWidget.NoDockWidgetFeatures
+except (AttributeError, ImportError):
+    # Fallback values if QDockWidget unavailable
+    DockWidgetClosable = 0x01
+    DockWidgetMovable = 0x02
+    DockWidgetFloatable = 0x04
+    NoDockWidgetFeatures = 0x00
+
+
+# =============================================================================
 # ToolButtonStyle enums
 # =============================================================================
 if QT_VERSION == 6:
-    from qgis.PyQt.QtCore import Qt as QtCore
     try:
-        ToolButtonIconOnly = QtCore.ToolButtonStyle.ToolButtonIconOnly
-        ToolButtonTextOnly = QtCore.ToolButtonStyle.ToolButtonTextOnly
-        ToolButtonTextBesideIcon = QtCore.ToolButtonStyle.ToolButtonTextBesideIcon
-        ToolButtonTextUnderIcon = QtCore.ToolButtonStyle.ToolButtonTextUnderIcon
-        ToolButtonFollowStyle = QtCore.ToolButtonStyle.ToolButtonFollowStyle
+        ToolButtonIconOnly = Qt.ToolButtonStyle.ToolButtonIconOnly
+        ToolButtonTextOnly = Qt.ToolButtonStyle.ToolButtonTextOnly
+        ToolButtonTextBesideIcon = Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        ToolButtonTextUnderIcon = Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+        ToolButtonFollowStyle = Qt.ToolButtonStyle.ToolButtonFollowStyle
     except AttributeError:
         # Fallback if ToolButtonStyle not in expected location
         ToolButtonIconOnly = Qt.ToolButtonIconOnly
@@ -887,6 +972,22 @@ __all__ = [
     'NormalEchoMode',
     # WidgetAttribute
     'WA_DeleteOnClose',
+    # WindowState (Focus Mode Plus)
+    'WindowNoState',
+    'WindowMinimized',
+    'WindowMaximized',
+    'WindowFullScreen',
+    'WindowActive',
+    # ShortcutContext (Focus Mode Plus)
+    'WidgetShortcut',
+    'WidgetWithChildrenShortcut',
+    'WindowShortcut',
+    'ApplicationShortcut',
+    # DockWidgetFeature (Focus Mode Plus)
+    'DockWidgetClosable',
+    'DockWidgetMovable',
+    'DockWidgetFloatable',
+    'NoDockWidgetFeatures',
     # EventLoop
     'AllEvents',
     'ExcludeUserInputEvents',
