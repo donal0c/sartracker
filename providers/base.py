@@ -306,7 +306,8 @@ class Provider(ABC):
 
     @abstractmethod
     def create_refresh_task(self, description: str,
-                            since_iso: Optional[str] = None) -> 'ProviderRefreshTask':
+                            since_iso: Optional[str] = None,
+                            device_timestamps: Optional[Dict[str, str]] = None) -> 'ProviderRefreshTask':
         """
         Create provider-specific refresh task for background data fetching.
 
@@ -327,6 +328,9 @@ class Provider(ABC):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time. Providers may ignore if not
+            device_timestamps: Optional dict mapping device_id to ISO8601 timestamp
+                              for incremental fetch (Phase 3). Providers that don't
+                              support incremental fetch may ignore this parameter.
                        applicable (e.g., CSV provider loads all data).
 
         Returns:

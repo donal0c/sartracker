@@ -283,6 +283,10 @@ class sartracker:
         self._skip_layer_ops = False   # Guard to avoid layer mutations during shutdown
         # BUG-019/BUG-021 FIX: Flag to prevent callbacks during plugin unload
         self._is_unloading = False
+        # SAR-jl0c FIX: Track exit blocker registration for proper cleanup
+        self._exit_blocker_registered = False
+        # Track whether exit blocker executed (used to decide state file cleanup)
+        self._focus_mode_exit_blocker_ran = False
 
         # Phase 4.4: Initialize diagnostics service for centralized status gathering
         self.diagnostics_service = DiagnosticsService()
@@ -1048,6 +1052,19 @@ class sartracker:
         QCoreApplication.instance().aboutToQuit.connect(self._on_app_about_to_quit)
         self.lifecycle.track_signal(QCoreApplication.instance().aboutToQuit, self._on_app_about_to_quit)
 
+        # CRITICAL: Register exit blocker for Focus Mode Plus (SAR-jl0c fix)
+        # Exit blockers run BEFORE QGIS saves window state, unlike aboutToQuit
+        # which fires AFTER. This ensures Focus Mode UI is restored before
+        # QGIS persists toolbar/dock visibility to QSettings.
+        try:
+            self.iface.registerApplicationExitBlocker(self._focus_mode_exit_blocker)
+            self._exit_blocker_registered = True
+            print("[SARTRACKER] Focus Mode exit blocker registered")
+        except Exception as e:
+            # Older QGIS versions may not have this API
+            self._exit_blocker_registered = False
+            print(f"[SARTRACKER] Exit blocker registration failed (older QGIS?): {e}")
+
     def _init_layer_manager(self):
         """Initialize LayerManager for canonical layer hierarchy.
 
@@ -1414,6 +1431,8 @@ class sartracker:
                 mission_controller=self.mission_controller,
                 layers_controller=self.layers_controller
             )
+            # CRITICAL: Set objectName so Focus Mode Plus knows to keep it visible
+            self.sar_panel.setObjectName("SARTrackerDock")
             self.iface.addDockWidget(RightDockWidgetArea, self.sar_panel)
             self.sar_panel.hide()  # Hidden by default
         except Exception as exc:
@@ -1427,6 +1446,8 @@ class sartracker:
         if SettingsPanel is not None:
             try:
                 self.settings_panel = SettingsPanel(self.iface.mainWindow())
+                # CRITICAL: Set objectName so Focus Mode Plus knows to keep it visible
+                self.settings_panel.setObjectName("SARTrackerSettings")
                 try:
                     self.iface.addDockWidget(LeftDockWidgetArea, self.settings_panel)
                     self.settings_panel.hide()  # Hidden by default
@@ -1573,6 +1594,74 @@ class sartracker:
         # Check for paused mission (delayed to let QGIS fully load)
         QTimer.singleShot(1000, self._check_for_paused_mission)
 
+        # Check for unclean Focus Mode Plus exit (crash recovery) - SAR-cksi.5
+        # Delayed slightly to ensure main window is fully loaded
+        QTimer.singleShot(1500, self._check_focus_mode_crash_recovery)
+
+    def _check_focus_mode_crash_recovery(self):
+        """Restore UI only if state file exists (crash during Focus Mode).
+
+        SAR-jl0c: This is the CRASH RECOVERY fallback only.
+
+        The primary mechanism is the exit blocker (_focus_mode_exit_blocker)
+        which restores UI BEFORE QGIS saves state on clean exit.
+
+        This method ONLY runs if a state file exists, which means:
+        - QGIS crashed while Focus Mode was active
+        - Force quit / SIGKILL during Focus Mode
+
+        We respect user's toolbar preferences - only restore what Focus Mode hid.
+        """
+        try:
+            from .utils.focus_mode_state import FocusModeStateFile, FocusModePlusState
+            from .utils.notify import info, warning
+
+            # ONLY restore if state file exists - this is the crash indicator
+            if not FocusModeStateFile.exists():
+                return  # Normal startup - respect user's UI preferences
+
+            print("[SARTRACKER] Focus Mode state file found - recovering from crash")
+
+            main_window = self.iface.mainWindow()
+            if main_window is None:
+                FocusModeStateFile.delete()
+                return
+
+            # Load state and restore ONLY what Focus Mode hid
+            state_data = FocusModeStateFile.load()
+            if state_data and state_data.get('is_active', False):
+                state = FocusModePlusState.from_dict(state_data, main_window)
+                if state and state.is_active:
+                    restored, errors = state.restore(main_window)
+                    print(f"[SARTRACKER] Crash recovery: restored {restored} elements, {errors} errors")
+
+                    if errors > 0:
+                        warning(
+                            self.iface.messageBar(),
+                            "SAR Tracker",
+                            f"Restored UI after crash ({errors} elements could not be restored).",
+                            duration=5
+                        )
+                    else:
+                        info(
+                            self.iface.messageBar(),
+                            "SAR Tracker",
+                            "Restored UI after previous session crash.",
+                            duration=3
+                        )
+
+            # Delete state file
+            FocusModeStateFile.delete()
+            print("[SARTRACKER] Focus Mode state file cleaned up")
+
+        except Exception as e:
+            print(f"[SARTRACKER] Focus Mode crash recovery failed: {e}")
+            try:
+                from .utils.focus_mode_state import FocusModeStateFile
+                FocusModeStateFile.delete()
+            except Exception:
+                pass
+
     def _init_coordinates_controller(self):
         """Initialize CoordinatesController for status bar display.
 
@@ -1595,6 +1684,10 @@ class sartracker:
                     self._map_canvas_connected = True
                     _coords_init_success = True
                     print("[SARTRACKER] CoordinatesController initialized successfully")
+
+                    # Wire coordinates to SAR Panel for Focus Mode Plus mirroring (SAR-cksi.4)
+                    if self.sar_panel:
+                        self.sar_panel.connect_coordinates_controller(self.coordinates_controller)
                 else:
                     print("[SARTRACKER] CoordinatesController.init() returned False")
                     self.coordinates_controller = None
@@ -1928,6 +2021,103 @@ class sartracker:
             except Exception as exc:
                 print(f"[SARTRACKER] Warning: Failed to refresh Mission Logs window: {exc}")
 
+    def _focus_mode_exit_blocker(self) -> bool:
+        """
+        Exit blocker callback for Focus Mode Plus.
+
+        CRITICAL (SAR-jl0c): This runs BEFORE QGIS saves window state!
+        Unlike aboutToQuit signal handlers, exit blockers are called during
+        fileExit() BEFORE qApp->exit() triggers aboutToQuit and saveWindowState.
+
+        This is the CORRECT place to restore Focus Mode UI because:
+        1. It runs BEFORE QGIS serializes toolbar/dock visibility
+        2. The visibility changes will be captured in the saved state
+        3. QGIS will start with normal UI next time
+
+        Returns:
+            True: Always allow exit (we're just restoring UI, not blocking)
+        """
+        try:
+            print("[SARTRACKER] Exit blocker: Checking Focus Mode state...")
+            self._focus_mode_exit_blocker_ran = True
+
+            # Check if SAR Panel has active Focus Mode
+            if (self.sar_panel and not self._is_qt_deleted(self.sar_panel) and
+                    getattr(self.sar_panel, 'focus_mode_active', False)):
+
+                panel_state = getattr(self.sar_panel, 'focus_mode_state', None)
+                main_window = self.iface.mainWindow() if self.iface else None
+
+                if panel_state and panel_state.is_active and main_window:
+                    print("[SARTRACKER] Exit blocker: RESTORING Focus Mode UI before QGIS saves state")
+                    restored, errors = panel_state.restore(main_window)
+                    print(f"[SARTRACKER] Exit blocker: Restored {restored} elements, {errors} errors")
+
+                    # Clear panel state to prevent double-restore in aboutToQuit
+                    self.sar_panel.focus_mode_active = False
+                    self.sar_panel.focus_mode_state = None
+
+            # Delete state file - UI is now restored, file not needed for crash recovery
+            from .utils.focus_mode_state import FocusModeStateFile
+            if FocusModeStateFile.exists():
+                FocusModeStateFile.delete()
+                print("[SARTRACKER] Exit blocker: State file deleted")
+
+        except Exception as e:
+            print(f"[SARTRACKER] Exit blocker error: {e}")
+            # Leave state file in place for startup recovery on failure
+
+        return True  # Always allow exit
+
+    def _restore_focus_mode_before_quit(self):
+        """
+        Restore Focus Mode Plus UI before QGIS quits.
+
+        CRITICAL: This must run BEFORE QGIS saves window state.
+        Called from _on_app_about_to_quit at the very start.
+
+        NOTE (SAR-jl0c): This is now a BACKUP mechanism. The primary restoration
+        happens in _focus_mode_exit_blocker() which runs BEFORE saveWindowState.
+        This method handles the case where exit blocker API isn't available.
+
+        Focus Mode is opt-in only. QGIS must never start with hidden UI.
+        """
+        try:
+            # Check if SAR Panel has active Focus Mode
+            if (self.sar_panel and not self._is_qt_deleted(self.sar_panel) and
+                    getattr(self.sar_panel, 'focus_mode_active', False)):
+
+                panel_state = getattr(self.sar_panel, 'focus_mode_state', None)
+                main_window = self.iface.mainWindow() if self.iface else None
+
+                if panel_state and panel_state.is_active and main_window:
+                    print("[SARTRACKER] Restoring Focus Mode UI before quit (from live state)")
+                    restored, errors = panel_state.restore(main_window)
+                    print(f"[SARTRACKER] Focus Mode restored: {restored} elements, {errors} errors")
+
+                    # Clear panel state
+                    self.sar_panel.focus_mode_active = False
+                    self.sar_panel.focus_mode_state = None
+
+            # Only delete state file if exit blocker already ran.
+            # aboutToQuit fires AFTER QGIS saves window state, so if the exit
+            # blocker didn't run we must preserve the state file for startup recovery.
+            if self._focus_mode_exit_blocker_ran:
+                from .utils.focus_mode_state import FocusModeStateFile
+                if FocusModeStateFile.exists():
+                    FocusModeStateFile.delete()
+                    print("[SARTRACKER] Focus Mode state file deleted")
+
+        except Exception as e:
+            print(f"[SARTRACKER] Error restoring Focus Mode before quit: {e}")
+            # Best effort - only delete if exit blocker already ran
+            if self._focus_mode_exit_blocker_ran:
+                try:
+                    from .utils.focus_mode_state import FocusModeStateFile
+                    FocusModeStateFile.delete()
+                except Exception:
+                    pass
+
     def _on_app_about_to_quit(self):
         """
         Handle application exit signal.
@@ -1937,6 +2127,11 @@ class sartracker:
         cleanup in unload() which runs after this handler.
         """
         print("[SARTRACKER] Application about to quit - starting early cleanup")
+
+        # CRITICAL: Restore Focus Mode Plus UI FIRST, before QGIS saves window state!
+        # This must happen BEFORE setting _app_is_quitting flag.
+        self._restore_focus_mode_before_quit()
+
         self._app_is_quitting = True
         self._skip_layer_ops = True
         self._is_unloading = True  # BUG-079: Also set unloading flag early
@@ -2170,6 +2365,15 @@ class sartracker:
                 app.aboutToQuit.disconnect(self._on_app_about_to_quit)
         except Exception:
             pass
+
+        # SAR-jl0c FIX: Unregister Focus Mode exit blocker
+        try:
+            if self._exit_blocker_registered and self.iface:
+                self.iface.unregisterApplicationExitBlocker(self._focus_mode_exit_blocker)
+                self._exit_blocker_registered = False
+                print("[SARTRACKER] Focus Mode exit blocker unregistered")
+        except Exception as e:
+            print(f"[SARTRACKER] Exit blocker unregistration failed: {e}")
 
         # Disconnect project lifecycle signals
         try:
@@ -2610,6 +2814,50 @@ class sartracker:
         Phase 4.2: Sub-helper for _unload_panels.
         BUG-079 FIX: Check if already cleaned up or deleted before accessing.
         """
+        # CRITICAL: Restore Focus Mode Plus UI before QGIS quits (SAR-cksi.5)
+        # QGIS remembers UI state (menu bar, status bar visibility) between sessions.
+        # If we don't restore now, QGIS will start with hidden UI next time.
+        try:
+            from .utils.focus_mode_state import FocusModeStateFile, FocusModePlusState
+            main_window = self.iface.mainWindow() if self.iface else None
+            restored_ui = False
+
+            # First try: restore from SAR Panel's live state (most accurate)
+            if (self.sar_panel and not self._is_qt_deleted(self.sar_panel) and
+                    getattr(self.sar_panel, 'focus_mode_active', False)):
+                panel_state = getattr(self.sar_panel, 'focus_mode_state', None)
+                if panel_state and panel_state.is_active and main_window:
+                    print("[SARTRACKER] Restoring Focus Mode Plus UI from live panel state")
+                    panel_state.restore(main_window)
+                    restored_ui = True
+                    print("[SARTRACKER] Focus Mode Plus UI restored before shutdown")
+
+            # Second try: restore from state file (backup/crash recovery scenario)
+            if not restored_ui and FocusModeStateFile.exists():
+                print("[SARTRACKER] Restoring Focus Mode Plus UI from state file")
+                state_data = FocusModeStateFile.load()
+                if state_data and state_data.get('is_active', False) and main_window:
+                    state = FocusModePlusState.from_dict(state_data, main_window)
+                    if state and state.is_active:
+                        state.restore(main_window)
+                        print("[SARTRACKER] Focus Mode Plus UI restored before shutdown")
+
+            # Delete state file unless QGIS is quitting without exit blocker.
+            # In that case, preserve it for startup recovery.
+            should_delete_state = (not self._app_is_quitting) or self._focus_mode_exit_blocker_ran
+            if should_delete_state and FocusModeStateFile.exists():
+                FocusModeStateFile.delete()
+                print("[SARTRACKER] Focus Mode state file cleaned up during unload")
+        except Exception as e:
+            print(f"[SARTRACKER] Focus Mode cleanup error (non-fatal): {e}")
+            # Best effort delete even on error (same conditions as above)
+            if (not self._app_is_quitting) or self._focus_mode_exit_blocker_ran:
+                try:
+                    from .utils.focus_mode_state import FocusModeStateFile
+                    FocusModeStateFile.delete()
+                except Exception:
+                    pass
+
         if self.sar_panel and not self._is_qt_deleted(self.sar_panel):
             try:
                 # During shutdown, avoid running full cleanup (may restore hidden panels)

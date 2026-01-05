@@ -803,7 +803,8 @@ class FileCSVProvider(Provider):
     def create_refresh_task(
         self,
         description: str,
-        since_iso: Optional[str] = None
+        since_iso: Optional[str] = None,
+        device_timestamps: Optional[Dict[str, str]] = None
     ) -> 'ProviderRefreshTask':
         """
         Create CSV-specific refresh task.
@@ -811,12 +812,16 @@ class FileCSVProvider(Provider):
         Args:
             description: Task description for progress display
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
+            device_timestamps: Optional per-device timestamps (ignored for CSV -
+                              CSV provider reads full file each time, incremental
+                              fetch not supported).
 
         Returns:
             CSVRefreshTask instance for background parsing
 
         Qt5/Qt6 Compatible: Returns QgsTask subclass.
         """
+        # Note: device_timestamps ignored - CSV doesn't support incremental fetch
         from .tasks import CSVRefreshTask
         return CSVRefreshTask(self, description, since_iso=since_iso)
 

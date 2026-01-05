@@ -27,16 +27,18 @@ Usage:
     FocusModeStateFile.delete()
 """
 
+import base64
 import json
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
 
+from qgis.PyQt.QtCore import QByteArray
 from qgis.PyQt.QtWidgets import QDockWidget, QToolBar, QMainWindow
 
 # Import sip_isdeleted from qt_compat to avoid duplication
-from utils.qt_compat import sip_isdeleted
+from .qt_compat import sip_isdeleted
 
 
 def find_layers_dock_widget(iface) -> Optional[QDockWidget]:
@@ -146,6 +148,7 @@ class FocusModePlusState:
         hidden_toolbars: List of (name, toolbar) tuples for hidden toolbars
         hidden_dock_names: List of dock object names (for serialization)
         hidden_toolbar_names: List of toolbar object names (for serialization)
+        main_window_state: Base64-encoded main window state (QMainWindow.saveState)
         keep_visible_docks: List of dock object names to keep visible
     """
 
@@ -163,12 +166,47 @@ class FocusModePlusState:
     hidden_dock_names: List[str] = field(default_factory=list)
     hidden_toolbar_names: List[str] = field(default_factory=list)
 
+    # Full main window state (QMainWindow.saveState) for exact restoration
+    main_window_state: Optional[str] = None
+
     # Panels to keep visible (by objectName)
     keep_visible_docks: List[str] = field(default_factory=lambda: [
-        "SARTrackerDock",  # SAR Panel
-        "Layers",          # Layers panel (common name)
-        "LayerTreeDock",   # Layers panel (alternative name)
+        "SARTrackerDock",      # SAR Panel
+        "Layers",              # Layers panel (common name)
+        "LayerTreeDock",       # Layers panel (alternative name)
     ])
+
+    @staticmethod
+    def _encode_main_window_state(state_obj: Any) -> Optional[str]:
+        """Encode QMainWindow.saveState() output as base64 string."""
+        if state_obj is None:
+            return None
+        try:
+            if isinstance(state_obj, QByteArray):
+                raw_bytes = bytes(state_obj.toBase64())
+            elif isinstance(state_obj, (bytes, bytearray)):
+                raw_bytes = base64.b64encode(bytes(state_obj))
+            elif hasattr(state_obj, "toBase64"):
+                raw_bytes = bytes(state_obj.toBase64())
+            else:
+                return None
+            return raw_bytes.decode("ascii")
+        except Exception as e:
+            print(f"[FocusModePlus] Failed to encode window state: {e}")
+            return None
+
+    @staticmethod
+    def _decode_main_window_state(state_b64: Optional[str]) -> Optional[QByteArray]:
+        """Decode base64 window state into QByteArray for restoreState."""
+        if not state_b64:
+            return None
+        try:
+            if isinstance(state_b64, bytes):
+                return QByteArray.fromBase64(state_b64)
+            return QByteArray.fromBase64(state_b64.encode("ascii"))
+        except Exception as e:
+            print(f"[FocusModePlus] Failed to decode window state: {e}")
+            return None
 
     def capture(self, main_window: QMainWindow, iface=None) -> int:
         """
@@ -193,6 +231,14 @@ class FocusModePlusState:
 
         # Find layers dock for exclusion
         layers_dock = find_layers_dock_widget(iface) if iface else None
+
+        # Capture full main window state (for exact restoration)
+        try:
+            if hasattr(main_window, "saveState"):
+                state_obj = main_window.saveState()
+                self.main_window_state = self._encode_main_window_state(state_obj)
+        except Exception as e:
+            print(f"[FocusModePlus] Error capturing main window state: {e}")
 
         # Capture menu bar state
         try:
@@ -274,6 +320,15 @@ class FocusModePlusState:
         if not self.is_active:
             return 0
 
+        # CRITICAL: Validate main_window before accessing its children
+        # main_window could be deleted between capture() and apply_hide()
+        if main_window is None:
+            print("[FocusModePlus] Cannot apply_hide: main_window is None")
+            return 0
+        if sip_isdeleted(main_window):
+            print("[FocusModePlus] Cannot apply_hide: main_window is deleted")
+            return 0
+
         hidden_count = 0
 
         # Hide menu bar
@@ -339,6 +394,17 @@ class FocusModePlusState:
         restored_count = 0
         error_count = 0
 
+        # Restore full main window state first (exact layout)
+        try:
+            if self.main_window_state and hasattr(main_window, "restoreState"):
+                restored_state = self._decode_main_window_state(self.main_window_state)
+                if restored_state is not None:
+                    if not main_window.restoreState(restored_state):
+                        print("[FocusModePlus] restoreState reported failure")
+        except Exception as e:
+            error_count += 1
+            print(f"[FocusModePlus] Error restoring main window state: {e}")
+
         # Restore dock widgets
         for obj_name, dock in self.hidden_docks:
             try:
@@ -393,10 +459,11 @@ class FocusModePlusState:
         self.hidden_toolbars = []
         self.hidden_dock_names = []
         self.hidden_toolbar_names = []
+        self.main_window_state = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize state for file-based persistence."""
-        return {
+        data = {
             "version": 1,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "is_active": self.is_active,
@@ -405,6 +472,9 @@ class FocusModePlusState:
             "hidden_dock_names": self.hidden_dock_names,
             "hidden_toolbar_names": self.hidden_toolbar_names,
         }
+        if self.main_window_state:
+            data["main_window_state"] = self.main_window_state
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], main_window: QMainWindow) -> 'FocusModePlusState':
@@ -426,6 +496,7 @@ class FocusModePlusState:
         state.status_bar_was_visible = data.get("status_bar_was_visible", True)
         state.hidden_dock_names = data.get("hidden_dock_names", [])
         state.hidden_toolbar_names = data.get("hidden_toolbar_names", [])
+        state.main_window_state = data.get("main_window_state")
 
         # Rebuild dock references
         if state.is_active and main_window:

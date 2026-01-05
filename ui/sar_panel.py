@@ -98,7 +98,9 @@ class SARPanel(QDockWidget):
         self.last_autosave_time = None
         self._last_autosave_success: Optional[bool] = None
         self.focus_mode_active = False
-        self.hidden_panels = []  # Track which panels we hid
+        self.focus_mode_state = None  # FocusModePlusState for menu/status/toolbar hiding
+        self.hidden_panels = []  # Track which panels we hid (legacy, kept for compatibility)
+        self._coords_controller = None  # Reference for coordinate mirroring (SAR-cksi.4)
         self._pause_flash = False
         self._is_finalized = False
         self._is_active = True
@@ -293,10 +295,10 @@ class SARPanel(QDockWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(10)
 
-        # Focus Mode Toggle (at top)
+        # Focus Mode Plus Toggle (at top)
         focus_layout = QHBoxLayout()
         self.focus_mode_button = QToolButton()
-        self.focus_mode_button.setText("Enter Focus Mode")
+        self.focus_mode_button.setText("Enter Focus Mode Plus")
         self.focus_mode_button.setToolButtonStyle(ToolButtonTextBesideIcon)
         self.focus_mode_button.setAutoRaise(False)
         self.focus_mode_button.setCursor(PointingHandCursor)
@@ -305,10 +307,28 @@ class SARPanel(QDockWidget):
         )
         self.focus_mode_button.clicked.connect(self._toggle_focus_mode)
         self.focus_mode_button.setToolTip(
-            "Hide other QGIS panels for cleaner workspace.\n"
-            "Press F11 for full-screen mode."
+            "Hide menu bar, status bar, toolbars, and other QGIS panels.\n"
+            "Keeps SAR Panel and Layers visible for distraction-free operations."
         )
         focus_layout.addWidget(self.focus_mode_button)
+
+        # Coordinate display widget (hidden by default, shown in Focus Mode Plus)
+        # Mirrors status bar coordinates when status bar is hidden (SAR-cksi.4)
+        self._coord_display_widget = QLabel()
+        self._coord_display_widget.setFont(QFont("Courier New", 9))
+        self._coord_display_widget.setStyleSheet(
+            "QLabel { "
+            "  background-color: #1a1a2e; "
+            "  color: #00ff00; "
+            "  padding: 4px 8px; "
+            "  border-radius: 3px; "
+            "  font-family: 'Courier New', monospace; "
+            "}"
+        )
+        self._coord_display_widget.setText("Coordinates: --")
+        self._coord_display_widget.setVisible(False)
+        focus_layout.addWidget(self._coord_display_widget)
+
         layout.addLayout(focus_layout)
         self._apply_focus_mode_style()
 
@@ -1459,146 +1479,277 @@ class SARPanel(QDockWidget):
 
     def _toggle_focus_mode(self):
         """
-        Toggle Focus Mode - hide/show other QGIS panels.
+        Toggle Focus Mode Plus - hide/show QGIS UI elements.
 
-        Qt5/Qt6 Compatible: Uses standard Qt widget visibility methods.
+        Focus Mode Plus hides:
+        - Menu bar
+        - Status bar
+        - All toolbars
+        - All dock widgets except SAR Panel and Layers panel
+
+        Qt5/Qt6 Compatible: Uses FocusModePlusState for safe capture/restore.
         """
+        # Guard against rapid toggle clicks (race condition protection)
+        if getattr(self, '_focus_mode_transitioning', False):
+            return
+        self._focus_mode_transitioning = True
+
         try:
             from qgis.utils import iface
+            from ..utils.focus_mode_state import FocusModePlusState, FocusModeStateFile
+
+            # CRITICAL: Validate iface and main_window before proceeding
+            # These can be None during plugin loading/unloading or in headless mode
+            if iface is None:
+                print("[FocusModePlus] Cannot toggle: iface is None")
+                return
+
+            main_window = iface.mainWindow()
+            if main_window is None:
+                print("[FocusModePlus] Cannot toggle: main_window is None")
+                return
 
             if not self.focus_mode_active:
-                # Enter Focus Mode - hide other panels
-                self.hidden_panels = []
+                # Enter Focus Mode Plus - hide UI elements
+                self.focus_mode_state = FocusModePlusState()
 
-                # Get main window and find all dock widgets
-                main_window = iface.mainWindow()
-                all_docks = main_window.findChildren(QDockWidget)
+                # Capture current UI state and hide elements
+                hidden_count = self.focus_mode_state.capture(main_window, iface)
 
-                # Hide all dock widgets except SAR panel
-                for dock in all_docks:
-                    if dock != self and dock.isVisible():
-                        # Store reference to restore later
-                        self.hidden_panels.append(dock)
-                        dock.setVisible(False)
+                # Save state file for crash recovery
+                FocusModeStateFile.save(self.focus_mode_state)
+
+                # Hide UI elements after state persistence
+                self.focus_mode_state.apply_hide(main_window)
 
                 # Update button
-                self.focus_mode_button.setText("Exit Focus Mode")
+                self.focus_mode_button.setText("Exit Focus Mode Plus")
                 self.focus_mode_active = True
                 self._apply_focus_mode_style()
+
+                # Show coordinate mirror widget (status bar is now hidden)
+                if hasattr(self, '_coord_display_widget'):
+                    self._coord_display_widget.setVisible(True)
 
                 # Show message
                 info(
                     iface.messageBar(),
-                    "Focus Mode",
-                    f"Focus Mode enabled - {len(self.hidden_panels)} panels hidden. Click 'Exit Focus Mode' to restore.",
+                    "Focus Mode Plus",
+                    f"Focus Mode Plus enabled - {hidden_count} UI elements hidden.",
                     duration=3
                 )
 
             else:
-                # Exit Focus Mode - restore panels
-                # CRITICAL FIX (BUG-025): Guard against deleted panels
-                # User may have closed a panel while it was hidden, causing crash
-                restored = 0
-                for panel in self.hidden_panels:
-                    try:
-                        # Check if Qt object is still valid before accessing
-                        if panel and not sip.isdeleted(panel):
-                            panel.setVisible(True)
-                            restored += 1
-                    except (RuntimeError, AttributeError):
-                        # Panel was destroyed - skip it
-                        pass
+                # Exit Focus Mode Plus - restore UI elements
+                if self.focus_mode_state and self.focus_mode_state.is_active:
+                    restored, errors = self.focus_mode_state.restore(main_window)
 
-                self.hidden_panels = []
+                    # Delete crash recovery state file
+                    FocusModeStateFile.delete()
 
-                # Update button
-                self.focus_mode_button.setText("Enter Focus Mode")
-                self.focus_mode_active = False
-                self._apply_focus_mode_style()
+                    # Clear state
+                    self.focus_mode_state = None
 
-                # Show message
-                info(
-                    iface.messageBar(),
-                    "Focus Mode",
-                    f"Focus Mode disabled - {restored} panels restored.",
-                    duration=2
-                )
+                    # Update button
+                    self.focus_mode_button.setText("Enter Focus Mode Plus")
+                    self.focus_mode_active = False
+                    self._apply_focus_mode_style()
+
+                    # Hide coordinate mirror widget (status bar is now visible)
+                    if hasattr(self, '_coord_display_widget'):
+                        self._coord_display_widget.setVisible(False)
+
+                    # Show message
+                    if errors > 0:
+                        warning(
+                            iface.messageBar(),
+                            "Focus Mode Plus",
+                            f"Focus Mode Plus disabled - {restored} elements restored ({errors} errors).",
+                            duration=3
+                        )
+                    else:
+                        info(
+                            iface.messageBar(),
+                            "Focus Mode Plus",
+                            f"Focus Mode Plus disabled - {restored} elements restored.",
+                            duration=2
+                        )
+                else:
+                    # State was lost (should not happen) - just reset button
+                    self.focus_mode_button.setText("Enter Focus Mode Plus")
+                    self.focus_mode_active = False
+                    self._apply_focus_mode_style()
+                    FocusModeStateFile.delete()
+                    # Also hide coordinate widget
+                    if hasattr(self, '_coord_display_widget'):
+                        self._coord_display_widget.setVisible(False)
 
         except Exception as e:
+            # CRITICAL: Attempt to restore hidden UI before clearing state
+            # If exception occurred AFTER apply_hide(), UI elements are hidden
+            # and must be restored to prevent QGIS being left in broken state
+            if self.focus_mode_state and self.focus_mode_state.is_active:
+                try:
+                    from qgis.utils import iface
+                    mw = iface.mainWindow() if iface else None
+                    if mw:
+                        self.focus_mode_state.restore(mw)
+                        print("[FocusModePlus] Restored UI after exception")
+                except Exception as restore_err:
+                    print(f"[FocusModePlus] Failed to restore UI after exception: {restore_err}")
+
+            # Reset state flags to prevent stuck UI
+            self.focus_mode_active = False
+            self.focus_mode_state = None
+            try:
+                from ..utils.focus_mode_state import FocusModeStateFile
+                FocusModeStateFile.delete()
+            except Exception:
+                pass
+
             # Fail gracefully - focus mode is optional
-            print(f"Focus mode toggle failed: {e}")
-            from qgis.utils import iface
-            warning(
-                iface.messageBar(),
-                "Focus Mode",
-                f"Error in focus mode: {e}",
-                duration=3
-            )
+            print(f"Focus Mode Plus toggle failed: {e}")
+            import traceback
+            traceback.print_exc()
+            try:
+                from qgis.utils import iface
+                warning(
+                    iface.messageBar(),
+                    "Focus Mode Plus",
+                    f"Error in focus mode: {e}",
+                    duration=3
+                )
+            except Exception:
+                pass  # Message bar might not be available
+        finally:
+            # Always clear the transitioning guard
+            self._focus_mode_transitioning = False
 
     def _restore_hidden_panels(self):
         """
-        Restore panels hidden by Focus Mode.
+        Restore UI elements hidden by Focus Mode Plus.
 
         This is called during cleanup to ensure QGIS returns to its prior
-        state even if the plugin is unloaded while Focus Mode is active.
+        state even if the plugin is unloaded while Focus Mode Plus is active.
+
+        Uses FocusModePlusState to safely restore:
+        - Menu bar
+        - Status bar
+        - Toolbars
+        - Dock widgets
 
         Handles edge cases:
-        - Panels already deleted/destroyed (RuntimeError caught)
-        - Panels manually re-shown by user (setVisible is no-op)
+        - Elements already deleted/destroyed (handled by FocusModePlusState)
         - Multiple calls (idempotent via focus_mode_active guard)
+        - Plugin shutdown (defensive checks)
 
-        Qt5/Qt6 Compatible: Uses standard QDockWidget visibility methods.
+        Qt5/Qt6 Compatible: Uses FocusModePlusState for safe restoration.
 
-        ISSUE #3 FIX: Ensures Focus Mode exits cleanly during plugin unload.
+        ISSUE #3 FIX: Ensures Focus Mode Plus exits cleanly during plugin unload.
         """
         if not self.focus_mode_active:
             # Not in focus mode, nothing to restore
             return
 
         try:
-            restored_count = 0
-            error_count = 0
+            from qgis.utils import iface
+            from ..utils.focus_mode_state import FocusModeStateFile
 
-            # Iterate over copy of list to avoid issues if Qt deletes objects during iteration
-            for panel in list(self.hidden_panels):
-                try:
-                    # Attempt to restore panel visibility
-                    # Note: This may fail if panel was destroyed by user or during shutdown
-                    if not panel.isVisible():  # Optional optimization: only restore if still hidden
-                        panel.setVisible(True)
-                        restored_count += 1
-                except RuntimeError as e:
-                    # Panel's C++ object was deleted - this is expected in some scenarios
-                    # (user closed the panel, or QGIS is shutting down)
-                    error_count += 1
-                    print(f"[SARTRACKER] Panel restoration skipped - C++ object deleted: {e}")
-                except Exception as e:
-                    # Unexpected error - log but continue restoring other panels
-                    error_count += 1
-                    print(f"[SARTRACKER] Warning: Error restoring panel: {e}")
+            main_window = iface.mainWindow() if iface else None
 
-            # Clear state
+            if self.focus_mode_state and self.focus_mode_state.is_active and main_window:
+                # Use FocusModePlusState to restore UI elements
+                restored_count, error_count = self.focus_mode_state.restore(main_window)
+
+                # Delete crash recovery state file
+                FocusModeStateFile.delete()
+
+                # Clear state
+                self.focus_mode_state = None
+
+                # Log result
+                if restored_count > 0:
+                    print(f"[SARTRACKER] Focus Mode Plus cleanup: {restored_count} elements restored, {error_count} errors")
+            else:
+                # State was lost or iface unavailable - just delete state file
+                FocusModeStateFile.delete()
+                self.focus_mode_state = None
+
+            # Clear legacy state
             self.hidden_panels = []
             self.focus_mode_active = False
 
             # Update button UI if possible (may fail during shutdown)
             try:
-                self.focus_mode_button.setText("Enter Focus Mode")
+                self.focus_mode_button.setText("Enter Focus Mode Plus")
                 self._apply_focus_mode_style()
             except (RuntimeError, AttributeError):
                 # Button already destroyed or doesn't exist - ignore
                 pass
 
-            # Log result
-            if restored_count > 0:
-                print(f"[SARTRACKER] Focus Mode cleanup: {restored_count} panels restored, {error_count} errors")
-
         except Exception as e:
-            # Catch-all: Don't let panel restoration crash the cleanup sequence
+            # Catch-all: Don't let restoration crash the cleanup sequence
             print(f"[SARTRACKER] Error in _restore_hidden_panels: {e}")
+            import traceback
+            traceback.print_exc()
             # Ensure state is cleared even if restoration failed
+            try:
+                from ..utils.focus_mode_state import FocusModeStateFile
+                FocusModeStateFile.delete()
+            except Exception:
+                pass
+            self.focus_mode_state = None
             self.hidden_panels = []
             self.focus_mode_active = False
+
+    # ========== Coordinate Mirroring (SAR-cksi.4) ==========
+
+    def connect_coordinates_controller(self, coords_controller):
+        """
+        Connect to coordinates controller for mirrored display.
+
+        When Focus Mode Plus is active, coordinates from the status bar
+        are mirrored to the SAR Panel since the status bar is hidden.
+
+        Args:
+            coords_controller: CoordinatesController instance
+
+        Qt5/Qt6 Compatible: Uses standard signal/slot connection.
+        """
+        if coords_controller:
+            try:
+                # Safety check: ensure controller Qt object is still valid
+                if sip_isdeleted(coords_controller):
+                    print("[SARPanel] Cannot connect: coordinates controller already deleted")
+                    return
+
+                coords_controller.coordinates_updated.connect(
+                    self._on_coordinates_updated
+                )
+                self._coords_controller = coords_controller
+                print("[SARPanel] Connected to coordinates controller for mirroring")
+            except Exception as e:
+                print(f"[SARPanel] Failed to connect coordinates controller: {e}")
+
+    def _on_coordinates_updated(self, text: str, lat: float, lon: float,
+                                 easting: float, northing: float):
+        """
+        Update mirrored coordinate display.
+
+        Only updates the display when Focus Mode Plus is active.
+
+        Args:
+            text: Formatted coordinate string
+            lat: Latitude (WGS84)
+            lon: Longitude (WGS84)
+            easting: Irish Grid easting
+            northing: Irish Grid northing
+        """
+        if self.focus_mode_active and hasattr(self, '_coord_display_widget'):
+            try:
+                self._coord_display_widget.setText(text)
+            except (RuntimeError, AttributeError):
+                pass  # Widget may be destroyed
 
     def cleanup(self):
         """
@@ -1635,6 +1786,18 @@ class SARPanel(QDockWidget):
                     except (TypeError, RuntimeError, AttributeError):
                         pass
                 self._mission_controller_connections = []
+
+            # Disconnect coordinates controller signal (SAR-cksi.4)
+            if hasattr(self, '_coords_controller') and self._coords_controller:
+                try:
+                    # Safety check: ensure controller Qt object is still valid
+                    if not sip_isdeleted(self._coords_controller):
+                        self._coords_controller.coordinates_updated.disconnect(
+                            self._on_coordinates_updated
+                        )
+                except (TypeError, RuntimeError):
+                    pass  # Already disconnected or destroyed
+                self._coords_controller = None
 
             # CRITICAL: Restore hidden panels FIRST (Issue #3 fix)
             # If Focus Mode is active when plugin unloads, we must restore

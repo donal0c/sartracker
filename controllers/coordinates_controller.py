@@ -22,7 +22,7 @@ implementation are preserved.
 import math
 from typing import Optional, Callable, TYPE_CHECKING
 
-from qgis.PyQt.QtCore import QObject, QTimer
+from qgis.PyQt.QtCore import QObject, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QFont
 from qgis.PyQt.QtWidgets import QLabel
 
@@ -59,6 +59,7 @@ class CoordinatesController(QObject):
     - Handle mouse movement over map canvas (throttled)
     - Transform coordinates to WGS84 and Irish Grid (ITM)
     - Clean up safely on unload (no crashes during plugin reload)
+    - Emit coordinates_updated signal for Focus Mode Plus mirroring
 
     Dependencies are injected via __init__ to avoid plugin globals.
 
@@ -66,6 +67,10 @@ class CoordinatesController(QObject):
     historically caused crashes during plugin reload. All defensive patterns
     from the original implementation are preserved.
     """
+
+    # Signal emitted when coordinates are updated (for Focus Mode Plus mirroring)
+    # Signature: (formatted_text, lat, lon, itm_easting, itm_northing)
+    coordinates_updated = pyqtSignal(str, float, float, float, float)
 
     def __init__(
         self,
@@ -349,6 +354,18 @@ class CoordinatesController(QObject):
 
                 # Update label (may raise RuntimeError if widget C++ object destroyed)
                 self.coords_label.setText(coords_text)
+
+                # Emit signal for Focus Mode Plus coordinate mirroring (SAR-cksi.4)
+                try:
+                    self.coordinates_updated.emit(
+                        coords_text,
+                        wgs84_point.y(),  # lat
+                        wgs84_point.x(),  # lon
+                        itm_point.x(),    # easting
+                        itm_point.y()     # northing
+                    )
+                except Exception:
+                    pass  # Signal emission is optional, don't crash if it fails
 
             except RuntimeError as e:
                 # Qt C++ object has been deleted but Python wrapper still exists
