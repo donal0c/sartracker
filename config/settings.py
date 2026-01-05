@@ -22,6 +22,21 @@ ACTIVE_DEVICE_STALE_THRESHOLD_SECONDS = 3600
 
 
 # =============================================================================
+# INITIAL ZOOM SETTINGS (SAR-drpu: Prevent extreme zoom on first load)
+# =============================================================================
+
+# Buffer applied to initial zoom extent when tracking data first arrives.
+# In degrees (WGS84). 0.01 degrees ≈ 1km at Irish latitudes.
+# This prevents the map from zooming to street-level on a single device point.
+INITIAL_ZOOM_BUFFER_DEGREES = 0.01
+
+# Minimum extent threshold in degrees. If the combined extent of all device
+# positions is smaller than this, the buffer is applied.
+# 0.02 degrees ≈ 2km - ensures a reasonable overview even with clustered devices.
+INITIAL_ZOOM_MIN_EXTENT_DEGREES = 0.02
+
+
+# =============================================================================
 # FUTURE SETTINGS (placeholders for SAR-kz7 expansion)
 # =============================================================================
 

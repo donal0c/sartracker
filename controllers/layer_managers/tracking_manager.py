@@ -24,7 +24,7 @@ from qgis.core import (
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
     QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext,
-    QgsTask, QgsProject, QgsLayerTreeGroup
+    QgsTask, QgsProject, QgsLayerTreeGroup, QgsRectangle
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QVariant, QTimer
@@ -49,6 +49,7 @@ from ...layers.utilities import refresh_layer_tree_view
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 from ...utils.notify import warning as notify_warning
 from ..per_item_layer_factory import ItemType, PerItemLayerFactory, SAR_ITEM_TYPE, SAR_ITEM_ID
+from ...config.settings import INITIAL_ZOOM_BUFFER_DEGREES, INITIAL_ZOOM_MIN_EXTENT_DEGREES
 
 
 logger = logging.getLogger(__name__)
@@ -729,6 +730,32 @@ class TrackingLayerManager(BaseLayerManager):
         self._log_tracking_event(layer, "CURRENT", "ensure")
         return layer
 
+    def _calculate_combined_device_extent(self) -> Optional[QgsRectangle]:
+        """
+        Calculate the combined extent of all per-device position layers.
+
+        SAR-drpu: Used for initial zoom to show all tracked devices at once,
+        rather than zooming to just the first device found.
+
+        Returns:
+            QgsRectangle combining all device positions, or None if no valid layers.
+        """
+        combined_extent = QgsRectangle()
+
+        for device_id, layer in self._device_position_layers.items():
+            if layer and layer.isValid() and layer.featureCount() > 0:
+                layer_extent = layer.extent()
+                if not layer_extent.isEmpty():
+                    if combined_extent.isNull():
+                        combined_extent = QgsRectangle(layer_extent)
+                    else:
+                        combined_extent.combineExtentWith(layer_extent)
+
+        if combined_extent.isNull():
+            return None
+
+        return combined_extent
+
     def update_current_positions(self, positions: List[Dict]):
         """
         Update current positions layer.
@@ -777,16 +804,17 @@ class TrackingLayerManager(BaseLayerManager):
 
             self._update_positions_per_device(valid_positions)
 
-            # Zoom to extent ONLY on first load
+            # Zoom to extent ONLY on first load (SAR-drpu fix: use combined extent + buffering)
             if self.first_load and valid_positions:
-                # Find a device layer to get extent from
-                for device_id in self._device_position_layers:
-                    layer = self._device_position_layers[device_id]
-                    if layer and layer.isValid() and layer.featureCount() > 0:
-                        self.iface.mapCanvas().setExtent(layer.extent())
-                        self.iface.mapCanvas().refresh()
-                        self.first_load = False
-                        break
+                combined_extent = self._calculate_combined_device_extent()
+                if combined_extent and not combined_extent.isEmpty():
+                    # Apply buffering if extent is too small for useful SAR overview
+                    if (combined_extent.width() < INITIAL_ZOOM_MIN_EXTENT_DEGREES or
+                            combined_extent.height() < INITIAL_ZOOM_MIN_EXTENT_DEGREES):
+                        combined_extent = combined_extent.buffered(INITIAL_ZOOM_BUFFER_DEGREES)
+                    self.iface.mapCanvas().setExtent(combined_extent)
+                    self.iface.mapCanvas().refresh()
+                    self.first_load = False
 
             self._log_tracking_event(
                 None,  # No single layer
