@@ -21,7 +21,13 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import QDateTime
 
 from ..utils.dialog_utils import BaseDialog
-from ..utils.qt_compat import Checked, Unchecked, ItemIsUserCheckable
+from ..utils.qt_compat import (
+    Checked,
+    Unchecked,
+    ItemIsUserCheckable,
+    DialogButtonOk,
+    DialogButtonCancel,
+)
 
 
 class MissionMetadataDialog(BaseDialog):
@@ -93,7 +99,7 @@ class MissionMetadataDialog(BaseDialog):
             self.resume_time_edit.setCalendarPopup(True)
             layout.addWidget(self.resume_time_edit)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons = QDialogButtonBox(DialogButtonOk | DialogButtonCancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)

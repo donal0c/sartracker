@@ -825,18 +825,25 @@ def get_expected_structure() -> GroupDefinition:
         parent_path=None,
         metadata={"schema_version": str(SAR_LAYER_SCHEMA_VERSION)},
         subgroups=[
-            # Tracking group (per-device layers created dynamically)
+            # Current Positions group (per-device layers created dynamically)
+            GroupDefinition(
+                name=GroupNames.CURRENT_POSITIONS,
+                parent_path=[GroupNames.ROOT],
+                position=0
+            ),
+
+            # Tracking group (per-device trails created dynamically)
             GroupDefinition(
                 name=GroupNames.TRACKING,
                 parent_path=[GroupNames.ROOT],
-                position=0
+                position=1
             ),
 
             # Helicopters group
             GroupDefinition(
                 name=GroupNames.HELICOPTERS,
                 parent_path=[GroupNames.ROOT],
-                position=1,
+                position=2,
                 layers=[
                     LayerDefinition(
                         layer_id=LayerIds.HELICOPTER_1,
@@ -877,7 +884,7 @@ def get_expected_structure() -> GroupDefinition:
             GroupDefinition(
                 name=GroupNames.MAP_TOOLS,
                 parent_path=[GroupNames.ROOT],
-                position=2,
+                position=3,
                 subgroups=map_tools_subgroups
             ),
 

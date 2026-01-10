@@ -207,6 +207,66 @@ class TestInitialZoomBuffering:
         assert extent_arg.height() >= 0.04, \
             f"Expected combined extent height >= 0.04, got {extent_arg.height()}"
 
+    def test_initial_zoom_transforms_extent_to_canvas_crs(self):
+        """
+        First-load auto-zoom should reproject the extent to the canvas CRS.
+
+        Prevents the map jumping to (0,0) when the project/map CRS is not WGS84.
+        """
+        from sartracker.controllers.layer_managers.tracking_manager import TrackingLayerManager
+
+        mock_iface = MagicMock()
+        mock_canvas = MagicMock()
+        mock_settings = MagicMock()
+        mock_canvas.mapSettings.return_value = mock_settings
+        mock_iface.mapCanvas.return_value = mock_canvas
+
+        manager = TrackingLayerManager(mock_iface)
+        manager.first_load = True
+        manager.USE_PER_DEVICE_POSITIONS = True
+
+        class FakeCrs:
+            def __init__(self, authid):
+                self.authid_value = authid
+
+            def isValid(self):
+                return True
+
+            def __eq__(self, other):
+                return isinstance(other, FakeCrs) and other.authid_value == self.authid_value
+
+        source_crs = FakeCrs("EPSG:4326")
+        target_crs = FakeCrs("EPSG:2157")
+        mock_settings.destinationCrs.return_value = target_crs
+
+        device_layer = create_mock_layer(-9.5, 52.0, -9.5, 52.0)
+        device_layer.crs.return_value = source_crs
+        manager._device_position_layers = {"device1": device_layer}
+
+        combined_extent = MockQgsRectangle(-9.5, 52.0, -9.5, 52.0)
+        transformed_extent = MockQgsRectangle(1000, 2000, 3000, 4000)
+        transform_call = {}
+
+        class FakeTransform:
+            def __init__(self, from_crs, to_crs, project):
+                transform_call["init_args"] = (from_crs, to_crs)
+
+            def transformBoundingBox(self, bbox):
+                transform_call["bbox"] = bbox
+                return transformed_extent
+
+        with patch('sartracker.controllers.layer_managers.tracking_manager.QgsCoordinateTransform', FakeTransform, create=True):
+            with patch.object(manager, '_ensure_per_device_ready'):
+                with patch.object(manager, '_update_positions_per_device'):
+                    with patch.object(manager, '_log_tracking_event'):
+                        with patch.object(manager, '_calculate_combined_device_extent', return_value=combined_extent):
+                            manager.update_current_positions([
+                                {'device_id': 'device1', 'name': 'D1', 'lat': 52.0, 'lon': -9.5, 'ts': '2026-01-05T12:00:00Z'},
+                            ])
+
+        mock_canvas.setExtent.assert_called_once_with(transformed_extent)
+        assert transform_call.get("bbox") is not None, "Expected extent to be transformed to canvas CRS"
+
     def test_first_load_flag_prevents_repeated_zoom(self):
         """
         SAR-drpu: Auto-zoom should only happen on first load, not every update.

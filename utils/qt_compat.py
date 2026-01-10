@@ -537,6 +537,29 @@ else:  # Qt5
 
 
 # =============================================================================
+# QDialogButtonBox StandardButton enums
+# =============================================================================
+try:
+    from qgis.PyQt.QtWidgets import QDialogButtonBox
+    if QT_VERSION == 6:
+        # Qt6: Enums in StandardButton namespace
+        try:
+            DialogButtonOk = QDialogButtonBox.StandardButton.Ok
+            DialogButtonCancel = QDialogButtonBox.StandardButton.Cancel
+        except AttributeError:
+            DialogButtonOk = QDialogButtonBox.Ok
+            DialogButtonCancel = QDialogButtonBox.Cancel
+    else:
+        # Qt5: Direct access
+        DialogButtonOk = QDialogButtonBox.Ok
+        DialogButtonCancel = QDialogButtonBox.Cancel
+except (AttributeError, ImportError):
+    # Fallback values if QDialogButtonBox unavailable
+    DialogButtonOk = 0x00000400
+    DialogButtonCancel = 0x00400000
+
+
+# =============================================================================
 # QMessageBox StandardButton enums
 # =============================================================================
 try:
@@ -838,6 +861,8 @@ __all__ = [
     # Dialog constants
     'DialogAccepted',
     'DialogRejected',
+    'DialogButtonOk',
+    'DialogButtonCancel',
     # DockWidgetArea
     'LeftDockWidgetArea',
     'RightDockWidgetArea',

@@ -422,6 +422,18 @@ class TestFormatting:
         result = converter.format_irish_grid(715830, 734697)
         assert result == "E: 715830  N: 734697"
 
+    def test_format_irish_grid_reference_returns_expected(self):
+        """Verify TM65 Irish Grid reference formatting."""
+        from utils.coordinates import format_irish_grid_reference
+        result = format_irish_grid_reference(99840, 104018)
+        assert result == "Q 99840 04018"
+
+    def test_format_irish_grid_reference_out_of_range_raises_value_error(self):
+        """Reject TM65 grid references outside valid range."""
+        from utils.coordinates import format_irish_grid_reference
+        with pytest.raises(ValueError, match="TM65"):
+            format_irish_grid_reference(-10, 1000)
+
     def test_format_wgs84_north_east_returns_correct_string(self, converter):
         """Verify WGS84 formatting for northern hemisphere, eastern longitude."""
         result = converter.format_wgs84(53.3498, 6.2603)

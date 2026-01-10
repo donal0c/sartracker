@@ -11,7 +11,7 @@ to wrong locations. All inputs are validated before transformation.
 
 import logging
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 
 from qgis.core import (
     QgsCoordinateReferenceSystem,
@@ -35,6 +35,114 @@ WGS84_LAT_MIN = -90.0
 WGS84_LAT_MAX = 90.0
 WGS84_LON_MIN = -180.0
 WGS84_LON_MAX = 180.0
+
+# TM65 (Irish Grid reference) valid ranges
+TM65_EASTING_MIN = 0.0
+TM65_EASTING_MAX = 500_000.0
+TM65_NORTHING_MIN = 0.0
+TM65_NORTHING_MAX = 500_000.0
+
+# TM65 projection string (Irish Grid) for display-only grid references.
+# Using PROJ string avoids hardcoding deprecated EPSG identifiers.
+TM65_PROJ = (
+    "+proj=tmerc +lat_0=53.5 +lon_0=-8 +k=1.000035 "
+    "+x_0=200000 +y_0=250000 +a=6377340.189 +b=6356034.447 "
+    "+towgs84=482.530,130.596,564.557,-1.042,-0.214,-0.631,8.15 "
+    "+units=m +no_defs"
+)
+
+# Irish Grid reference letter grid (north to south).
+_IRISH_GRID_ROWS = [
+    "ABCDE",
+    "FGHJK",
+    "LMNOP",
+    "QRSTU",
+    "VWXYZ",
+]
+_IRISH_GRID_SIZE = 100_000
+_IRISH_GRID_DIM = 5
+
+
+def build_tm65_crs() -> Optional[QgsCoordinateReferenceSystem]:
+    """Return TM65 CRS for Irish Grid reference display (or None if unavailable)."""
+    try:
+        crs = QgsCoordinateReferenceSystem(TM65_PROJ)
+        if crs.isValid():
+            return crs
+    except Exception:
+        crs = None
+
+    try:
+        crs = QgsCoordinateReferenceSystem()
+        for method_name in ("createFromProj", "createFromProj4", "createFromString"):
+            method = getattr(crs, method_name, None)
+            if not method:
+                continue
+            try:
+                ok = method(TM65_PROJ)
+            except Exception:
+                continue
+            if ok and crs.isValid():
+                return crs
+    except Exception as exc:
+        logger.warning("TM65 CRS initialization failed: %s", exc)
+        return None
+
+    logger.warning("TM65 CRS initialization failed: invalid CRS")
+    return None
+
+
+def format_irish_grid_reference(easting: float, northing: float, digits: int = 5) -> str:
+    """
+    Format TM65 easting/northing as Irish Grid reference string.
+
+    Returns format like "Q 99840 04018".
+    """
+    context = "format_irish_grid_reference"
+
+    if not isinstance(digits, int) or digits <= 0:
+        raise ValueError(f"Invalid digit precision during {context}: {digits}")
+
+    if not isinstance(easting, (int, float)) or not isinstance(northing, (int, float)):
+        raise TypeError(f"Invalid coordinates during {context}: expected numeric values")
+
+    easting = float(easting)
+    northing = float(northing)
+
+    if math.isnan(easting) or math.isnan(northing):
+        raise ValueError(f"Invalid TM65 coordinate during {context}: value is NaN")
+    if math.isinf(easting) or math.isinf(northing):
+        raise ValueError(f"Invalid TM65 coordinate during {context}: value is Infinity")
+
+    if not (TM65_EASTING_MIN <= easting < TM65_EASTING_MAX):
+        raise ValueError(
+            f"TM65 easting outside valid range during {context}: {easting:.2f}"
+        )
+    if not (TM65_NORTHING_MIN <= northing < TM65_NORTHING_MAX):
+        raise ValueError(
+            f"TM65 northing outside valid range during {context}: {northing:.2f}"
+        )
+
+    e100k = int(easting) // _IRISH_GRID_SIZE
+    n100k = int(northing) // _IRISH_GRID_SIZE
+    if not (0 <= e100k < _IRISH_GRID_DIM and 0 <= n100k < _IRISH_GRID_DIM):
+        raise ValueError(
+            f"TM65 grid square outside valid range during {context}: "
+            f"E={easting:.2f}, N={northing:.2f}"
+        )
+
+    row = (_IRISH_GRID_DIM - 1) - n100k
+    col = e100k
+    letter = _IRISH_GRID_ROWS[row][col]
+
+    e_remainder = int(round(easting - (e100k * _IRISH_GRID_SIZE)))
+    n_remainder = int(round(northing - (n100k * _IRISH_GRID_SIZE)))
+    if e_remainder >= _IRISH_GRID_SIZE:
+        e_remainder = _IRISH_GRID_SIZE - 1
+    if n_remainder >= _IRISH_GRID_SIZE:
+        n_remainder = _IRISH_GRID_SIZE - 1
+
+    return f"{letter} {e_remainder:0{digits}d} {n_remainder:0{digits}d}"
 
 
 class CoordinateConverter:

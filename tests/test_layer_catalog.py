@@ -142,6 +142,101 @@ def _make_gpkg_layer(layer_catalog, path):
     return FakeLayer(path)
 
 
+def test_discover_tracking_layers_groups_by_type(monkeypatch):
+    layer_catalog = _install_catalog_module(monkeypatch)
+    svc = _make_service(layer_catalog, MetadataStubLayerManager())
+
+    class FakeBaseLayer:
+        pass
+
+    monkeypatch.setattr(layer_catalog, "QgsVectorLayer", FakeBaseLayer, raising=False)
+
+    class FakeField:
+        def __init__(self, name):
+            self._name = name
+
+        def name(self):
+            return self._name
+
+    class FakeLayer(FakeBaseLayer):
+        def __init__(self, name, item_type, device_name, device_id, item_id):
+            self._name = name
+            self._feature_count = 1
+            self._fields = [FakeField("device_id")]
+            self._source = f"/tmp/{name}.gpkg|layername={name}"
+            self._props = {}
+            self.setCustomProperty(layer_catalog.SAR_ITEM_TYPE, item_type)
+            self.setCustomProperty("sartracker:device_id", device_id)
+            self.setCustomProperty("sartracker:device_name", device_name)
+            self.setCustomProperty("sartracker:item_id", item_id)
+
+        def name(self):
+            return self._name
+
+        def setCustomProperty(self, key, value):
+            self._props[key] = value
+
+        def customProperty(self, key):
+            return self._props.get(key)
+
+        def featureCount(self):
+            return self._feature_count
+
+        def fields(self):
+            return self._fields
+
+        def source(self):
+            return self._source
+
+        def id(self):
+            return f"id-{self._name}"
+
+        def isValid(self):
+            return True
+
+    device_name = "Alpha"
+    pos_layer = FakeLayer(
+        name="Alpha Position",
+        item_type=layer_catalog.ItemType.DEVICE_POSITION,
+        device_name=device_name,
+        device_id="dev-001",
+        item_id="pos-item"
+    )
+    trail_layer = FakeLayer(
+        name="Alpha Trail",
+        item_type=layer_catalog.ItemType.DEVICE_TRAIL,
+        device_name=device_name,
+        device_id="dev-001",
+        item_id="trail-item"
+    )
+
+    class FakeProject:
+        def mapLayers(self):
+            return {
+                pos_layer.id(): pos_layer,
+                trail_layer.id(): trail_layer
+            }
+
+    svc.project = FakeProject()
+
+    svc._discover_tracking_layers()
+
+    current_group_id = f"{layer_catalog.GroupNames.ROOT}/{layer_catalog.GroupNames.CURRENT_POSITIONS}"
+    tracking_group_id = f"{layer_catalog.GroupNames.ROOT}/{layer_catalog.GroupNames.TRACKING}"
+    device_pos_group_id = f"{current_group_id}/{device_name}"
+    device_trail_group_id = f"{tracking_group_id}/{device_name}"
+
+    root_info = svc._groups[layer_catalog.GroupNames.ROOT]
+    assert current_group_id in svc._groups
+    assert tracking_group_id in svc._groups
+    assert current_group_id in root_info.subgroups
+    assert tracking_group_id in root_info.subgroups
+    assert device_pos_group_id in svc._groups
+    assert device_trail_group_id in svc._groups
+    assert svc._layers["pos-item"].group_id == device_pos_group_id
+    assert svc._layers["trail-item"].group_id == device_trail_group_id
+
+
 class StubTaskManager:
     def __init__(self):
         self.started = []

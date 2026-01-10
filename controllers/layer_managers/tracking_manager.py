@@ -24,7 +24,7 @@ from qgis.core import (
     QgsMarkerSymbol, QgsLineSymbol, QgsPalLayerSettings,
     QgsVectorLayerSimpleLabeling, QgsTextFormat, QgsTextBufferSettings,
     QgsFeatureRequest, QgsVectorFileWriter, QgsCoordinateTransformContext,
-    QgsTask, QgsProject, QgsLayerTreeGroup, QgsRectangle
+    QgsTask, QgsProject, QgsLayerTreeGroup, QgsRectangle, QgsCoordinateTransform
 )
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtCore import QVariant, QTimer
@@ -756,6 +756,21 @@ class TrackingLayerManager(BaseLayerManager):
 
         return combined_extent
 
+    def _get_device_positions_crs(self):
+        """
+        Return CRS for per-device current position layers.
+
+        Uses the first valid layer CRS as all device layers share the same schema.
+        """
+        for layer in self._device_position_layers.values():
+            try:
+                crs = layer.crs()
+                if crs and crs.isValid():
+                    return crs
+            except Exception:
+                continue
+        return None
+
     def update_current_positions(self, positions: List[Dict]):
         """
         Update current positions layer.
@@ -812,9 +827,28 @@ class TrackingLayerManager(BaseLayerManager):
                     if (combined_extent.width() < INITIAL_ZOOM_MIN_EXTENT_DEGREES or
                             combined_extent.height() < INITIAL_ZOOM_MIN_EXTENT_DEGREES):
                         combined_extent = combined_extent.buffered(INITIAL_ZOOM_BUFFER_DEGREES)
-                    self.iface.mapCanvas().setExtent(combined_extent)
-                    self.iface.mapCanvas().refresh()
-                    self.first_load = False
+                    target_extent = combined_extent
+                    canvas = None
+                    try:
+                        canvas = self.iface.mapCanvas() if hasattr(self.iface, "mapCanvas") else None
+                        if canvas:
+                            canvas_crs = canvas.mapSettings().destinationCrs() if hasattr(canvas, "mapSettings") else None
+                            layer_crs = self._get_device_positions_crs()
+                            if (
+                                layer_crs and canvas_crs and
+                                hasattr(layer_crs, "isValid") and hasattr(canvas_crs, "isValid") and
+                                layer_crs.isValid() and canvas_crs.isValid() and
+                                layer_crs != canvas_crs
+                            ):
+                                transform = QgsCoordinateTransform(layer_crs, canvas_crs, QgsProject.instance())
+                                target_extent = transform.transformBoundingBox(combined_extent)
+                    except Exception as exc:
+                        logger.warning("Initial zoom CRS transform failed: %s", exc)
+
+                    if canvas:
+                        canvas.setExtent(target_extent)
+                        canvas.refresh()
+                        self.first_load = False
 
             self._log_tracking_event(
                 None,  # No single layer
@@ -1220,12 +1254,15 @@ class TrackingLayerManager(BaseLayerManager):
 
         return factory
 
-    def _ensure_tracking_group(self) -> Optional[QgsLayerTreeGroup]:
+    def _ensure_tracking_group(self, group_name: str) -> Optional[QgsLayerTreeGroup]:
         """
-        Ensure the Tracking group exists under SAR Tracker.
+        Ensure a tracking-related group exists under SAR Tracker.
+
+        Args:
+            group_name: Group name under SAR Tracker
 
         Returns:
-            QgsLayerTreeGroup for Tracking, or None on failure
+            QgsLayerTreeGroup for group_name, or None on failure
         """
         project = QgsProject.instance()
         root = project.layerTreeRoot()
@@ -1235,26 +1272,30 @@ class TrackingLayerManager(BaseLayerManager):
         if not sar_root:
             sar_root = root.insertGroup(0, GroupNames.ROOT)
 
-        # Find or create Tracking group
-        tracking_group = sar_root.findGroup(GroupNames.TRACKING)
+        # Find or create target group
+        tracking_group = sar_root.findGroup(group_name)
         if not tracking_group:
-            tracking_group = sar_root.insertGroup(0, GroupNames.TRACKING)
+            insert_pos = 0
+            if group_name == GroupNames.TRACKING:
+                insert_pos = 1
+            tracking_group = sar_root.insertGroup(insert_pos, group_name)
 
         return tracking_group
 
-    def _ensure_device_group(self, device_name: str) -> Optional[QgsLayerTreeGroup]:
+    def _ensure_device_group(self, device_name: str, group_name: str) -> Optional[QgsLayerTreeGroup]:
         """
-        Ensure a device group exists under Tracking.
+        Ensure a device group exists under a tracking group.
 
-        Structure: SAR Tracker / Tracking / {DeviceName}
+        Structure: SAR Tracker / {group_name} / {DeviceName}
 
         Args:
             device_name: Display name for the device
+            group_name: Parent tracking group name
 
         Returns:
             QgsLayerTreeGroup for the device, or None on failure
         """
-        tracking_group = self._ensure_tracking_group()
+        tracking_group = self._ensure_tracking_group(group_name)
         if not tracking_group:
             return None
 
@@ -1265,27 +1306,31 @@ class TrackingLayerManager(BaseLayerManager):
 
         return device_group
 
-    def _get_tracking_group(self) -> Optional[QgsLayerTreeGroup]:
-        """Return the Tracking group if it exists (without creating)."""
+    def _get_tracking_group(self, group_name: str) -> Optional[QgsLayerTreeGroup]:
+        """Return the named tracking group if it exists (without creating)."""
         root = QgsProject.instance().layerTreeRoot()
         if not root:
             return None
         sar_root = root.findGroup(GroupNames.ROOT)
         if not sar_root:
             return None
-        return sar_root.findGroup(GroupNames.TRACKING)
+        return sar_root.findGroup(group_name)
 
-    def _remove_device_group_if_empty(self, device_name: Optional[str]) -> None:
-        """Remove empty device group under Tracking (if present)."""
+    def _remove_device_group_if_empty(self, device_name: Optional[str], group_name: str) -> None:
+        """Remove empty device group under the named tracking group (if present)."""
         if not device_name:
             return
-        tracking_group = self._get_tracking_group()
+        tracking_group = self._get_tracking_group(group_name)
         if not tracking_group:
             return
         device_group = tracking_group.findGroup(device_name)
         if not device_group:
             return
-        if not device_group.children():
+        try:
+            has_children = bool(device_group.children())
+        except Exception:
+            return
+        if not has_children:
             tracking_group.removeChildNode(device_group)
 
     def _get_device_layers_by_property(self, device_id: str) -> Dict[str, Optional[QgsVectorLayer]]:
@@ -1387,7 +1432,7 @@ class TrackingLayerManager(BaseLayerManager):
         device_name = sample_position.get('name') or f"Device {device_id[:8]}"
 
         # Ensure device group exists
-        device_group = self._ensure_device_group(device_name)
+        device_group = self._ensure_device_group(device_name, GroupNames.CURRENT_POSITIONS)
         if not device_group:
             logger.warning("Failed to create device group for %s", device_name)
             return None
@@ -1674,8 +1719,8 @@ class TrackingLayerManager(BaseLayerManager):
         # Get device name for display
         device_name = sample_position.get('name') or f"Device {device_id[:8]}"
 
-        # Ensure device group exists (same group as position layer)
-        device_group = self._ensure_device_group(device_name)
+        # Ensure device group exists (trails group)
+        device_group = self._ensure_device_group(device_name, GroupNames.TRACKING)
         if not device_group:
             logger.warning("Failed to create device group for %s", device_name)
             return None
@@ -3005,7 +3050,7 @@ class TrackingLayerManager(BaseLayerManager):
                 QgsProject.instance().removeMapLayer(layer.id())
 
             self._device_position_layers.pop(device_id, None)
-            self._remove_device_group_if_empty(device_name)
+            self._remove_device_group_if_empty(device_name, GroupNames.CURRENT_POSITIONS)
 
         logger.info(
             "[TrackingManager] Deleted %s position(s) across %s device(s)",
@@ -3064,7 +3109,7 @@ class TrackingLayerManager(BaseLayerManager):
                 QgsProject.instance().removeMapLayer(layer.id())
 
             self._device_trail_layers.pop(device_id, None)
-            self._remove_device_group_if_empty(device_name)
+            self._remove_device_group_if_empty(device_name, GroupNames.TRACKING)
 
         logger.info(
             "[TrackingManager] Deleted %s breadcrumb segment(s) across %s device(s)",

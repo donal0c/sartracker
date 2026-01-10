@@ -16,6 +16,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..utils.dialog_utils import BaseDialog
+from ..utils.coordinates import build_tm65_crs, format_irish_grid_reference
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsPointXY, QgsRectangle, QgsCsException
@@ -39,6 +40,7 @@ class CoordinateConverterDialog(BaseDialog):
         # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
         # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
         self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
+        self.tm65 = build_tm65_crs()
 
         # BUG-057 fix: Track timers to prevent crashes on early dialog close
         self.copy_timer = None
@@ -212,6 +214,19 @@ class CoordinateConverterDialog(BaseDialog):
                     )
                     return
 
+                tm65_ref = None
+                if self.tm65 and self.tm65.isValid():
+                    try:
+                        transform_tm65 = QgsCoordinateTransform(
+                            self.wgs84,
+                            self.tm65,
+                            QgsProject.instance()
+                        )
+                        tm65_point = transform_tm65.transform(point)
+                        tm65_ref = format_irish_grid_reference(tm65_point.x(), tm65_point.y())
+                    except Exception:
+                        tm65_ref = None
+
                 # Store results
                 self.last_lat = lat
                 self.last_lon = lon
@@ -228,6 +243,11 @@ class CoordinateConverterDialog(BaseDialog):
                     f"Easting: {round(itm_point.x()):,}<br>"
                     f"Northing: {round(itm_point.y()):,}"
                 )
+                if tm65_ref:
+                    result_text += (
+                        f"<br><br><b>Irish Grid (TM65) Reference:</b><br>"
+                        f"{tm65_ref}"
+                    )
 
             else:
                 # Convert Irish Grid -> WGS84
@@ -276,6 +296,19 @@ class CoordinateConverterDialog(BaseDialog):
                     )
                     return
 
+                tm65_ref = None
+                if self.tm65 and self.tm65.isValid():
+                    try:
+                        transform_tm65 = QgsCoordinateTransform(
+                            self.itm,
+                            self.tm65,
+                            QgsProject.instance()
+                        )
+                        tm65_point = transform_tm65.transform(point)
+                        tm65_ref = format_irish_grid_reference(tm65_point.x(), tm65_point.y())
+                    except Exception:
+                        tm65_ref = None
+
                 # Store results
                 self.last_lat = wgs84_point.y()
                 self.last_lon = wgs84_point.x()
@@ -290,6 +323,11 @@ class CoordinateConverterDialog(BaseDialog):
                     f"Latitude: {wgs84_point.y():.6f}°N<br>"
                     f"Longitude: {wgs84_point.x():.6f}°E"
                 )
+                if tm65_ref:
+                    result_text += (
+                        f"<br><br><b>Irish Grid (TM65) Reference:</b><br>"
+                        f"{tm65_ref}"
+                    )
 
             self.last_result_text = result_text
             self.result_label.setText(result_text)

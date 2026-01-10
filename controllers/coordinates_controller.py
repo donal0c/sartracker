@@ -34,6 +34,7 @@ from qgis.core import (
 )
 
 from ..utils.notify import warning
+from ..utils.coordinates import build_tm65_crs, format_irish_grid_reference
 
 # sip.isdeleted import pattern (Qt5/Qt6 compatible)
 try:
@@ -113,6 +114,7 @@ class CoordinatesController(QObject):
         # Use EPSG:2157 (Irish Transverse Mercator / ITM) - the modern Irish Grid
         # Note: EPSG:29903 is the older TM65 Irish Grid which has 1-3m accuracy issues
         self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
+        self.tm65 = build_tm65_crs()
 
     def init(self) -> bool:
         """
@@ -337,6 +339,18 @@ class CoordinatesController(QObject):
                 )
                 itm_point = transform_to_itm.transform(self.last_coords_point)
 
+                tm65_point = None
+                if self.tm65 and self.tm65.isValid():
+                    try:
+                        transform_to_tm65 = QgsCoordinateTransform(
+                            canvas_crs,
+                            self.tm65,
+                            QgsProject.instance()
+                        )
+                        tm65_point = transform_to_tm65.transform(self.last_coords_point)
+                    except Exception:
+                        tm65_point = None
+
                 # BUG-FIX: Validate transformed coordinates before display
                 # int(NaN) raises ValueError, and displaying invalid coords is dangerous
                 if (math.isnan(wgs84_point.x()) or math.isnan(wgs84_point.y()) or
@@ -344,13 +358,23 @@ class CoordinatesController(QObject):
                     math.isinf(wgs84_point.x()) or math.isinf(wgs84_point.y()) or
                     math.isinf(itm_point.x()) or math.isinf(itm_point.y())):
                     return  # Skip update, keep last valid display
+                if tm65_point:
+                    if (math.isnan(tm65_point.x()) or math.isnan(tm65_point.y()) or
+                            math.isinf(tm65_point.x()) or math.isinf(tm65_point.y())):
+                        return
 
                 # Format display text with fixed-width formatting
                 # BUG-FIX: Use round() instead of int() for consistency (BUG-029)
                 coords_text = (
                     f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
-                    f"Irish Grid: E:{round(itm_point.x()):7d}  N:{round(itm_point.y()):7d}"
+                    f"ITM: E:{round(itm_point.x()):7d}  N:{round(itm_point.y()):7d}"
                 )
+                if tm65_point:
+                    try:
+                        grid_ref = format_irish_grid_reference(tm65_point.x(), tm65_point.y())
+                        coords_text += f"  |  IG TM65: {grid_ref}"
+                    except ValueError:
+                        pass
 
                 # Update label (may raise RuntimeError if widget C++ object destroyed)
                 self.coords_label.setText(coords_text)

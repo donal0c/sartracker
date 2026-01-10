@@ -389,7 +389,7 @@ class DrawingLayerManager(BaseLayerManager):
         return datetime.now(timezone.utc).isoformat()
 
     def _style_lines_layer(self, layer: QgsVectorLayer):
-        symbol = QgsLineSymbol.createSimple({'color': 'red', 'width': '2'})
+        symbol = QgsLineSymbol.createSimple({'color': '#FF0000', 'width': '0.7'})
         layer.renderer().setSymbol(symbol)
 
     def _style_search_areas_layer(self, layer: QgsVectorLayer):

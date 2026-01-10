@@ -587,9 +587,9 @@ class MarkerLayerManager(BaseLayerManager):
 
     def _style_clues_layer(self, layer: QgsVectorLayer):
         symbol = QgsMarkerSymbol.createSimple({
-            'name': 'triangle',
-            'color': '#FFD700',
-            'size': '6',
+            'name': 'circle',
+            'color': '#FFFFFF',
+            'size': '10',
             'outline_color': 'black',
             'outline_width': '0.5'
         })
@@ -600,7 +600,7 @@ class MarkerLayerManager(BaseLayerManager):
         symbol = QgsMarkerSymbol.createSimple({
             'name': 'filled_arrowhead',
             'color': '#FF0000',
-            'size': '7',
+            'size': '12',
             'outline_color': 'black',
             'outline_width': '0.5',
             'angle': '180'
@@ -611,8 +611,8 @@ class MarkerLayerManager(BaseLayerManager):
     def _style_casualties_layer(self, layer: QgsVectorLayer):
         symbol = QgsMarkerSymbol.createSimple({
             'name': 'cross2',
-            'color': '#DC143C',
-            'size': '8',
+            'color': '#FF0000',
+            'size': '12',
             'outline_color': 'black',
             'outline_width': '0.8'
         })

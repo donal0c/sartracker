@@ -1499,7 +1499,7 @@ class LayerCatalogService(QObject):
         Per-device tracking layers (SAR-nh9, SAR-nj0) are created dynamically
         and aren't defined in the schema. This method scans the project for
         layers with sartracker:item_type = device_position or device_trail
-        and adds them to the catalog under the Tracking group.
+        and adds them to the catalog under the Current Positions/Tracking groups.
 
         This fixes the regression where tracking layers stopped appearing
         in the Layer Console after the per-device migration.
@@ -1507,21 +1507,34 @@ class LayerCatalogService(QObject):
         if not self.project:
             return
 
-        # Ensure Tracking group exists in catalog
-        tracking_group_id = f"{GroupNames.ROOT}/{GroupNames.TRACKING}"
-        if tracking_group_id not in self._groups:
-            self._groups[tracking_group_id] = LayerGroupInfo(
-                id=tracking_group_id,
-                name=GroupNames.TRACKING,
+        root_info = self._groups.get(GroupNames.ROOT)
+
+        current_group_id = f"{GroupNames.ROOT}/{GroupNames.CURRENT_POSITIONS}"
+        if current_group_id not in self._groups:
+            self._groups[current_group_id] = LayerGroupInfo(
+                id=current_group_id,
+                name=GroupNames.CURRENT_POSITIONS,
                 order=0,
                 parent_id=GroupNames.ROOT,
                 visible=True,
                 expanded=True
             )
-            # Add to root's subgroups if not present
-            root_info = self._groups.get(GroupNames.ROOT)
-            if root_info and tracking_group_id not in root_info.subgroups:
-                root_info.subgroups.insert(0, tracking_group_id)
+        if root_info and current_group_id not in root_info.subgroups:
+            root_info.subgroups.insert(0, current_group_id)
+
+        tracking_group_id = f"{GroupNames.ROOT}/{GroupNames.TRACKING}"
+        if tracking_group_id not in self._groups:
+            self._groups[tracking_group_id] = LayerGroupInfo(
+                id=tracking_group_id,
+                name=GroupNames.TRACKING,
+                order=1,
+                parent_id=GroupNames.ROOT,
+                visible=True,
+                expanded=True
+            )
+        if root_info and tracking_group_id not in root_info.subgroups:
+            insert_pos = 1 if current_group_id in root_info.subgroups else 0
+            root_info.subgroups.insert(insert_pos, tracking_group_id)
 
         # Scan all layers for per-device tracking layers
         discovered_count = 0
@@ -1544,23 +1557,24 @@ class LayerCatalogService(QObject):
             if layer_id in self._layers:
                 continue
 
-            # Determine group path: Tracking/{DeviceName}
-            device_group_id = f"{tracking_group_id}/{device_name}"
+            # Determine group path: Current Positions or Tracking
+            parent_group_id = current_group_id if item_type == ItemType.DEVICE_POSITION else tracking_group_id
+            device_group_id = f"{parent_group_id}/{device_name}"
 
             # Ensure device group exists
             if device_group_id not in self._groups:
                 self._groups[device_group_id] = LayerGroupInfo(
                     id=device_group_id,
                     name=device_name,
-                    order=len([g for g in self._groups if g.startswith(tracking_group_id + "/")]),
-                    parent_id=tracking_group_id,
+                    order=len([g for g in self._groups if g.startswith(parent_group_id + "/")]),
+                    parent_id=parent_group_id,
                     visible=True,
                     expanded=True
                 )
-                # Add to Tracking group's subgroups
-                tracking_info = self._groups.get(tracking_group_id)
-                if tracking_info and device_group_id not in tracking_info.subgroups:
-                    tracking_info.subgroups.append(device_group_id)
+                # Add to parent group's subgroups
+                parent_info = self._groups.get(parent_group_id)
+                if parent_info and device_group_id not in parent_info.subgroups:
+                    parent_info.subgroups.append(device_group_id)
 
             # Determine layer display name and geometry type
             if item_type == ItemType.DEVICE_POSITION:
@@ -1579,16 +1593,19 @@ class LayerCatalogService(QObject):
             layer_info = LayerInfo(
                 id=layer_id,
                 canonical_name=layer.name(),
-                display_name=display_name,
                 group_id=device_group_id,
-                geometry_type=geometry_type,
-                feature_count=feature_count,
+                qgis_layer_id=layer.id(),
+                alias=None,
+                order=0,
                 visible=True,
-                editable=False,
-                favorite=False,
                 provider="ogr",
+                feature_count=feature_count,
                 last_updated=None,
-                fields=[f.name() for f in layer.fields()] if layer.isValid() else [],
+                favorite=False,
+                schema_fields=[f.name() for f in layer.fields()] if layer.isValid() else [],
+                layer_type=item_type,
+                geometry_type=geometry_type,
+                editable=False,
                 data_source_uri=layer.source() if layer.isValid() else ""
             )
 

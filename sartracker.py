@@ -4378,6 +4378,9 @@ class sartracker:
         """Handle auto-save request from SAR Panel."""
         if self._is_unloading or self._app_is_quitting:
             return
+        panel = self.sar_panel
+        if panel and self._is_qt_deleted(panel):
+            panel = None
         try:
             # Save the current QGIS project
             project = QgsProject.instance()
@@ -4409,7 +4412,8 @@ class sartracker:
                             duration=4
                         )
                     overall_success = persistence_ok and backup_ok
-                    self.sar_panel.update_autosave_status(overall_success)
+                    if panel:
+                        panel.update_autosave_status(overall_success)
                     if overall_success:
                         success(
                             self.iface.messageBar(),
@@ -4418,7 +4422,8 @@ class sartracker:
                             duration=2
                         )
                 else:
-                    self.sar_panel.update_autosave_status(False)
+                    if panel:
+                        panel.update_autosave_status(False)
                     error(
                         self.iface.messageBar(),
                         "SAR Tracker",
@@ -4456,7 +4461,8 @@ class sartracker:
                                 "Mission backup could not be completed.",
                                 duration=4
                             )
-                        self.sar_panel.update_autosave_status(overall_success)
+                        if panel:
+                            panel.update_autosave_status(overall_success)
                         if overall_success:
                             success(
                                 self.iface.messageBar(),
@@ -4465,14 +4471,15 @@ class sartracker:
                                 duration=3
                             )
                     else:
-                        self.sar_panel.update_autosave_status(False)
+                        if panel:
+                            panel.update_autosave_status(False)
                 else:
                     # User cancelled - don't mark as failed
                     pass
 
         except Exception as e:
-            if self.sar_panel:
-                self.sar_panel.update_autosave_status(False)
+            if panel:
+                panel.update_autosave_status(False)
             self._log_exception("_on_autosave_requested", e)
             QMessageBox.critical(
                 self.iface.mainWindow(),
