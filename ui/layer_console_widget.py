@@ -55,6 +55,60 @@ PER_DEVICE_POSITION_TYPES = {"device_position"}
 PER_DEVICE_TRAIL_TYPES = {"device_trail"}
 
 
+def layer_matches_type_filter(layer: Dict[str, Any], filter_value: Optional[str]) -> bool:
+    """Pure helper for type filtering (testable without Qt widgets)."""
+    if not filter_value:
+        return True
+
+    layer_id = layer.get("layer_id") or layer.get("id") or ""
+
+    if filter_value == "favorites":
+        return layer.get("is_favorite", False)
+    if filter_value == "markers":
+        return layer_id in MARKER_LAYER_IDS
+    if filter_value == "search_areas":
+        return layer_id in SEARCH_AREA_LAYER_IDS
+    if filter_value == "lines":
+        return layer_id in LINE_LAYER_IDS
+    if filter_value == "range_rings":
+        return layer_id in RANGE_RING_LAYER_IDS
+    if filter_value == "bearing_lines":
+        return layer_id in BEARING_LINE_LAYER_IDS
+    if filter_value == "text_labels":
+        return layer_id in TEXT_LABEL_LAYER_IDS
+    if filter_value == "positions":
+        # Support both legacy shared layer and per-device layers (SAR-nh9)
+        if layer_id in POSITION_LAYER_IDS:
+            return True
+        # Per-device position layers have IDs like "pos_{device_id}"
+        if layer_id.startswith("pos_"):
+            return True
+        # Per-device position layers from catalog use layer_type/item_type
+        layer_type = layer.get("layer_type") or layer.get("item_type")
+        if layer_type in PER_DEVICE_POSITION_TYPES:
+            return True
+        # Also check display_name for catalog-discovered layers
+        if layer.get("display_name") == "Position":
+            return True
+        return False
+    if filter_value == "breadcrumbs":
+        # Support both legacy shared layer and per-device layers (SAR-nj0)
+        if layer_id in TRACK_LAYER_IDS:
+            return True
+        # Per-device trail layers have IDs like "trail_{device_id}"
+        if layer_id.startswith("trail_"):
+            return True
+        # Per-device trail layers from catalog use layer_type/item_type
+        layer_type = layer.get("layer_type") or layer.get("item_type")
+        if layer_type in PER_DEVICE_TRAIL_TYPES:
+            return True
+        # Also check display_name for catalog-discovered layers
+        if layer.get("display_name") == "Trail":
+            return True
+        return False
+    return True
+
+
 class LayerConsoleWidget(QWidget):
     """
     CalTopo-style layer console (presentation layer).
@@ -2214,58 +2268,7 @@ class LayerConsoleWidget(QWidget):
     @staticmethod
     def _layer_matches_type_filter_static(layer: Dict[str, Any], filter_value: Optional[str]) -> bool:
         """Determine if a layer matches the selected type filter (pure helper)."""
-        if not filter_value:
-            return True
-        if not isinstance(layer, dict):
-            return False
-        layer_id = layer.get("layer_id")
-        if not layer_id:
-            return False
-        if filter_value == "favorites":
-            return layer.get("is_favorite", False)
-        if filter_value == "markers":
-            return layer_id in MARKER_LAYER_IDS
-        if filter_value == "search_areas":
-            return layer_id in SEARCH_AREA_LAYER_IDS
-        if filter_value == "lines":
-            return layer_id in LINE_LAYER_IDS
-        if filter_value == "range_rings":
-            return layer_id in RANGE_RING_LAYER_IDS
-        if filter_value == "bearing_lines":
-            return layer_id in BEARING_LINE_LAYER_IDS
-        if filter_value == "text_labels":
-            return layer_id in TEXT_LABEL_LAYER_IDS
-        if filter_value == "positions":
-            # Support both legacy shared layer and per-device layers (SAR-nh9)
-            if layer_id in POSITION_LAYER_IDS:
-                return True
-            # Per-device position layers have IDs like "pos_{device_id}"
-            if layer_id.startswith("pos_"):
-                return True
-            # Per-device position layers from catalog use layer_type/item_type
-            layer_type = layer.get("layer_type") or layer.get("item_type")
-            if layer_type in PER_DEVICE_POSITION_TYPES:
-                return True
-            # Also check display_name for catalog-discovered layers
-            if layer.get("display_name") == "Position":
-                return True
-            return False
-        if filter_value == "breadcrumbs":
-            # Support both legacy shared layer and per-device layers (SAR-nj0)
-            if layer_id in TRACK_LAYER_IDS:
-                return True
-            # Per-device trail layers have IDs like "trail_{device_id}"
-            if layer_id.startswith("trail_"):
-                return True
-            # Per-device trail layers from catalog use layer_type/item_type
-            layer_type = layer.get("layer_type") or layer.get("item_type")
-            if layer_type in PER_DEVICE_TRAIL_TYPES:
-                return True
-            # Also check display_name for catalog-discovered layers
-            if layer.get("display_name") == "Trail":
-                return True
-            return False
-        return True
+        return layer_matches_type_filter(layer, filter_value)
 
     @staticmethod
     def _shape_filtered_groups(groups: List[Dict[str, Any]], filter_value: Optional[str],

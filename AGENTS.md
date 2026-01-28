@@ -194,6 +194,11 @@ Before committing any changes:
    - Confirm error messages are clear
    - Ensure no data loss on errors
 
+### Test Execution Notes
+- Preferred runner (QGIS env configured): `./run_tests.sh`
+- For unit tests without QGIS/pytest-qgis autoload:
+  `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 SARTRACKER_FORCE_MOCK_QGIS=1 .venv/bin/python -m pytest <tests>`
+
 ## Common Tasks
 
 ### Adding a New Feature (TDD Required)
