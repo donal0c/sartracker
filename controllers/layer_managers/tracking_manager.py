@@ -178,6 +178,7 @@ class TrackingLayerManager(BaseLayerManager):
         # Per-device factory instance (created on first use when mission store exists)
         self._per_device_factory: Optional[PerItemLayerFactory] = None
         self._per_device_migration_checked = False
+        self._per_device_layout_normalized = False
 
         # Phase SAR-nj0: Per-device generation tracking for async safety
         # Each device has its own generation counter to detect stale async data
@@ -202,6 +203,7 @@ class TrackingLayerManager(BaseLayerManager):
         self._device_trail_layers.clear()
         self._per_device_factory = None
         self._per_device_migration_checked = False
+        self._per_device_layout_normalized = False
         # Phase SAR-nj0: Clear per-device generations
         self._device_generations.clear()
 
@@ -1251,15 +1253,78 @@ class TrackingLayerManager(BaseLayerManager):
                     "Per-device migration failed; tracking layers were not upgraded.",
                     title="Tracking Migration Failed"
                 )
+        if not self._per_device_layout_normalized:
+            self._normalize_per_device_tracking_layout()
+            self._per_device_layout_normalized = True
 
         return factory
 
+    def _normalize_per_device_tracking_layout(self) -> None:
+        """Ensure per-device tracking layers live under Tracking subgroups."""
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        if not root:
+            return
+
+        factory = self._get_per_device_factory()
+        self._ensure_tracking_subgroup(GroupNames.CURRENT_POSITIONS)
+        self._ensure_tracking_subgroup(GroupNames.TRACKING_TRAILS)
+
+        for layer in project.mapLayers().values():
+            if not isinstance(layer, QgsVectorLayer):
+                continue
+            item_type = layer.customProperty(SAR_ITEM_TYPE)
+            if item_type == ItemType.DEVICE_POSITION:
+                device_name = layer.customProperty(self.DEVICE_NAME_PROP) or layer.name()
+                self._ensure_tracking_layer_placement(layer, GroupNames.CURRENT_POSITIONS)
+                self._ensure_tracking_layer_name(layer, device_name, factory)
+            elif item_type == ItemType.DEVICE_TRAIL:
+                device_name = layer.customProperty(self.DEVICE_NAME_PROP) or layer.name()
+                self._ensure_tracking_layer_placement(layer, GroupNames.TRACKING_TRAILS)
+                self._ensure_tracking_layer_name(layer, device_name, factory)
+
+        tracking_root = self._get_tracking_group(GroupNames.TRACKING)
+        if not tracking_root:
+            return
+        sar_root = root.findGroup(GroupNames.ROOT)
+        if sar_root:
+            for child in list(sar_root.children()):
+                if not isinstance(child, QgsLayerTreeGroup):
+                    continue
+                if child.name() != GroupNames.CURRENT_POSITIONS:
+                    continue
+                # Move any remaining layers from legacy root group.
+                for node in list(child.children()):
+                    try:
+                        layer = node.layer()
+                    except Exception:
+                        layer = None
+                    if isinstance(layer, QgsVectorLayer):
+                        item_type = layer.customProperty(SAR_ITEM_TYPE)
+                        if item_type == ItemType.DEVICE_POSITION:
+                            self._ensure_tracking_layer_placement(layer, GroupNames.CURRENT_POSITIONS)
+                        elif item_type == ItemType.DEVICE_TRAIL:
+                            self._ensure_tracking_layer_placement(layer, GroupNames.TRACKING_TRAILS)
+                if not child.children():
+                    sar_root.removeChildNode(child)
+        for child in list(tracking_root.children()):
+            if not isinstance(child, QgsLayerTreeGroup):
+                continue
+            if child.name() in (GroupNames.CURRENT_POSITIONS, GroupNames.TRACKING_TRAILS):
+                continue
+            if not child.children():
+                tracking_root.removeChildNode(child)
+
     def _ensure_tracking_group(self, group_name: str) -> Optional[QgsLayerTreeGroup]:
         """
-        Ensure a tracking-related group exists under SAR Tracker.
+        Ensure a tracking group exists under SAR Tracker.
+
+        Structure:
+            SAR Tracker / Tracking
+            SAR Tracker / Tracking / {group_name}
 
         Args:
-            group_name: Group name under SAR Tracker
+            group_name: Tracking subgroup name under Tracking
 
         Returns:
             QgsLayerTreeGroup for group_name, or None on failure
@@ -1272,39 +1337,69 @@ class TrackingLayerManager(BaseLayerManager):
         if not sar_root:
             sar_root = root.insertGroup(0, GroupNames.ROOT)
 
-        # Find or create target group
-        tracking_group = sar_root.findGroup(group_name)
+        # Find or create Tracking root group
+        tracking_root = sar_root.findGroup(GroupNames.TRACKING)
+        if not tracking_root:
+            tracking_root = sar_root.insertGroup(0, GroupNames.TRACKING)
+
+        if group_name == GroupNames.TRACKING:
+            return tracking_root
+
+        # Find or create tracking subgroup
+        tracking_group = tracking_root.findGroup(group_name)
         if not tracking_group:
-            insert_pos = 0
-            if group_name == GroupNames.TRACKING:
-                insert_pos = 1
-            tracking_group = sar_root.insertGroup(insert_pos, group_name)
+            tracking_group = tracking_root.addGroup(group_name)
 
         return tracking_group
 
-    def _ensure_device_group(self, device_name: str, group_name: str) -> Optional[QgsLayerTreeGroup]:
+    def _ensure_tracking_subgroup(self, group_name: str) -> Optional[QgsLayerTreeGroup]:
         """
-        Ensure a device group exists under a tracking group.
-
-        Structure: SAR Tracker / {group_name} / {DeviceName}
+        Ensure a tracking subgroup exists under Tracking.
 
         Args:
-            device_name: Display name for the device
-            group_name: Parent tracking group name
+            group_name: Subgroup name under Tracking
 
         Returns:
-            QgsLayerTreeGroup for the device, or None on failure
+            QgsLayerTreeGroup for group_name, or None on failure
         """
-        tracking_group = self._ensure_tracking_group(group_name)
-        if not tracking_group:
-            return None
+        return self._ensure_tracking_group(group_name)
 
-        # Find or create device group
-        device_group = tracking_group.findGroup(device_name)
-        if not device_group:
-            device_group = tracking_group.addGroup(device_name)
+    def _ensure_tracking_layer_placement(self, layer: QgsVectorLayer, group_name: str) -> None:
+        """Move layer into the correct tracking subgroup if needed."""
+        if not layer or not layer.isValid():
+            return
+        target_group = self._ensure_tracking_subgroup(group_name)
+        if not target_group:
+            return
+        root = QgsProject.instance().layerTreeRoot()
+        if not root:
+            return
+        layer_node = root.findLayer(layer.id())
+        if layer_node:
+            current_parent = layer_node.parent()
+            if current_parent != target_group:
+                if current_parent:
+                    current_parent.removeChildNode(layer_node)
+                target_group.insertChildNode(0, layer_node)
+        else:
+            self.project.addMapLayer(layer, False)
+            target_group.insertLayer(0, layer)
 
-        return device_group
+    def _ensure_tracking_layer_name(self, layer: QgsVectorLayer, device_name: str, factory: PerItemLayerFactory) -> None:
+        """Ensure layer display name matches device name and registry."""
+        if not layer or not device_name or layer.name() == device_name:
+            return
+        item_id = layer.customProperty(SAR_ITEM_ID)
+        if item_id and factory:
+            try:
+                if factory.rename_item_layer(item_id, device_name):
+                    return
+            except Exception as exc:
+                logger.warning("Failed to rename tracking layer via registry: %s", exc)
+        try:
+            layer.setName(device_name)
+        except Exception as exc:
+            logger.warning("Failed to rename tracking layer: %s", exc)
 
     def _get_tracking_group(self, group_name: str) -> Optional[QgsLayerTreeGroup]:
         """Return the named tracking group if it exists (without creating)."""
@@ -1314,24 +1409,18 @@ class TrackingLayerManager(BaseLayerManager):
         sar_root = root.findGroup(GroupNames.ROOT)
         if not sar_root:
             return None
-        return sar_root.findGroup(group_name)
+        tracking_root = sar_root.findGroup(GroupNames.TRACKING)
+        if not tracking_root:
+            return None
+        if group_name == GroupNames.TRACKING:
+            return tracking_root
+        return tracking_root.findGroup(group_name)
 
     def _remove_device_group_if_empty(self, device_name: Optional[str], group_name: str) -> None:
-        """Remove empty device group under the named tracking group (if present)."""
-        if not device_name:
-            return
-        tracking_group = self._get_tracking_group(group_name)
-        if not tracking_group:
-            return
-        device_group = tracking_group.findGroup(device_name)
-        if not device_group:
-            return
-        try:
-            has_children = bool(device_group.children())
-        except Exception:
-            return
-        if not has_children:
-            tracking_group.removeChildNode(device_group)
+        """Deprecated: device groups are no longer used in tracking layout."""
+        _ = device_name
+        _ = group_name
+        return
 
     def _get_device_layers_by_property(self, device_id: str) -> Dict[str, Optional[QgsVectorLayer]]:
         """
@@ -1402,7 +1491,9 @@ class TrackingLayerManager(BaseLayerManager):
         Create or retrieve position layer for a device.
 
         Each device gets its own position layer under:
-            SAR Tracker / Tracking / {DeviceName} / Position
+            SAR Tracker / Tracking / Current Positions
+
+        Layer display name is the device name (no per-device subgroup).
 
         Args:
             device_id: Stable device identifier from Traccar
@@ -1411,10 +1502,16 @@ class TrackingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer for the device position, or None on failure
         """
+        # Get device name for display
+        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
+
         # Check cache first
         if device_id in self._device_position_layers:
             layer = self._device_position_layers[device_id]
             if layer and layer.isValid():
+                factory = self._get_per_device_factory()
+                self._ensure_tracking_layer_placement(layer, GroupNames.CURRENT_POSITIONS)
+                self._ensure_tracking_layer_name(layer, device_name, factory)
                 return layer
             # Stale cache entry
             del self._device_position_layers[device_id]
@@ -1422,38 +1519,38 @@ class TrackingLayerManager(BaseLayerManager):
         # Search by custom property (handles plugin reload)
         existing = self._get_device_layers_by_property(device_id)
         if existing['position'] and existing['position'].isValid():
+            factory = self._get_per_device_factory()
+            self._ensure_tracking_layer_placement(existing['position'], GroupNames.CURRENT_POSITIONS)
+            self._ensure_tracking_layer_name(existing['position'], device_name, factory)
             self._device_position_layers[device_id] = existing['position']
             return existing['position']
 
         # Create new layer via factory
         factory = self._get_per_device_factory()
 
-        # Get device name for display
-        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
-
-        # Ensure device group exists
-        device_group = self._ensure_device_group(device_name, GroupNames.CURRENT_POSITIONS)
-        if not device_group:
-            logger.warning("Failed to create device group for %s", device_name)
+        # Ensure Current Positions subgroup exists
+        positions_group = self._ensure_tracking_subgroup(GroupNames.CURRENT_POSITIONS)
+        if not positions_group:
+            logger.warning("Failed to create Current Positions group for %s", device_name)
             return None
 
         legacy_item_id, safe_item_id = self._candidate_device_item_ids("pos", device_id)
 
         try:
             # Try legacy item id first (existing missions), then safe hash id.
-            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, device_group)
+            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, positions_group)
             if not layer and safe_item_id != legacy_item_id:
-                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, device_group)
+                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, positions_group)
 
             if not layer:
                 # Create the layer via PerItemLayerFactory
                 item_info = factory.create_item_layer(
                     item_type=ItemType.DEVICE_POSITION,
-                    display_name="Position",
+                    display_name=device_name,
                     item_id=safe_item_id,
                     fields=DEVICE_POSITION_FIELDS,
                     add_to_project=True,
-                    target_group=device_group
+                    target_group=positions_group
                 )
                 layer = item_info.layer
 
@@ -1462,6 +1559,8 @@ class TrackingLayerManager(BaseLayerManager):
                 return None
 
             self._apply_device_layer_identity(layer, device_id, device_name, is_trail=False)
+            self._ensure_tracking_layer_placement(layer, GroupNames.CURRENT_POSITIONS)
+            self._ensure_tracking_layer_name(layer, device_name, factory)
 
             # Cache and return
             self._device_position_layers[device_id] = layer
@@ -1688,7 +1787,9 @@ class TrackingLayerManager(BaseLayerManager):
         Create or retrieve trail layer for a device.
 
         Each device gets its own trail layer under:
-            SAR Tracker / Tracking / {DeviceName} / Trail
+            SAR Tracker / Tracking / Trail
+
+        Layer display name is the device name (no per-device subgroup).
 
         Trail layers contain LineString segments for that device's breadcrumbs.
 
@@ -1699,10 +1800,16 @@ class TrackingLayerManager(BaseLayerManager):
         Returns:
             QgsVectorLayer for the device trail, or None on failure
         """
+        # Get device name for display
+        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
+
         # Check cache first
         if device_id in self._device_trail_layers:
             layer = self._device_trail_layers[device_id]
             if layer and layer.isValid():
+                factory = self._get_per_device_factory()
+                self._ensure_tracking_layer_placement(layer, GroupNames.TRACKING_TRAILS)
+                self._ensure_tracking_layer_name(layer, device_name, factory)
                 return layer
             # Stale cache entry
             del self._device_trail_layers[device_id]
@@ -1710,38 +1817,38 @@ class TrackingLayerManager(BaseLayerManager):
         # Search by custom property (handles plugin reload)
         existing = self._get_device_layers_by_property(device_id)
         if existing['trail'] and existing['trail'].isValid():
+            factory = self._get_per_device_factory()
+            self._ensure_tracking_layer_placement(existing['trail'], GroupNames.TRACKING_TRAILS)
+            self._ensure_tracking_layer_name(existing['trail'], device_name, factory)
             self._device_trail_layers[device_id] = existing['trail']
             return existing['trail']
 
         # Create new layer via factory
         factory = self._get_per_device_factory()
 
-        # Get device name for display
-        device_name = sample_position.get('name') or f"Device {device_id[:8]}"
-
-        # Ensure device group exists (trails group)
-        device_group = self._ensure_device_group(device_name, GroupNames.TRACKING)
-        if not device_group:
-            logger.warning("Failed to create device group for %s", device_name)
+        # Ensure Trail subgroup exists
+        trails_group = self._ensure_tracking_subgroup(GroupNames.TRACKING_TRAILS)
+        if not trails_group:
+            logger.warning("Failed to create Trail group for %s", device_name)
             return None
 
         legacy_item_id, safe_item_id = self._candidate_device_item_ids("trail", device_id)
 
         try:
             # Try legacy item id first (existing missions), then safe hash id.
-            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, device_group)
+            layer = self._get_or_rebuild_device_layer(factory, legacy_item_id, trails_group)
             if not layer and safe_item_id != legacy_item_id:
-                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, device_group)
+                layer = self._get_or_rebuild_device_layer(factory, safe_item_id, trails_group)
 
             if not layer:
                 # Create the layer via PerItemLayerFactory
                 item_info = factory.create_item_layer(
                     item_type=ItemType.DEVICE_TRAIL,
-                    display_name="Trail",
+                    display_name=device_name,
                     item_id=safe_item_id,
                     fields=DEVICE_TRAIL_FIELDS,
                     add_to_project=True,
-                    target_group=device_group
+                    target_group=trails_group
                 )
                 layer = item_info.layer
 
@@ -1750,6 +1857,8 @@ class TrackingLayerManager(BaseLayerManager):
                 return None
 
             self._apply_device_layer_identity(layer, device_id, device_name, is_trail=True)
+            self._ensure_tracking_layer_placement(layer, GroupNames.TRACKING_TRAILS)
+            self._ensure_tracking_layer_name(layer, device_name, factory)
 
             # Cache and return
             self._device_trail_layers[device_id] = layer

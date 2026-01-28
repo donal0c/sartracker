@@ -221,20 +221,19 @@ def test_discover_tracking_layers_groups_by_type(monkeypatch):
 
     svc._discover_tracking_layers()
 
-    current_group_id = f"{layer_catalog.GroupNames.ROOT}/{layer_catalog.GroupNames.CURRENT_POSITIONS}"
     tracking_group_id = f"{layer_catalog.GroupNames.ROOT}/{layer_catalog.GroupNames.TRACKING}"
-    device_pos_group_id = f"{current_group_id}/{device_name}"
-    device_trail_group_id = f"{tracking_group_id}/{device_name}"
+    positions_group_id = f"{tracking_group_id}/{layer_catalog.GroupNames.CURRENT_POSITIONS}"
+    trails_group_id = f"{tracking_group_id}/{layer_catalog.GroupNames.TRACKING_TRAILS}"
 
     root_info = svc._groups[layer_catalog.GroupNames.ROOT]
-    assert current_group_id in svc._groups
     assert tracking_group_id in svc._groups
-    assert current_group_id in root_info.subgroups
     assert tracking_group_id in root_info.subgroups
-    assert device_pos_group_id in svc._groups
-    assert device_trail_group_id in svc._groups
-    assert svc._layers["pos-item"].group_id == device_pos_group_id
-    assert svc._layers["trail-item"].group_id == device_trail_group_id
+    assert positions_group_id in svc._groups
+    assert trails_group_id in svc._groups
+    assert positions_group_id in svc._groups[tracking_group_id].subgroups
+    assert trails_group_id in svc._groups[tracking_group_id].subgroups
+    assert svc._layers["pos-item"].group_id == positions_group_id
+    assert svc._layers["trail-item"].group_id == trails_group_id
 
 
 class StubTaskManager:

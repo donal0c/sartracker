@@ -51,6 +51,8 @@ BEARING_LINE_LAYER_IDS = {"sar_bearing_lines"}
 TEXT_LABEL_LAYER_IDS = {"sar_text_labels"}
 POSITION_LAYER_IDS = {"sar_current_positions_active"}
 TRACK_LAYER_IDS = {"sar_breadcrumbs"}
+PER_DEVICE_POSITION_TYPES = {"device_position"}
+PER_DEVICE_TRAIL_TYPES = {"device_trail"}
 
 
 class LayerConsoleWidget(QWidget):
@@ -2240,6 +2242,10 @@ class LayerConsoleWidget(QWidget):
             # Per-device position layers have IDs like "pos_{device_id}"
             if layer_id.startswith("pos_"):
                 return True
+            # Per-device position layers from catalog use layer_type/item_type
+            layer_type = layer.get("layer_type") or layer.get("item_type")
+            if layer_type in PER_DEVICE_POSITION_TYPES:
+                return True
             # Also check display_name for catalog-discovered layers
             if layer.get("display_name") == "Position":
                 return True
@@ -2250,6 +2256,10 @@ class LayerConsoleWidget(QWidget):
                 return True
             # Per-device trail layers have IDs like "trail_{device_id}"
             if layer_id.startswith("trail_"):
+                return True
+            # Per-device trail layers from catalog use layer_type/item_type
+            layer_type = layer.get("layer_type") or layer.get("item_type")
+            if layer_type in PER_DEVICE_TRAIL_TYPES:
                 return True
             # Also check display_name for catalog-discovered layers
             if layer.get("display_name") == "Trail":

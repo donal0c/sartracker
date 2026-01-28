@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Schema version - increment when structure changes
 # Version 4: Per-device tracking + per-item map tools layers
-#   - Each device gets its own Position and Trail layers under Tracking/{DeviceName}/
+#   - Each device gets its own Position and Trail layers under Tracking/{Type}/
 #   - Each map tool item is stored in its own layer under Map Tools/{Type}/
 #   - Migration from shared Current Positions/Breadcrumbs layers
 SAR_LAYER_SCHEMA_VERSION = 4
@@ -399,7 +399,8 @@ class GroupNames:
     # Tracking groups
     CURRENT_POSITIONS = "Current Positions"
     BREADCRUMBS = "Breadcrumbs"
-    TRACKING = "Tracking"  # For future per-device tracking layers
+    TRACKING = "Tracking"
+    TRACKING_TRAILS = "Trail"
     # Helicopters
     HELICOPTERS = "Helicopters"
     # Mission Overlays (legacy - retained for compatibility)
@@ -825,25 +826,30 @@ def get_expected_structure() -> GroupDefinition:
         parent_path=None,
         metadata={"schema_version": str(SAR_LAYER_SCHEMA_VERSION)},
         subgroups=[
-            # Current Positions group (per-device layers created dynamically)
-            GroupDefinition(
-                name=GroupNames.CURRENT_POSITIONS,
-                parent_path=[GroupNames.ROOT],
-                position=0
-            ),
-
-            # Tracking group (per-device trails created dynamically)
+            # Tracking group (per-device layers created dynamically)
             GroupDefinition(
                 name=GroupNames.TRACKING,
                 parent_path=[GroupNames.ROOT],
-                position=1
+                position=0,
+                subgroups=[
+                    GroupDefinition(
+                        name=GroupNames.CURRENT_POSITIONS,
+                        parent_path=[GroupNames.ROOT, GroupNames.TRACKING],
+                        position=0
+                    ),
+                    GroupDefinition(
+                        name=GroupNames.TRACKING_TRAILS,
+                        parent_path=[GroupNames.ROOT, GroupNames.TRACKING],
+                        position=1
+                    ),
+                ]
             ),
 
             # Helicopters group
             GroupDefinition(
                 name=GroupNames.HELICOPTERS,
                 parent_path=[GroupNames.ROOT],
-                position=2,
+                position=1,
                 layers=[
                     LayerDefinition(
                         layer_id=LayerIds.HELICOPTER_1,
@@ -1047,20 +1053,20 @@ def get_per_device_group_path(device_name: str) -> List[str]:
     """
     Get the group path for a device's tracking layers.
 
-    Phase SAR-nh9: Per-device tracking layers are organized as:
-        SAR Tracker / Tracking / {DeviceName} / [Position, Trail]
+    Phase SAR-3xk: Per-device tracking layers are organized by type:
+        SAR Tracker / Tracking / Current Positions
+        SAR Tracker / Tracking / Trail
 
-    This device-centric grouping matches coordinator mental model
-    ("show me Alpha Team") and enables one-click device visibility toggle.
+    Device names are used as layer names (not group names).
 
     Args:
         device_name: Display name of the device (e.g., "Alpha Team")
 
     Returns:
         List of group names forming the path
-        e.g., ["SAR Tracker", "Tracking", "Alpha Team"]
     """
-    return [GroupNames.ROOT, GroupNames.TRACKING, device_name]
+    _ = device_name
+    return [GroupNames.ROOT, GroupNames.TRACKING]
 
 
 # Mapping of canonical layer names to LayerIds for metadata tagging

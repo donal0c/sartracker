@@ -3,8 +3,8 @@
 Test: Per-Device Tracking Layers (SAR-33p / SAR-nh9 Phase 1)
 
 Validates the per-device current position layer implementation:
-- Device groups created under Tracking/
-- Each device gets its own Position layer
+- Tracking contains "Current Positions" and "Trail" subgroups
+- Each device gets its own layer under the correct subgroup
 - Position updates replace feature (not accumulate)
 - Device colors are consistent
 - Feature flag routing works
@@ -90,12 +90,24 @@ def find_tracking_group() -> Optional[QgsLayerTreeGroup]:
     return sar_root.findGroup("Tracking")
 
 
-def find_device_group(device_name: str) -> Optional[QgsLayerTreeGroup]:
-    """Find a device group under Tracking."""
+def find_tracking_subgroup(group_name: str) -> Optional[QgsLayerTreeGroup]:
+    """Find a subgroup under Tracking."""
     tracking = find_tracking_group()
     if not tracking:
         return None
-    return tracking.findGroup(device_name)
+    return tracking.findGroup(group_name)
+
+
+def get_layer_parent_group_name(layer: QgsVectorLayer) -> Optional[str]:
+    """Return the parent group name for a layer."""
+    if not layer:
+        return None
+    root = QgsProject.instance().layerTreeRoot()
+    node = root.findLayer(layer.id())
+    if not node:
+        return None
+    parent = node.parent()
+    return parent.name() if parent else None
 
 
 def find_device_position_layer(device_id: str) -> Optional[QgsVectorLayer]:
@@ -168,12 +180,12 @@ def test_single_device():
         return False
     print("  [PASS] Tracking group exists")
 
-    # Verify device group exists
-    device_group = find_device_group(device_name)
-    if not device_group:
-        print(f"  [FAIL] Device group '{device_name}' not created")
+    # Verify Current Positions subgroup exists
+    positions_group = find_tracking_subgroup("Current Positions")
+    if not positions_group:
+        print("  [FAIL] Current Positions subgroup not created")
         return False
-    print(f"  [PASS] Device group '{device_name}' exists")
+    print("  [PASS] Current Positions subgroup exists")
 
     # Verify position layer exists
     layer = find_device_position_layer(device_id)
@@ -181,6 +193,19 @@ def test_single_device():
         print(f"  [FAIL] Position layer not found for device {device_id}")
         return False
     print(f"  [PASS] Position layer found: {layer.name()}")
+
+    # Verify layer name matches device name
+    if layer.name() != device_name:
+        print(f"  [FAIL] Position layer name mismatch: {layer.name()} != {device_name}")
+        return False
+    print("  [PASS] Position layer name matches device name")
+
+    # Verify layer is under Current Positions
+    parent_group = get_layer_parent_group_name(layer)
+    if parent_group != "Current Positions":
+        print(f"  [FAIL] Position layer group mismatch: {parent_group}")
+        return False
+    print("  [PASS] Position layer is under Current Positions")
 
     # Verify single feature
     fc = count_features(layer)
@@ -420,6 +445,19 @@ def test_single_device_trail():
         print(f"  [FAIL] Trail layer not found for device {device_id}")
         return False
     print(f"  [PASS] Trail layer found: {trail_layer.name()}")
+
+    # Verify layer name matches device name
+    if trail_layer.name() != device_name:
+        print(f"  [FAIL] Trail layer name mismatch: {trail_layer.name()} != {device_name}")
+        return False
+    print("  [PASS] Trail layer name matches device name")
+
+    # Verify layer is under Trail
+    parent_group = get_layer_parent_group_name(trail_layer)
+    if parent_group != "Trail":
+        print(f"  [FAIL] Trail layer group mismatch: {parent_group}")
+        return False
+    print("  [PASS] Trail layer is under Trail")
 
     # Verify features (should have at least 1 segment)
     fc = count_features(trail_layer)
@@ -721,11 +759,8 @@ def cleanup_test_layers():
         tracking = sar_root.findGroup("Tracking")
         if tracking:
             for child in list(tracking.children()):
-                if isinstance(child, QgsLayerTreeGroup):
-                    # Match test group names from both position and trail tests
-                    if (child.name().startswith("Test ") or
-                        child.name().startswith("Perf ") or
-                        child.name().startswith("Test Trail")):
+                if isinstance(child, QgsLayerTreeGroup) and child.name() in ("Current Positions", "Trail"):
+                    if not child.children():
                         tracking.removeChildNode(child)
                         print(f"  Removed group: {child.name()}")
 

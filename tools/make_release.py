@@ -100,6 +100,9 @@ Git SHA: {git_sha}
     print(f"✓ Created VERSION.txt (Git SHA: {git_sha})")
 
 
+# The plugin folder name MUST be 'sartracker' for QGIS to load it correctly
+PLUGIN_NAME = "sartracker"
+
 EXCLUDED_DIRS = {
     ".git",
     ".github",
@@ -172,8 +175,7 @@ def create_release_zip(plugin_dir, version, output_dir=None):
     zip_path = output_dir / zip_filename
 
     print(f"📦 Creating release ZIP: {zip_filename}")
-
-    parent_dir = plugin_dir.parent
+    print(f"   Internal folder name: {PLUGIN_NAME}/")
 
     with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         files_added = 0
@@ -181,7 +183,6 @@ def create_release_zip(plugin_dir, version, output_dir=None):
 
         for root, dirs, files in os.walk(plugin_dir):
             root_path = Path(root)
-            rel_root = root_path.relative_to(parent_dir)
 
             # Filter directories in-place
             dirs[:] = [
@@ -200,8 +201,11 @@ def create_release_zip(plugin_dir, version, output_dir=None):
                 if any(part in EXCLUDED_DIRS for part in rel_parts[:-1]):
                     continue
 
-                rel_path = file_path.relative_to(parent_dir)
-                zipf.write(str(file_path), str(rel_path))
+                # Always use 'sartracker/' as the archive folder name, regardless of
+                # what the source directory is called (fixes sartracker-master issue)
+                rel_path_from_plugin = file_path.relative_to(plugin_dir)
+                archive_path = Path(PLUGIN_NAME) / rel_path_from_plugin
+                zipf.write(str(file_path), str(archive_path))
                 files_added += 1
                 total_size += file_path.stat().st_size
 

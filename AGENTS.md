@@ -37,6 +37,21 @@ This project maintains multiple documentation files for different audiences:
 - **docs/architecture.md**: System architecture and hardening features
 - **README.md**: User documentation and setup instructions
 
+## Issue Tracking (beads / bd)
+
+This project uses **bd** (beads) for issue tracking and planning. Prefer filing work as beads and keeping them updated during a session.
+
+Quick commands:
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --status in_progress  # Claim work
+bd close <id>         # Complete work
+bd sync               # Sync issues with git
+```
+
+Tip: Run `bd onboard` for the latest workflow snippet. Keep bead notes up to date at major milestones.
+
 ## Quick Architecture Reference
 
 ```
