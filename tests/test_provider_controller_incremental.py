@@ -266,6 +266,51 @@ class TestBreadcrumbAccumulatorIntegration:
         # Should have accumulated breadcrumbs (pre-existing + new)
         assert len(all_breadcrumbs) == 3
 
+    def test_incremental_refresh_ignores_refresh_level_segments(self):
+        """
+        Incremental refresh should not pass refresh-level processed segments to layers.
+
+        This prevents per-device trail layers from being replaced by a tiny delta.
+        """
+        controller, mock_provider, _ = _build_controller()
+
+        # Mock layers controller
+        mock_layers = MagicMock()
+        controller._layers_controller = mock_layers
+
+        # Seed accumulator so incremental mode is used
+        controller._breadcrumb_accumulator = BreadcrumbAccumulator(max_positions=1000)
+        controller._breadcrumb_accumulator.add([
+            {'device_id': 'dev1', 'name': 'Device 1', 'lat': 52.0, 'lon': -9.5, 'ts': '2024-01-01T08:00:00Z'},
+        ])
+
+        # Start refresh to mark incremental usage
+        controller.start_refresh()
+
+        # Mock task with new breadcrumbs and refresh-level processing
+        mock_task = MagicMock()
+        mock_task.isCanceled.return_value = False
+        mock_task.results = {
+            'current': [{'device_id': 'dev1', 'name': 'Device 1', 'lat': 52.02, 'lon': -9.52, 'ts': '2024-01-01T10:00:00Z'}],
+            'breadcrumbs': [
+                {'device_id': 'dev1', 'name': 'Device 1', 'lat': 52.015, 'lon': -9.515, 'ts': '2024-01-01T09:00:00Z'},
+                {'device_id': 'dev1', 'name': 'Device 1', 'lat': 52.016, 'lon': -9.516, 'ts': '2024-01-01T09:05:00Z'},
+            ],
+            'devices': [{'device_id': 'dev1', 'name': 'Device 1', 'status': 'online'}],
+            'breadcrumb_processing': {
+                'segments': [{'device_id': 'dev1', 'points': [1, 2]}],
+                'stats': {},
+                'time_gap_minutes': 5.0
+            }
+        }
+
+        controller._on_refresh_task_complete(mock_task)
+
+        # Should not pass refresh-level segments when incremental mode is active
+        mock_layers.update_breadcrumbs.assert_called_once()
+        call_kwargs = mock_layers.update_breadcrumbs.call_args[1]
+        assert call_kwargs.get('processed_segments') is None
+
     def test_diagnostics_show_accumulator_stats(self):
         """Diagnostics endpoint should return accumulator statistics."""
         controller, _, _ = _build_controller()

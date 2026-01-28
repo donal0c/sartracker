@@ -156,6 +156,7 @@ class ProviderController(QObject):
         self._refresh_in_progress = False
         self._current_refresh_task = None
         self._refresh_started_at: Optional[datetime] = None
+        self._current_refresh_incremental = False
 
         # SAR-la0: Track network failures for recovery notification
         self._consecutive_refresh_failures = 0
@@ -762,6 +763,7 @@ class ProviderController(QObject):
                 except Exception:
                     pass
                 self._breadcrumb_accumulator = None
+            self._current_refresh_incremental = False
 
             print("[PROVIDER_CONTROLLER] Cleanup complete")
 
@@ -1038,6 +1040,7 @@ class ProviderController(QObject):
                 device_timestamps = self._breadcrumb_accumulator.get_latest_timestamps()
                 if device_timestamps:
                     print(f'[PROVIDER_CONTROLLER] Incremental fetch for {len(device_timestamps)} devices')
+            self._current_refresh_incremental = bool(device_timestamps)
 
             # Create provider-specific background task
             task = self.provider.create_refresh_task(
@@ -1116,6 +1119,8 @@ class ProviderController(QObject):
             # Reset refresh state
             self._refresh_in_progress = False
             self._current_refresh_task = None
+            used_incremental = bool(self._current_refresh_incremental)
+            self._current_refresh_incremental = False
 
             # SAR-la0: Detect network recovery after failures
             was_in_outage = self._consecutive_refresh_failures > 0
@@ -1303,11 +1308,12 @@ class ProviderController(QObject):
 
                 try:
                     if all_breadcrumbs:
+                        processed_segments = None if used_incremental else breadcrumb_processing
                         # Phase 3: Send ALL accumulated breadcrumbs to layers
                         # (not just new ones - accumulator holds full session history)
                         self._layers_controller.update_breadcrumbs(
                             all_breadcrumbs,
-                            processed_segments=breadcrumb_processing
+                            processed_segments=processed_segments
                         )
                     elif breadcrumbs:
                         # Had breadcrumbs but all were filtered (all inactive devices)
@@ -1465,6 +1471,7 @@ class ProviderController(QObject):
             self._current_refresh_task = None
             self._refresh_started_at = None
             self._last_refresh_duration_ms = None
+            self._current_refresh_incremental = False
 
             # SAR-la0: Track consecutive failures for recovery notification
             self._consecutive_refresh_failures += 1
