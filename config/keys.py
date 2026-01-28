@@ -76,6 +76,9 @@ class SETTINGS_KEYS:
     PROVIDER_TRACCAR_TIMEOUT = "SARTracker/Providers/traccar_http/timeout_s"
     PROVIDER_TRACCAR_CACHE_TTL = "SARTracker/Providers/traccar_http/cache_ttl"
     PROVIDER_TRACCAR_CACHE_ENABLED = "SARTracker/Providers/traccar_http/enable_last_good_cache"
+    PROVIDER_TRACCAR_TEST_WINDOW_ENABLED = "SARTracker/Providers/traccar_http/test_window_enabled"
+    PROVIDER_TRACCAR_TEST_WINDOW_START = "SARTracker/Providers/traccar_http/test_window_start"
+    PROVIDER_TRACCAR_TEST_WINDOW_HOURS = "SARTracker/Providers/traccar_http/test_window_hours"
 
     # Defaults
     PROVIDER_AUTO_CONNECT_DEFAULT = False
@@ -83,6 +86,9 @@ class SETTINGS_KEYS:
     PROVIDER_TRACCAR_TIMEOUT_DEFAULT = 10  # seconds
     PROVIDER_TRACCAR_CACHE_TTL_DEFAULT = 300  # seconds
     PROVIDER_TRACCAR_CACHE_ENABLED_DEFAULT = True
+    PROVIDER_TRACCAR_TEST_WINDOW_ENABLED_DEFAULT = False
+    PROVIDER_TRACCAR_TEST_WINDOW_START_DEFAULT = ""
+    PROVIDER_TRACCAR_TEST_WINDOW_HOURS_DEFAULT = 3
 
     # ========================================================================
     # MISSION STATE (transient - not configuration)
@@ -393,6 +399,49 @@ class ConfigStore:
             SETTINGS_KEYS.PROVIDER_AUTO_CONNECT_DEFAULT,
             bool
         )
+
+    @staticmethod
+    def get_traccar_test_window_enabled() -> bool:
+        """Get replay/test window enabled setting."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_ENABLED,
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_ENABLED_DEFAULT,
+            bool
+        )
+
+    @staticmethod
+    def set_traccar_test_window_enabled(enabled: bool):
+        """Set replay/test window enabled setting."""
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_ENABLED, bool(enabled))
+
+    @staticmethod
+    def get_traccar_test_window_start() -> str:
+        """Get replay/test window start timestamp (ISO8601 string)."""
+        value = ConfigStore.get(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_START,
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_START_DEFAULT,
+            str
+        )
+        return value or ""
+
+    @staticmethod
+    def set_traccar_test_window_start(start_iso: str):
+        """Set replay/test window start timestamp (ISO8601 string)."""
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_START, start_iso or "")
+
+    @staticmethod
+    def get_traccar_test_window_hours() -> int:
+        """Get replay/test window duration (hours)."""
+        return ConfigStore.get(
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_HOURS,
+            SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_HOURS_DEFAULT,
+            int
+        )
+
+    @staticmethod
+    def set_traccar_test_window_hours(hours: int):
+        """Set replay/test window duration (hours)."""
+        ConfigStore.set(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_HOURS, int(hours))
 
     @staticmethod
     def get_debug_logging_enabled() -> bool:

@@ -8,7 +8,7 @@ Main docked control panel for SAR tracking operations.
 from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem,
-    QGroupBox, QFileDialog, QLineEdit,
+    QGroupBox, QFileDialog, QLineEdit, QSpinBox,
     QScrollArea, QComboBox, QStackedWidget,
     QToolButton, QMessageBox, QStyle
 )
@@ -27,7 +27,7 @@ except ImportError:
 # Create sip namespace for compatibility
 class sip:
     isdeleted = staticmethod(sip_isdeleted)
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict, Any, Callable, Tuple
 import json
 import os
@@ -371,6 +371,17 @@ class SARPanel(QDockWidget):
         
         # Mission controls
         controls_layout = QHBoxLayout()
+
+        start_offset_label = QLabel("Start offset:")
+        start_offset_label.setToolTip("Back-date mission start (hours back, max 5)")
+        controls_layout.addWidget(start_offset_label)
+
+        self.mission_start_offset_spin = QSpinBox()
+        self.mission_start_offset_spin.setRange(0, 5)
+        self.mission_start_offset_spin.setSuffix("h")
+        self.mission_start_offset_spin.setToolTip("Back-date mission start (hours back, max 5)")
+        self.mission_start_offset_spin.setObjectName("mission_start_offset_spin")
+        controls_layout.addWidget(self.mission_start_offset_spin)
         
         self.start_button = QToolButton()
         self.start_button.setText("Start Mission")
@@ -674,8 +685,20 @@ class SARPanel(QDockWidget):
             mission_name = f"Mission {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             self.mission_name_input.setText(mission_name)
 
+        hours_back = 0
         try:
-            self._mission_controller.start_mission(mission_name)
+            if hasattr(self, "mission_start_offset_spin") and self.mission_start_offset_spin:
+                hours_back = int(self.mission_start_offset_spin.value())
+        except Exception as exc:
+            print(f"[SARPanel] Warning: Invalid start offset value: {exc}")
+            hours_back = 0
+
+        start_ts = None
+        if hours_back > 0:
+            start_ts = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+
+        try:
+            self._mission_controller.start_mission(mission_name, start_ts=start_ts)
         except ValueError as exc:
             print(f"[SARPanel] Mission start validation failed: {exc}")
             QMessageBox.warning(self, "Mission Control", str(exc))
@@ -791,6 +814,8 @@ class SARPanel(QDockWidget):
         """Sync button enablement and styles to mission state."""
         if self._mission_state == MissionState.ACTIVE:
             self.start_button.setEnabled(False)
+            if hasattr(self, "mission_start_offset_spin"):
+                self.mission_start_offset_spin.setEnabled(False)
             self.pause_button.setEnabled(True)
             self.finish_button.setEnabled(True)
             self.pause_button.setText("Pause")
@@ -803,6 +828,8 @@ class SARPanel(QDockWidget):
             self._set_button_state(self.finish_button, "state", "ready")
         elif self._mission_state == MissionState.PAUSED:
             self.start_button.setEnabled(False)
+            if hasattr(self, "mission_start_offset_spin"):
+                self.mission_start_offset_spin.setEnabled(False)
             self.pause_button.setEnabled(True)
             self.finish_button.setEnabled(True)
             self.pause_button.setText("Resume")
@@ -814,6 +841,8 @@ class SARPanel(QDockWidget):
             self._set_button_state(self.finish_button, "state", "ready")
         else:
             self.start_button.setEnabled(True)
+            if hasattr(self, "mission_start_offset_spin"):
+                self.mission_start_offset_spin.setEnabled(True)
             self.pause_button.setEnabled(False)
             self.finish_button.setEnabled(False)
             self.pause_button.setText("Pause")

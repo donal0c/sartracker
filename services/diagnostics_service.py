@@ -309,6 +309,16 @@ class DiagnosticsService:
                 except Exception as e:
                     print(f"[SARTRACKER] Warning: Error reading provider cache stats: {e}")
 
+            # Replay/test window settings (Traccar HTTP)
+            if provider_name == 'traccar_http':
+                try:
+                    from ..config.keys import ConfigStore
+                    status['replay_window_enabled'] = ConfigStore.get_traccar_test_window_enabled()
+                    status['replay_window_start'] = ConfigStore.get_traccar_test_window_start()
+                    status['replay_window_hours'] = ConfigStore.get_traccar_test_window_hours()
+                except Exception as e:
+                    print(f"[SARTRACKER] Warning: Error reading replay settings: {e}")
+
         except Exception as e:
             print(f"[SARTRACKER] Warning: Error reading provider status: {e}")
 

@@ -454,6 +454,22 @@ class TestTraccarRefreshTaskDeviceTimestamps:
         assert hasattr(task, '_device_timestamps')
         assert task._device_timestamps == timestamps
 
+    def test_task_accepts_until_iso_parameter(self):
+        """TraccarRefreshTask should accept until_iso in __init__."""
+        from sartracker.providers.tasks import TraccarRefreshTask
+
+        mock_provider = MagicMock()
+        until_iso = '2024-01-01T12:00:00Z'
+
+        task = TraccarRefreshTask(
+            provider=mock_provider,
+            description="Test",
+            until_iso=until_iso
+        )
+
+        assert hasattr(task, 'until_iso')
+        assert task.until_iso == until_iso
+
     def test_task_passes_timestamps_to_provider(self):
         """TraccarRefreshTask should pass device_timestamps to get_breadcrumbs."""
         from sartracker.providers.tasks import TraccarRefreshTask

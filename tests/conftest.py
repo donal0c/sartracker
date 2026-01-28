@@ -79,10 +79,31 @@ class MockQTimer:
     def isActive(self):
         return self._active
 
+class MockQgsTask:
+    """Mock QgsTask for unit tests that instantiate provider tasks."""
+    CanCancel = 0
+
+    def __init__(self, description="", flags=None):
+        self._description = description
+        self._flags = flags
+        self._progress = 0.0
+        self._canceled = False
+
+    def isCanceled(self):
+        return self._canceled
+
+    def setProgress(self, value):
+        try:
+            self._progress = float(value)
+        except Exception:
+            self._progress = 0.0
+
 class MockQSettings:
     """Mock QSettings for testing."""
+    _data = {}
+
     def __init__(self):
-        self._data = {}
+        pass
 
     def value(self, key, default=None, type=None):
         val = self._data.get(key, default)
@@ -132,6 +153,7 @@ if not _qgis_available:
     qgis_pyqt_mock.QtCore = qgis_pyqt_qtcore_mock
     qgis_mock.PyQt = qgis_pyqt_mock
     qgis_mock.core = qgis_core_mock
+    qgis_core_mock.QgsTask = MockQgsTask
 
     sys.modules['qgis'] = qgis_mock
     sys.modules['qgis.core'] = qgis_core_mock
@@ -241,6 +263,13 @@ def pytest_collection_modifyitems(config, items):
 # ====================================================================
 # Common Test Fixtures
 # ====================================================================
+
+if not _qgis_available:
+    @pytest.fixture(autouse=True)
+    def _reset_mock_qsettings():
+        """Clear mock QSettings between tests to avoid cross-test leakage."""
+        MockQSettings._data.clear()
+        yield
 
 @pytest.fixture(scope="session")
 def qgis_app():

@@ -14,9 +14,9 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QGroupBox, QSpinBox, QCheckBox,
     QFileDialog, QLineEdit, QScrollArea, QComboBox, QStackedWidget,
-    QMessageBox, QPlainTextEdit
+    QMessageBox, QPlainTextEdit, QDateTimeEdit
 )
-from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings
+from qgis.PyQt.QtCore import QTimer, pyqtSignal, QSettings, QDateTime, Qt
 from qgis.PyQt.QtGui import QFont
 from typing import Optional, List, Dict, Any
 import os
@@ -432,6 +432,37 @@ class SettingsPanel(QDockWidget):
         http_advanced_group.setLayout(http_advanced_layout)
         http_config_layout.addWidget(http_advanced_group)
 
+        # Replay / Testing Window (Advanced)
+        replay_group = QGroupBox("Replay / Testing Window")
+        replay_layout = QGridLayout()
+
+        self.replay_enable_check = QCheckBox("Enable replay/testing window")
+        self.replay_enable_check.setToolTip("Use a fixed historical time window for testing (no live ops)")
+        self.replay_enable_check.setObjectName("replay_enable_check")
+        self.replay_enable_check.stateChanged.connect(self._on_replay_settings_changed)
+        replay_layout.addWidget(self.replay_enable_check, 0, 0, 1, 2)
+
+        replay_layout.addWidget(QLabel("Start time (local):"), 1, 0)
+        self.replay_start_edit = QDateTimeEdit(QDateTime.currentDateTime())
+        self.replay_start_edit.setCalendarPopup(True)
+        self.replay_start_edit.setToolTip("Local start time for replay window")
+        self.replay_start_edit.setObjectName("replay_start_edit")
+        self.replay_start_edit.dateTimeChanged.connect(self._on_replay_settings_changed)
+        replay_layout.addWidget(self.replay_start_edit, 1, 1)
+
+        replay_layout.addWidget(QLabel("Duration (hours):"), 2, 0)
+        self.replay_window_hours_spin = QSpinBox()
+        self.replay_window_hours_spin.setMinimum(1)
+        self.replay_window_hours_spin.setMaximum(24)
+        self.replay_window_hours_spin.setValue(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_HOURS_DEFAULT)
+        self.replay_window_hours_spin.setToolTip("Replay window length in hours (max 24)")
+        self.replay_window_hours_spin.setObjectName("replay_window_hours_spin")
+        self.replay_window_hours_spin.valueChanged.connect(self._on_replay_settings_changed)
+        replay_layout.addWidget(self.replay_window_hours_spin, 2, 1)
+
+        replay_group.setLayout(replay_layout)
+        http_config_layout.addWidget(replay_group)
+
         http_config_layout.addStretch()
         http_config_page.setLayout(http_config_layout)
 
@@ -470,6 +501,17 @@ class SettingsPanel(QDockWidget):
 
             # Load last provider configuration
             self._load_provider_config()
+
+            # Replay/test window settings (Traccar HTTP)
+            replay_enabled = ConfigStore.get_traccar_test_window_enabled()
+            self.replay_enable_check.setChecked(replay_enabled)
+            self.replay_window_hours_spin.setValue(ConfigStore.get_traccar_test_window_hours())
+            start_iso = ConfigStore.get_traccar_test_window_start()
+            if start_iso:
+                start_dt = QDateTime.fromString(start_iso, Qt.ISODate)
+                if start_dt.isValid():
+                    self.replay_start_edit.setDateTime(start_dt.toLocalTime())
+            self._on_replay_settings_changed()
 
             print("[SETTINGS_PANEL] Settings loaded from QSettings")
 
@@ -751,6 +793,15 @@ class SettingsPanel(QDockWidget):
         """Handle admin roster edits."""
         self.apply_button.setEnabled(True)
 
+    def _on_replay_settings_changed(self, *args):
+        """Handle replay/test window setting changes."""
+        enabled = self.replay_enable_check.isChecked() if hasattr(self, "replay_enable_check") else False
+        if hasattr(self, "replay_start_edit"):
+            self.replay_start_edit.setEnabled(enabled)
+        if hasattr(self, "replay_window_hours_spin"):
+            self.replay_window_hours_spin.setEnabled(enabled)
+        self.apply_button.setEnabled(True)
+
     def _on_repair_layers_clicked(self):
         """Emit signal to request layer structure repair."""
         self.repair_layers_requested.emit()
@@ -912,6 +963,12 @@ class SettingsPanel(QDockWidget):
             ConfigStore.set_mission_backup_root(backup_root)
             ConfigStore.set_coordinator_roster(self.coordinator_roster_input.toPlainText().strip())
             ConfigStore.set_admin_roster(self.admin_roster_input.toPlainText().strip())
+            ConfigStore.set_traccar_test_window_enabled(self.replay_enable_check.isChecked())
+            # Save replay start in UTC ISO format
+            start_qdt = self.replay_start_edit.dateTime().toUTC()
+            start_iso = start_qdt.toString(Qt.ISODate)
+            ConfigStore.set_traccar_test_window_start(start_iso)
+            ConfigStore.set_traccar_test_window_hours(self.replay_window_hours_spin.value())
 
             # Disable Apply button
             self.apply_button.setEnabled(False)
@@ -926,7 +983,10 @@ class SettingsPanel(QDockWidget):
                 'mission_primary_root': ConfigStore.get_mission_primary_root(),
                 'mission_backup_root': ConfigStore.get_mission_backup_root(),
                 'coordinators': ConfigStore.get_coordinator_list(),
-                'admins': ConfigStore.get_admin_list()
+                'admins': ConfigStore.get_admin_list(),
+                'replay_window_enabled': self.replay_enable_check.isChecked(),
+                'replay_window_start': ConfigStore.get_traccar_test_window_start(),
+                'replay_window_hours': self.replay_window_hours_spin.value()
             })
 
             # Show success message (import iface locally to avoid circular imports)
@@ -972,6 +1032,10 @@ class SettingsPanel(QDockWidget):
             self.auto_save_checkbox.setChecked(SETTINGS_KEYS.AUTO_SAVE_ENABLED_DEFAULT)
             self.autosave_interval_spin.setValue(SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT)
             self.auto_connect_checkbox.setChecked(SETTINGS_KEYS.PROVIDER_AUTO_CONNECT_DEFAULT)
+            self.replay_enable_check.setChecked(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_ENABLED_DEFAULT)
+            self.replay_window_hours_spin.setValue(SETTINGS_KEYS.PROVIDER_TRACCAR_TEST_WINDOW_HOURS_DEFAULT)
+            self.replay_start_edit.setDateTime(QDateTime.currentDateTime())
+            self._on_replay_settings_changed()
 
             # Enable Apply button
             self.apply_button.setEnabled(True)

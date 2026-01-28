@@ -590,6 +590,7 @@ class TraccarHttpProvider(Provider):
     def get_breadcrumbs(
         self,
         since_iso: Optional[str] = None,
+        until_iso: Optional[str] = None,
         mission_id: Optional[int] = None,
         session=None,
         cancel_check: Optional[Callable[[], bool]] = None,
@@ -612,6 +613,7 @@ class TraccarHttpProvider(Provider):
         Args:
             since_iso: Optional ISO8601 timestamp to filter from (default: last 3 hours).
                       Used as fallback for devices not in device_timestamps.
+            until_iso: Optional ISO8601 timestamp to cap history (replay window).
             mission_id: Optional mission ID (ignored by HTTP provider)
             session: Optional requests.Session for thread-safe execution
             cancel_check: Optional callable returning True to request cancellation
@@ -685,9 +687,16 @@ class TraccarHttpProvider(Provider):
                 else:
                     # Default: last 3 hours
                     from_iso, _ = window(hours=3)
+                    from_dt = parse_iso(from_iso)
 
-                # Current time
-                to_iso = format_iso(datetime.now(timezone.utc))
+                if until_iso:
+                    to_dt = parse_iso(until_iso)
+                    if to_dt < from_dt:
+                        raise ValueError("until_iso cannot be before since_iso")
+                    to_iso = format_iso(to_dt)
+                else:
+                    # Current time
+                    to_iso = format_iso(datetime.now(timezone.utc))
 
                 logger.debug("Breadcrumb time window: %s -> %s", from_iso, to_iso)
 
@@ -1691,6 +1700,7 @@ class TraccarHttpProvider(Provider):
 
     def create_refresh_task(self, description: str,
                             since_iso: Optional[str] = None,
+                            until_iso: Optional[str] = None,
                             device_timestamps: Optional[Dict[str, str]] = None) -> 'ProviderRefreshTask':
         """
         Create Traccar-specific refresh task for background data fetching.
@@ -1700,6 +1710,7 @@ class TraccarHttpProvider(Provider):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time instead of the default 3 hours.
+            until_iso: Optional ISO8601 timestamp to cap breadcrumbs (replay window).
             device_timestamps: Optional dict mapping device_id to ISO8601 timestamp.
                               Phase 3 (SAR-4vs): Enables incremental fetch mode where
                               each device fetches positions only after its last known
@@ -1714,6 +1725,7 @@ class TraccarHttpProvider(Provider):
         return TraccarRefreshTask(
             self, description,
             since_iso=since_iso,
+            until_iso=until_iso,
             device_timestamps=device_timestamps
         )
 

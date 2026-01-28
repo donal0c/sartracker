@@ -143,12 +143,13 @@ class MissionController(QObject):
         )
         return True
 
-    def start_mission(self, name: str) -> bool:
+    def start_mission(self, name: str, start_ts: Optional[datetime] = None) -> bool:
         """
         Start a new mission.
 
         Args:
             name: Mission name (non-empty string)
+            start_ts: Optional timezone-aware UTC datetime for back-dated start
 
         Returns:
             bool: True if mission started, False otherwise
@@ -160,9 +161,18 @@ class MissionController(QObject):
         # BUG-064 FIX: Use explicit state transition validation
         self._validate_transition(MissionState.ACTIVE)
 
+        if start_ts is not None:
+            if not isinstance(start_ts, datetime):
+                raise ValueError("start_ts must be a datetime")
+            if start_ts.tzinfo is None or start_ts.tzinfo.utcoffset(start_ts) is None:
+                raise ValueError("start_ts must be timezone-aware (UTC)")
+            start_ts = start_ts.astimezone(timezone.utc)
+            if start_ts > _utcnow():
+                raise ValueError("start_ts cannot be in the future")
+
         self._reset_internal_state()
         self._mission_name = mission_name
-        self._mission_start_ts = _utcnow()
+        self._mission_start_ts = start_ts or _utcnow()
 
         # BUG-047 FIX: Use timing lock for atomic state + timer update
         # Prevents race conditions between state transitions and timer ticks

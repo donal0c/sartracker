@@ -121,7 +121,8 @@ The SAR Tracking panel will open on the right side of QGIS.
 ### 2. Start a Mission
 
 1. Enter a **mission name** (e.g., "Glenbeigh Search")
-2. Click **"Start Mission"**
+2. (Optional) Set **Start offset** to back-date mission start (0–5 hours)
+3. Click **"Start Mission"**
 3. Watch the dual mission timers:
    - **Elapsed** – Total time since mission start
    - **Active Search** – Time excluding pauses (auto-pauses when you pause the mission)
@@ -145,6 +146,23 @@ Status badges directly beneath the controls show Auto Refresh / Auto Save state 
 **Supported formats:**
 - Traccar CSV exports
 - Must have: `latitude`, `longitude`, `time`, `name` columns
+
+### 4. Replay / Testing Window (Advanced)
+
+For training or verification, you can load a fixed historical time slice without an active mission.
+
+1. Open **Plugins → SAR Tracker → Settings**
+2. Select **Traccar HTTP** provider
+3. Under **Replay / Testing Window**:
+   - Enable replay
+   - Choose **Start time (local)**
+   - Set **Duration** (default 3 hours, max 24 hours)
+4. Click **Apply**
+
+**Guardrails:**
+- Replay is automatically disabled if a mission is active or paused.
+- Start time must be in the past.
+- Duration is capped at 24 hours.
 
 ### 4. Add Markers
 

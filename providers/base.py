@@ -92,6 +92,7 @@ class Provider(ABC):
 
     @abstractmethod
     def get_breadcrumbs(self, since_iso: Optional[str] = None,
+                       until_iso: Optional[str] = None,
                        mission_id: Optional[int] = None) -> List[FeatureDict]:
         """
         Get breadcrumb trail for all devices.
@@ -104,6 +105,9 @@ class Provider(ABC):
             since_iso: Optional ISO8601 timestamp to filter from (inclusive).
                       Format: "2025-11-15T14:30:00Z" or "2025-11-15T14:30:00+00:00"
                       If None, provider chooses reasonable default (e.g., last 3 hours)
+            until_iso: Optional ISO8601 timestamp to cap history (exclusive or inclusive
+                       provider-defined). Used for replay windows; providers may ignore
+                       if unsupported.
             mission_id: Optional mission ID for filtering positions associated
                        with specific mission. CSV providers may ignore this.
                        Database providers should filter by mission.
@@ -307,6 +311,7 @@ class Provider(ABC):
     @abstractmethod
     def create_refresh_task(self, description: str,
                             since_iso: Optional[str] = None,
+                            until_iso: Optional[str] = None,
                             device_timestamps: Optional[Dict[str, str]] = None) -> 'ProviderRefreshTask':
         """
         Create provider-specific refresh task for background data fetching.
@@ -328,10 +333,13 @@ class Provider(ABC):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time. Providers may ignore if not
+                       applicable (e.g., CSV provider loads all data).
+            until_iso: Optional ISO8601 timestamp to cap breadcrumb history.
+                       Used for historical replay windows; providers may ignore
+                       if not supported.
             device_timestamps: Optional dict mapping device_id to ISO8601 timestamp
                               for incremental fetch (Phase 3). Providers that don't
                               support incremental fetch may ignore this parameter.
-                       applicable (e.g., CSV provider loads all data).
 
         Returns:
             ProviderRefreshTask subclass instance (inherits QgsTask)

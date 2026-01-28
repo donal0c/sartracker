@@ -415,6 +415,9 @@ python -m pytest tests/
 
 # Run with coverage
 ./run_tests.sh --cov=. --cov-report=html
+
+# Run unit tests without pytest-qgis auto-load (mock QGIS)
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 SARTRACKER_FORCE_MOCK_QGIS=1 .venv/bin/python -m pytest tests/
 ```
 
 ### Test Infrastructure

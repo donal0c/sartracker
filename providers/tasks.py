@@ -124,9 +124,11 @@ class CSVRefreshTask(ProviderRefreshTask):
     block the UI or crash during active rescue missions.
     """
 
-    def __init__(self, provider: 'Provider', description: str = "Refreshing data", since_iso: Optional[str] = None):
+    def __init__(self, provider: 'Provider', description: str = "Refreshing data",
+                 since_iso: Optional[str] = None, until_iso: Optional[str] = None):
         super().__init__(provider, description)
         self.since_iso = since_iso
+        self.until_iso = until_iso
 
     def run(self) -> bool:
         """
@@ -159,6 +161,7 @@ class CSVRefreshTask(ProviderRefreshTask):
             # Parse breadcrumbs (historical trail)
             breadcrumbs = provider.get_breadcrumbs(
                 since_iso=self.since_iso,
+                until_iso=self.until_iso,
                 cancel_cb=self.isCanceled
             )
 
@@ -621,6 +624,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
 
     def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data",
                  since_iso: Optional[str] = None,
+                 until_iso: Optional[str] = None,
                  device_timestamps: Optional[Dict[str, str]] = None):
         """
         Initialize Traccar refresh task.
@@ -631,6 +635,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time instead of the default 3 hours.
+            until_iso: Optional ISO8601 timestamp to cap breadcrumbs (replay window).
             device_timestamps: Optional dict mapping device_id to ISO8601 timestamp.
                               When provided, enables incremental fetch mode where
                               each device fetches positions only after its last known
@@ -638,6 +643,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
         """
         super().__init__(provider, description)
         self.since_iso = since_iso
+        self.until_iso = until_iso
         self._device_timestamps = device_timestamps
 
     def run(self) -> bool:
@@ -761,6 +767,7 @@ class TraccarRefreshTask(ProviderRefreshTask):
                 # Phase 3 (SAR-4vs): Pass device_timestamps for incremental fetch
                 breadcrumbs = provider.get_breadcrumbs(
                     since_iso=self.since_iso,
+                    until_iso=self.until_iso,
                     device_timestamps=self._device_timestamps,  # Incremental fetch
                     session=session,
                     cancel_check=self.isCanceled,

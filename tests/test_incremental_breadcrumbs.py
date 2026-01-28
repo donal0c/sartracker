@@ -80,6 +80,16 @@ class TestIncrementalParameterAcceptance:
                 result = provider.get_breadcrumbs(since_iso='2026-01-04T10:00:00Z')
                 assert isinstance(result, list)
 
+    def test_get_breadcrumbs_accepts_until_iso_parameter(self, provider):
+        """get_breadcrumbs() accepts until_iso parameter without error."""
+        with patch.object(provider, '_load_devices', return_value={}):
+            with patch.object(provider.http_client, 'get', return_value=[]):
+                result = provider.get_breadcrumbs(
+                    since_iso='2026-01-04T10:00:00Z',
+                    until_iso='2026-01-04T12:00:00Z'
+                )
+                assert isinstance(result, list)
+
 
 class TestIncrementalFetchLogic:
     """Tests for per-device incremental fetch time ranges."""
@@ -151,6 +161,33 @@ class TestIncrementalFetchLogic:
         assert len(dev3_calls) == 1
         assert mission_start in dev3_calls[0]['from']
 
+    def test_until_iso_sets_to_param(self, provider, device_map):
+        """until_iso should be used as the 'to' parameter when provided."""
+        calls_made = []
+
+        def capture_calls(endpoint, session=None, params=None, expect_json=True):
+            if params and 'deviceId' in params:
+                calls_made.append({
+                    'device_id': params['deviceId'],
+                    'to': params.get('to'),
+                })
+            return []
+
+        until_iso = '2026-01-04T12:00:00Z'
+
+        with patch.object(provider, '_load_devices', return_value=device_map):
+            with patch.object(provider.http_client, 'get', side_effect=capture_calls):
+                provider.get_breadcrumbs(
+                    since_iso='2026-01-04T08:00:00Z',
+                    until_iso=until_iso
+                )
+
+        assert len(calls_made) == 3
+        until_dt = parse_iso(until_iso)
+        for call in calls_made:
+            assert call['to'] is not None
+            assert parse_iso(call['to']) == until_dt
+
     def test_timestamp_boundary_offset_prevents_duplicates(self, provider, device_map):
         """1 second offset added to device timestamp to prevent duplicate fetch."""
         device_timestamps = {
@@ -176,6 +213,14 @@ class TestIncrementalFetchLogic:
         from_dt = parse_iso(from_times[0])
         expected_dt = parse_iso('2026-01-04T11:30:00Z') + timedelta(seconds=1)
         assert from_dt == expected_dt
+
+    def test_until_iso_before_since_raises(self, provider):
+        """until_iso earlier than since_iso should be rejected."""
+        with pytest.raises(ValueError):
+            provider.get_breadcrumbs(
+                since_iso='2026-01-04T10:00:00Z',
+                until_iso='2026-01-04T09:00:00Z'
+            )
 
 
 class TestLegacyModeUnchanged:

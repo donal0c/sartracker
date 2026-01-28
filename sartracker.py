@@ -1540,6 +1540,7 @@ class sartracker:
             if self.sar_panel:
                 self.provider_controller.set_panel(self.sar_panel)
             self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
+            self.provider_controller.set_mission_active_getter(self._is_mission_active)
 
             # Rewire refresh signal to controller with a single guarded handler
             try:
@@ -3036,6 +3037,16 @@ class sartracker:
         mission_name = context.get('mission_name') or "Mission"
         prev_state = self._last_mission_state
         self._last_mission_state = state
+
+        # Keep provider breadcrumb accumulator lifecycle in sync with mission state
+        try:
+            if self.provider_controller:
+                old_state_value = prev_state.value if prev_state else MissionState.IDLE.value
+                new_state_value = state.value if state else None
+                if new_state_value:
+                    self.provider_controller._on_mission_state_changed(old_state_value, new_state_value)
+        except Exception as exc:
+            print(f"[SARTRACKER] Warning: Provider mission-state handler failed: {exc}")
 
         if state == MissionState.ACTIVE:
             if prev_state == MissionState.PAUSED:
@@ -4564,6 +4575,22 @@ class sartracker:
         try:
             print(f"[SARTRACKER] Settings changed: {changes}")
 
+            if changes.get('replay_window_enabled') and self._is_mission_active():
+                ConfigStore.set_traccar_test_window_enabled(False)
+                if self.settings_panel and hasattr(self.settings_panel, "replay_enable_check"):
+                    try:
+                        self.settings_panel.replay_enable_check.blockSignals(True)
+                        self.settings_panel.replay_enable_check.setChecked(False)
+                    finally:
+                        self.settings_panel.replay_enable_check.blockSignals(False)
+                warning(
+                    self.iface.messageBar(),
+                    "Replay Disabled",
+                    "Replay window cannot be enabled while a mission is active.",
+                    duration=4
+                )
+                changes['replay_window_enabled'] = False
+
             if self.sar_panel:
                 if 'auto_refresh_enabled' in changes or 'auto_refresh_interval' in changes:
                     enabled = changes.get('auto_refresh_enabled', ConfigStore.get_auto_refresh_enabled())
@@ -4689,6 +4716,16 @@ class sartracker:
             pass
 
         return None
+
+    def _is_mission_active(self) -> bool:
+        """Return True if mission is active or paused."""
+        if not self.mission_controller:
+            return False
+        try:
+            status = self.mission_controller.status_snapshot()
+            return status.get('state') in ('active', 'paused')
+        except Exception:
+            return False
 
     def get_plugin_status(self, debug_hook=None) -> dict:
         """

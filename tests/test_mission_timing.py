@@ -193,6 +193,40 @@ class TestElapsedTimeCalculation:
 
 
 # =============================================================================
+# Test: Mission Start Override (Back-date)
+# =============================================================================
+
+class TestMissionStartOverride:
+    """Test optional mission start timestamp overrides."""
+
+    def test_start_mission_with_past_start_uses_backdated_time(self, controller):
+        """Back-dated start should drive elapsed time calculations."""
+        start = make_utc(2024, 6, 15, 8, 0, 0)
+        now = make_utc(2024, 6, 15, 9, 0, 0)
+
+        controller.start_mission("Backdated Mission", start_ts=start)
+
+        timing = controller._compute_timing(now=now)
+
+        assert timing.elapsed_seconds == pytest.approx(60 * 60, abs=1)
+        assert timing.active_seconds == pytest.approx(60 * 60, abs=1)
+
+    def test_start_mission_rejects_future_timestamp(self, controller):
+        """Future start timestamps must be rejected."""
+        future = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        with pytest.raises(ValueError):
+            controller.start_mission("Future Mission", start_ts=future)
+
+    def test_start_mission_rejects_naive_timestamp(self, controller):
+        """Naive (non-timezone-aware) timestamps must be rejected."""
+        naive = datetime(2024, 6, 15, 8, 0, 0)
+
+        with pytest.raises(ValueError):
+            controller.start_mission("Naive Mission", start_ts=naive)
+
+
+# =============================================================================
 # Test: Pause/Resume Timing
 # =============================================================================
 

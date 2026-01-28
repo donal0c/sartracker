@@ -629,6 +629,7 @@ class FileCSVProvider(Provider):
     def get_breadcrumbs(
         self,
         since_iso: Optional[str] = None,
+        until_iso: Optional[str] = None,
         mission_id: Optional[int] = None,
         cancel_cb: Optional[Any] = None
     ) -> List[FeatureDict]:
@@ -637,6 +638,7 @@ class FileCSVProvider(Provider):
 
         Args:
             since_iso: Optional ISO timestamp to filter from
+            until_iso: Optional ISO timestamp to cap history (ignored for CSV)
             mission_id: Ignored for CSV provider
 
         Returns:
@@ -804,6 +806,7 @@ class FileCSVProvider(Provider):
         self,
         description: str,
         since_iso: Optional[str] = None,
+        until_iso: Optional[str] = None,
         device_timestamps: Optional[Dict[str, str]] = None
     ) -> 'ProviderRefreshTask':
         """
@@ -812,6 +815,7 @@ class FileCSVProvider(Provider):
         Args:
             description: Task description for progress display
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
+            until_iso: Optional ISO8601 timestamp to cap breadcrumbs (ignored for CSV).
             device_timestamps: Optional per-device timestamps (ignored for CSV -
                               CSV provider reads full file each time, incremental
                               fetch not supported).
@@ -823,7 +827,7 @@ class FileCSVProvider(Provider):
         """
         # Note: device_timestamps ignored - CSV doesn't support incremental fetch
         from .tasks import CSVRefreshTask
-        return CSVRefreshTask(self, description, since_iso=since_iso)
+        return CSVRefreshTask(self, description, since_iso=since_iso, until_iso=until_iso)
 
     def invalidate_cache(self, filepath: Optional[str] = None):
         """

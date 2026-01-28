@@ -18,7 +18,7 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and qt_compat for all Qt imports.
 LIFE-SAFETY CRITICAL: All async handlers use defensive guards (Pattern 9).
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer, QSettings
 from typing import Optional, Dict, Any, Callable, List, TYPE_CHECKING
 
@@ -165,6 +165,7 @@ class ProviderController(QObject):
         self._layers_controller = None
         self._sar_panel = None
         self._mission_start_getter: Optional[Callable[[], Optional[str]]] = None
+        self._mission_active_getter: Optional[Callable[[], bool]] = None
 
         # ================================================================
         # Phase 3 (SAR-4vs): Incremental breadcrumb state (session-scoped)
@@ -807,6 +808,15 @@ class ProviderController(QObject):
         """
         self._mission_start_getter = getter
 
+    def set_mission_active_getter(self, getter: Callable[[], bool]):
+        """
+        Inject callback to determine if a mission is active/paused.
+
+        Args:
+            getter: Callable returning True if mission is active/paused
+        """
+        self._mission_active_getter = getter
+
     # ========================================================================
     # Phase 3 (SAR-4vs): Incremental Breadcrumb Accumulation
     # ========================================================================
@@ -899,7 +909,7 @@ class ProviderController(QObject):
     # Phase 8: Refresh Workflow (Consolidated)
     # ========================================================================
 
-    def start_refresh(self, since_iso: Optional[str] = None) -> bool:
+    def start_refresh(self, since_iso: Optional[str] = None, until_iso: Optional[str] = None) -> bool:
         """
         Start a data refresh using background task.
 
@@ -911,6 +921,7 @@ class ProviderController(QObject):
         Args:
             since_iso: Optional ISO8601 timestamp for breadcrumb filtering.
                       If None and mission_start_getter is set, uses mission start time.
+            until_iso: Optional ISO8601 timestamp to cap breadcrumb history (replay).
 
         Returns:
             True if refresh started, False if blocked or no provider
@@ -955,14 +966,71 @@ class ProviderController(QObject):
                 except Exception as e:
                     print(f"[PROVIDER_CONTROLLER] Warning: Could not set panel loading state: {e}")
 
-            # Get mission start time for breadcrumb filtering (skip for CSV by default)
-            effective_since = since_iso
-            use_mission_start = self.provider_name != 'csv'
-            if effective_since is None and self._mission_start_getter and use_mission_start:
+            # Determine replay/test window settings (Traccar HTTP only)
+            replay_enabled = False
+            replay_start_iso = None
+            replay_hours = None
+            if self.provider_name == 'traccar_http':
                 try:
-                    effective_since = self._mission_start_getter()
+                    replay_enabled = ConfigStore.get_traccar_test_window_enabled()
+                    replay_start_iso = ConfigStore.get_traccar_test_window_start()
+                    replay_hours = ConfigStore.get_traccar_test_window_hours()
                 except Exception as e:
-                    print(f"[PROVIDER_CONTROLLER] Warning: Could not get mission start time: {e}")
+                    print(f"[PROVIDER_CONTROLLER] Warning: Could not read replay settings: {e}")
+
+            # Replay guard: disable if mission active/paused
+            if replay_enabled and self._mission_active_getter:
+                try:
+                    if self._mission_active_getter():
+                        ConfigStore.set_traccar_test_window_enabled(False)
+                        replay_enabled = False
+                        safe_warning(
+                            self.iface,
+                            "Replay Disabled",
+                            "Replay window disabled while a mission is active.",
+                            duration=4
+                        )
+                except Exception as e:
+                    print(f"[PROVIDER_CONTROLLER] Warning: mission active check failed: {e}")
+
+            # Compute replay window if enabled
+            effective_since = since_iso
+            effective_until = until_iso
+            if replay_enabled:
+                try:
+                    from ..utils.timeparse import parse_iso, format_iso
+                    if not replay_start_iso:
+                        raise ValueError("Replay start time not set")
+                    if not isinstance(replay_hours, int) or replay_hours < 1 or replay_hours > 24:
+                        raise ValueError("Replay hours must be between 1 and 24")
+                    start_dt = parse_iso(replay_start_iso)
+                    now_dt = datetime.now(timezone.utc)
+                    if start_dt > now_dt:
+                        raise ValueError("Replay start time must be in the past")
+                    end_dt = start_dt + timedelta(hours=replay_hours)
+                    if end_dt < start_dt:
+                        raise ValueError("Replay end time is before start time")
+                    effective_since = format_iso(start_dt)
+                    effective_until = format_iso(end_dt)
+                except Exception as e:
+                    safe_warning(
+                        self.iface,
+                        "Replay Window Invalid",
+                        f"Replay window invalid: {e}",
+                        duration=4
+                    )
+                    self._refresh_in_progress = False
+                    self._refresh_started_at = None
+                    self._clear_loading_state()
+                    return False
+            else:
+                # Get mission start time for breadcrumb filtering (skip for CSV by default)
+                use_mission_start = self.provider_name != 'csv'
+                if effective_since is None and self._mission_start_getter and use_mission_start:
+                    try:
+                        effective_since = self._mission_start_getter()
+                    except Exception as e:
+                        print(f"[PROVIDER_CONTROLLER] Warning: Could not get mission start time: {e}")
 
             # Phase 3 (SAR-4vs): Get device timestamps for incremental fetch
             device_timestamps = None
@@ -975,6 +1043,7 @@ class ProviderController(QObject):
             task = self.provider.create_refresh_task(
                 "Refreshing tracking data",
                 since_iso=effective_since,
+                until_iso=effective_until,
                 device_timestamps=device_timestamps  # Phase 3: incremental fetch
             )
 
