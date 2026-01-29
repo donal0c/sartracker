@@ -87,6 +87,21 @@ def test_replay_window_used_when_enabled_and_no_active_mission():
     assert kwargs.get('until_iso') == expected_until
 
 
+def test_replay_missing_start_disables_replay_and_blocks_refresh():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: False)
+
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start("")
+    ConfigStore.set_traccar_test_window_hours(3)
+
+    started = controller.start_refresh()
+
+    assert started is False
+    assert ConfigStore.get_traccar_test_window_enabled() is False
+    provider.create_refresh_task.assert_not_called()
+
+
 def test_replay_disabled_when_mission_active():
     controller, provider, task_manager = _build_controller('traccar_http')
     controller.set_mission_active_getter(lambda: True)

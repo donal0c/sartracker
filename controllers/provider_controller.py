@@ -1015,6 +1015,10 @@ class ProviderController(QObject):
                     effective_since = format_iso(start_dt)
                     effective_until = format_iso(end_dt)
                 except Exception as e:
+                    try:
+                        ConfigStore.set_traccar_test_window_enabled(False)
+                    except Exception as disable_error:
+                        print(f"[PROVIDER_CONTROLLER] Warning: Could not disable replay after invalid settings: {disable_error}")
                     safe_warning(
                         self.iface,
                         "Replay Window Invalid",
