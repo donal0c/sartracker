@@ -25,13 +25,24 @@ import os
 from ..utils.qt_compat import (
     LeftDockWidgetArea, RightDockWidgetArea,
     Checked, PasswordEchoMode,
-    MessageBoxYes, MessageBoxNo
+    MessageBoxYes, MessageBoxNo,
+    ISODate,
 )
 from ..utils.notify import info, warning, error, success
 
 # Import centralized config keys
 from ..config.keys import SETTINGS_KEYS, ConfigStore
 from ..utils.secure_store import SecureStore
+
+
+def _parse_iso_datetime(value: str) -> QDateTime:
+    """Parse ISO datetime using Qt5/Qt6 compatible ISODate enum."""
+    return QDateTime.fromString(value, ISODate)
+
+
+def _format_iso_datetime(value: QDateTime) -> str:
+    """Format datetime using Qt5/Qt6 compatible ISODate enum."""
+    return value.toString(ISODate)
 
 
 class SettingsPanel(QDockWidget):
@@ -508,7 +519,7 @@ class SettingsPanel(QDockWidget):
             self.replay_window_hours_spin.setValue(ConfigStore.get_traccar_test_window_hours())
             start_iso = ConfigStore.get_traccar_test_window_start()
             if start_iso:
-                start_dt = QDateTime.fromString(start_iso, Qt.ISODate)
+                start_dt = _parse_iso_datetime(start_iso)
                 if start_dt.isValid():
                     self.replay_start_edit.setDateTime(start_dt.toLocalTime())
             self._on_replay_settings_changed()
@@ -966,7 +977,7 @@ class SettingsPanel(QDockWidget):
             ConfigStore.set_traccar_test_window_enabled(self.replay_enable_check.isChecked())
             # Save replay start in UTC ISO format
             start_qdt = self.replay_start_edit.dateTime().toUTC()
-            start_iso = start_qdt.toString(Qt.ISODate)
+            start_iso = _format_iso_datetime(start_qdt)
             ConfigStore.set_traccar_test_window_start(start_iso)
             ConfigStore.set_traccar_test_window_hours(self.replay_window_hours_spin.value())
 

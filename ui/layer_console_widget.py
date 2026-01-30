@@ -28,6 +28,7 @@ from ..utils.qt_compat import (
     Checked, Unchecked,
     AlignCenter, CustomContextMenu, UserRole,
     ItemIsUserCheckable, ItemIsEnabled, ItemIsSelectable,
+    SelectItems, ExtendedSelection,
     dialog_exec, DialogAccepted,
     Key_Delete, Key_Backspace,
     Key_F5
@@ -275,8 +276,8 @@ class LayerConsoleWidget(QWidget):
         self.tree.setColumnWidth(1, 60)
         self.tree.setColumnWidth(2, 120)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setSelectionBehavior(self.tree.SelectItems)
-        self.tree.setSelectionMode(self.tree.ExtendedSelection)
+        self.tree.setSelectionBehavior(SelectItems)
+        self.tree.setSelectionMode(ExtendedSelection)
         self.tree.setContextMenuPolicy(CustomContextMenu)
         self.tree.itemSelectionChanged.connect(self._on_selection_changed)
         self._ui_signal_connections.append((self.tree.itemSelectionChanged, self._on_selection_changed))

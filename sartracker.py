@@ -454,7 +454,7 @@ class sartracker:
         """Stop SAR panel timers early to prevent shutdown races."""
         if not self.sar_panel or self._is_qt_deleted(self.sar_panel):
             return
-        for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+        for timer_name in ("refresh_timer", "_refresh_watchdog_timer", "autosave_timer", "pause_flash_timer"):
             timer = getattr(self.sar_panel, timer_name, None)
             if not timer or self._is_qt_deleted(timer):
                 continue
@@ -2866,7 +2866,7 @@ class sartracker:
                     self.sar_panel.cleanup()
                 else:
                     # Best-effort stop timers
-                    for timer_name in ("refresh_timer", "autosave_timer", "pause_flash_timer"):
+                    for timer_name in ("refresh_timer", "_refresh_watchdog_timer", "autosave_timer", "pause_flash_timer"):
                         timer = getattr(self.sar_panel, timer_name, None)
                         if timer and not self._is_qt_deleted(timer):
                             try:

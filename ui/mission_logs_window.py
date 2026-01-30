@@ -34,6 +34,16 @@ from .layer_console_widget import LayerConsoleWidget
 from .marker_log_widget import MarkerLogWidget
 
 
+def safe_refresh_call(refresh_fn: Callable[[], None], label: str) -> bool:
+    """Call refresh function defensively to prevent UI lockups."""
+    try:
+        refresh_fn()
+        return True
+    except Exception as exc:
+        print(f"[MissionLogsWindow] Warning: {label} failed: {exc}")
+        return False
+
+
 class MissionDetailsWidget(QWidget):
     """
     Widget displaying mission summary information.
@@ -343,7 +353,7 @@ class MissionLogsWindow(BaseDialog):
 
     def refresh(self):
         """Refresh all tabs with current data."""
-        self._refresh_all()
+        safe_refresh_call(self._refresh_all, "Mission Logs refresh")
 
     def _refresh_all(self):
         """Refresh all three tabs."""
@@ -395,7 +405,7 @@ class MissionLogsWindow(BaseDialog):
         super().showEvent(event)
         # Refresh on show to ensure data is current
         if not self._cleanup_in_progress:
-            self._refresh_all()
+            safe_refresh_call(self._refresh_all, "Mission Logs showEvent refresh")
 
     def closeEvent(self, event):
         """Handle close event - cleanup, save state, and emit signal."""

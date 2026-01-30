@@ -107,12 +107,12 @@ Functions (2 functions):
     dialog_exec(dialog) - Execute dialog in Qt5/Qt6 compatible way
     push_message(bar, title, msg, level, duration) - Push message to QGIS message bar
 
-Total: 102 exported symbols for Qt5/Qt6 compatibility
+Total: 104 exported symbols for Qt5/Qt6 compatibility
 """
 
 from qgis.PyQt import QtCore
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtWidgets import QLineEdit
+from qgis.PyQt.QtWidgets import QLineEdit, QAbstractItemView
 
 # =============================================================================
 # sip isdeleted helper (Qt5/Qt6 compatible)
@@ -326,6 +326,17 @@ else:  # Qt5
     ItemIsEditable = Qt.ItemIsEditable
     ItemIsDragEnabled = Qt.ItemIsDragEnabled
     ItemIsDropEnabled = Qt.ItemIsDropEnabled
+
+
+# =============================================================================
+# SelectionBehavior / SelectionMode enums
+# =============================================================================
+if QT_VERSION == 6:
+    SelectItems = QAbstractItemView.SelectionBehavior.SelectItems
+    ExtendedSelection = QAbstractItemView.SelectionMode.ExtendedSelection
+else:  # Qt5
+    SelectItems = QAbstractItemView.SelectItems
+    ExtendedSelection = QAbstractItemView.ExtendedSelection
 
 
 # =============================================================================
@@ -930,6 +941,9 @@ __all__ = [
     'ItemIsEditable',
     'ItemIsDragEnabled',
     'ItemIsDropEnabled',
+    # SelectionBehavior / SelectionMode
+    'SelectItems',
+    'ExtendedSelection',
     # ItemDataRole
     'UserRole',
     # ContextMenuPolicy

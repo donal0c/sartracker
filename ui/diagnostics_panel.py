@@ -14,6 +14,13 @@ Qt5/Qt6 Compatible: Uses qgis.PyQt and BaseDialog.
 import sys
 import platform
 import os
+import glob
+import json
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+DEFAULT_TAIL_LINES = 200
 
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
@@ -87,6 +94,10 @@ class DiagnosticsPanel(BaseDialog):
         # Buttons
         button_layout = QHBoxLayout()
         button_layout.addStretch()
+
+        incident_button = QPushButton("Copy Incident Bundle")
+        incident_button.clicked.connect(self._copy_incident_bundle)
+        button_layout.addWidget(incident_button)
 
         copy_button = QPushButton("Copy to Clipboard")
         copy_button.clicked.connect(self._copy_to_clipboard)
@@ -831,6 +842,209 @@ class DiagnosticsPanel(BaseDialog):
 
         return "\n".join(lines)
 
+    def _copy_incident_bundle(self):
+        """Copy an incident bundle to the clipboard."""
+        payload = self._build_incident_payload()
+        bundle_text = format_incident_bundle(payload)
+        clipboard = QApplication.clipboard()
+        clipboard.setText(bundle_text)
+
+        from ..utils.notify import success
+        from qgis.utils import iface
+        success(
+            iface.messageBar(),
+            "Diagnostics",
+            "Incident bundle copied to clipboard",
+            duration=3
+        )
+
+    def _build_incident_payload(self) -> Dict[str, Any]:
+        """Assemble the diagnostic payload for the incident bundle."""
+        plugin_status = self._gather_plugin_status()
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "environment": self._gather_environment_info(),
+            "plugin": self._gather_plugin_info(plugin_status),
+            "project": self._gather_project_info(),
+            "plugin_status": plugin_status,
+            "config": self._gather_config_snapshot(),
+            "ui_state": self._gather_ui_state(),
+            "diagnostics_report": self.details_text.toPlainText(),
+            "import_report": self._gather_import_report(),
+            "log_tail": self._gather_log_tail(),
+            "audit_tail": self._gather_audit_tail(),
+        }
+
+    def _gather_environment_info(self) -> Dict[str, Any]:
+        """Collect environment details for the incident payload."""
+        info = {
+            "qgis_version": capabilities.QGIS_VERSION_STR,
+            "qgis_version_int": capabilities.QGIS_VERSION_INT,
+            "qt_version": capabilities.QT_VERSION_STR,
+            "python_version": sys.version.split()[0],
+            "platform": platform.platform(),
+            "os": f"{platform.system()} {platform.release()} ({platform.machine()})",
+            "python_executable": sys.executable,
+        }
+        try:
+            from qgis.core import QgsApplication
+
+            info["settings_dir"] = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            pass
+        return info
+
+    def _gather_plugin_info(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        """Gather plugin-specific metadata."""
+        plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        info = {
+            "version": self._get_plugin_version(),
+            "path": plugin_dir,
+            "safe_mode_active": status.get("safe_mode_active"),
+            "available_providers": status.get("available_providers"),
+            "unavailable_features": status.get("unavailable_features"),
+        }
+        return info
+
+    def _gather_project_info(self) -> Dict[str, Any]:
+        """Pull current QGIS project details."""
+        info: Dict[str, Any] = {
+            "file": None,
+            "dirty": False,
+            "layers": 0,
+            "crs": None,
+            "directory": None,
+        }
+        try:
+            from qgis.core import QgsProject
+
+            project = QgsProject.instance()
+            file_path = project.fileName()
+            if file_path:
+                info["file"] = file_path
+                info["directory"] = os.path.dirname(file_path)
+            else:
+                info["file"] = "Unsaved project"
+            info["dirty"] = project.isDirty()
+            info["layers"] = len(project.mapLayers())
+            try:
+                info["crs"] = project.crs().authid()
+            except Exception:
+                pass
+        except Exception as exc:
+            print(f"[DIAGNOSTICS] Error gathering project info: {exc}")
+        return info
+
+    def _gather_config_snapshot(self) -> Dict[str, Any]:
+        """Snapshot of configurable settings relevant to incidents."""
+        config: Dict[str, Any] = {}
+        try:
+            from ..config.keys import ConfigStore, SETTINGS_KEYS
+            from ..utils.logging_config import _is_debug_enabled
+
+            config = {
+                "auto_refresh_enabled": ConfigStore.get_auto_refresh_enabled(),
+                "auto_refresh_interval": ConfigStore.get_auto_refresh_interval(),
+                "auto_save_enabled": ConfigStore.get_auto_save_enabled(),
+                "auto_save_interval": ConfigStore.get_auto_save_interval(),
+                "debug_logging_enabled": _is_debug_enabled(),
+            }
+        except Exception as exc:
+            print(f"[DIAGNOSTICS] Error gathering config snapshot: {exc}")
+        return config
+
+    def _gather_ui_state(self) -> Dict[str, Any]:
+        """Capture UI state such as auto-refresh timers and mission status."""
+        state: Dict[str, Any] = {}
+        try:
+            from qgis.utils import plugins
+
+            sar_plugin = plugins.get('sartracker')
+            panel = getattr(sar_plugin, 'sar_panel', None)
+            if panel:
+                state["auto_refresh_enabled"] = getattr(panel, "auto_refresh_enabled", False)
+                state["auto_refresh_interval_seconds"] = getattr(panel, "auto_refresh_interval_seconds", None)
+                refresh_timer = getattr(panel, "refresh_timer", None)
+                state["auto_refresh_timer_active"] = refresh_timer.isActive() if refresh_timer else False
+                watchdog_timer = getattr(panel, "_refresh_watchdog_timer", None)
+                state["refresh_watchdog_active"] = watchdog_timer.isActive() if watchdog_timer else False
+                mission_state = getattr(panel, "_mission_state", None)
+                if mission_state is not None:
+                    state["mission_state"] = getattr(mission_state, "name", str(mission_state))
+                else:
+                    state["mission_state"] = "Unknown"
+                mission_name_input = getattr(panel, "mission_name_input", None)
+                if mission_name_input and hasattr(mission_name_input, "text"):
+                    state["mission_name"] = mission_name_input.text().strip()
+                state["panel_visible"] = panel.isVisible()
+        except Exception as exc:
+            print(f"[DIAGNOSTICS] Error gathering UI state: {exc}")
+        return state
+
+    def _gather_plugin_status(self) -> Dict[str, Any]:
+        """Retrieve the plugin status dictionary if available."""
+        status: Dict[str, Any] = {}
+        try:
+            from qgis.utils import plugins
+
+            if 'sartracker' in plugins:
+                sar_plugin = plugins['sartracker']
+                if hasattr(sar_plugin, 'get_plugin_status'):
+                    status = sar_plugin.get_plugin_status()
+        except Exception as exc:
+            print(f"[DIAGNOSTICS] Error reading plugin status: {exc}")
+        return status
+
+    def _gather_import_report(self) -> Dict[str, Any]:
+        """Format the import report stored by the plugin."""
+        try:
+            from ..services.import_guard import get_import_report
+        except Exception:
+            return {"ok": True, "errors": [], "warnings": []}
+
+        report = get_import_report()
+        if not report:
+            return {"ok": True, "errors": [], "warnings": []}
+
+        errors: List[Dict[str, Any]] = []
+        for err in report.errors:
+            errors.append({
+                "module": err.module_name,
+                "exception": f"{type(err.exception).__name__}: {err.exception}",
+                "optional": err.is_optional,
+            })
+
+        warnings = list(report.warnings or [])
+        return {
+            "ok": report.ok,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    def _gather_log_tail(self) -> Dict[str, Any]:
+        """Tail the latest QGIS log file for clipboard inclusion."""
+        try:
+            from qgis.core import QgsApplication
+
+            logs_dir = os.path.join(QgsApplication.qgisSettingsDirPath(), "logs")
+        except Exception as exc:
+            print(f"[DIAGNOSTICS] Error locating QGIS logs: {exc}")
+            return {"path": None, "lines": []}
+
+        log_files = sorted(glob.glob(os.path.join(logs_dir, "*.log")), key=os.path.getmtime)
+        if not log_files:
+            return {"path": None, "lines": []}
+
+        latest = log_files[-1]
+        return {"path": latest, "lines": tail_file(latest, max_lines=DEFAULT_TAIL_LINES)}
+
+    def _gather_audit_tail(self) -> Dict[str, Any]:
+        """Tail the local audit JSONL log if it exists."""
+        path = _get_audit_log_path()
+        if not path:
+            return {"path": None, "lines": []}
+        return {"path": path, "lines": tail_file(path, max_lines=DEFAULT_TAIL_LINES)}
+
     def _copy_to_clipboard(self):
         """Copy diagnostics report to clipboard."""
         clipboard = QApplication.clipboard()
@@ -845,3 +1059,151 @@ class DiagnosticsPanel(BaseDialog):
             "Report copied to clipboard",
             duration=2
         )
+
+
+def tail_file(path: Optional[str], max_lines: int = DEFAULT_TAIL_LINES) -> List[str]:
+    """Return the last `max_lines` from a text file."""
+    if not path:
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            dq = deque(maxlen=max_lines)
+            for line in fh:
+                dq.append(line.rstrip("\n"))
+        return list(dq)
+    except Exception as exc:
+        print(f"[DIAGNOSTICS] Error tailing file {path}: {exc}")
+        return []
+
+
+def _get_audit_log_path() -> Optional[str]:
+    """Return the audit log path used by `SARPanel` or `None` if unavailable."""
+    try:
+        from qgis.core import QgsProject
+
+        project = QgsProject.instance()
+        project_path = project.fileName()
+        if project_path:
+            logs_dir = os.path.join(os.path.dirname(project_path), "logs")
+        else:
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            logs_dir = os.path.join(plugin_dir, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        return os.path.join(logs_dir, "audit.jsonl")
+    except Exception as exc:
+        print(f"[DIAGNOSTICS] Error determining audit log path: {exc}")
+    return None
+
+
+def _scalar_to_string(value: Any) -> str:
+    """Convert scalars and small structures to printable strings."""
+    if value is None:
+        return "None"
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(value)
+
+
+def _render_kv_section(title: str, data: Any) -> List[str]:
+    """Format a key/value section, gracefully handling empty data."""
+    lines = [f"[{title}]"]
+    if data is None:
+        lines.append("No data available")
+    elif isinstance(data, dict):
+        if not data:
+            lines.append("No data available")
+        else:
+            for key in sorted(data):
+                lines.append(f"{key}: {_scalar_to_string(data[key])}")
+    elif isinstance(data, list):
+        if not data:
+            lines.append("No data available")
+        else:
+            for item in data:
+                lines.append(f"- {_scalar_to_string(item)}")
+    else:
+        lines.append(_scalar_to_string(data))
+    lines.append("")
+    return lines
+
+
+def _render_import_report_section(report: Any) -> List[str]:
+    """Format the import report block."""
+    lines = ["[IMPORT REPORT]"]
+    if not report:
+        lines.append("No import report available")
+        lines.append("")
+        return lines
+
+    status = "OK" if report.get("ok") else "Errors detected"
+    lines.append(f"Status: {status}")
+
+    errors = report.get("errors") or []
+    if errors:
+        lines.append("Errors:")
+        for err in errors:
+            module = err.get("module") or "Unknown module"
+            exception = err.get("exception") or ""
+            lines.append(f"  - {module}: {exception}")
+
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines.append("Warnings:")
+        for warning in warnings:
+            lines.append(f"  - {warning}")
+
+    lines.append("")
+    return lines
+
+
+def _render_log_tail_section(title: str, tail: Any) -> List[str]:
+    """Format a log/audit tail section."""
+    lines = [f"[{title}]"]
+    if not tail:
+        lines.append("No log data available")
+        lines.append("")
+        return lines
+
+    path = tail.get("path")
+    if path:
+        lines.append(f"Path: {path}")
+
+    entries = tail.get("lines") or []
+    if entries:
+        lines.append("Last lines:")
+        lines.extend(entries)
+    else:
+        lines.append("No entries available")
+
+    lines.append("")
+    return lines
+
+
+def format_incident_bundle(payload: Dict[str, Any]) -> str:
+    """Render a complete incident bundle text block."""
+    sections: List[str] = []
+    sections.append("SAR TRACKER INCIDENT BUNDLE")
+    sections.append("=" * 70)
+    generated = payload.get("generated_at") or "Unknown"
+    sections.append(f"Generated At: {generated}")
+    sections.append("")
+
+    sections.extend(_render_kv_section("ENVIRONMENT", payload.get("environment")))
+    sections.extend(_render_kv_section("PLUGIN", payload.get("plugin")))
+    sections.extend(_render_kv_section("PROJECT", payload.get("project")))
+    sections.extend(_render_kv_section("CONFIG", payload.get("config")))
+    sections.extend(_render_kv_section("PLUGIN STATUS", payload.get("plugin_status")))
+    sections.extend(_render_kv_section("UI STATE", payload.get("ui_state")))
+    sections.extend(_render_import_report_section(payload.get("import_report")))
+    sections.extend(_render_log_tail_section("LOG TAIL", payload.get("log_tail")))
+    sections.extend(_render_log_tail_section("AUDIT LOG TAIL", payload.get("audit_tail")))
+
+    sections.append("[DIAGNOSTICS REPORT]")
+    report = payload.get("diagnostics_report") or "No diagnostics report available"
+    sections.append(report)
+    sections.append("")
+
+    return "\n".join(sections)

@@ -44,6 +44,23 @@ from ..config.keys import ConfigStore, SETTINGS_KEYS
 from ..controllers.mission_controller import MissionState
 
 
+def should_restart_auto_refresh_timer(
+    *,
+    auto_refresh_enabled: bool,
+    is_active: bool,
+    mission_state: MissionState,
+    timer_active: bool,
+) -> bool:
+    """Return True when auto-refresh should be restarted defensively."""
+    if not auto_refresh_enabled or not is_active:
+        return False
+    if mission_state == MissionState.PAUSED:
+        return False
+    if timer_active:
+        return False
+    return True
+
+
 class SARPanel(QDockWidget):
     """
     Main SAR tracking control panel.
@@ -116,6 +133,11 @@ class SARPanel(QDockWidget):
         # Setup auto-refresh timer (Issue #5: Parent = self for proper Qt lifecycle)
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self._on_auto_refresh)
+
+        # Defensive watchdog to restart auto-refresh if it stops unexpectedly
+        self._refresh_watchdog_timer = QTimer(self)
+        self._refresh_watchdog_timer.setInterval(30000)  # 30s safety check
+        self._refresh_watchdog_timer.timeout.connect(self._on_refresh_watchdog)
 
         # Setup auto-save timer
         self.autosave_timer = QTimer(self)
@@ -1009,11 +1031,33 @@ class SARPanel(QDockWidget):
         """Start/stop the auto-refresh timer based on current config."""
         if not self._is_active:
             self.refresh_timer.stop()
+            if hasattr(self, '_refresh_watchdog_timer') and self._refresh_watchdog_timer:
+                self._refresh_watchdog_timer.stop()
             return
         if self.auto_refresh_enabled:
             self.refresh_timer.start(self.auto_refresh_interval_seconds * 1000)
+            if hasattr(self, '_refresh_watchdog_timer') and self._refresh_watchdog_timer:
+                if not self._refresh_watchdog_timer.isActive():
+                    self._refresh_watchdog_timer.start()
         else:
             self.refresh_timer.stop()
+            if hasattr(self, '_refresh_watchdog_timer') and self._refresh_watchdog_timer:
+                self._refresh_watchdog_timer.stop()
+
+    def _on_refresh_watchdog(self):
+        """Restart auto-refresh timer if it stops unexpectedly."""
+        try:
+            should_restart = should_restart_auto_refresh_timer(
+                auto_refresh_enabled=self.auto_refresh_enabled,
+                is_active=self._is_active,
+                mission_state=self._mission_state,
+                timer_active=self.refresh_timer.isActive(),
+            )
+            if should_restart:
+                self.refresh_timer.start(self.auto_refresh_interval_seconds * 1000)
+                print("[SARTRACKER] SARPanel: Auto-refresh timer restarted by watchdog")
+        except Exception as exc:
+            print(f"[SARPanel] Warning: Auto-refresh watchdog error: {exc}")
 
     def _update_auto_refresh_status_label(self):
         """Update the read-only auto-refresh status indicator."""
@@ -1839,6 +1883,10 @@ class SARPanel(QDockWidget):
                 if self.refresh_timer.isActive():
                     self.refresh_timer.stop()
                     print("[SARTRACKER] SARPanel: Stopped refresh_timer")
+            if hasattr(self, '_refresh_watchdog_timer') and self._refresh_watchdog_timer:
+                if self._refresh_watchdog_timer.isActive():
+                    self._refresh_watchdog_timer.stop()
+                    print("[SARTRACKER] SARPanel: Stopped refresh_watchdog_timer")
 
             if hasattr(self, 'pause_flash_timer') and self.pause_flash_timer:
                 if self.pause_flash_timer.isActive():
