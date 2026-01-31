@@ -284,51 +284,219 @@ class TestReplayTempStoreLifecycle:
     """Integration tests for temp store with replay enable/disable."""
 
     @pytest.mark.qgis_required
-    def test_replay_enable_without_mission_creates_temp_store(self):
+    def test_replay_enable_without_mission_creates_temp_store(self, tmp_path):
         """
         CRITICAL: Enabling replay without active mission creates temp store.
 
         VALUE: Replay always has storage, even without mission.
         """
-        # This test verifies the orchestration in provider_controller
-        # Will be implemented after unit tests pass
-        pytest.skip("Integration test - implement after unit tests pass")
+        pytest.importorskip("qgis.core")
+
+        from sartracker.controllers.provider_controller import ProviderController
+        from sartracker.utils.mission_storage import MissionStorageHelper
+        from sartracker.utils.task_manager import TaskManager
+
+        # Track what setter receives
+        temp_store_path_received = []
+
+        def mock_setter(path):
+            temp_store_path_received.append(path)
+
+        def mock_clearer():
+            temp_store_path_received.clear()
+
+        def mock_getter():
+            return temp_store_path_received[0] if temp_store_path_received else None
+
+        # Create controller with mocked dependencies
+        mock_iface = MagicMock()
+        mock_task_manager = MagicMock(spec=TaskManager)
+        controller = ProviderController(mock_iface, mock_task_manager)
+        controller.set_temp_store_handlers(mock_setter, mock_clearer, mock_getter)
+
+        # Mock the storage helper to use tmp_path
+        with patch.object(MissionStorageHelper, '_get_replay_cache_root', return_value=tmp_path):
+            # Simulate replay enabled, no mission active
+            controller._manage_replay_temp_store(replay_enabled=True, mission_is_active=False)
+
+            # Temp store should have been created
+            assert len(temp_store_path_received) == 1
+            assert temp_store_path_received[0] is not None
+            assert 'replay' in temp_store_path_received[0]
+            assert temp_store_path_received[0].endswith('.gpkg')
 
     @pytest.mark.qgis_required
-    def test_replay_disable_clears_temp_store(self):
+    def test_replay_disable_clears_temp_store(self, tmp_path):
         """
         CRITICAL: Disabling replay clears the temp store.
 
         VALUE: No stale replay data persists.
         """
-        pytest.skip("Integration test - implement after unit tests pass")
+        pytest.importorskip("qgis.core")
+
+        from sartracker.controllers.provider_controller import ProviderController
+        from sartracker.utils.mission_storage import MissionStorageHelper
+        from sartracker.utils.task_manager import TaskManager
+
+        # Track temp store state
+        temp_store_path = [None]
+        clearer_called = [False]
+
+        def mock_setter(path):
+            temp_store_path[0] = path
+
+        def mock_clearer():
+            clearer_called[0] = True
+            temp_store_path[0] = None
+
+        def mock_getter():
+            return temp_store_path[0]
+
+        # Create controller with mocked dependencies
+        mock_iface = MagicMock()
+        mock_task_manager = MagicMock(spec=TaskManager)
+        controller = ProviderController(mock_iface, mock_task_manager)
+        controller.set_temp_store_handlers(mock_setter, mock_clearer, mock_getter)
+
+        with patch.object(MissionStorageHelper, '_get_replay_cache_root', return_value=tmp_path):
+            # First enable replay to create temp store
+            controller._manage_replay_temp_store(replay_enabled=True, mission_is_active=False)
+            assert temp_store_path[0] is not None, "Temp store should be created"
+
+            # Store the path for cleanup verification
+            created_path = temp_store_path[0]
+
+            # Now disable replay
+            controller._manage_replay_temp_store(replay_enabled=False, mission_is_active=False)
+
+            # Clearer should have been called
+            assert clearer_called[0], "Clearer should be called when replay disabled"
 
     @pytest.mark.qgis_required
-    def test_mission_start_clears_temp_store(self):
+    def test_mission_start_clears_temp_store(self, tmp_path):
         """
         CRITICAL: Starting a mission clears any active temp store.
 
         VALUE: Mission data never mixes with replay temp data.
         """
-        pytest.skip("Integration test - implement after unit tests pass")
+        pytest.importorskip("qgis.core")
+
+        from sartracker.controllers.provider_controller import ProviderController
+        from sartracker.utils.mission_storage import MissionStorageHelper
+        from sartracker.utils.task_manager import TaskManager
+
+        # Track temp store state
+        temp_store_path = [None]
+        clearer_call_count = [0]
+
+        def mock_setter(path):
+            temp_store_path[0] = path
+
+        def mock_clearer():
+            clearer_call_count[0] += 1
+            temp_store_path[0] = None
+
+        def mock_getter():
+            return temp_store_path[0]
+
+        # Create controller with mocked dependencies
+        mock_iface = MagicMock()
+        mock_task_manager = MagicMock(spec=TaskManager)
+        controller = ProviderController(mock_iface, mock_task_manager)
+        controller.set_temp_store_handlers(mock_setter, mock_clearer, mock_getter)
+
+        with patch.object(MissionStorageHelper, '_get_replay_cache_root', return_value=tmp_path):
+            # Enable replay without mission to create temp store
+            controller._manage_replay_temp_store(replay_enabled=True, mission_is_active=False)
+            assert temp_store_path[0] is not None, "Temp store should exist"
+
+            # Now mission becomes active (simulates mission start)
+            # Replay should auto-disable when mission is active
+            controller._manage_replay_temp_store(replay_enabled=True, mission_is_active=True)
+
+            # Clearer should have been called
+            assert clearer_call_count[0] >= 1, "Clearer should be called when mission starts"
 
     @pytest.mark.qgis_required
-    def test_live_mission_store_never_modified_by_replay(self):
+    def test_live_mission_store_never_modified_by_replay(self, tmp_path):
         """
         LIFE-SAFETY CRITICAL: Replay must never write to live mission store.
 
         VALUE: Live mission data integrity is preserved.
         """
-        pytest.skip("Integration test - implement after unit tests pass")
+        pytest.importorskip("qgis.core")
+
+        from sartracker.layers.manager import LayerManager
+
+        # Create a mock iface
+        iface = MagicMock()
+
+        manager = LayerManager(iface)
+
+        # Set up a live mission store
+        live_store = str(tmp_path / "live_mission.gpkg")
+        manager.set_mission_store(live_store)
+
+        # Set up a temp replay store
+        temp_store = str(tmp_path / "replay_temp.gpkg")
+        manager.set_temp_mission_store(temp_store)
+
+        # Effective store should be temp, not live
+        effective = manager._get_effective_store_path()
+        assert effective == temp_store, "Temp store should take priority"
+        assert effective != live_store, "Live store should NOT be used when temp is set"
+
+        # Verify mission store path is preserved
+        assert manager._mission_store_path == live_store, "Live store path should be preserved"
+
+        # Clear temp store - now effective should be live
+        manager.clear_temp_mission_store()
+        effective_after = manager._get_effective_store_path()
+        assert effective_after == live_store, "Should fall back to live store after temp cleared"
 
     @pytest.mark.qgis_required
-    def test_plugin_unload_cleans_temp_store(self):
+    def test_plugin_unload_cleans_temp_store(self, tmp_path):
         """
         Temp store should be cleaned up on plugin unload.
 
         VALUE: No orphaned temp directories.
         """
-        pytest.skip("Integration test - implement after unit tests pass")
+        pytest.importorskip("qgis.core")
+
+        from sartracker.controllers.provider_controller import ProviderController
+        from sartracker.utils.mission_storage import MissionStorageHelper
+        from sartracker.utils.task_manager import TaskManager
+
+        # Track cleanup
+        cleanup_called = [False]
+        temp_store_path = [None]
+
+        def mock_setter(path):
+            temp_store_path[0] = path
+
+        def mock_clearer():
+            cleanup_called[0] = True
+            temp_store_path[0] = None
+
+        def mock_getter():
+            return temp_store_path[0]
+
+        # Create controller with mocked dependencies
+        mock_iface = MagicMock()
+        mock_task_manager = MagicMock(spec=TaskManager)
+        controller = ProviderController(mock_iface, mock_task_manager)
+        controller.set_temp_store_handlers(mock_setter, mock_clearer, mock_getter)
+
+        with patch.object(MissionStorageHelper, '_get_replay_cache_root', return_value=tmp_path):
+            # Enable replay to create temp store
+            controller._manage_replay_temp_store(replay_enabled=True, mission_is_active=False)
+            assert temp_store_path[0] is not None
+
+            # Simulate unload - cleanup_replay_temp_store should be called
+            controller._cleanup_replay_temp_store()
+
+            # Clearer should have been called
+            assert cleanup_called[0], "Cleanup should be called on unload"
 
 
 # =============================================================================
