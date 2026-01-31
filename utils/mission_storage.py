@@ -836,3 +836,93 @@ class MissionStorageHelper:
         finally:
             # Clean up temporary snapshot
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    # ------------------------------------------------------------------ #
+    # Temporary Replay Store (Phase 3: SAR-604i)
+    # ------------------------------------------------------------------ #
+    # These methods manage temporary storage for replay mode.
+    # Replay data must be isolated from live mission data.
+
+    @staticmethod
+    def _get_replay_cache_root() -> Path:
+        """
+        Get the root directory for replay temp stores.
+
+        Returns path under QGIS profile: <profile>/sartracker/replay/
+
+        Returns:
+            Path to replay cache root directory.
+
+        Raises:
+            RuntimeError: If QGIS profile path cannot be determined.
+        """
+        try:
+            from qgis.core import QgsApplication
+            profile_dir = QgsApplication.qgisSettingsDirPath()
+        except Exception:
+            # Fallback to temp directory if QGIS not available
+            import tempfile
+            profile_dir = tempfile.gettempdir()
+
+        cache_root = Path(profile_dir) / "sartracker" / "replay"
+        return cache_root
+
+    @staticmethod
+    def prepare_temp_replay_store(token: str) -> Optional[str]:
+        """
+        Create a temporary mission store for replay mode.
+
+        Creates a unique directory under the replay cache root and returns
+        the path to a GeoPackage file within it.
+
+        Args:
+            token: Unique identifier for this replay session (e.g., UUID).
+
+        Returns:
+            Absolute path to the temp GeoPackage file, or None if creation fails.
+
+        Note:
+            The directory structure is:
+            <profile>/sartracker/replay/<token>/replay_temp.gpkg
+        """
+        if not token:
+            return None
+
+        try:
+            cache_root = MissionStorageHelper._get_replay_cache_root()
+            store_dir = cache_root / token
+            store_dir.mkdir(parents=True, exist_ok=True)
+
+            gpkg_path = store_dir / "replay_temp.gpkg"
+            return str(gpkg_path)
+
+        except Exception as exc:
+            print(f"[MissionStorageHelper] Failed to create temp replay store: {exc}")
+            return None
+
+    @staticmethod
+    def cleanup_temp_replay_store(gpkg_path: Optional[str]) -> None:
+        """
+        Clean up a temporary replay store.
+
+        Removes the entire directory containing the temp GeoPackage.
+        Safe to call with None or non-existent path.
+
+        Args:
+            gpkg_path: Path to the temp GeoPackage, or None.
+        """
+        if not gpkg_path:
+            return
+
+        try:
+            store_dir = Path(gpkg_path).parent
+            if store_dir.exists() and store_dir.is_dir():
+                # Safety check: only delete if it's under replay cache
+                cache_root = MissionStorageHelper._get_replay_cache_root()
+                if str(store_dir).startswith(str(cache_root)):
+                    shutil.rmtree(store_dir, ignore_errors=True)
+                else:
+                    print(f"[MissionStorageHelper] Refusing to delete {store_dir} - not under replay cache")
+        except Exception as exc:
+            # Best-effort cleanup - don't raise
+            print(f"[MissionStorageHelper] Failed to cleanup temp replay store: {exc}")

@@ -1542,6 +1542,18 @@ class sartracker:
             self.provider_controller.set_mission_start_getter(self._get_mission_start_iso)
             self.provider_controller.set_mission_active_getter(self._is_mission_active)
 
+            # SAR-604i: Wire up temp store handlers for replay mode
+            self.provider_controller.set_temp_store_handlers(
+                setter=self.layer_manager.set_temp_mission_store,
+                clearer=self.layer_manager.clear_temp_mission_store,
+                getter=self.layer_manager.get_temp_mission_store
+            )
+
+            # SAR-f02j: Wire replay mode indicator to SAR panel
+            self.provider_controller.replay_mode_changed.connect(
+                self.sar_panel.set_replay_mode_active
+            )
+
             # Rewire refresh signal to controller with a single guarded handler
             try:
                 self.sar_panel.refresh_requested.disconnect()

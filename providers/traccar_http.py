@@ -1701,7 +1701,8 @@ class TraccarHttpProvider(Provider):
     def create_refresh_task(self, description: str,
                             since_iso: Optional[str] = None,
                             until_iso: Optional[str] = None,
-                            device_timestamps: Optional[Dict[str, str]] = None) -> 'ProviderRefreshTask':
+                            device_timestamps: Optional[Dict[str, str]] = None,
+                            replay_enabled: bool = False) -> 'ProviderRefreshTask':
         """
         Create Traccar-specific refresh task for background data fetching.
 
@@ -1715,6 +1716,8 @@ class TraccarHttpProvider(Provider):
                               Phase 3 (SAR-4vs): Enables incremental fetch mode where
                               each device fetches positions only after its last known
                               timestamp, reducing duplicate data transfer by ~99%.
+            replay_enabled: If True, derive current positions from breadcrumbs
+                           instead of fetching live data (SAR-zh9y).
 
         Returns:
             TraccarRefreshTask instance (inherits from ProviderRefreshTask)
@@ -1726,7 +1729,8 @@ class TraccarHttpProvider(Provider):
             self, description,
             since_iso=since_iso,
             until_iso=until_iso,
-            device_timestamps=device_timestamps
+            device_timestamps=device_timestamps,
+            replay_enabled=replay_enabled
         )
 
 

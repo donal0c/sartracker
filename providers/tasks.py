@@ -25,6 +25,63 @@ DEFAULT_BREADCRUMB_GAP_MINUTES = 5.0
 MAX_BREADCRUMB_POSITIONS = 100000
 
 
+def derive_current_from_breadcrumbs(breadcrumbs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Derive current positions from breadcrumbs by finding latest per device.
+
+    In replay mode, we cannot use the live API for "current" positions because
+    that would mix live data with historical breadcrumbs. Instead, we derive
+    "current" as the latest position per device within the replay window.
+
+    Args:
+        breadcrumbs: List of breadcrumb dicts, each containing at minimum:
+            - device_id: str (device identifier)
+            - ts: str (ISO8601 timestamp)
+            Plus any other position fields (lat, lon, name, etc.)
+
+    Returns:
+        List of position dicts, one per device, representing the latest
+        position for each device within the breadcrumbs.
+
+    Edge cases:
+        - Empty breadcrumbs: returns []
+        - Missing device_id or ts: entry is skipped
+        - Multiple devices: returns one entry per device
+
+    Thread-safe: Pure function with no side effects.
+    """
+    from ..utils.timeparse import parse_iso
+
+    if not breadcrumbs:
+        return []
+
+    latest_by_device: Dict[str, Dict[str, Any]] = {}
+    latest_ts_by_device: Dict[str, datetime] = {}
+
+    for bc in breadcrumbs:
+        device_id = bc.get('device_id')
+        ts_str = bc.get('ts')
+
+        # Skip entries without required fields
+        if not device_id or not ts_str:
+            continue
+
+        try:
+            ts = parse_iso(ts_str)
+        except (ValueError, TypeError):
+            # Skip entries with unparseable timestamps
+            logger.debug("Skipping breadcrumb with unparseable timestamp: device_id=%s, ts=%s",
+                        device_id, ts_str)
+            continue
+
+        # Update if this is the first entry or later than current latest
+        if device_id not in latest_ts_by_device or ts > latest_ts_by_device[device_id]:
+            latest_ts_by_device[device_id] = ts
+            latest_by_device[device_id] = bc
+
+    return list(latest_by_device.values())
+
+
 class ProviderRefreshTask(QgsTask):
     """
     Abstract base class for provider refresh tasks.
@@ -625,7 +682,8 @@ class TraccarRefreshTask(ProviderRefreshTask):
     def __init__(self, provider: 'TraccarHttpProvider', description: str = "Fetching Traccar data",
                  since_iso: Optional[str] = None,
                  until_iso: Optional[str] = None,
-                 device_timestamps: Optional[Dict[str, str]] = None):
+                 device_timestamps: Optional[Dict[str, str]] = None,
+                 replay_enabled: bool = False):
         """
         Initialize Traccar refresh task.
 
@@ -640,11 +698,15 @@ class TraccarRefreshTask(ProviderRefreshTask):
                               When provided, enables incremental fetch mode where
                               each device fetches positions only after its last known
                               timestamp, reducing duplicate data transfer.
+            replay_enabled: If True, derive current positions from breadcrumbs
+                           instead of fetching live data. This ensures consistency
+                           when viewing historical data in replay mode.
         """
         super().__init__(provider, description)
         self.since_iso = since_iso
         self.until_iso = until_iso
         self._device_timestamps = device_timestamps
+        self.replay_enabled = replay_enabled
 
     def run(self) -> bool:
         """
@@ -724,71 +786,124 @@ class TraccarRefreshTask(ProviderRefreshTask):
             # Update progress
             self.setProgress(33)
 
-            # Fetch current positions with session
-            try:
-                current = provider.get_current(session=session)
-            except (ProviderNetworkError, ProviderDataError) as e:
-                if fallback_features is None and getattr(provider, 'enable_last_good_cache', False):
-                    fallback_features = provider._load_last_good_cache()
-                if fallback_features:
-                    logger.info("Using cached positions due to %s: %s", e.__class__.__name__, e)
-                    current = fallback_features
-                else:
-                    self.error_message = f"Failed to fetch current positions: {str(e)}"
-                    return False
-            except ProviderAuthError as e:
-                # SAR-5vu FIX: Add recovery guidance
-                self.error_message = f"Failed to fetch current positions: {str(e)} - Check Provider Settings to re-authenticate."
-                return False
-            except Exception as e:
-                logger.error("Error fetching current positions: %s", e)
-                self.error_message = f"Failed to fetch current positions: {str(e)}"
-                return False
-
-            # BUG-054 FIX: Check for cancellation with context
-            if self.check_cancellation("Traccar after get_current"):
-                return False
-
-            # Update progress
-            self.setProgress(66)
-
-            # Fetch breadcrumbs with session (always attempt, even when using cached positions)
+            # SAR-zh9y: In replay mode, fetch breadcrumbs first, then derive current
+            # In normal mode, fetch current positions first for responsiveness
             breadcrumb_processing = None
+            current = []
+            breadcrumbs = []
+
             def _breadcrumb_progress(fraction: float):
                 try:
                     fraction_val = max(0.0, min(1.0, float(fraction)))
                 except Exception:
                     fraction_val = 0.0
-                start = 66.0
-                end = 95.0
+                # In replay mode, breadcrumbs are fetched first (33-80%)
+                # In normal mode, breadcrumbs are fetched after current (66-95%)
+                if self.replay_enabled:
+                    start, end = 33.0, 80.0
+                else:
+                    start, end = 66.0, 95.0
                 self.setProgress(start + (end - start) * fraction_val)
 
-            try:
-                # Phase 3 (SAR-4vs): Pass device_timestamps for incremental fetch
-                breadcrumbs = provider.get_breadcrumbs(
-                    since_iso=self.since_iso,
-                    until_iso=self.until_iso,
-                    device_timestamps=self._device_timestamps,  # Incremental fetch
-                    session=session,
-                    cancel_check=self.isCanceled,
-                    progress_callback=_breadcrumb_progress
-                )
-            except (ProviderNetworkError, ProviderDataError) as e:
-                logger.info("%s fetching breadcrumbs: %s", e.__class__.__name__, e)
-                breadcrumbs = provider._load_last_good_breadcrumbs() if getattr(provider, 'enable_last_good_cache', False) else []
-                if breadcrumbs:
-                    logger.info("Using cached breadcrumbs (%d points)", len(breadcrumbs))
-                _breadcrumb_progress(1.0)
-            except ProviderAuthError as e:
-                # SAR-5vu FIX: Add recovery guidance
-                self.error_message = f"Failed to fetch breadcrumbs: {str(e)} - Check Provider Settings to re-authenticate."
-                return False
-            except Exception as e:
-                logger.error("Error fetching breadcrumbs: %s", e)
-                breadcrumbs = []
-                _breadcrumb_progress(1.0)
+            if self.replay_enabled:
+                # SAR-zh9y CRITICAL: Replay mode derives current from breadcrumbs ONLY.
+                # We must NOT fall back to last-good cache because:
+                # 1. Cache contains LIVE positions (today's data)
+                # 2. Breadcrumbs contain HISTORICAL positions (replay window)
+                # Mixing these would show misleading data on the map, which is
+                # dangerous for training and after-action review scenarios.
+                logger.info("Replay mode: deriving current positions from breadcrumbs")
+
+                try:
+                    breadcrumbs = provider.get_breadcrumbs(
+                        since_iso=self.since_iso,
+                        until_iso=self.until_iso,
+                        device_timestamps=self._device_timestamps,
+                        session=session,
+                        cancel_check=self.isCanceled,
+                        progress_callback=_breadcrumb_progress
+                    )
+                except (ProviderNetworkError, ProviderDataError) as e:
+                    logger.info("%s fetching breadcrumbs: %s", e.__class__.__name__, e)
+                    # In replay mode, do NOT fall back to live cache - that would mix data
+                    breadcrumbs = []
+                    _breadcrumb_progress(1.0)
+                except ProviderAuthError as e:
+                    self.error_message = f"Failed to fetch breadcrumbs: {str(e)} - Check Provider Settings to re-authenticate."
+                    return False
+                except Exception as e:
+                    logger.error("Error fetching breadcrumbs: %s", e)
+                    breadcrumbs = []
+                    _breadcrumb_progress(1.0)
+                else:
+                    _breadcrumb_progress(1.0)
+
+                if self.check_cancellation("Traccar after get_breadcrumbs (replay)"):
+                    return False
+
+                # Derive current from breadcrumbs (latest position per device)
+                current = derive_current_from_breadcrumbs(breadcrumbs)
+                logger.info("Replay mode: derived %d current positions from %d breadcrumbs",
+                           len(current), len(breadcrumbs))
+
+                # Warn if replay mode produces no data (helps troubleshooting)
+                if not current:
+                    logger.warning("Replay mode: no positions to display - "
+                                  "breadcrumb data may be empty or unavailable for the selected time window")
+
+                self.setProgress(85)
+
             else:
-                _breadcrumb_progress(1.0)
+                # NORMAL MODE: Fetch current positions first for responsiveness
+                try:
+                    current = provider.get_current(session=session)
+                except (ProviderNetworkError, ProviderDataError) as e:
+                    if fallback_features is None and getattr(provider, 'enable_last_good_cache', False):
+                        fallback_features = provider._load_last_good_cache()
+                    if fallback_features:
+                        logger.info("Using cached positions due to %s: %s", e.__class__.__name__, e)
+                        current = fallback_features
+                    else:
+                        self.error_message = f"Failed to fetch current positions: {str(e)}"
+                        return False
+                except ProviderAuthError as e:
+                    self.error_message = f"Failed to fetch current positions: {str(e)} - Check Provider Settings to re-authenticate."
+                    return False
+                except Exception as e:
+                    logger.error("Error fetching current positions: %s", e)
+                    self.error_message = f"Failed to fetch current positions: {str(e)}"
+                    return False
+
+                if self.check_cancellation("Traccar after get_current"):
+                    return False
+
+                self.setProgress(66)
+
+                # Fetch breadcrumbs
+                try:
+                    breadcrumbs = provider.get_breadcrumbs(
+                        since_iso=self.since_iso,
+                        until_iso=self.until_iso,
+                        device_timestamps=self._device_timestamps,
+                        session=session,
+                        cancel_check=self.isCanceled,
+                        progress_callback=_breadcrumb_progress
+                    )
+                except (ProviderNetworkError, ProviderDataError) as e:
+                    logger.info("%s fetching breadcrumbs: %s", e.__class__.__name__, e)
+                    breadcrumbs = provider._load_last_good_breadcrumbs() if getattr(provider, 'enable_last_good_cache', False) else []
+                    if breadcrumbs:
+                        logger.info("Using cached breadcrumbs (%d points)", len(breadcrumbs))
+                    _breadcrumb_progress(1.0)
+                except ProviderAuthError as e:
+                    self.error_message = f"Failed to fetch breadcrumbs: {str(e)} - Check Provider Settings to re-authenticate."
+                    return False
+                except Exception as e:
+                    logger.error("Error fetching breadcrumbs: %s", e)
+                    breadcrumbs = []
+                    _breadcrumb_progress(1.0)
+                else:
+                    _breadcrumb_progress(1.0)
 
             # BUG-054 FIX: Check for cancellation with context
             if self.check_cancellation("Traccar after get_breadcrumbs"):

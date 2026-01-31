@@ -45,6 +45,50 @@ def _format_iso_datetime(value: QDateTime) -> str:
     return value.toString(ISODate)
 
 
+def validate_replay_settings(start_dt, hours: int, now_dt=None) -> Optional[str]:
+    """
+    Validate replay window settings.
+
+    Args:
+        start_dt: Start datetime (timezone-aware, should be UTC)
+        hours: Duration in hours (1-24)
+        now_dt: Current datetime for comparison (default: now UTC)
+
+    Returns:
+        Error message string if invalid, None if valid.
+
+    Validation rules:
+        - hours must be 1-24
+        - start_dt must not be in the future
+        - start_dt must be within 30 days of now
+        - end_dt (start + hours) must not be in the future
+    """
+    from datetime import datetime, timezone, timedelta
+
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+
+    # Validate hours range
+    if not isinstance(hours, int) or hours < 1 or hours > 24:
+        return "Replay duration must be between 1 and 24 hours"
+
+    # Validate start not in future
+    if start_dt > now_dt:
+        return "Replay start time cannot be in the future"
+
+    # Validate start within 30 days
+    max_lookback = now_dt - timedelta(days=30)
+    if start_dt < max_lookback:
+        return "Replay start time cannot be more than 30 days ago"
+
+    # Validate end not in future
+    end_dt = start_dt + timedelta(hours=hours)
+    if end_dt > now_dt:
+        return "Replay end time cannot be in the future (reduce duration or use earlier start)"
+
+    return None  # Valid
+
+
 class SettingsPanel(QDockWidget):
     """
     Settings and configuration panel for SAR Tracker.
@@ -444,24 +488,34 @@ class SettingsPanel(QDockWidget):
         http_config_layout.addWidget(http_advanced_group)
 
         # Replay / Testing Window (Advanced)
-        replay_group = QGroupBox("Replay / Testing Window")
+        # SAR-f02j: Store as instance variable for provider gating
+        self.replay_group = QGroupBox("Replay / Testing Window")
         replay_layout = QGridLayout()
+
+        # SAR-f02j: Warning text about replay being for testing only
+        replay_warning = QLabel(
+            "<small><i>Replay shows historical data for testing. "
+            "Not for live operations.</i></small>"
+        )
+        replay_warning.setWordWrap(True)
+        replay_warning.setStyleSheet("QLabel { color: #856404; }")
+        replay_layout.addWidget(replay_warning, 0, 0, 1, 2)
 
         self.replay_enable_check = QCheckBox("Enable replay/testing window")
         self.replay_enable_check.setToolTip("Use a fixed historical time window for testing (no live ops)")
         self.replay_enable_check.setObjectName("replay_enable_check")
         self.replay_enable_check.stateChanged.connect(self._on_replay_settings_changed)
-        replay_layout.addWidget(self.replay_enable_check, 0, 0, 1, 2)
+        replay_layout.addWidget(self.replay_enable_check, 1, 0, 1, 2)
 
-        replay_layout.addWidget(QLabel("Start time (local):"), 1, 0)
+        replay_layout.addWidget(QLabel("Start time (local):"), 2, 0)
         self.replay_start_edit = QDateTimeEdit(QDateTime.currentDateTime())
         self.replay_start_edit.setCalendarPopup(True)
         self.replay_start_edit.setToolTip("Local start time for replay window")
         self.replay_start_edit.setObjectName("replay_start_edit")
         self.replay_start_edit.dateTimeChanged.connect(self._on_replay_settings_changed)
-        replay_layout.addWidget(self.replay_start_edit, 1, 1)
+        replay_layout.addWidget(self.replay_start_edit, 2, 1)
 
-        replay_layout.addWidget(QLabel("Duration (hours):"), 2, 0)
+        replay_layout.addWidget(QLabel("Duration (hours):"), 3, 0)
         self.replay_window_hours_spin = QSpinBox()
         self.replay_window_hours_spin.setMinimum(1)
         self.replay_window_hours_spin.setMaximum(24)
@@ -469,10 +523,10 @@ class SettingsPanel(QDockWidget):
         self.replay_window_hours_spin.setToolTip("Replay window length in hours (max 24)")
         self.replay_window_hours_spin.setObjectName("replay_window_hours_spin")
         self.replay_window_hours_spin.valueChanged.connect(self._on_replay_settings_changed)
-        replay_layout.addWidget(self.replay_window_hours_spin, 2, 1)
+        replay_layout.addWidget(self.replay_window_hours_spin, 3, 1)
 
-        replay_group.setLayout(replay_layout)
-        http_config_layout.addWidget(replay_group)
+        self.replay_group.setLayout(replay_layout)
+        http_config_layout.addWidget(self.replay_group)
 
         http_config_layout.addStretch()
         http_config_page.setLayout(http_config_layout)
@@ -836,7 +890,32 @@ class SettingsPanel(QDockWidget):
         elif provider_name in ['http_traccar', 'traccar_http']:
             self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_HTTP_TRACCAR)
 
+        # SAR-f02j: Gate replay controls to traccar_http only
+        self._update_replay_controls_visibility(provider_name)
+
         self.apply_button.setEnabled(True)
+
+    def _update_replay_controls_visibility(self, provider_name: str):
+        """
+        SAR-f02j: Show/hide replay controls based on provider.
+
+        Replay only works with traccar_http (not legacy http_traccar or csv).
+
+        Args:
+            provider_name: Current provider name
+        """
+        if not hasattr(self, 'replay_group'):
+            return
+
+        # Only show replay for the new traccar_http provider
+        replay_supported = (provider_name == 'traccar_http')
+        self.replay_group.setVisible(replay_supported)
+
+        # If switching away from traccar_http, disable replay to prevent confusion
+        if not replay_supported and hasattr(self, 'replay_enable_check'):
+            if self.replay_enable_check.isChecked():
+                self.replay_enable_check.setChecked(False)
+                print("[SETTINGS_PANEL] Replay disabled - not supported for this provider")
 
     def _on_csv_browse(self):
         """Handle CSV browse button click."""
@@ -974,7 +1053,34 @@ class SettingsPanel(QDockWidget):
             ConfigStore.set_mission_backup_root(backup_root)
             ConfigStore.set_coordinator_roster(self.coordinator_roster_input.toPlainText().strip())
             ConfigStore.set_admin_roster(self.admin_roster_input.toPlainText().strip())
-            ConfigStore.set_traccar_test_window_enabled(self.replay_enable_check.isChecked())
+
+            # SAR-d39o: Validate replay settings before saving (if enabled)
+            replay_enabled = self.replay_enable_check.isChecked()
+            if replay_enabled:
+                from datetime import datetime, timezone
+                start_qdt = self.replay_start_edit.dateTime().toUTC()
+                # Convert QDateTime to Python datetime for validation
+                start_dt = datetime(
+                    start_qdt.date().year(),
+                    start_qdt.date().month(),
+                    start_qdt.date().day(),
+                    start_qdt.time().hour(),
+                    start_qdt.time().minute(),
+                    start_qdt.time().second(),
+                    tzinfo=timezone.utc
+                )
+                hours = self.replay_window_hours_spin.value()
+                validation_error = validate_replay_settings(start_dt, hours)
+                if validation_error:
+                    from qgis.PyQt.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Replay Settings",
+                        validation_error
+                    )
+                    return  # Don't save invalid settings
+
+            ConfigStore.set_traccar_test_window_enabled(replay_enabled)
             # Save replay start in UTC ISO format
             start_qdt = self.replay_start_edit.dateTime().toUTC()
             start_iso = _format_iso_datetime(start_qdt)

@@ -369,7 +369,23 @@ class SARPanel(QDockWidget):
         # Mission status
         self.mission_status_label = QLabel("Status: <b>No active mission</b>")
         mission_layout.addWidget(self.mission_status_label)
-        
+
+        # SAR-f02j: Replay mode warning banner
+        self.replay_mode_badge = QLabel()
+        self.replay_mode_badge.setWordWrap(True)
+        self.replay_mode_badge.setStyleSheet(
+            "QLabel { "
+            "  background-color: #fff3cd; "
+            "  color: #856404; "
+            "  padding: 8px; "
+            "  border-radius: 4px; "
+            "  border-left: 4px solid #ffc107; "
+            "  font-weight: bold; "
+            "}"
+        )
+        self.replay_mode_badge.setVisible(False)
+        mission_layout.addWidget(self.replay_mode_badge)
+
         # Mission timers
         timer_grid = QGridLayout()
         timer_font = QFont("Courier New", 12)
@@ -1312,6 +1328,46 @@ class SARPanel(QDockWidget):
             self.active_tool_label.setText("<i>None</i>")
         else:
             self.active_tool_label.setText(f"<b>{tool_name}</b>")
+
+    def set_replay_mode_active(self, enabled: bool, start_iso: str = None, end_iso: str = None):
+        """
+        SAR-f02j: Show or hide the replay mode warning banner.
+
+        When replay mode is active, displays a prominent warning banner
+        to prevent operators from confusing historical data with live positions.
+
+        Args:
+            enabled: True to show banner, False to hide
+            start_iso: Replay window start time (ISO8601) for display
+            end_iso: Replay window end time (ISO8601) for display
+
+        Qt5/Qt6 Compatible: Uses standard QLabel visibility.
+        """
+        if not hasattr(self, 'replay_mode_badge'):
+            return
+
+        if enabled:
+            # Format time window for display
+            time_info = ""
+            if start_iso and end_iso:
+                try:
+                    from datetime import datetime
+                    start_dt = datetime.fromisoformat(start_iso.replace('Z', '+00:00'))
+                    end_dt = datetime.fromisoformat(end_iso.replace('Z', '+00:00'))
+                    # Convert to local time for display
+                    start_local = start_dt.astimezone()
+                    end_local = end_dt.astimezone()
+                    time_info = f"\n{start_local.strftime('%Y-%m-%d %H:%M')} to {end_local.strftime('%H:%M')}"
+                except Exception:
+                    time_info = ""
+
+            self.replay_mode_badge.setText(
+                f"REPLAY MODE - NOT LIVE{time_info}\n"
+                f"<small>Historical data for testing only</small>"
+            )
+            self.replay_mode_badge.setVisible(True)
+        else:
+            self.replay_mode_badge.setVisible(False)
 
     def update_measurements_indicator(self, count: int):
         """

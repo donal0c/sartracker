@@ -39,6 +39,45 @@ from ..utils.device_filtering import should_show_device
 from ..config.settings import ACTIVE_DEVICE_STALE_THRESHOLD_SECONDS
 
 
+def validate_replay_window(start_dt, hours: int, now_dt=None) -> Optional[str]:
+    """
+    Validate replay window parameters (controller safety net).
+
+    This provides a safety net in case invalid settings reach the controller.
+    Primary validation should happen at save time in SettingsPanel.
+
+    Args:
+        start_dt: Start datetime (timezone-aware, should be UTC)
+        hours: Duration in hours (1-24)
+        now_dt: Current datetime for comparison (default: now UTC)
+
+    Returns:
+        Error message string if invalid, None if valid.
+    """
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+
+    # Validate hours range
+    if not isinstance(hours, int) or hours < 1 or hours > 24:
+        return "Replay hours must be between 1 and 24"
+
+    # Validate start not in future
+    if start_dt > now_dt:
+        return "Replay start time must be in the past"
+
+    # Validate start within 30 days
+    max_lookback = now_dt - timedelta(days=30)
+    if start_dt < max_lookback:
+        return "Replay start time cannot be more than 30 days ago"
+
+    # Validate end not in future
+    end_dt = start_dt + timedelta(hours=hours)
+    if end_dt > now_dt:
+        return "Replay end time cannot be in the future"
+
+    return None  # Valid
+
+
 class ProviderController(QObject):
     """
     Controller for provider selection, connection testing, polling, and refresh.
@@ -102,6 +141,10 @@ class ProviderController(QObject):
     refresh_started = pyqtSignal()      # Emitted when refresh begins
     refresh_complete = pyqtSignal(dict) # Emitted with sanitized results
     refresh_error = pyqtSignal(str)     # Emitted with error message
+
+    # SAR-f02j: Replay mode visibility signal
+    # Emitted when replay mode changes: (enabled, start_iso, end_iso)
+    replay_mode_changed = pyqtSignal(bool, str, str)
 
     # Legacy signal - kept for backwards compatibility during migration
     refresh_requested = pyqtSignal()    # DEPRECATED: Use start_refresh() instead
@@ -168,11 +211,21 @@ class ProviderController(QObject):
         self._mission_start_getter: Optional[Callable[[], Optional[str]]] = None
         self._mission_active_getter: Optional[Callable[[], bool]] = None
 
+        # SAR-604i: Temp store callbacks for replay mode
+        self._temp_store_setter: Optional[Callable[[str], None]] = None  # set_temp_mission_store
+        self._temp_store_clearer: Optional[Callable[[], None]] = None    # clear_temp_mission_store
+        self._temp_store_getter: Optional[Callable[[], Optional[str]]] = None  # get_temp_mission_store
+        self._replay_session_token: Optional[str] = None  # Current replay session ID
+
         # ================================================================
         # Phase 3 (SAR-4vs): Incremental breadcrumb state (session-scoped)
         # ================================================================
         self._breadcrumb_accumulator: Optional['BreadcrumbAccumulator'] = None
         self._incremental_breadcrumbs_enabled = True  # Feature flag
+
+        # SAR-i1by: Track replay config for change detection
+        # Tuple: (enabled, start_iso, hours)
+        self._last_replay_config: tuple = (False, None, None)
 
     def set_provider(self, provider_name: str, config: Dict[str, Any], test_only: bool = False):
         """
@@ -751,10 +804,16 @@ class ProviderController(QObject):
                     pass
                 self._current_refresh_task = None
 
+            # SAR-604i: Clean up replay temp store on shutdown
+            self._cleanup_replay_temp_store()
+
             # Clear dependency references
             self._layers_controller = None
             self._sar_panel = None
             self._mission_start_getter = None
+            self._temp_store_setter = None
+            self._temp_store_clearer = None
+            self._temp_store_getter = None
 
             # Phase 3 (SAR-4vs): Clear breadcrumb accumulator to release memory
             if self._breadcrumb_accumulator:
@@ -819,6 +878,29 @@ class ProviderController(QObject):
         """
         self._mission_active_getter = getter
 
+    def set_temp_store_handlers(
+        self,
+        setter: Callable[[str], None],
+        clearer: Callable[[], None],
+        getter: Callable[[], Optional[str]]
+    ):
+        """
+        SAR-604i: Inject callbacks for temporary mission store management.
+
+        These callbacks are used to manage isolated storage for replay mode.
+        When replay is enabled without an active mission, a temp store is
+        created. When replay is disabled or a mission starts, the temp
+        store is cleaned up.
+
+        Args:
+            setter: Callable to set temp store path (layer_manager.set_temp_mission_store)
+            clearer: Callable to clear temp store (layer_manager.clear_temp_mission_store)
+            getter: Callable to get current temp store path (layer_manager.get_temp_mission_store)
+        """
+        self._temp_store_setter = setter
+        self._temp_store_clearer = clearer
+        self._temp_store_getter = getter
+
     # ========================================================================
     # Phase 3 (SAR-4vs): Incremental Breadcrumb Accumulation
     # ========================================================================
@@ -870,6 +952,143 @@ class ProviderController(QObject):
             print('[PROVIDER_CONTROLLER] Mission resumed - keeping breadcrumb accumulator')
             # No reset - continue accumulating
             return
+
+    def _check_replay_config_reset(self, replay_enabled: bool, start_iso: Optional[str], hours: Optional[int]):
+        """
+        Check if replay config changed and reset accumulator if needed.
+
+        SAR-i1by: Prevents stale data from leaking across replay windows or
+        into live mode by resetting the accumulator when replay settings change.
+
+        Args:
+            replay_enabled: Whether replay mode is currently enabled
+            start_iso: Replay start time (ISO8601) or None
+            hours: Replay duration in hours or None
+
+        Qt5/Qt6 Compatible: Pure Python.
+        """
+        last_enabled, last_start, last_hours = self._last_replay_config
+
+        # Determine if there's a meaningful change
+        # When replay is disabled, we only care about the enabled flag changing
+        # When replay is enabled, we care about all three fields
+        needs_reset = False
+
+        if replay_enabled != last_enabled:
+            # Enabled/disabled state changed - always reset
+            needs_reset = True
+        elif replay_enabled:
+            # Replay is enabled - check if window changed
+            if start_iso != last_start or hours != last_hours:
+                needs_reset = True
+        # else: replay disabled and was disabled - no reset needed
+
+        if needs_reset:
+            # Config changed - reset accumulator
+            if self._breadcrumb_accumulator:
+                print(f'[PROVIDER_CONTROLLER] Replay config changed: enabled={last_enabled}->{replay_enabled}')
+                print('[PROVIDER_CONTROLLER] Resetting breadcrumb accumulator')
+                try:
+                    self._breadcrumb_accumulator.clear()
+                except Exception as e:
+                    print(f'[PROVIDER_CONTROLLER] Warning: Error clearing accumulator: {e}')
+
+        # Always update tracked config
+        self._last_replay_config = (replay_enabled, start_iso, hours)
+
+    def _manage_replay_temp_store(self, replay_enabled: bool, mission_is_active: bool):
+        """
+        SAR-604i: Manage temporary mission store for replay mode.
+
+        Creates temp store when replay is enabled without a mission.
+        Cleans up temp store when replay is disabled.
+
+        Args:
+            replay_enabled: Whether replay mode is enabled
+            mission_is_active: Whether a mission is currently active/paused
+        """
+        if not self._temp_store_setter or not self._temp_store_clearer:
+            # Callbacks not wired - skip temp store management
+            return
+
+        try:
+            current_temp_store = self._temp_store_getter() if self._temp_store_getter else None
+
+            if replay_enabled and not mission_is_active:
+                # Replay enabled without mission - ensure temp store exists
+                if not current_temp_store:
+                    # Create new temp store with unique session token
+                    import uuid
+                    from ..utils.mission_storage import MissionStorageHelper
+
+                    self._replay_session_token = str(uuid.uuid4())
+                    temp_path = MissionStorageHelper.prepare_temp_replay_store(
+                        self._replay_session_token
+                    )
+                    if temp_path:
+                        self._temp_store_setter(temp_path)
+                        print(f"[PROVIDER_CONTROLLER] Replay temp store created: {temp_path}")
+                    else:
+                        print("[PROVIDER_CONTROLLER] Warning: Failed to create replay temp store")
+            else:
+                # Replay disabled or mission active - cleanup temp store if exists
+                if current_temp_store:
+                    self._cleanup_replay_temp_store()
+        except Exception as e:
+            print(f"[PROVIDER_CONTROLLER] Warning: Error managing replay temp store: {e}")
+
+    def _cleanup_replay_temp_store(self):
+        """
+        SAR-604i: Clean up the replay temporary store.
+
+        Clears the temp store from LayerManager and removes the directory.
+        Safe to call even if no temp store exists.
+        """
+        if not self._temp_store_clearer:
+            return
+
+        try:
+            # Get current temp store path before clearing
+            temp_path = self._temp_store_getter() if self._temp_store_getter else None
+
+            # Clear from LayerManager first
+            self._temp_store_clearer()
+
+            # Then cleanup filesystem
+            if temp_path:
+                from ..utils.mission_storage import MissionStorageHelper
+                MissionStorageHelper.cleanup_temp_replay_store(temp_path)
+                print(f"[PROVIDER_CONTROLLER] Replay temp store cleaned up: {temp_path}")
+
+            self._replay_session_token = None
+        except Exception as e:
+            print(f"[PROVIDER_CONTROLLER] Warning: Error cleaning up replay temp store: {e}")
+
+    def _get_incremental_timestamps(self, replay_enabled: bool) -> Optional[Dict[str, str]]:
+        """
+        Get device timestamps for incremental fetch, if applicable.
+
+        SAR-i1by: Incremental fetch is disabled in replay mode to ensure
+        complete historical data is fetched for the replay window.
+
+        Args:
+            replay_enabled: Whether replay mode is enabled
+
+        Returns:
+            Dict of device_id -> ISO timestamp for incremental fetch,
+            or None if incremental fetch is disabled.
+
+        Qt5/Qt6 Compatible: Pure Python.
+        """
+        # Disable incremental fetch in replay mode
+        if replay_enabled:
+            return None
+
+        # Normal mode - use incremental fetch if enabled
+        if self._incremental_breadcrumbs_enabled and self._breadcrumb_accumulator:
+            return self._breadcrumb_accumulator.get_latest_timestamps()
+
+        return None
 
     def get_breadcrumb_stats(self) -> Dict[str, Any]:
         """
@@ -981,9 +1200,11 @@ class ProviderController(QObject):
                     print(f"[PROVIDER_CONTROLLER] Warning: Could not read replay settings: {e}")
 
             # Replay guard: disable if mission active/paused
+            mission_is_active = False
             if replay_enabled and self._mission_active_getter:
                 try:
-                    if self._mission_active_getter():
+                    mission_is_active = self._mission_active_getter()
+                    if mission_is_active:
                         ConfigStore.set_traccar_test_window_enabled(False)
                         replay_enabled = False
                         safe_warning(
@@ -992,8 +1213,23 @@ class ProviderController(QObject):
                             "Replay window disabled while a mission is active.",
                             duration=4
                         )
+                        # SAR-604i: Clear temp store when mission becomes active
+                        self._cleanup_replay_temp_store()
                 except Exception as e:
                     print(f"[PROVIDER_CONTROLLER] Warning: mission active check failed: {e}")
+
+            # SAR-604i: Manage temporary mission store for replay
+            self._manage_replay_temp_store(replay_enabled, mission_is_active)
+
+            # SAR-f02j: Emit replay mode signal when disabled
+            if not replay_enabled:
+                try:
+                    self.replay_mode_changed.emit(False, "", "")
+                except Exception as sig_err:
+                    print(f"[PROVIDER_CONTROLLER] Warning: Could not emit replay_mode_changed: {sig_err}")
+
+            # SAR-i1by: Check if replay config changed and reset accumulator if needed
+            self._check_replay_config_reset(replay_enabled, replay_start_iso, replay_hours)
 
             # Compute replay window if enabled
             effective_since = since_iso
@@ -1007,13 +1243,21 @@ class ProviderController(QObject):
                         raise ValueError("Replay hours must be between 1 and 24")
                     start_dt = parse_iso(replay_start_iso)
                     now_dt = datetime.now(timezone.utc)
-                    if start_dt > now_dt:
-                        raise ValueError("Replay start time must be in the past")
+
+                    # SAR-d39o: Use validation function as safety net
+                    validation_error = validate_replay_window(start_dt, replay_hours, now_dt)
+                    if validation_error:
+                        raise ValueError(validation_error)
+
                     end_dt = start_dt + timedelta(hours=replay_hours)
-                    if end_dt < start_dt:
-                        raise ValueError("Replay end time is before start time")
                     effective_since = format_iso(start_dt)
                     effective_until = format_iso(end_dt)
+
+                    # SAR-f02j: Emit replay mode signal for UI indicator
+                    try:
+                        self.replay_mode_changed.emit(True, effective_since, effective_until)
+                    except Exception as sig_err:
+                        print(f"[PROVIDER_CONTROLLER] Warning: Could not emit replay_mode_changed: {sig_err}")
                 except Exception as e:
                     try:
                         ConfigStore.set_traccar_test_window_enabled(False)
@@ -1039,19 +1283,20 @@ class ProviderController(QObject):
                         print(f"[PROVIDER_CONTROLLER] Warning: Could not get mission start time: {e}")
 
             # Phase 3 (SAR-4vs): Get device timestamps for incremental fetch
-            device_timestamps = None
-            if self._incremental_breadcrumbs_enabled and self._breadcrumb_accumulator:
-                device_timestamps = self._breadcrumb_accumulator.get_latest_timestamps()
-                if device_timestamps:
-                    print(f'[PROVIDER_CONTROLLER] Incremental fetch for {len(device_timestamps)} devices')
+            # SAR-i1by: Disable incremental fetch in replay mode
+            device_timestamps = self._get_incremental_timestamps(replay_enabled)
+            if device_timestamps:
+                print(f'[PROVIDER_CONTROLLER] Incremental fetch for {len(device_timestamps)} devices')
             self._current_refresh_incremental = bool(device_timestamps)
 
             # Create provider-specific background task
+            # SAR-zh9y: Pass replay_enabled to derive current from breadcrumbs
             task = self.provider.create_refresh_task(
                 "Refreshing tracking data",
                 since_iso=effective_since,
                 until_iso=effective_until,
-                device_timestamps=device_timestamps  # Phase 3: incremental fetch
+                device_timestamps=device_timestamps,  # Phase 3: incremental fetch
+                replay_enabled=replay_enabled  # SAR-zh9y: derive current from breadcrumbs
             )
 
             # Start task with managed lifecycle

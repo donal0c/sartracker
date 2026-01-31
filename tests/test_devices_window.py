@@ -10,9 +10,21 @@ Correct display of online/offline status helps coordinators know which
 team members have active tracking.
 
 REQUIRES: Real QGIS for Qt widgets
+
+NOTE: Skipped on macOS due to Qt/Rosetta crashes (SAR-efn7).
+These tests work on Linux CI.
 """
 
+import sys
 import pytest
+
+# Skip entire module on macOS - Qt widget tests crash Python on macOS/Rosetta
+# due to QApplication initialization race conditions with pytest-qgis.
+# See: https://github.com/pytest-dev/pytest-qt/issues/284
+pytestmark = pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="Qt widget tests crash on macOS due to Rosetta/Qt initialization issues (SAR-efn7)"
+)
 
 # Skip if QGIS not available
 pytest.importorskip("qgis.core")

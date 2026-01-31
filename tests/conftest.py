@@ -171,55 +171,20 @@ else:
     print("QGIS available - using real QGIS for integration testing")
 
 # ====================================================================
-# QApplication Early Initialization (CRITICAL for crash prevention)
+# QApplication Handling
 # ====================================================================
-# Qt widgets CANNOT be created without a QApplication instance.
-# This module-level initialization ensures QApplication exists BEFORE
-# any test modules are imported, preventing crashes when test files
-# import dialog classes at module level.
+# NOTE: We do NOT create QApplication at conftest import time.
+# pytest-qgis handles QApplication creation via its qgis_app fixture.
 #
-# Issue: On macOS with Rosetta 2 (x86_64 QGIS on Apple Silicon), Qt
-# can crash with SIGABRT or hang in uninterruptible sleep if widgets
-# are created before QApplication is initialized.
+# On macOS with Rosetta 2, creating QApplication in conftest causes
+# SIGSEGV crashes during Python shutdown (Py_FinalizeEx).
 #
-# Solution: Create QApplication here, at conftest import time, before
-# pytest collects test modules that might import Qt widget classes.
+# Tests that need Qt widgets should:
+# 1. Use the qgis_app fixture (provided by pytest-qgis)
+# 2. Be skipped on macOS if they cause crashes (see test_devices_window.py)
+#
+# See SAR-efn7 and SAR-1t49 for crash investigation details.
 # ====================================================================
-
-_qapp_instance = None
-
-if _qgis_available:
-    try:
-        from qgis.PyQt.QtWidgets import QApplication
-
-        # Check if QApplication already exists (pytest-qgis may have created it)
-        _qapp_instance = QApplication.instance()
-
-        if _qapp_instance is None:
-            # Set offscreen platform for headless environments (CI, etc.)
-            # This must be done BEFORE QApplication is created
-            if "QT_QPA_PLATFORM" not in os.environ:
-                # Only set offscreen if we can't detect a display
-                # On macOS with a display, we want to use the native platform
-                if sys.platform == "darwin":
-                    # macOS: check for display availability
-                    # Note: We don't force offscreen on macOS as it can cause
-                    # different behavior than real QGIS usage
-                    pass
-                elif not os.environ.get("DISPLAY"):
-                    # Linux without DISPLAY: use offscreen
-                    os.environ["QT_QPA_PLATFORM"] = "offscreen"
-
-            # Create QApplication with empty args
-            # This MUST happen before any QWidget subclass is instantiated
-            _qapp_instance = QApplication([])
-            print("QApplication created by conftest.py for test session")
-        else:
-            print("QApplication already exists (likely from pytest-qgis)")
-
-    except Exception as e:
-        print(f"Warning: Failed to create QApplication: {e}")
-        print("Tests that create Qt widgets may crash!")
 
 
 # ====================================================================
@@ -271,32 +236,19 @@ if not _qgis_available:
         MockQSettings._data.clear()
         yield
 
-@pytest.fixture(scope="session")
-def qgis_app():
-    """
-    Provide a QApplication instance for the test session.
+# Note: When pytest-qgis is available, it provides the qgis_app fixture.
+# We only define our own when pytest-qgis is NOT available.
+if not _pytest_qgis_available:
+    @pytest.fixture(scope="session")
+    def qgis_app():
+        """
+        Provide a QApplication instance for the test session (fallback).
 
-    This fixture ensures QApplication exists before any Qt widgets are created.
-    It's session-scoped to avoid creating multiple QApplication instances
-    (Qt only allows one per process).
+        This fixture is only used when pytest-qgis is not available.
+        When pytest-qgis IS available, its qgis_app fixture takes precedence.
 
-    The QApplication is created at module import time (above) to ensure it
-    exists before any test modules are collected. This fixture simply
-    provides access to that instance.
-
-    CRITICAL: Tests that create Qt widgets (dialogs, windows, etc.) MUST
-    depend on this fixture to ensure proper initialization order.
-    """
-    if _qgis_available:
-        from qgis.PyQt.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app is None:
-            # This shouldn't happen if the module-level init worked,
-            # but create one as a fallback
-            app = QApplication([])
-        return app
-    else:
-        # Return a mock for non-QGIS tests
+        Returns a mock for non-QGIS test environments.
+        """
         from unittest.mock import MagicMock
         return MagicMock()
 

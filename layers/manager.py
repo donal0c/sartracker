@@ -171,6 +171,8 @@ class LayerManager(QObject):
         self._event_filter_installed = False
         self._main_window = iface.mainWindow() if iface else None
         self._mission_store_path: Optional[str] = self._load_mission_store_path()
+        # SAR-604i: Temporary mission store for replay mode (takes priority)
+        self._temp_mission_store_path: Optional[str] = None
         self._layer_provider_uris: Dict[str, str] = {}
         self._metadata_lock = RLock()  # Thread-safety for metadata operations
         self._metadata_migration_in_progress = False
@@ -377,6 +379,76 @@ class LayerManager(QObject):
         self._layer_provider_uris.clear()
         self._layer_cache.clear()
 
+    # ------------------------------------------------------------------ #
+    # Temporary Mission Store for Replay (Phase 3: SAR-604i)
+    # ------------------------------------------------------------------ #
+
+    def set_temp_mission_store(self, path: str) -> None:
+        """
+        Set a temporary mission store path for replay mode.
+
+        The temp store takes priority over the regular mission store.
+        This ensures replay data is isolated from live mission data.
+
+        Args:
+            path: Absolute path to the temporary GeoPackage file.
+        """
+        if not path:
+            return
+
+        normalized = str(Path(path).expanduser())
+        target_dir = Path(normalized).parent
+
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self._log("WARN", f"Failed to create temp store directory: {exc}")
+            return
+
+        old_path = self._temp_mission_store_path
+        self._temp_mission_store_path = normalized
+
+        # Clear caches when store changes (layers need to be recreated)
+        if old_path != normalized:
+            self._layer_provider_uris.clear()
+            self._layer_cache.clear()
+            self._log("INFO", f"Temp mission store set: {normalized}")
+
+    def clear_temp_mission_store(self) -> None:
+        """
+        Clear the temporary mission store.
+
+        After clearing, layers will route to the regular mission store
+        (if configured) or memory.
+        """
+        if self._temp_mission_store_path:
+            self._log("INFO", f"Clearing temp mission store: {self._temp_mission_store_path}")
+
+        self._temp_mission_store_path = None
+        self._layer_provider_uris.clear()
+        self._layer_cache.clear()
+
+    def get_temp_mission_store(self) -> Optional[str]:
+        """Return the current temp mission store path, if any."""
+        return self._temp_mission_store_path
+
+    def _get_effective_store_path(self) -> Optional[str]:
+        """
+        Get the effective store path, considering temp store priority.
+
+        Priority order:
+        1. Temp mission store (for replay)
+        2. Regular mission store (cached value)
+        3. None (memory layers)
+
+        Returns:
+            The path to use for layer storage, or None for memory layers.
+        """
+        if self._temp_mission_store_path:
+            return self._temp_mission_store_path
+        # Use cached value for efficiency; project sync happens via refresh calls
+        return self._mission_store_path
+
     def set_mission_finalized(self, finalized: bool, finalized_by: str = "", finalized_at: Optional[str] = None):
         """
         Persist mission finalized flag and metadata.
@@ -461,6 +533,10 @@ class LayerManager(QObject):
             return ""
 
     def _mission_store_enabled(self) -> bool:
+        """Check if a mission store (temp or regular) is available."""
+        # SAR-604i: Check temp store first (replay mode priority)
+        if self._temp_mission_store_path:
+            return True
         return bool(self._refresh_mission_store_path(emit_signal=False))
 
     def _notify_metadata_warning(self, message: str):
@@ -1155,23 +1231,27 @@ class LayerManager(QObject):
         return layer
 
     def _ensure_mission_store_directory(self):
-        """Ensure the directory containing the mission store exists."""
-        if not self._mission_store_path:
+        """Ensure the directory containing the effective mission store exists."""
+        # SAR-604i: Use effective path (temp store takes priority)
+        effective_path = self._get_effective_store_path()
+        if not effective_path:
             raise RuntimeError("Mission store path is not configured")
-        Path(self._mission_store_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(effective_path).parent.mkdir(parents=True, exist_ok=True)
 
     def _build_mission_store_uri(self, layer_def: LayerDefinition) -> str:
         """Construct and cache the provider URI for a mission-store layer."""
         if layer_def.layer_id in self._layer_provider_uris:
             return self._layer_provider_uris[layer_def.layer_id]
 
-        if not self._mission_store_path:
+        # SAR-604i: Use effective path (temp store takes priority)
+        effective_path = self._get_effective_store_path()
+        if not effective_path:
             raise RuntimeError("Mission store path is not configured")
 
         # OGR provider expects the canonical "<path>|layername=<table>" syntax for GeoPackage layers.
         # Using QgsDataSourceUri yields a PostGIS-style connection string that the ogr provider
         # does not understand, which in turn produces invalid layers and forces a fallback to memory.
-        path = Path(self._mission_store_path).as_posix()
+        path = Path(effective_path).as_posix()
         uri = f"{path}|layername={layer_def.layer_id}"
 
         self._layer_provider_uris[layer_def.layer_id] = uri
@@ -1179,7 +1259,8 @@ class LayerManager(QObject):
 
     def _load_persistent_layer(self, layer_def: LayerDefinition) -> Optional[QgsVectorLayer]:
         """Try to load an existing GeoPackage layer."""
-        if not self._mission_store_path:
+        # SAR-604i: Use effective path (temp store takes priority)
+        if not self._get_effective_store_path():
             return None
 
         uri = self._build_mission_store_uri(layer_def)
@@ -1203,7 +1284,9 @@ class LayerManager(QObject):
         _set_option_if_available(options, "includeMetadata", True)
         _set_option_if_available(options, "overwriteWithEmptyLayer", True)
 
-        mission_store_exists = Path(self._mission_store_path).exists()
+        # SAR-604i: Use effective path (temp store takes priority)
+        effective_path = self._get_effective_store_path()
+        mission_store_exists = Path(effective_path).exists()
         if hasattr(options, "actionOnExistingFile"):
             if mission_store_exists:
                 options.actionOnExistingFile = _EXPORT_CREATE_OR_OVERWRITE_LAYER
@@ -1212,7 +1295,7 @@ class LayerManager(QObject):
 
         export_result = _export_layer(
             template_layer,
-            self._mission_store_path,
+            effective_path,
             options,
             QgsCoordinateTransformContext()
         )
