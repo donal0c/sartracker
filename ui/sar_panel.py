@@ -1978,20 +1978,31 @@ class SARPanel(QDockWidget):
 
     def closeEvent(self, event):
         """
-        Handle widget close event - stop timers and restore panels before closing.
+        Handle widget close event.
 
-        This ensures timers are stopped and Focus Mode is exited when user manually
-        closes the dock widget (not just during plugin unload).
+        IMPORTANT: In QGIS, closing a dock widget typically hides it.
+        We must NOT run full cleanup here, because that stops refresh timers
+        and disconnects mission signals. Full cleanup is reserved for plugin unload.
 
         Args:
             event: QCloseEvent from Qt
 
         Qt5/Qt6 Compatible: Standard Qt event handler.
         """
-        # Stop all timers and restore panels before closing
-        self.cleanup()
-
-        # Call parent implementation to complete close
+        # Call parent implementation to complete close (hide)
         super().closeEvent(event)
 
-        print("[SARTRACKER] SARPanel: closeEvent handled, timers stopped")
+        print("[SARTRACKER] SARPanel: closeEvent handled (panel hidden)")
+
+    def showEvent(self, event):
+        """
+        Handle widget show event.
+
+        Resume auto-refresh/autosave timers when the panel is shown again.
+        """
+        super().showEvent(event)
+
+        # Reactivate timers if panel was previously hidden
+        self._is_active = True
+        self._apply_auto_refresh_timer()
+        self._apply_autosave_timer()
