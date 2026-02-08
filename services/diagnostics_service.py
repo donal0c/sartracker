@@ -42,6 +42,7 @@ class DiagnosticsService:
         self._task_manager = None
         self._tool_registry = None
         self._sar_panel = None
+        self._layers_controller = None
         self._layer_manager = None
 
         # Callbacks for plugin-level state
@@ -65,6 +66,7 @@ class DiagnosticsService:
         self._task_manager = None
         self._tool_registry = None
         self._sar_panel = None
+        self._layers_controller = None
         self._layer_manager = None
 
         self._get_unavailable_features = None
@@ -129,6 +131,10 @@ class DiagnosticsService:
         """Set the SARPanel for legacy state fallback."""
         self._sar_panel = panel
 
+    def set_layers_controller(self, controller) -> None:
+        """Set the LayersController for manager diagnostics."""
+        self._layers_controller = controller
+
     def set_layer_manager(self, manager) -> None:
         """Set the LayerManager for storage status."""
         self._layer_manager = manager
@@ -189,6 +195,7 @@ class DiagnosticsService:
             self._gather_tool_status(status)
             self._gather_task_status(status)
             self._gather_lifecycle_status(status)
+            self._gather_layers_status(status)
 
         except Exception as e:
             # Defensive: Don't let diagnostics crash
@@ -219,6 +226,7 @@ class DiagnosticsService:
             'devices_count': 0,
             'last_refresh': None,
             'last_refresh_duration_ms': None,
+            'tracking_diagnostics': {'status': 'not_available'},
 
             # Task state
             'active_tasks_count': 0,
@@ -379,6 +387,20 @@ class DiagnosticsService:
             status['mission_backup_path'] = self._safe_call(self._get_mission_backup_dir, None)
             status['mission_finalized'] = self._safe_call(self._get_mission_finalized, False)
             status['mission_coordinators'] = self._safe_call(self._get_coordinators_cache, '')
+
+    def _gather_layers_status(self, status: Dict[str, Any]) -> None:
+        """Gather layer manager/controller diagnostics."""
+        if not self._layers_controller or self._is_deleted(self._layers_controller):
+            return
+
+        try:
+            if hasattr(self._layers_controller, 'get_all_diagnostics'):
+                all_diags = self._layers_controller.get_all_diagnostics() or {}
+                tracking_diag = all_diags.get('tracking')
+                if isinstance(tracking_diag, dict):
+                    status['tracking_diagnostics'] = tracking_diag
+        except Exception as e:
+            print(f"[SARTRACKER] Warning: Error reading layers diagnostics: {e}")
 
     # ========================================================================
     # Convenience Methods

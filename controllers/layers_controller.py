@@ -1604,10 +1604,15 @@ class LayersController:
             diagnostics['catalog'] = {'status': 'not_available'}
 
         # Manager diagnostics
-        # Note: Managers would need get_diagnostics() methods for full implementation
         diagnostics['tracking'] = {'status': 'operational'}
         diagnostics['markers'] = {'status': 'operational'}
         diagnostics['drawings'] = {'status': 'operational'}
+
+        if getattr(self, 'tracking', None) and hasattr(self.tracking, 'get_diagnostics'):
+            try:
+                diagnostics['tracking'] = self.tracking.get_diagnostics()
+            except Exception as e:
+                diagnostics['tracking'] = {'status': 'error', 'error': str(e)}
 
         return diagnostics
 

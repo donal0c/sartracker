@@ -48,6 +48,7 @@ from ...layers.schema import (
 from ...layers.utilities import refresh_layer_tree_view
 from ...utils.exceptions import LayerLockError, LayerTransactionError, LayerError
 from ...utils.notify import warning as notify_warning
+from ...utils.qt_compat import sip_isdeleted
 from ..per_item_layer_factory import ItemType, PerItemLayerFactory, SAR_ITEM_TYPE, SAR_ITEM_ID
 from ...config.settings import INITIAL_ZOOM_BUFFER_DEGREES, INITIAL_ZOOM_MIN_EXTENT_DEGREES
 
@@ -158,6 +159,88 @@ class TrackingLayerManager(BaseLayerManager):
             else:
                 self._apply_device_position_style(layer, color)
 
+    @staticmethod
+    def _is_layer_usable(layer: Optional[QgsVectorLayer]) -> bool:
+        """Return True only for live, valid QgsVectorLayer wrappers."""
+        if layer is None:
+            return False
+        try:
+            if sip_isdeleted(layer):
+                return False
+        except Exception:
+            # Non-Qt test doubles can fail sip checks; continue with isValid().
+            pass
+        try:
+            return bool(layer.isValid())
+        except Exception:
+            # Covers wrapped C/C++ object deleted and any stale-wrapper errors.
+            return False
+
+    def _record_stale_cache_event(
+        self,
+        *,
+        device_id: str,
+        layer_kind: str,
+        reason: str
+    ) -> None:
+        """Record and log stale cached layer references for diagnostics."""
+        self._stale_layer_cache_events += 1
+        event = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "device_id": device_id,
+            "layer_kind": layer_kind,
+            "reason": reason,
+        }
+        self._last_stale_layer_cache_event = event
+        logger.warning(
+            "Stale cached %s layer purged for device %s: %s",
+            layer_kind,
+            device_id,
+            reason,
+        )
+
+    def _is_cached_layer_usable(
+        self,
+        layer: Optional[QgsVectorLayer],
+        *,
+        device_id: str,
+        layer_kind: str
+    ) -> bool:
+        """
+        Validate cached layer references and capture stale-wrapper diagnostics.
+        """
+        if layer is None:
+            return False
+
+        try:
+            if sip_isdeleted(layer):
+                self._record_stale_cache_event(
+                    device_id=device_id,
+                    layer_kind=layer_kind,
+                    reason="sip_deleted",
+                )
+                return False
+        except Exception:
+            # Non-Qt test doubles can fail sip checks; continue with isValid().
+            pass
+
+        try:
+            if not bool(layer.isValid()):
+                self._record_stale_cache_event(
+                    device_id=device_id,
+                    layer_kind=layer_kind,
+                    reason="is_valid_false",
+                )
+                return False
+            return True
+        except Exception as exc:
+            self._record_stale_cache_event(
+                device_id=device_id,
+                layer_kind=layer_kind,
+                reason=str(exc),
+            )
+            return False
+
     def __init__(self, iface, shared_device_colors=None, layer_manager=None, task_manager=None):
         """Initialize tracking layer manager."""
         super().__init__(iface, shared_device_colors, layer_manager)
@@ -184,6 +267,10 @@ class TrackingLayerManager(BaseLayerManager):
         # Each device has its own generation counter to detect stale async data
         self._device_generations: Dict[str, int] = {}
 
+        # Cache-health diagnostics for incident bundle correlation.
+        self._stale_layer_cache_events = 0
+        self._last_stale_layer_cache_event: Optional[Dict[str, str]] = None
+
     def get_managed_layer_names(self):
         """Return list of fixed layer names this manager handles (legacy only)."""
         return []
@@ -206,6 +293,18 @@ class TrackingLayerManager(BaseLayerManager):
         self._per_device_layout_normalized = False
         # Phase SAR-nj0: Clear per-device generations
         self._device_generations.clear()
+        self._stale_layer_cache_events = 0
+        self._last_stale_layer_cache_event = None
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Return tracking-manager diagnostics for incident bundles."""
+        return {
+            "status": "operational",
+            "per_device_position_cache_size": len(self._device_position_layers),
+            "per_device_trail_cache_size": len(self._device_trail_layers),
+            "stale_layer_cache_events": int(self._stale_layer_cache_events),
+            "last_stale_layer_cache_event": self._last_stale_layer_cache_event,
+        }
 
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
@@ -745,7 +844,7 @@ class TrackingLayerManager(BaseLayerManager):
         combined_extent = QgsRectangle()
 
         for device_id, layer in self._device_position_layers.items():
-            if layer and layer.isValid() and layer.featureCount() > 0:
+            if self._is_layer_usable(layer) and layer.featureCount() > 0:
                 layer_extent = layer.extent()
                 if not layer_extent.isEmpty():
                     if combined_extent.isNull():
@@ -766,6 +865,8 @@ class TrackingLayerManager(BaseLayerManager):
         """
         for layer in self._device_position_layers.values():
             try:
+                if not self._is_layer_usable(layer):
+                    continue
                 crs = layer.crs()
                 if crs and crs.isValid():
                     return crs
@@ -1366,7 +1467,7 @@ class TrackingLayerManager(BaseLayerManager):
 
     def _ensure_tracking_layer_placement(self, layer: QgsVectorLayer, group_name: str) -> None:
         """Move layer into the correct tracking subgroup if needed."""
-        if not layer or not layer.isValid():
+        if not self._is_layer_usable(layer):
             return
         target_group = self._ensure_tracking_subgroup(group_name)
         if not target_group:
@@ -1457,12 +1558,13 @@ class TrackingLayerManager(BaseLayerManager):
     def _get_existing_device_position_layer(self, device_id: str) -> Optional[QgsVectorLayer]:
         """Return existing per-device position layer without creating new ones."""
         cached = self._device_position_layers.get(device_id)
-        if cached and cached.isValid():
+        if self._is_cached_layer_usable(cached, device_id=device_id, layer_kind="position"):
             return cached
+        self._device_position_layers.pop(device_id, None)
 
         existing = self._get_device_layers_by_property(device_id)
         layer = existing.get('position')
-        if layer and layer.isValid():
+        if self._is_layer_usable(layer):
             self._device_position_layers[device_id] = layer
             return layer
 
@@ -1471,12 +1573,13 @@ class TrackingLayerManager(BaseLayerManager):
     def _get_existing_device_trail_layer(self, device_id: str) -> Optional[QgsVectorLayer]:
         """Return existing per-device trail layer without creating new ones."""
         cached = self._device_trail_layers.get(device_id)
-        if cached and cached.isValid():
+        if self._is_cached_layer_usable(cached, device_id=device_id, layer_kind="trail"):
             return cached
+        self._device_trail_layers.pop(device_id, None)
 
         existing = self._get_device_layers_by_property(device_id)
         layer = existing.get('trail')
-        if layer and layer.isValid():
+        if self._is_layer_usable(layer):
             self._device_trail_layers[device_id] = layer
             return layer
 
@@ -1508,7 +1611,7 @@ class TrackingLayerManager(BaseLayerManager):
         # Check cache first
         if device_id in self._device_position_layers:
             layer = self._device_position_layers[device_id]
-            if layer and layer.isValid():
+            if self._is_cached_layer_usable(layer, device_id=device_id, layer_kind="position"):
                 factory = self._get_per_device_factory()
                 self._ensure_tracking_layer_placement(layer, GroupNames.CURRENT_POSITIONS)
                 self._ensure_tracking_layer_name(layer, device_name, factory)
@@ -1518,7 +1621,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Search by custom property (handles plugin reload)
         existing = self._get_device_layers_by_property(device_id)
-        if existing['position'] and existing['position'].isValid():
+        if self._is_layer_usable(existing['position']):
             factory = self._get_per_device_factory()
             self._ensure_tracking_layer_placement(existing['position'], GroupNames.CURRENT_POSITIONS)
             self._ensure_tracking_layer_name(existing['position'], device_name, factory)
@@ -1554,7 +1657,7 @@ class TrackingLayerManager(BaseLayerManager):
                 )
                 layer = item_info.layer
 
-            if not layer or not layer.isValid():
+            if not self._is_layer_usable(layer):
                 logger.error("Failed to create position layer for device %s", device_id)
                 return None
 
@@ -1806,7 +1909,7 @@ class TrackingLayerManager(BaseLayerManager):
         # Check cache first
         if device_id in self._device_trail_layers:
             layer = self._device_trail_layers[device_id]
-            if layer and layer.isValid():
+            if self._is_cached_layer_usable(layer, device_id=device_id, layer_kind="trail"):
                 factory = self._get_per_device_factory()
                 self._ensure_tracking_layer_placement(layer, GroupNames.TRACKING_TRAILS)
                 self._ensure_tracking_layer_name(layer, device_name, factory)
@@ -1816,7 +1919,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         # Search by custom property (handles plugin reload)
         existing = self._get_device_layers_by_property(device_id)
-        if existing['trail'] and existing['trail'].isValid():
+        if self._is_layer_usable(existing['trail']):
             factory = self._get_per_device_factory()
             self._ensure_tracking_layer_placement(existing['trail'], GroupNames.TRACKING_TRAILS)
             self._ensure_tracking_layer_name(existing['trail'], device_name, factory)
@@ -1852,7 +1955,7 @@ class TrackingLayerManager(BaseLayerManager):
                 )
                 layer = item_info.layer
 
-            if not layer or not layer.isValid():
+            if not self._is_layer_usable(layer):
                 logger.error("Failed to create trail layer for device %s", device_id)
                 return None
 

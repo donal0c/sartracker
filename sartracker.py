@@ -1734,6 +1734,7 @@ class sartracker:
             self.diagnostics_service.set_task_manager(self.task_manager)
             self.diagnostics_service.set_tool_registry(self.tool_registry)
             self.diagnostics_service.set_sar_panel(self.sar_panel)
+            self.diagnostics_service.set_layers_controller(self.layers_controller)
             self.diagnostics_service.set_layer_manager(self.layer_manager)
 
             # Inject plugin-level state callbacks

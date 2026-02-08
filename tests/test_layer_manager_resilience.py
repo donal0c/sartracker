@@ -527,14 +527,25 @@ def _ensure_qgis(monkeypatch):
 
 
 def _load_manager_module():
-    layers_pkg = types.ModuleType("sartracker.layers")
-    layers_pkg.__path__ = [str(Path(__file__).resolve().parent.parent / "layers")]
-    sys.modules["sartracker.layers"] = layers_pkg
-    from sartracker.layers import manager, schema
+    import importlib
 
-    # Ensure schema is also registered for monkeypatching
-    sys.modules["sartracker.layers.schema"] = schema
-    return manager
+    # Prefer the real package when available to avoid polluting sys.modules
+    # for other tests in the same pytest process.
+    try:
+        manager = importlib.import_module("sartracker.layers.manager")
+        schema = importlib.import_module("sartracker.layers.schema")
+        sys.modules["sartracker.layers.schema"] = schema
+        return manager
+    except Exception:
+        # Fallback for environments where package discovery is unavailable.
+        layers_pkg = types.ModuleType("sartracker.layers")
+        layers_pkg.__path__ = [str(Path(__file__).resolve().parent.parent / "layers")]
+        sys.modules["sartracker.layers"] = layers_pkg
+        from sartracker.layers import manager, schema
+
+        # Ensure schema is also registered for monkeypatching
+        sys.modules["sartracker.layers.schema"] = schema
+        return manager
 
 
 @pytest.mark.qgis_required
