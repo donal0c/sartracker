@@ -177,13 +177,13 @@ class TestFocusModePlusStateSerialization:
         result = state.to_dict()
         assert "version" in result
 
-    def test_to_dict_includes_main_window_state_when_present(self):
-        """to_dict should include main_window_state when captured."""
+    def test_to_dict_does_not_serialize_main_window_state(self):
+        """to_dict should not persist binary main_window_state across sessions."""
         from utils.focus_mode_state import FocusModePlusState
         state = FocusModePlusState()
         state.main_window_state = "YWJj"
         result = state.to_dict()
-        assert result["main_window_state"] == "YWJj"
+        assert "main_window_state" not in result
 
     def test_to_dict_is_json_serializable(self):
         """to_dict result should be JSON serializable."""
@@ -754,6 +754,24 @@ class TestFocusModePlusStateCrashRecovery:
         assert state.is_active is True
         assert state.menu_bar_was_visible is True
         assert state.status_bar_was_visible is False
+
+    def test_from_dict_ignores_persisted_main_window_state(self):
+        """from_dict should ignore serialized main_window_state for safety."""
+        from utils.focus_mode_state import FocusModePlusState
+
+        data = {
+            "version": 1,
+            "is_active": True,
+            "menu_bar_was_visible": True,
+            "status_bar_was_visible": True,
+            "hidden_dock_names": [],
+            "hidden_toolbar_names": [],
+            "main_window_state": "YWJj",
+        }
+
+        state = FocusModePlusState.from_dict(data, MagicMock())
+
+        assert state.main_window_state is None
 
     def test_from_dict_reconstructs_dock_references(self):
         """from_dict should rebuild dock references from names."""

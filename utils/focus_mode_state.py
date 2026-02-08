@@ -472,8 +472,9 @@ class FocusModePlusState:
             "hidden_dock_names": self.hidden_dock_names,
             "hidden_toolbar_names": self.hidden_toolbar_names,
         }
-        if self.main_window_state:
-            data["main_window_state"] = self.main_window_state
+        # Do NOT persist binary QMainWindow state across sessions.
+        # It can become stale/invalid after UI/layout/plugin changes and trigger
+        # Qt enum parse warnings during restoreState() on startup recovery.
         return data
 
     @classmethod
@@ -496,7 +497,10 @@ class FocusModePlusState:
         state.status_bar_was_visible = data.get("status_bar_was_visible", True)
         state.hidden_dock_names = data.get("hidden_dock_names", [])
         state.hidden_toolbar_names = data.get("hidden_toolbar_names", [])
-        state.main_window_state = data.get("main_window_state")
+        # Ignore persisted main_window_state from older state files.
+        # Crash recovery should use explicit dock/toolbar/menu/status restoration
+        # based on object names, which is safer across sessions/versions.
+        state.main_window_state = None
 
         # Rebuild dock references
         if state.is_active and main_window:
