@@ -1111,8 +1111,9 @@ class LayerManager(QObject):
         # Check if layer already exists in project
         existing_layer = self._find_layer_by_id(layer_def.layer_id)
         if existing_layer:
-            self._layer_cache[layer_def.layer_id] = existing_layer
-            return existing_layer
+            migrated_layer = self._migrate_existing_layer_if_needed(existing_layer, layer_def, group_path)
+            self._layer_cache[layer_def.layer_id] = migrated_layer
+            return migrated_layer
 
         # Create new layer
         layer = self._create_vector_layer(layer_def)
@@ -1143,6 +1144,76 @@ class LayerManager(QObject):
         print(f"[LayerManager] Created layer: {layer_def.name} ({layer_def.layer_id})")
 
         return layer
+
+    def _migrate_existing_layer_if_needed(
+        self,
+        layer: QgsVectorLayer,
+        layer_def: LayerDefinition,
+        group_path: List[str]
+    ) -> QgsVectorLayer:
+        """
+        Migrate an existing memory layer to mission store when persistence is enabled.
+
+        Keeps legacy in-project memory layers from staying transient after mission
+        storage becomes available.
+        """
+        if not layer:
+            return layer
+
+        try:
+            provider = (layer.providerType() or "").lower()
+        except Exception:
+            provider = ""
+
+        if provider != "memory" or not self._mission_store_enabled():
+            return layer
+
+        try:
+            persistent_layer = self.migrate_memory_layer_to_store(layer, layer_def)
+            self._replace_layer_in_project_tree(layer, persistent_layer, group_path, layer_def.position)
+            return persistent_layer
+        except Exception as exc:
+            self._log("WARN", f"Failed to migrate existing memory layer '{layer_def.layer_id}': {exc}")
+            try:
+                warning(
+                    self.iface.messageBar(),
+                    "Mission Store",
+                    f"Could not migrate '{layer_def.layer_id}' to mission store; continuing with memory layer.",
+                    duration=5
+                )
+            except Exception:
+                pass
+            return layer
+
+    def _replace_layer_in_project_tree(
+        self,
+        old_layer: QgsVectorLayer,
+        new_layer: QgsVectorLayer,
+        group_path: List[str],
+        fallback_position: int
+    ) -> None:
+        """Replace old layer with new layer in the same tree location (best effort)."""
+        if not old_layer or not new_layer:
+            return
+
+        root = self.project.layerTreeRoot()
+        old_node = root.findLayer(old_layer.id()) if root else None
+        parent_group = old_node.parent() if old_node and old_node.parent() else self.ensure_group(group_path)
+        target_index = fallback_position
+        if old_node and parent_group:
+            try:
+                target_index = parent_group.children().index(old_node)
+            except Exception:
+                target_index = fallback_position
+
+        self.project.addMapLayer(new_layer, False)
+        if parent_group:
+            parent_group.insertLayer(target_index, new_layer)
+
+        try:
+            self.project.removeMapLayer(old_layer.id())
+        except Exception:
+            pass
 
     def _create_vector_layer(self, layer_def: LayerDefinition) -> QgsVectorLayer:
         """Create a layer backed by memory or the mission store."""
@@ -1660,12 +1731,29 @@ class LayerManager(QObject):
         options.fileEncoding = "UTF-8"
         _set_option_if_available(options, "includeMetadata", True)
 
-        result, error_message = _export_layer(
+        # SAR-604i: Use effective path (temp store takes priority)
+        effective_path = self._get_effective_store_path()
+        if not effective_path:
+            raise RuntimeError("Mission store path is not configured")
+
+        export_result = _export_layer(
             layer,
-            self._mission_store_path,
+            effective_path,
             options,
             self.project.transformContext()
         )
+
+        if isinstance(export_result, tuple):
+            if len(export_result) == 3:
+                result, error_message, _ = export_result
+            elif len(export_result) == 2:
+                result, error_message = export_result
+            else:
+                result = export_result[0]
+                error_message = export_result[1] if len(export_result) > 1 else ""
+        else:
+            result = export_result
+            error_message = ""
 
         if result != _EXPORT_NO_ERROR:
             # BUG-062 FIX: Enhanced error logging
