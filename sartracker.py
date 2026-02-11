@@ -4398,6 +4398,19 @@ class sartracker:
     # - _update_measurement_overlay_indicator, _on_clear_measurements_requested
     # ============================================================================
 
+    @staticmethod
+    def _format_persistence_issue_message(persistence_issues: Dict[str, str], preview_limit: int = 5) -> str:
+        """Format persistence warning with actionable layer identifiers."""
+        if not persistence_issues:
+            return "0 layer(s) still in memory during auto-save."
+
+        layer_ids = sorted(str(layer_id) for layer_id in persistence_issues.keys())
+        preview = ", ".join(layer_ids[:preview_limit])
+        remaining = len(layer_ids) - preview_limit
+        if remaining > 0:
+            preview = f"{preview}, +{remaining} more"
+        return f"{len(layer_ids)} layer(s) still in memory during auto-save: {preview}."
+
     def _on_autosave_requested(self):
         """Handle auto-save request from SAR Panel."""
         if self._is_unloading or self._app_is_quitting:
@@ -4422,10 +4435,11 @@ class sartracker:
                     persistence_ok = not persistence_issues
                     backup_ok = self._sync_mission_backup(async_run=True)
                     if not persistence_ok:
+                        persistence_message = self._format_persistence_issue_message(persistence_issues)
                         warning(
                             self.iface.messageBar(),
                             "Persistence",
-                            f"{len(persistence_issues)} layer(s) still in memory during auto-save.",
+                            persistence_message,
                             duration=4
                         )
                     if not backup_ok:
@@ -4472,10 +4486,11 @@ class sartracker:
                         backup_ok = self._sync_mission_backup(async_run=True)
                         overall_success = persistence_ok and backup_ok
                         if not persistence_ok:
+                            persistence_message = self._format_persistence_issue_message(persistence_issues)
                             warning(
                                 self.iface.messageBar(),
                                 "Persistence",
-                                f"{len(persistence_issues)} layer(s) still in memory during auto-save.",
+                                persistence_message,
                                 duration=4
                             )
                         if not backup_ok:

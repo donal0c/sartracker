@@ -663,7 +663,8 @@ class SARPanel(QDockWidget):
         self.coord_converter_button.clicked.connect(self._on_coordinate_converter)
         utilities_grid.addWidget(self.coord_converter_button, 0, 0)
 
-        self.measure_button = QPushButton("Measure Distance")
+        self.measure_button = QPushButton("Measure Distance & Bearing")
+        self.measure_button.setToolTip("Measure distance and true bearing between two map points")
         self.measure_button.clicked.connect(self._on_measure_distance)
         utilities_grid.addWidget(self.measure_button, 0, 1)
 

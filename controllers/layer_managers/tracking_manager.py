@@ -1991,7 +1991,7 @@ class TrackingLayerManager(BaseLayerManager):
 
         symbol = QgsLineSymbol.createSimple({
             'color': color.name(),
-            'width': '2',
+            'width': '1.5',
             'line_style': 'dash',
             'joinstyle': 'round',
             'capstyle': 'round'
@@ -3165,7 +3165,7 @@ class TrackingLayerManager(BaseLayerManager):
                 color = self._get_device_color(device_id)
                 symbol = QgsLineSymbol.createSimple({
                     'color': color.name(),
-                    'width': '2',
+                    'width': '1.5',
                     'line_style': 'dash',
                     'joinstyle': 'round',
                     'capstyle': 'round'
@@ -3193,7 +3193,7 @@ class TrackingLayerManager(BaseLayerManager):
                 color = self._get_device_color(device_id)
                 symbol = QgsLineSymbol.createSimple({
                     'color': color.name(),
-                    'width': '2',
+                    'width': '1.5',
                     'line_style': 'dash',
                     'joinstyle': 'round',
                     'capstyle': 'round'

@@ -207,6 +207,19 @@ class MarkerLogWidget(QWidget):
                 f"Coordinators: {record.get('coordinator_ids') or ''}",
                 f"Attachment: {record.get('attachment_path') or ''}"
             ]
+            marker_type = (record.get("type") or "").strip().lower()
+            if marker_type == "casualty":
+                details.extend([
+                    f"Condition: {record.get('condition') or ''}",
+                    f"Treatment: {record.get('treatment') or ''}",
+                    f"Evacuation Priority: {record.get('evacuation_priority') or ''}",
+                    f"Found By: {record.get('found_by') or ''}",
+                ])
+            elif marker_type == "clue":
+                details.extend([
+                    f"Clue Type: {record.get('clue_type') or ''}",
+                    f"Confidence: {record.get('confidence') or ''}",
+                ])
             self.detail_text.setPlainText("\n".join(details))
         else:
             self.detail_text.clear()

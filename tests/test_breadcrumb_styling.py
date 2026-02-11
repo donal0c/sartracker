@@ -24,6 +24,10 @@ def _line_style(symbol):
     return symbol.symbolLayer(0).properties().get("line_style")
 
 
+def _line_width(symbol):
+    return float(symbol.symbolLayer(0).width())
+
+
 def _make_breadcrumb_layer():
     layer = QgsVectorLayer("LineString?crs=EPSG:4326", "Breadcrumbs", "memory")
     provider = layer.dataProvider()
@@ -62,6 +66,7 @@ def test_per_device_trail_defaults_to_dash(sar_iface, sar_qgis_project):
     renderer = layer.renderer()
     assert renderer is not None
     assert _line_style(renderer.symbol()) == "dash"
+    assert _line_width(renderer.symbol()) == pytest.approx(1.5)
 
 
 def test_shared_breadcrumbs_default_to_dash(sar_iface, sar_qgis_project):
@@ -74,3 +79,4 @@ def test_shared_breadcrumbs_default_to_dash(sar_iface, sar_qgis_project):
     assert isinstance(renderer, QgsCategorizedSymbolRenderer)
     for category in renderer.categories():
         assert _line_style(category.symbol()) == "dash"
+        assert _line_width(category.symbol()) == pytest.approx(1.5)
