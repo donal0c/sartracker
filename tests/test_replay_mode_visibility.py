@@ -134,19 +134,18 @@ class TestSettingsPanelProviderGating:
         assert hasattr(SettingsPanel, '_on_provider_changed'), \
             "SettingsPanel must have _on_provider_changed method"
 
-    def test_replay_controls_hidden_for_csv_provider(self):
+    def test_replay_controls_hidden_for_legacy_http_traccar(self):
         """
-        CRITICAL: Replay controls should be hidden for CSV provider.
+        CRITICAL: Replay controls should be hidden for legacy provider.
 
-        VALUE: Prevents confusion - replay only works with Traccar.
+        VALUE: Prevents confusion - replay only works with traccar_http.
         """
         pytest.importorskip("qgis.core")
 
         # This tests that the provider gating logic exists
         from sartracker.ui.settings_panel import SettingsPanel
 
-        # The replay_group should be an instance attribute for visibility control
-        # This will be verified in implementation
+        # Replay controls should only be active for traccar_http.
 
     def test_replay_controls_hidden_for_legacy_http_traccar(self):
         """

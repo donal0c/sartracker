@@ -397,7 +397,7 @@ def _validate_coordinate(value: Any, min_val: float, max_val: float, field_name:
         raise ValueError(f"{field_name} must be a float-compatible value") from None
 
     # CRITICAL: Check NaN/Inf BEFORE range check (NaN comparisons always return False)
-    # This matches validation pattern in utils/exceptions.py and providers/csv.py
+    # This matches validation pattern in utils/exceptions.py and active providers.
     if math.isnan(numeric):
         raise ValueError(f"{field_name} is NaN")
     if math.isinf(numeric):

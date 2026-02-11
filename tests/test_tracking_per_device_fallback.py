@@ -34,7 +34,14 @@ def _build_manager():
     mgr._report_validation_warning = lambda *args, **kwargs: None
     mgr._log_tracking_event = lambda *args, **kwargs: None
     mgr._maybe_schedule_breadcrumb_task = lambda *args, **kwargs: False
+    mgr._pre_mission_breadcrumb_warning_shown = False
+    mgr._notify_warning = lambda *args, **kwargs: None
     return mgr
+
+
+class _FakeLayer:
+    def triggerRepaint(self):
+        return None
 
 
 def test_update_current_positions_falls_back_to_shared_when_per_device_unavailable():
@@ -45,7 +52,7 @@ def test_update_current_positions_falls_back_to_shared_when_per_device_unavailab
 
     mgr._ensure_per_device_ready = _raise_unavailable
 
-    fake_layer = object()
+    fake_layer = _FakeLayer()
     called = {}
 
     mgr._get_or_create_current_layer = lambda: fake_layer
@@ -80,10 +87,11 @@ def test_update_breadcrumbs_falls_back_to_shared_when_per_device_unavailable():
 
     mgr._ensure_per_device_ready = _raise_unavailable
 
-    fake_layer = object()
+    fake_layer = _FakeLayer()
     mgr._get_or_create_breadcrumbs_layer = lambda: fake_layer
 
     applied = {}
+    warnings = []
 
     def _fake_apply(layer, segments, total_inputs, invalid_count, last_error, expected_generation=None):
         applied["layer"] = layer
@@ -93,6 +101,7 @@ def test_update_breadcrumbs_falls_back_to_shared_when_per_device_unavailable():
         applied["last_error"] = last_error
 
     mgr._apply_breadcrumb_results = _fake_apply
+    mgr._notify_warning = lambda title, message, duration=0: warnings.append((title, message, duration))
 
     positions = [
         {
@@ -117,3 +126,41 @@ def test_update_breadcrumbs_falls_back_to_shared_when_per_device_unavailable():
     assert applied["total_inputs"] == 2
     assert applied["invalid_count"] == 0
     assert applied["segments"]
+    assert warnings, "Expected pre-mission breadcrumb mode warning"
+    assert "temporary breadcrumb trails in memory" in warnings[0][1]
+
+
+def test_breadcrumb_fallback_warning_shown_once_per_session():
+    mgr = _build_manager()
+
+    def _raise_unavailable():
+        raise LayerError("Mission Store Required", title="Mission Store Required")
+
+    mgr._ensure_per_device_ready = _raise_unavailable
+    mgr._get_or_create_breadcrumbs_layer = lambda: _FakeLayer()
+    mgr._apply_breadcrumb_results = lambda *args, **kwargs: None
+
+    warnings = []
+    mgr._notify_warning = lambda title, message, duration=0: warnings.append((title, message, duration))
+
+    positions = [
+        {
+            "device_id": "dev1",
+            "name": "Dev 1",
+            "ts": "2024-01-01T00:00:00Z",
+            "lat": 1.0,
+            "lon": 2.0,
+        },
+        {
+            "device_id": "dev1",
+            "name": "Dev 1",
+            "ts": "2024-01-01T00:05:00Z",
+            "lat": 1.1,
+            "lon": 2.1,
+        },
+    ]
+
+    mgr.update_breadcrumbs(positions, time_gap_minutes=5)
+    mgr.update_breadcrumbs(positions, time_gap_minutes=5)
+
+    assert len(warnings) == 1

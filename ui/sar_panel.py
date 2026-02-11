@@ -67,14 +67,12 @@ class SARPanel(QDockWidget):
     
     Signals:
         refresh_requested: Emitted when manual refresh requested
-        csv_load_requested: Emitted when user wants to load CSV (file_path: str)
         marker_edit_requested: Emitted when user requests marker edit
         marker_delete_requested: Emitted when user requests marker delete
         marker_zoom_requested: Emitted when user wants to zoom to marker
     """
     
     refresh_requested = pyqtSignal()
-    csv_load_requested = pyqtSignal(str)  # file_path
     add_poi_requested = pyqtSignal()
     add_clue_requested = pyqtSignal()
     add_casualty_requested = pyqtSignal()
@@ -486,11 +484,6 @@ class SARPanel(QDockWidget):
         self.refresh_button.clicked.connect(self._on_manual_refresh)
         refresh_layout.addWidget(self.refresh_button)
 
-        self.load_csv_button = QPushButton("Load CSV...")
-        self.load_csv_button.setToolTip("Load tracking data directly from a Traccar CSV export")
-        self.load_csv_button.clicked.connect(self._on_load_csv)
-        refresh_layout.addWidget(self.load_csv_button)
-        
         refresh_group.setLayout(refresh_layout)
         layout.addWidget(refresh_group)
 
@@ -1167,27 +1160,6 @@ class SARPanel(QDockWidget):
         """Handle manual refresh button."""
         self.refresh_requested.emit()
     
-    def _on_load_csv(self):
-        """Handle load CSV button."""
-        # Show dialog with option to select file or folder
-        file_path = QFileDialog.getExistingDirectory(
-            self,
-            "Select Folder with CSV Files (or Cancel and select single file)",
-            ""
-        )
-
-        # If user cancelled folder selection, try file selection
-        if not file_path:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Traccar CSV Export",
-                "",
-                "CSV Files (*.csv);;All Files (*)"
-            )
-
-        if file_path:
-            self.csv_load_requested.emit(file_path)
-
     # NOTE: update_devices() method removed - Devices moved to standalone Devices window
 
     def set_data_source(self, source_info: str):

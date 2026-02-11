@@ -425,6 +425,7 @@ class MapToolsController(QObject):
 
         self.current_marker_type = 'ipp_lkp'
         if self.marker_tool:
+            self.marker_tool.set_marker_context('ipp_lkp')
             self.iface.mapCanvas().setMapTool(self.marker_tool)
             info(
                 self.iface.messageBar(),
@@ -447,6 +448,7 @@ class MapToolsController(QObject):
 
         self.current_marker_type = 'clue'
         if self.marker_tool:
+            self.marker_tool.set_marker_context('clue')
             self.iface.mapCanvas().setMapTool(self.marker_tool)
             info(
                 self.iface.messageBar(),
@@ -469,6 +471,7 @@ class MapToolsController(QObject):
 
         self.current_marker_type = 'casualty'
         if self.marker_tool:
+            self.marker_tool.set_marker_context('casualty')
             self.iface.mapCanvas().setMapTool(self.marker_tool)
             info(
                 self.iface.messageBar(),
@@ -491,6 +494,7 @@ class MapToolsController(QObject):
 
         self.current_marker_type = 'hazard'
         if self.marker_tool:
+            self.marker_tool.set_marker_context('hazard')
             self.iface.mapCanvas().setMapTool(self.marker_tool)
             info(
                 self.iface.messageBar(),
@@ -550,6 +554,7 @@ class MapToolsController(QObject):
         # Deactivate marker tool (return to pan/zoom)
         if self.marker_tool:
             try:
+                self.marker_tool.set_marker_context(None)
                 self.iface.mapCanvas().unsetMapTool(self.marker_tool)
             except Exception:
                 pass  # Canvas may be unavailable during shutdown

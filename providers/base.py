@@ -2,7 +2,7 @@
 """
 Base Provider ABC
 
-Defines the interface for all data providers (CSV, PostGIS, SpatiaLite).
+Defines the interface for all data providers (HTTP APIs, PostGIS, SpatiaLite).
 All providers must implement this interface and follow the error handling
 contract specified in AI_CODE_REFERENCE.md.
 
@@ -54,8 +54,8 @@ class Provider(ABC):
         Get latest position per device.
 
         Returns the most recent position for each device known to the provider.
-        For CSV providers, this is the last position in each file. For API
-        providers, this queries the live server state.
+        For file-based providers, this can be the last position in each file.
+        For API providers, this queries the live server state.
 
         RETURN SCHEMA:
         Each dict in the returned list must contain:
@@ -79,8 +79,8 @@ class Provider(ABC):
         Raises:
             ProviderAuthError: If authentication fails (API providers)
             ProviderNetworkError: If network request fails (API providers)
-            ProviderDataError: If data files missing/malformed (CSV providers)
-                               or API response has invalid schema
+            ProviderDataError: If provider data is missing/malformed or
+                               API response has invalid schema
 
         THREAD-SAFETY:
         Method is called from background threads (QgsTask). Must not access
@@ -109,8 +109,8 @@ class Provider(ABC):
                        provider-defined). Used for replay windows; providers may ignore
                        if unsupported.
             mission_id: Optional mission ID for filtering positions associated
-                       with specific mission. CSV providers may ignore this.
-                       Database providers should filter by mission.
+                       with specific mission. Read-only providers may ignore
+                       this. Database providers should filter by mission.
 
         RETURN SCHEMA:
         Each dict must contain the same mandatory fields as get_current():
@@ -134,8 +134,8 @@ class Provider(ABC):
         Raises:
             ProviderAuthError: If authentication fails (API providers)
             ProviderNetworkError: If network request fails (API providers)
-            ProviderDataError: If data files missing/malformed (CSV providers)
-                               or API response has invalid schema
+            ProviderDataError: If provider data is missing/malformed or
+                               API response has invalid schema
 
         THREAD-SAFETY:
         Method is called from background threads (QgsTask). Must not access
@@ -171,8 +171,8 @@ class Provider(ABC):
         Raises:
             ProviderAuthError: If authentication fails (API providers)
             ProviderNetworkError: If network request fails (API providers)
-            ProviderDataError: If data files missing/malformed (CSV providers)
-                               or API response has invalid schema
+            ProviderDataError: If provider data is missing/malformed or
+                               API response has invalid schema
 
         THREAD-SAFETY:
         Method is called from background threads (QgsTask). Must not access
@@ -192,7 +192,7 @@ class Provider(ABC):
         Save casualty location to provider's persistent storage.
 
         Casualties are life-safety critical features. Providers that cannot
-        persist data (e.g., CSV, read-only APIs) must raise NotImplementedError.
+        persist data (e.g., read-only APIs) must raise NotImplementedError.
 
         INPUT VALIDATION:
         Implementations must validate all inputs before persistence:
@@ -285,9 +285,9 @@ class Provider(ABC):
         Test if provider can access its data source.
 
         Performs a lightweight check to verify:
-        - CSV providers: Files exist and are readable
         - API providers: Server is reachable and credentials valid
         - Database providers: Connection can be established
+        - File-based providers: files exist and are readable
 
         This method should be fast (< 5 seconds) and safe to call repeatedly.
         It must NOT raise exceptions - all failures return False.
@@ -316,8 +316,8 @@ class Provider(ABC):
         """
         Create provider-specific refresh task for background data fetching.
 
-        Each provider implements its own QgsTask subclass (CSVRefreshTask,
-        HTTPRefreshTask, etc.) that handles provider-specific data fetching
+        Each provider implements its own QgsTask subclass (e.g., HTTPRefreshTask)
+        that handles provider-specific data fetching
         in a background thread managed by QGIS TaskManager.
 
         The returned task will be scheduled by the controller and must:
@@ -333,7 +333,7 @@ class Provider(ABC):
             since_iso: Optional ISO8601 timestamp to filter breadcrumbs from.
                        If provided (e.g., mission start time), breadcrumbs will
                        be fetched from this time. Providers may ignore if not
-                       applicable (e.g., CSV provider loads all data).
+                       applicable.
             until_iso: Optional ISO8601 timestamp to cap breadcrumb history.
                        Used for historical replay windows; providers may ignore
                        if not supported.

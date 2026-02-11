@@ -58,9 +58,6 @@ class SETTINGS_KEYS:
     PROVIDER_AUTO_CONNECT = "SARTracker/Providers/auto_connect_on_startup"
 
     # Provider-specific config (use format: f"SARTracker/Providers/{provider_name}/{key}")
-    # CSV Provider
-    PROVIDER_CSV_PATH = "SARTracker/Providers/csv/csv_path"
-
     # HTTP Traccar Provider (legacy)
     PROVIDER_HTTP_SERVER_URL = "SARTracker/Providers/http_traccar/server_url"
     PROVIDER_HTTP_USERNAME = "SARTracker/Providers/http_traccar/username"

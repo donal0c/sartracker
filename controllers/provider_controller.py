@@ -246,7 +246,7 @@ class ProviderController(QObject):
         - Current provider unchanged
 
         Args:
-            provider_name: Provider identifier (e.g., 'csv', 'http_traccar')
+            provider_name: Provider identifier (e.g., 'traccar_http', 'http_traccar')
             config: Provider-specific configuration dict
             test_only: If True, only test connection without committing provider
                       (for "Test Connection" button vs "Connect" button)
@@ -1274,9 +1274,8 @@ class ProviderController(QObject):
                     self._clear_loading_state()
                     return False
             else:
-                # Get mission start time for breadcrumb filtering (skip for CSV by default)
-                use_mission_start = self.provider_name != 'csv'
-                if effective_since is None and self._mission_start_getter and use_mission_start:
+                # Get mission start time for breadcrumb filtering.
+                if effective_since is None and self._mission_start_getter:
                     try:
                         effective_since = self._mission_start_getter()
                     except Exception as e:
@@ -1805,7 +1804,7 @@ class ProviderController(QObject):
         for auto-restore on next startup.
 
         Args:
-            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            provider_name: Provider identifier (e.g., 'traccar_http')
             config: Provider configuration dict
 
         Qt5/Qt6 Compatible: Uses QSettings.
@@ -1815,11 +1814,7 @@ class ProviderController(QObject):
             ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, provider_name)
 
             # Save provider-specific config
-            if provider_name == 'csv':
-                csv_path = config.get('csv_path', '')
-                ConfigStore.set(SETTINGS_KEYS.PROVIDER_CSV_PATH, csv_path)
-
-            elif provider_name == 'traccar_http':
+            if provider_name == 'traccar_http':
                 self._persist_traccar_http_settings(config)
 
             print(f"[PROVIDER_CONTROLLER] Saved provider config: {provider_name}")
@@ -1884,12 +1879,7 @@ class ProviderController(QObject):
         """
         config = {}
 
-        if provider_name == 'csv':
-            csv_path = ConfigStore.get(SETTINGS_KEYS.PROVIDER_CSV_PATH, None)
-            if csv_path:
-                config['csv_path'] = str(csv_path)
-
-        elif provider_name == 'http_traccar':
+        if provider_name == 'http_traccar':
             # Legacy HTTP provider - migrate to traccar_http
             server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, None)
             username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, None)
@@ -2070,7 +2060,7 @@ class ProviderController(QObject):
         Signal signature: provider_test_requested(str, dict)
 
         Args:
-            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            provider_name: Provider identifier (e.g., 'traccar_http')
             config: Provider configuration dict
 
         Qt5/Qt6 Compatible: Pure Python slot.
@@ -2087,7 +2077,7 @@ class ProviderController(QObject):
         Signal signature: provider_save_requested(str, dict)
 
         Args:
-            provider_name: Provider identifier (e.g., 'csv', 'traccar_http')
+            provider_name: Provider identifier (e.g., 'traccar_http')
             config: Provider configuration dict
 
         Qt5/Qt6 Compatible: Pure Python slot.

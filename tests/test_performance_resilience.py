@@ -434,24 +434,12 @@ class TestProviderResilience:
     The system must handle failures gracefully without losing data.
     """
 
-    def test_graceful_handling_of_missing_csv(self, tmp_path):
+    def test_csv_provider_removed_from_runtime(self, tmp_path):
         """
-        Scenario: CSV file disappears during operation.
-
-        Files could be deleted, moved, or on unmounted drive.
+        Scenario: CSV provider runtime has been removed.
         """
-        from providers.csv import CSVProvider
-        from utils.exceptions import ProviderDataError
-
-        # Provider with non-existent file
-        provider = CSVProvider(csv_path=str(tmp_path / "missing.csv"))
-
-        # test_connection should return False, not crash
-        assert provider.test_connection() is False
-
-        # get_current should raise clear error
-        with pytest.raises(ProviderDataError):
-            provider.get_current()
+        with pytest.raises(ModuleNotFoundError):
+            from providers.csv import CSVProvider  # noqa: F401
 
     def test_corrupted_geopackage_detection(self, tmp_path):
         """

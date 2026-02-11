@@ -126,8 +126,7 @@ class SettingsPanel(QDockWidget):
         self.setAllowedAreas(LeftDockWidgetArea | RightDockWidgetArea)
 
         # Provider page indices (for maintainability)
-        self.PROVIDER_PAGE_CSV = 0
-        self.PROVIDER_PAGE_HTTP_TRACCAR = 1
+        self.PROVIDER_PAGE_HTTP_TRACCAR = 0
 
         # Internal provider metadata/state
         self._provider_metadata: List[Dict[str, Any]] = []
@@ -283,10 +282,6 @@ class SettingsPanel(QDockWidget):
         # Provider configuration stack (different UI for each provider)
         self.provider_config_stack = QStackedWidget()
 
-        # CSV Provider Configuration Page
-        csv_config_page = self._create_csv_config_page()
-        self.provider_config_stack.addWidget(csv_config_page)
-
         # HTTP Traccar Provider Configuration Page
         http_config_page = self._create_http_config_page()
         self.provider_config_stack.addWidget(http_config_page)
@@ -366,33 +361,6 @@ class SettingsPanel(QDockWidget):
         scroll_area.setWidgetResizable(True)
 
         self.setWidget(scroll_area)
-
-    def _create_csv_config_page(self) -> QWidget:
-        """
-        Create CSV provider configuration page.
-
-        Returns:
-            QWidget: CSV configuration widget
-        """
-        csv_config_page = QWidget()
-        csv_config_layout = QVBoxLayout()
-
-        csv_file_layout = QHBoxLayout()
-        csv_file_layout.addWidget(QLabel("File/Folder:"))
-        self.csv_path_input = QLineEdit()
-        self.csv_path_input.setPlaceholderText("Select CSV file or folder...")
-        self.csv_path_input.setReadOnly(True)
-        csv_file_layout.addWidget(self.csv_path_input)
-
-        self.csv_browse_button = QPushButton("Browse...")
-        self.csv_browse_button.clicked.connect(self._on_csv_browse)
-        csv_file_layout.addWidget(self.csv_browse_button)
-        csv_config_layout.addLayout(csv_file_layout)
-
-        csv_config_layout.addStretch()
-        csv_config_page.setLayout(csv_config_layout)
-
-        return csv_config_page
 
     def _create_http_config_page(self) -> QWidget:
         """
@@ -628,12 +596,6 @@ class SettingsPanel(QDockWidget):
 
     def _build_provider_config_from_store(self, provider_name: str) -> Optional[dict]:
         """Reconstruct provider config dict from persisted QSettings values."""
-        if provider_name == 'csv':
-            csv_path = ConfigStore.get(SETTINGS_KEYS.PROVIDER_CSV_PATH, "")
-            if csv_path:
-                return {'csv_path': csv_path}
-            return None
-
         if provider_name == 'http_traccar':
             server_url = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, "")
             username = ConfigStore.get(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, "")
@@ -762,11 +724,6 @@ class SettingsPanel(QDockWidget):
 
     def _populate_provider_fields(self, provider_name: str, config: Dict[str, Any]):
         """Populate provider-specific widgets from config dict."""
-        if provider_name == 'csv':
-            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_CSV)
-            self.csv_path_input.setText(config.get('csv_path', ''))
-            return
-
         if provider_name in ['http_traccar', 'traccar_http']:
             self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_HTTP_TRACCAR)
             self.http_url_input.setText(config.get('server_url') or config.get('base_url', ''))
@@ -885,9 +842,7 @@ class SettingsPanel(QDockWidget):
         self._pending_provider_name = provider_name
 
         # Switch to appropriate config page
-        if provider_name == 'csv':
-            self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_CSV)
-        elif provider_name in ['http_traccar', 'traccar_http']:
+        if provider_name in ['http_traccar', 'traccar_http']:
             self.provider_config_stack.setCurrentIndex(self.PROVIDER_PAGE_HTTP_TRACCAR)
 
         # SAR-f02j: Gate replay controls to traccar_http only
@@ -899,7 +854,7 @@ class SettingsPanel(QDockWidget):
         """
         SAR-f02j: Show/hide replay controls based on provider.
 
-        Replay only works with traccar_http (not legacy http_traccar or csv).
+        Replay only works with traccar_http (not legacy http_traccar).
 
         Args:
             provider_name: Current provider name
@@ -916,28 +871,6 @@ class SettingsPanel(QDockWidget):
             if self.replay_enable_check.isChecked():
                 self.replay_enable_check.setChecked(False)
                 print("[SETTINGS_PANEL] Replay disabled - not supported for this provider")
-
-    def _on_csv_browse(self):
-        """Handle CSV browse button click."""
-        # Show dialog with option to select file or folder
-        file_path = QFileDialog.getExistingDirectory(
-            self,
-            "Select Folder with CSV Files (or Cancel and select single file)",
-            ""
-        )
-
-        # If user cancelled folder selection, try file selection
-        if not file_path:
-            file_path, _ = QFileDialog.getOpenFileName(
-                self,
-                "Select Traccar CSV Export",
-                "",
-                "CSV Files (*.csv);;All Files (*)"
-            )
-
-        if file_path:
-            self.csv_path_input.setText(file_path)
-            self.apply_button.setEnabled(True)
 
     def _on_auth_type_changed(self, index):
         """Handle authentication type change."""
@@ -1187,13 +1120,7 @@ class SettingsPanel(QDockWidget):
 
         config = {}
 
-        if provider_name == 'csv':
-            csv_path = self.csv_path_input.text().strip()
-            if not csv_path:
-                raise ValueError("CSV file path not specified")
-            config['csv_path'] = csv_path
-
-        elif provider_name == 'http_traccar':
+        if provider_name == 'http_traccar':
             server_url = self.http_url_input.text().strip()
             username = self.http_username_input.text().strip()
             password = self.http_password_input.text().strip()
@@ -1296,12 +1223,7 @@ class SettingsPanel(QDockWidget):
             Error message if invalid, None if valid
         """
         try:
-            if provider_name == 'csv':
-                csv_path = config.get('csv_path', '')
-                if not SETTINGS_KEYS.validate_file_path(csv_path):
-                    return "Invalid CSV file path"
-
-            elif provider_name in ['http_traccar', 'traccar_http']:
+            if provider_name in ['http_traccar', 'traccar_http']:
                 url_key = 'server_url' if provider_name == 'http_traccar' else 'base_url'
                 url = config.get(url_key, '')
                 if not SETTINGS_KEYS.validate_url(url):
@@ -1329,10 +1251,7 @@ class SettingsPanel(QDockWidget):
             ConfigStore.set(SETTINGS_KEYS.PROVIDER_LAST, provider_name)
 
             # Save provider-specific config
-            if provider_name == 'csv':
-                ConfigStore.set(SETTINGS_KEYS.PROVIDER_CSV_PATH, config.get('csv_path', ''))
-
-            elif provider_name == 'http_traccar':
+            if provider_name == 'http_traccar':
                 ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_SERVER_URL, config.get('server_url', ''))
                 ConfigStore.set(SETTINGS_KEYS.PROVIDER_HTTP_USERNAME, config.get('username', ''))
                 # Save to SecureStore

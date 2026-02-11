@@ -526,23 +526,12 @@ class TestNetworkFailureResilience:
         assert error.provider_name == "traccar_http"
         assert error.recoverable is True  # Network issues are transient
 
-    def test_csv_provider_handles_missing_file_gracefully(self, tmp_path):
+    def test_csv_provider_removed_from_runtime(self, tmp_path):
         """
-        Scenario: CSV provider reports clear error for missing file.
+        Scenario: CSV provider runtime has been removed.
         """
-        from providers.csv import CSVProvider
-        from utils.exceptions import ProviderDataError
-
-        provider = CSVProvider(csv_path=str(tmp_path / "nonexistent.csv"))
-
-        # test_connection should return False
-        assert provider.test_connection() is False
-
-        # get_current should raise clear error
-        with pytest.raises(ProviderDataError) as exc_info:
-            provider.get_current()
-
-        assert "not found" in str(exc_info.value).lower() or "missing" in str(exc_info.value).lower()
+        with pytest.raises(ModuleNotFoundError):
+            from providers.csv import CSVProvider  # noqa: F401
 
 
 class TestDataIntegrity:

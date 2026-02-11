@@ -35,7 +35,7 @@ class ProviderMetadata:
         Initialize provider metadata.
 
         Args:
-            name: Internal provider name (e.g., 'csv', 'http_traccar')
+            name: Internal provider name (e.g., 'traccar_http', 'http_traccar')
             display_name: Human-readable name (e.g., 'CSV Files', 'Traccar Server (HTTP)')
             description: Provider description for UI tooltips
             requires_config: Whether provider requires configuration
@@ -103,7 +103,7 @@ class ProviderRegistry:
         Get provider instance.
 
         Args:
-            name: Provider name (e.g., 'csv', 'http_traccar')
+            name: Provider name (e.g., 'traccar_http', 'http_traccar')
             config: Provider-specific configuration dict
 
         Returns:
@@ -133,7 +133,7 @@ class ProviderRegistry:
         to filter and display appropriate provider options.
 
         Args:
-            name: Provider name (e.g., 'csv', 'http_traccar')
+            name: Provider name (e.g., 'traccar_http', 'http_traccar')
 
         Returns:
             ProviderMetadata instance with capabilities

@@ -270,6 +270,7 @@ class TrackingLayerManager(BaseLayerManager):
         # Cache-health diagnostics for incident bundle correlation.
         self._stale_layer_cache_events = 0
         self._last_stale_layer_cache_event: Optional[Dict[str, str]] = None
+        self._pre_mission_breadcrumb_warning_shown = False
 
     def get_managed_layer_names(self):
         """Return list of fixed layer names this manager handles (legacy only)."""
@@ -295,6 +296,7 @@ class TrackingLayerManager(BaseLayerManager):
         self._device_generations.clear()
         self._stale_layer_cache_events = 0
         self._last_stale_layer_cache_event = None
+        self._pre_mission_breadcrumb_warning_shown = False
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Return tracking-manager diagnostics for incident bundles."""
@@ -328,6 +330,17 @@ class TrackingLayerManager(BaseLayerManager):
                 notify_warning(bar, title, message, duration=duration)
         except Exception:
             logger.debug("Failed to display warning '%s': %s", title, message)
+
+    def _notify_pre_mission_breadcrumb_mode(self):
+        """Notify once per session when breadcrumbs are in pre-mission memory mode."""
+        if self._pre_mission_breadcrumb_warning_shown:
+            return
+        self._pre_mission_breadcrumb_warning_shown = True
+        self._notify_warning(
+            "Pre-Mission Trails",
+            "Showing temporary breadcrumb trails in memory. Start mission to persist trails.",
+            duration=8,
+        )
 
     def _report_validation_warning(self, data_label: str, total: int, skipped: int, last_error: Optional[str]):
         """Aggregate validation skips into user-facing + logged warnings."""
@@ -2987,14 +3000,43 @@ class TrackingLayerManager(BaseLayerManager):
         if not self.USE_PER_DEVICE_TRAILS:
             raise LayerError("Per-device tracking is disabled for breadcrumbs.", title="Tracking Disabled")
 
-        self._ensure_per_device_ready()
+        use_shared_fallback = False
+        shared_layer = None
+        try:
+            self._ensure_per_device_ready()
+        except LayerError as exc:
+            logger.warning(
+                "Per-device trails unavailable (%s); falling back to shared breadcrumb layer",
+                exc
+            )
+            use_shared_fallback = True
+            shared_layer = self._get_or_create_breadcrumbs_layer()
+            self._notify_pre_mission_breadcrumb_mode()
 
         total_inputs = len(positions) if isinstance(positions, list) else 0
-        if self._maybe_schedule_breadcrumb_task(positions, gap_minutes, total_inputs, processed_segments):
+        if (not use_shared_fallback and
+                self._maybe_schedule_breadcrumb_task(positions, gap_minutes, total_inputs, processed_segments)):
             return
 
         validated_segments = validate_processed_segments(processed_segments, gap_minutes)
         sanitized_positions = sanitize_breadcrumb_positions(positions)
+        if use_shared_fallback:
+            if validated_segments is not None:
+                segments = validated_segments
+            else:
+                segments = build_segments_from_positions(
+                    sanitized_positions.valid,
+                    gap_minutes
+                )
+            self._apply_breadcrumb_results(
+                shared_layer,
+                segments,
+                total_inputs,
+                sanitized_positions.invalid_count,
+                sanitized_positions.last_error
+            )
+            return
+
         self._report_validation_warning(
             "Breadcrumbs",
             total_inputs,

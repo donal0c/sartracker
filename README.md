@@ -138,14 +138,12 @@ Status badges directly beneath the controls show Auto Refresh / Auto Save state 
 
 ### 3. Load Tracking Data
 
-**From CSV Files:**
-1. Click **"Load CSV..."** in the Data Refresh section
-2. Select folder with CSV files OR single CSV file
-3. Data loads automatically to map
+Tracking data is provided through the configured **Traccar HTTP** source.
 
-**Supported formats:**
-- Traccar CSV exports
-- Must have: `latitude`, `longitude`, `time`, `name` columns
+1. Open **Plugins → SAR Tracker → Settings**
+2. Configure **Traccar Server (HTTP)** credentials
+3. Click **Save & Connect**
+4. Use **Refresh Now** in the SAR panel for manual updates
 
 ### 4. Replay / Testing Window (Advanced)
 
@@ -280,7 +278,7 @@ Understanding how tracking data refreshes helps operators know what to expect:
 | **Current Positions** | Replaced completely on each refresh (shows latest position per device) |
 | **Breadcrumbs** | Cumulative during mission; filtered from mission start or last 3 hours |
 
-**CSV Provider Note:** CSV files always load all data regardless of mission state (time filtering only applies to Traccar HTTP provider).
+All tracking behavior above applies to the Traccar HTTP provider.
 
 ---
 

@@ -12,7 +12,7 @@ from typing import Optional
 from qgis.core import QgsPointXY, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 from qgis.gui import QgsMapTool
 from qgis.PyQt.QtCore import pyqtSignal
-from qgis.PyQt.QtGui import QCursor
+from qgis.PyQt.QtGui import QCursor, QColor, QPainter, QPen, QPixmap
 
 # Import Qt5/Qt6 compatible constants
 from ..utils.qt_compat import CrossCursor
@@ -43,7 +43,9 @@ class MarkerMapTool(QgsMapTool):
         super().__init__(canvas)
         self.canvas = canvas
         self.iface = iface
-        self.setCursor(QCursor(CrossCursor))
+        self._marker_context = "default"
+        self._default_cursor = QCursor(CrossCursor)
+        self.setCursor(self._default_cursor)
         self._message_bar = None
         
         # Setup coordinate systems
@@ -142,7 +144,7 @@ class MarkerMapTool(QgsMapTool):
     def activate(self):
         """Called when tool is activated."""
         super().activate()
-        self.canvas.setCursor(QCursor(CrossCursor))
+        self.canvas.setCursor(self.cursor())
     
     def deactivate(self):
         """Called when tool is deactivated."""
@@ -183,3 +185,67 @@ class MarkerMapTool(QgsMapTool):
                 notify_warning(bar, title, detail, duration=6)
             except Exception:
                 logger.debug("Marker tool notification suppressed", exc_info=True)
+
+    def set_marker_context(self, marker_type: Optional[str]):
+        """
+        Update cursor context for marker placement.
+
+        Uses custom, high-visibility cursors for clue/casualty placement and
+        falls back to the standard crosshair for all other contexts.
+        """
+        context = (marker_type or "default").strip().lower()
+        self._marker_context = context
+
+        if context == "clue":
+            self._set_cursor_with_fallback(self._build_context_cursor(QColor("#ff8c00")))
+            return
+        if context == "casualty":
+            self._set_cursor_with_fallback(self._build_context_cursor(QColor("#d62828")))
+            return
+
+        self._set_cursor_with_fallback(None)
+
+    def _set_cursor_with_fallback(self, cursor: Optional[QCursor]):
+        """Apply context cursor and gracefully fall back to crosshair."""
+        try:
+            self.setCursor(cursor if cursor is not None else self._default_cursor)
+            if self.canvas:
+                self.canvas.setCursor(self.cursor())
+        except Exception:
+            # Qt cursor creation can fail on some platforms/Qt combinations.
+            self.setCursor(self._default_cursor)
+            if self.canvas:
+                self.canvas.setCursor(self._default_cursor)
+
+    def _build_context_cursor(self, accent: QColor) -> Optional[QCursor]:
+        """Build a high-visibility cross cursor with colored center ring."""
+        try:
+            size = 32
+            hotspot = size // 2
+            pixmap = QPixmap(size, size)
+            pixmap.fill(QColor(0, 0, 0, 0))
+
+            painter = QPainter(pixmap)
+            antialias_hint = getattr(QPainter, "Antialiasing", None)
+            if antialias_hint is None and hasattr(QPainter, "RenderHint"):
+                antialias_hint = QPainter.RenderHint.Antialiasing
+            if antialias_hint is not None:
+                painter.setRenderHint(antialias_hint, True)
+
+            outline_pen = QPen(QColor("#111111"))
+            outline_pen.setWidth(3)
+            painter.setPen(outline_pen)
+            painter.drawLine(hotspot, 2, hotspot, size - 3)
+            painter.drawLine(2, hotspot, size - 3, hotspot)
+
+            accent_pen = QPen(accent)
+            accent_pen.setWidth(2)
+            painter.setPen(accent_pen)
+            painter.drawLine(hotspot, 2, hotspot, size - 3)
+            painter.drawLine(2, hotspot, size - 3, hotspot)
+            painter.drawEllipse(hotspot - 4, hotspot - 4, 8, 8)
+            painter.end()
+
+            return QCursor(pixmap, hotspot, hotspot)
+        except Exception:
+            return None

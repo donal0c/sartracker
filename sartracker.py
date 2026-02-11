@@ -122,16 +122,14 @@ ensure_requests_charset_modules()
 # Import Provider Registry and trigger provider self-registration
 try:
     from .providers.registry import registry as provider_registry
-    # Trigger provider registration by importing them.
-    # CSV provider is considered core; HTTP provider is optional (dependency/SSL variance).
-    from .providers import csv  # noqa: F401
+    # Trigger provider registration by importing active providers.
     try:
         from .providers import traccar_http  # noqa: F401
     except Exception as e:
         traccar_http = track_optional_import_error(
             _import_report, 'providers.traccar_http', e
         )
-    # Note: provider_registry now contains registered providers (csv + any optional providers that loaded)
+    # Note: provider_registry now contains registered providers that loaded successfully.
 except Exception as e:
     provider_registry = track_import_error(_import_report, 'providers', e)
 
@@ -658,11 +656,9 @@ class sartracker:
         self.sar_panel.autosave_requested.connect(self._on_autosave_requested)
 
         # ====================================================================
-        # Provider Signals (refresh, csv load) -> ProviderController or Plugin
+        # Provider Signals (refresh) -> ProviderController or Plugin
         # ====================================================================
         # refresh_requested is wired after ProviderController setup in initGui
-        # csv_load_requested stays on plugin for now
-        self.sar_panel.csv_load_requested.connect(self._on_load_csv)
 
         # ====================================================================
         # Show warning if features unavailable
@@ -1405,7 +1401,7 @@ class sartracker:
                 error(
                     self.iface.messageBar(),
                     "SAR Tracker - Provider Controller Unavailable",
-                    f"Provider controller failed to initialize: {e}. CSV loading available via legacy workflow.",
+                    f"Provider controller failed to initialize: {e}. Restart plugin and run Diagnostics.",
                     duration=0
                 )
                 print(f"[SARTRACKER] ERROR initializing ProviderController: {e}")
@@ -1414,7 +1410,7 @@ class sartracker:
             error(
                 self.iface.messageBar(),
                 "SAR Tracker - Provider Controller Unavailable",
-                "Provider controller not available. CSV loading available via legacy workflow.",
+                "Provider controller not available. Restart plugin and run Diagnostics.",
                 duration=0
             )
             print("[SARTRACKER] ProviderController not available (import failed)")
@@ -2895,7 +2891,7 @@ class sartracker:
             # Disconnect signals - COMPLETE list matching _wire_sar_panel_signals
             panel_signals = [
                 # Tool signals
-                'refresh_requested', 'csv_load_requested', 'add_poi_requested',
+                'refresh_requested', 'add_poi_requested',
                 'add_clue_requested', 'add_casualty_requested', 'add_hazard_requested',
                 'line_tool_requested', 'polygon_tool_requested', 'range_rings_tool_requested',
                 'bearing_tool_requested', 'coordinate_converter_requested',
@@ -3156,14 +3152,14 @@ class sartracker:
 
         MEMORY STABILITY (SAR-ezy): Provider caches persist across mission
         changes without explicit cleanup. This method clears:
-        - CSV provider file cache (LRUTTLCache)
+        - Active provider data cache (if provider implements _cache)
         - GPX imported files tracking set
 
         Safe to call at any time - handles missing components gracefully.
         """
         cleared_items = []
 
-        # Clear CSV provider cache if available (via ProviderController)
+        # Clear active provider cache if available (via ProviderController)
         try:
             provider = getattr(self.provider_controller, 'provider', None) if self.provider_controller else None
             if provider and hasattr(provider, '_cache'):
@@ -3179,7 +3175,7 @@ class sartracker:
                     if hasattr(cache, 'reset_stats'):
                         cache.reset_stats()
 
-                    cleared_items.append(f"CSV cache ({cache_size} files)")
+                    cleared_items.append(f"Provider cache ({cache_size} entries)")
         except Exception as exc:
             print(f"[SARTRACKER] Warning: Failed to clear provider cache: {exc}")
 
@@ -4356,21 +4352,6 @@ class sartracker:
     # and ProviderController._on_refresh_task_error.
     # ========================================================================
 
-    def _on_load_csv(self, csv_file):
-        """
-        Handle CSV load request from panel.
-
-        Phase 3: Delegates directly to ProviderController.set_provider().
-
-        Args:
-            csv_file: Path to CSV file or folder
-        """
-        if self.provider_controller:
-            self.provider_controller.set_provider('csv', {'csv_path': csv_file})
-        else:
-            # Controller unavailable - show safe-mode message
-            self._safe_mode_block("Load CSV")
-
     # Phase 3: _on_load_complete removed (~120 lines)
     # CSV load completion now handled by ProviderController._on_refresh_task_complete
 
@@ -4770,8 +4751,8 @@ class sartracker:
                 - mission_active: bool (True if mission is running)
                 - mission_name: str or None (name of current mission)
                 - mission_paused: bool (True if mission is paused)
-                - data_source: str or None (e.g., "CSV: tracking.csv", "HTTP: Traccar")
-                - provider_type: str or None (e.g., "csv", "http_traccar")
+                - data_source: str or None (e.g., "HTTP: Traccar")
+                - provider_type: str or None (e.g., "traccar_http", "http_traccar")
                 - devices_count: int (number of tracked devices, cached)
                 - last_refresh: str or None (ISO timestamp of last refresh)
                 - active_tasks_count: int (number of active background tasks)
