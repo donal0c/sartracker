@@ -28,7 +28,7 @@ except ImportError:
 class sip:
     isdeleted = staticmethod(sip_isdeleted)
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Any, Callable, Tuple
+from typing import Optional, List, Dict, Any, Callable, Tuple, Union
 import json
 import os
 import getpass
@@ -112,6 +112,7 @@ class SARPanel(QDockWidget):
         self.autosave_interval_minutes = SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT
         self.last_autosave_time = None
         self._last_autosave_success: Optional[bool] = None
+        self._last_autosave_state: Optional[str] = None  # success | warning | failed
         self.focus_mode_active = False
         self.focus_mode_state = None  # FocusModePlusState for menu/status/toolbar hiding
         self.hidden_panels = []  # Track which panels we hid (legacy, kept for compatibility)
@@ -1103,11 +1104,14 @@ class SARPanel(QDockWidget):
         """Update the read-only auto-save status indicator."""
         status = "ON" if self.autosave_enabled else "OFF"
         interval_text = f"(every {self.autosave_interval_minutes} min)" if self.autosave_enabled else ""
+        autosave_state = self._last_autosave_state
         if self.last_autosave_time:
             time_str = self.last_autosave_time.strftime("%H:%M:%S")
-            if self._last_autosave_success is True:
+            if autosave_state == "success":
                 last_text = f"{time_str} ✓"
-            elif self._last_autosave_success is False:
+            elif autosave_state == "warning":
+                last_text = f"{time_str} ⚠ Warning"
+            elif autosave_state == "failed":
                 last_text = f"{time_str} ✗ Failed"
             else:
                 last_text = time_str
@@ -1115,9 +1119,11 @@ class SARPanel(QDockWidget):
             last_text = "Never"
 
         color = "#666"
-        if self._last_autosave_success is True:
+        if autosave_state == "success":
             color = "#1f8b4d"
-        elif self._last_autosave_success is False:
+        elif autosave_state == "warning":
+            color = "#b36b00"
+        elif autosave_state == "failed":
             color = "#d00"
         elif self.autosave_enabled:
             color = "#1f8b4d"
@@ -1440,15 +1446,28 @@ class SARPanel(QDockWidget):
         """Handle manual save button - request immediate project save."""
         self.autosave_requested.emit()
 
-    def update_autosave_status(self, success: bool):
+    def update_autosave_status(self, status: Union[bool, str]):
         """
         Update auto-save status label.
 
         Args:
-            success: Whether the save was successful
+            status: `True` for success, `False` for hard failure, `"warning"` for partial success
         """
         self.last_autosave_time = datetime.now()
-        self._last_autosave_success = success
+        if status is True:
+            self._last_autosave_state = "success"
+            self._last_autosave_success = True
+        elif status is False:
+            self._last_autosave_state = "failed"
+            self._last_autosave_success = False
+        elif isinstance(status, str) and status.lower() in {"warning", "partial"}:
+            self._last_autosave_state = "warning"
+            # Preserve historical field semantics while introducing warning state.
+            self._last_autosave_success = None
+        else:
+            # Defensive fallback: unknown state should never claim success.
+            self._last_autosave_state = "failed"
+            self._last_autosave_success = False
         self._update_autosave_status_label()
 
 

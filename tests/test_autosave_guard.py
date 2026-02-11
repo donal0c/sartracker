@@ -69,3 +69,4 @@ def test_autosave_persistence_warning_includes_layer_details(monkeypatch):
     assert persistence_messages, "Expected a persistence warning message"
     assert "sar_tracks_current_positions" in persistence_messages[0]
     assert "sar_tracks_breadcrumbs" in persistence_messages[0]
+    tracker.sar_panel.update_autosave_status.assert_called_once_with("warning")

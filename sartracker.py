@@ -4430,10 +4430,13 @@ class sartracker:
                             "Mission backup could not be completed.",
                             duration=4
                         )
-                    overall_success = persistence_ok and backup_ok
                     if panel:
-                        panel.update_autosave_status(overall_success)
-                    if overall_success:
+                        if persistence_ok and backup_ok:
+                            panel.update_autosave_status(True)
+                        else:
+                            # Partial success: project save worked, but follow-up persistence checks/backup warned.
+                            panel.update_autosave_status("warning")
+                    if persistence_ok and backup_ok:
                         success(
                             self.iface.messageBar(),
                             "SAR Tracker",
@@ -4465,7 +4468,6 @@ class sartracker:
                         persistence_issues = self.layer_manager.validate_persistence(quiet=True) if self.layer_manager else {}
                         persistence_ok = not persistence_issues
                         backup_ok = self._sync_mission_backup(async_run=True)
-                        overall_success = persistence_ok and backup_ok
                         if not persistence_ok:
                             persistence_message = self._format_persistence_issue_message(persistence_issues)
                             warning(
@@ -4482,8 +4484,12 @@ class sartracker:
                                 duration=4
                             )
                         if panel:
-                            panel.update_autosave_status(overall_success)
-                        if overall_success:
+                            if persistence_ok and backup_ok:
+                                panel.update_autosave_status(True)
+                            else:
+                                # Partial success: project save worked, but follow-up persistence checks/backup warned.
+                                panel.update_autosave_status("warning")
+                        if persistence_ok and backup_ok:
                             success(
                                 self.iface.messageBar(),
                                 "SAR Tracker",
