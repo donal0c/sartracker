@@ -145,6 +145,96 @@ def format_irish_grid_reference(easting: float, northing: float, digits: int = 5
     return f"{letter} {e_remainder:0{digits}d} {n_remainder:0{digits}d}"
 
 
+def parse_irish_grid_reference(grid_ref: str) -> Tuple[int, int]:
+    """
+    Parse an Irish Grid TM65 reference string into easting/northing meters.
+
+    Supports formats like "Q 99840 04018" and "Q9984004018".
+    """
+    context = "parse_irish_grid_reference"
+
+    if not isinstance(grid_ref, str):
+        raise TypeError(f"Invalid Irish Grid reference during {context}: expected string")
+
+    compact = "".join(grid_ref.upper().split())
+    if len(compact) < 3:
+        raise ValueError(f"Invalid Irish Grid reference during {context}: {grid_ref!r}")
+
+    letter = compact[0]
+    if letter == "I":
+        raise ValueError(f"Invalid Irish Grid letter during {context}: {letter}")
+
+    digits = compact[1:]
+    if not digits.isdigit() or len(digits) % 2 != 0:
+        raise ValueError(f"Invalid Irish Grid reference during {context}: {grid_ref!r}")
+
+    precision = len(digits) // 2
+    if precision < 3 or precision > 5:
+        raise ValueError(f"Invalid Irish Grid reference during {context}: {grid_ref!r}")
+
+    e_part = digits[:precision]
+    n_part = digits[precision:]
+
+    letter_found = False
+    row = 0
+    col = 0
+    for row_idx, chars in enumerate(_IRISH_GRID_ROWS):
+        col_idx = chars.find(letter)
+        if col_idx != -1:
+            row = row_idx
+            col = col_idx
+            letter_found = True
+            break
+
+    if not letter_found:
+        raise ValueError(f"Invalid Irish Grid letter during {context}: {letter}")
+
+    n100k = (_IRISH_GRID_DIM - 1) - row
+    e100k = col
+
+    scale = 10 ** (5 - precision)
+    easting = (e100k * _IRISH_GRID_SIZE) + (int(e_part) * scale)
+    northing = (n100k * _IRISH_GRID_SIZE) + (int(n_part) * scale)
+
+    if not (TM65_EASTING_MIN <= easting < TM65_EASTING_MAX):
+        raise ValueError(
+            f"TM65 easting outside valid range during {context}: {float(easting):.2f}"
+        )
+    if not (TM65_NORTHING_MIN <= northing < TM65_NORTHING_MAX):
+        raise ValueError(
+            f"TM65 northing outside valid range during {context}: {float(northing):.2f}"
+        )
+
+    return easting, northing
+
+
+def format_wgs84_degrees(lat: float, lon: float, precision: int = 6) -> str:
+    """
+    Format WGS84 coordinates with degree symbols and directional suffixes.
+
+    Returns format like "52.274681°N, 9.530912°W".
+    """
+    context = "format_wgs84_degrees"
+
+    if not isinstance(precision, int) or precision < 0:
+        raise ValueError(f"Invalid precision during {context}: {precision}")
+
+    if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        raise TypeError(f"Invalid coordinates during {context}: expected numeric values")
+
+    lat = float(lat)
+    lon = float(lon)
+
+    if math.isnan(lat) or math.isnan(lon):
+        raise ValueError(f"Invalid coordinate during {context}: value is NaN")
+    if math.isinf(lat) or math.isinf(lon):
+        raise ValueError(f"Invalid coordinate during {context}: value is Infinity")
+
+    lat_dir = "N" if lat >= 0 else "S"
+    lon_dir = "E" if lon >= 0 else "W"
+    return f"{abs(lat):.{precision}f}°{lat_dir}, {abs(lon):.{precision}f}°{lon_dir}"
+
+
 class CoordinateConverter:
     """
     Convert between Irish Grid (ITM EPSG:2157) and WGS84 (EPSG:4326).

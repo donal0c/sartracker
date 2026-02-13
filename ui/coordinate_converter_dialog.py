@@ -11,12 +11,18 @@ import math
 from qgis.PyQt.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFormLayout,
     QPushButton, QLineEdit, QLabel, QGroupBox, QRadioButton,
-    QButtonGroup, QApplication
+    QButtonGroup, QApplication, QComboBox
 )
 from qgis.PyQt.QtCore import pyqtSignal
 
 from ..utils.dialog_utils import BaseDialog
-from ..utils.coordinates import build_tm65_crs, format_irish_grid_reference
+from ..utils.coordinates import (
+    build_tm65_crs,
+    format_irish_grid_reference,
+    format_wgs84_degrees,
+    parse_irish_grid_reference,
+)
+from ..config.keys import ConfigStore, SETTINGS_KEYS
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform,
     QgsProject, QgsPointXY, QgsRectangle, QgsCsException
@@ -45,6 +51,7 @@ class CoordinateConverterDialog(BaseDialog):
         # BUG-057 fix: Track timers to prevent crashes on early dialog close
         self.copy_timer = None
         self.goto_timer = None
+        self.coordinate_display_mode = ConfigStore.get_coordinate_display_mode()
 
         self._setup_ui()
 
@@ -54,6 +61,26 @@ class CoordinateConverterDialog(BaseDialog):
         self.setMinimumWidth(500)
 
         layout = QVBoxLayout()
+
+        # Workflow Display Mode
+        mode_group = QGroupBox("Workflow Mode")
+        mode_layout = QFormLayout()
+        self.display_mode_combo = QComboBox()
+        self.display_mode_combo.addItem(
+            "Lat/Lon first",
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_LATLON_FIRST
+        )
+        self.display_mode_combo.addItem(
+            "TM65 grid first",
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_TM65_FIRST
+        )
+        mode_index = self.display_mode_combo.findData(self.coordinate_display_mode)
+        if mode_index >= 0:
+            self.display_mode_combo.setCurrentIndex(mode_index)
+        self.display_mode_combo.currentIndexChanged.connect(self._on_display_mode_changed)
+        mode_layout.addRow("Coordinate display:", self.display_mode_combo)
+        mode_group.setLayout(mode_layout)
+        layout.addWidget(mode_group)
 
         # Input Type Selection
         type_group = QGroupBox("Convert From")
@@ -71,6 +98,11 @@ class CoordinateConverterDialog(BaseDialog):
         self.irish_grid_radio.toggled.connect(self._on_input_type_changed)
         self.type_button_group.addButton(self.irish_grid_radio)
         type_layout.addWidget(self.irish_grid_radio)
+
+        self.tm65_grid_radio = QRadioButton("Irish Grid Reference (TM65)")
+        self.tm65_grid_radio.toggled.connect(self._on_input_type_changed)
+        self.type_button_group.addButton(self.tm65_grid_radio)
+        type_layout.addWidget(self.tm65_grid_radio)
 
         type_group.setLayout(type_layout)
         layout.addWidget(type_group)
@@ -100,6 +132,12 @@ class CoordinateConverterDialog(BaseDialog):
         self.northing_input.setPlaceholderText("e.g. 114716")
         self.northing_label = QLabel("Northing (N):")
         input_layout.addRow(self.northing_label, self.northing_input)
+
+        # TM65 Grid Reference Input
+        self.tm65_grid_input = QLineEdit()
+        self.tm65_grid_input.setPlaceholderText("e.g. Q 99840 04018")
+        self.tm65_grid_label = QLabel("Grid Reference:")
+        input_layout.addRow(self.tm65_grid_label, self.tm65_grid_input)
 
         input_group.setLayout(input_layout)
         layout.addWidget(input_group)
@@ -150,6 +188,11 @@ class CoordinateConverterDialog(BaseDialog):
 
         self.setLayout(layout)
 
+        if self._is_tm65_first_mode() and self.tm65 and self.tm65.isValid():
+            self.tm65_grid_radio.setChecked(True)
+        else:
+            self.wgs84_radio.setChecked(True)
+
         # Initial state
         self._on_input_type_changed()
 
@@ -161,6 +204,7 @@ class CoordinateConverterDialog(BaseDialog):
     def _on_input_type_changed(self):
         """Handle input type radio button change."""
         is_wgs84 = self.wgs84_radio.isChecked()
+        is_tm65_grid = self.tm65_grid_radio.isChecked()
 
         # Show/hide appropriate input fields
         self.lat_label.setVisible(is_wgs84)
@@ -168,10 +212,63 @@ class CoordinateConverterDialog(BaseDialog):
         self.lon_label.setVisible(is_wgs84)
         self.lon_input.setVisible(is_wgs84)
 
-        self.easting_label.setVisible(not is_wgs84)
-        self.easting_input.setVisible(not is_wgs84)
-        self.northing_label.setVisible(not is_wgs84)
-        self.northing_input.setVisible(not is_wgs84)
+        self.easting_label.setVisible(not is_wgs84 and not is_tm65_grid)
+        self.easting_input.setVisible(not is_wgs84 and not is_tm65_grid)
+        self.northing_label.setVisible(not is_wgs84 and not is_tm65_grid)
+        self.northing_input.setVisible(not is_wgs84 and not is_tm65_grid)
+
+        self.tm65_grid_label.setVisible(is_tm65_grid)
+        self.tm65_grid_input.setVisible(is_tm65_grid)
+
+    def _on_display_mode_changed(self, _index: int):
+        """Persist workflow display mode preference."""
+        mode = self.display_mode_combo.currentData()
+        ConfigStore.set_coordinate_display_mode(mode)
+        self.coordinate_display_mode = ConfigStore.get_coordinate_display_mode()
+
+    def _is_tm65_first_mode(self) -> bool:
+        return (
+            self.coordinate_display_mode ==
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_TM65_FIRST
+        )
+
+    def _format_result_text(self, lat: float, lon: float, itm_easting: float, itm_northing: float,
+                            tm65_ref: str = None, source_label: str = "WGS84") -> str:
+        """Build formatted result text honoring display mode preference."""
+        wgs84_text = format_wgs84_degrees(lat, lon, precision=6)
+        lat_text, lon_text = wgs84_text.split(", ")
+        itm_e = f"{round(itm_easting):,}"
+        itm_n = f"{round(itm_northing):,}"
+
+        tm65_block = ""
+        if tm65_ref:
+            tm65_block = (
+                f"<b>Irish Grid (TM65) Reference:</b><br>"
+                f"{tm65_ref}<br><br>"
+            )
+
+        wgs84_block = (
+            f"<b>WGS84:</b><br>"
+            f"Latitude: {lat_text}<br>"
+            f"Longitude: {lon_text}<br><br>"
+        )
+        itm_block = (
+            f"<b>Irish Grid (ITM):</b><br>"
+            f"Easting: {itm_e}<br>"
+            f"Northing: {itm_n}"
+        )
+        source_block = f"<b>Source:</b> {source_label}<br><br>"
+
+        if self._is_tm65_first_mode():
+            return source_block + tm65_block + wgs84_block + itm_block
+
+        result = source_block + wgs84_block + itm_block
+        if tm65_ref:
+            result += (
+                f"<br><br><b>Irish Grid (TM65) Reference:</b><br>"
+                f"{tm65_ref}"
+            )
+        return result
 
     def _on_convert(self):
         """Handle convert button click."""
@@ -231,25 +328,16 @@ class CoordinateConverterDialog(BaseDialog):
                 self.last_lat = lat
                 self.last_lon = lon
 
-                # Display results
-                # BUG-029 FIX: Use round() instead of int() to preserve precision
-                # int() truncates (e.g., 95553.7 -> 95553), while round() gives nearest integer
-                # For search and rescue, every meter of accuracy matters
-                result_text = (
-                    f"<b>WGS84 Input:</b><br>"
-                    f"Latitude: {lat:.6f}°N<br>"
-                    f"Longitude: {lon:.6f}°E<br><br>"
-                    f"<b>Irish Grid (ITM) Output:</b><br>"
-                    f"Easting: {round(itm_point.x()):,}<br>"
-                    f"Northing: {round(itm_point.y()):,}"
+                result_text = self._format_result_text(
+                    lat,
+                    lon,
+                    itm_point.x(),
+                    itm_point.y(),
+                    tm65_ref=tm65_ref,
+                    source_label="WGS84 (Lat/Lon)"
                 )
-                if tm65_ref:
-                    result_text += (
-                        f"<br><br><b>Irish Grid (TM65) Reference:</b><br>"
-                        f"{tm65_ref}"
-                    )
 
-            else:
+            elif self.irish_grid_radio.isChecked():
                 # Convert Irish Grid -> WGS84
                 easting = float(self.easting_input.text().strip().replace(',', ''))
                 northing = float(self.northing_input.text().strip().replace(',', ''))
@@ -313,21 +401,61 @@ class CoordinateConverterDialog(BaseDialog):
                 self.last_lat = wgs84_point.y()
                 self.last_lon = wgs84_point.x()
 
-                # Display results
-                # BUG-029 FIX: Use round() instead of int() for consistent precision handling
-                result_text = (
-                    f"<b>Irish Grid (ITM) Input:</b><br>"
-                    f"Easting: {round(easting):,}<br>"
-                    f"Northing: {round(northing):,}<br><br>"
-                    f"<b>WGS84 Output:</b><br>"
-                    f"Latitude: {wgs84_point.y():.6f}°N<br>"
-                    f"Longitude: {wgs84_point.x():.6f}°E"
+                result_text = self._format_result_text(
+                    wgs84_point.y(),
+                    wgs84_point.x(),
+                    easting,
+                    northing,
+                    tm65_ref=tm65_ref,
+                    source_label="Irish Grid (ITM)"
                 )
-                if tm65_ref:
-                    result_text += (
-                        f"<br><br><b>Irish Grid (TM65) Reference:</b><br>"
-                        f"{tm65_ref}"
+
+            else:
+                # Convert Irish Grid Reference (TM65) -> WGS84 and ITM
+                if not self.tm65 or not self.tm65.isValid():
+                    self.result_label.setText(
+                        "❌ Error: TM65 coordinate system is unavailable in this QGIS build."
                     )
+                    return
+
+                tm65_ref_input = self.tm65_grid_input.text().strip()
+                tm65_easting, tm65_northing = parse_irish_grid_reference(tm65_ref_input)
+                tm65_point = QgsPointXY(tm65_easting, tm65_northing)
+
+                transform_to_wgs84 = QgsCoordinateTransform(
+                    self.tm65,
+                    self.wgs84,
+                    QgsProject.instance()
+                )
+                wgs84_point = transform_to_wgs84.transform(tm65_point)
+
+                transform_to_itm = QgsCoordinateTransform(
+                    self.tm65,
+                    self.itm,
+                    QgsProject.instance()
+                )
+                itm_point = transform_to_itm.transform(tm65_point)
+
+                if (math.isnan(wgs84_point.x()) or math.isnan(wgs84_point.y()) or
+                        math.isinf(wgs84_point.x()) or math.isinf(wgs84_point.y()) or
+                        math.isnan(itm_point.x()) or math.isnan(itm_point.y()) or
+                        math.isinf(itm_point.x()) or math.isinf(itm_point.y())):
+                    self.result_label.setText(
+                        "❌ Error: Transformation produced invalid coordinates."
+                    )
+                    return
+
+                self.last_lat = wgs84_point.y()
+                self.last_lon = wgs84_point.x()
+                tm65_ref = format_irish_grid_reference(tm65_easting, tm65_northing)
+                result_text = self._format_result_text(
+                    wgs84_point.y(),
+                    wgs84_point.x(),
+                    itm_point.x(),
+                    itm_point.y(),
+                    tm65_ref=tm65_ref,
+                    source_label="Irish Grid Reference (TM65)"
+                )
 
             self.last_result_text = result_text
             self.result_label.setText(result_text)

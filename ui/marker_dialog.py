@@ -12,6 +12,7 @@ from qgis.PyQt.QtWidgets import (
 )
 
 from ..utils.dialog_utils import BaseDialog
+from ..utils.coordinates import format_wgs84_degrees
 
 
 class MarkerDialog(BaseDialog):
@@ -153,7 +154,7 @@ class MarkerDialog(BaseDialog):
         coords_layout = QFormLayout()
         
         # WGS84
-        wgs84_label = QLabel(f"<b>{self.lat:.6f}°N, {self.lon:.6f}°E</b>")
+        wgs84_label = QLabel(f"<b>{format_wgs84_degrees(self.lat, self.lon, precision=6)}</b>")
         coords_layout.addRow("WGS84:", wgs84_label)
         
         # Irish Grid (ITM) - BUG-083 FIX: Handle None values gracefully

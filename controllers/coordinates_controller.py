@@ -34,7 +34,11 @@ from qgis.core import (
 )
 
 from ..utils.notify import warning
-from ..utils.coordinates import build_tm65_crs, format_irish_grid_reference
+from ..utils.coordinates import (
+    build_tm65_crs,
+    format_irish_grid_reference,
+    format_wgs84_degrees,
+)
 
 # sip.isdeleted import pattern (Qt5/Qt6 compatible)
 try:
@@ -365,8 +369,13 @@ class CoordinatesController(QObject):
 
                 # Format display text with fixed-width formatting
                 # BUG-FIX: Use round() instead of int() for consistency (BUG-029)
+                wgs84_text = format_wgs84_degrees(
+                    wgs84_point.y(),
+                    wgs84_point.x(),
+                    precision=6
+                )
                 coords_text = (
-                    f"WGS84: {wgs84_point.y():9.6f}°N, {wgs84_point.x():10.6f}°E  |  "
+                    f"WGS84: {wgs84_text}  |  "
                     f"ITM: E:{round(itm_point.x()):7d}  N:{round(itm_point.y()):7d}"
                 )
                 if tm65_point:

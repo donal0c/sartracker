@@ -381,7 +381,7 @@ If you pause a mission and close QGIS:
 
 ### Coordinate Systems
 - WGS84 (GPS standard)
-- Irish Grid ITM (EPSG:29903)
+- Irish Grid ITM (EPSG:2157)
 
 ---
 

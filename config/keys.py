@@ -114,6 +114,10 @@ class SETTINGS_KEYS:
     # UI STATE (Phase N1)
     # ========================================================================
     SETTINGS_MIGRATION_NOTICE_SHOWN = "SARTracker/UI/settings_migration_notice_shown"
+    COORDINATE_DISPLAY_MODE = "SARTracker/Coordinates/display_mode"
+    COORDINATE_DISPLAY_MODE_LATLON_FIRST = "latlon_first"
+    COORDINATE_DISPLAY_MODE_TM65_FIRST = "tm65_first"
+    COORDINATE_DISPLAY_MODE_DEFAULT = COORDINATE_DISPLAY_MODE_LATLON_FIRST
     # Layer Console (Phase 4 canonical keys)
     LAYER_CONSOLE_EXPANDED_GROUPS = "sartracker/layer_console/expanded_groups"
     LAYER_CONSOLE_COLUMN_WIDTHS = "sartracker/layer_console/column_widths"
@@ -453,3 +457,29 @@ class ConfigStore:
     def set_debug_logging_enabled(enabled: bool):
         """Set debug logging enabled setting."""
         ConfigStore.set(SETTINGS_KEYS.DEBUG_LOGGING_ENABLED, enabled)
+
+    @staticmethod
+    def get_coordinate_display_mode() -> str:
+        """Get coordinate display mode with safe fallback."""
+        mode = ConfigStore.get(
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE,
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_DEFAULT,
+            str
+        )
+        valid_modes = {
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_LATLON_FIRST,
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_TM65_FIRST,
+        }
+        if mode not in valid_modes:
+            return SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_DEFAULT
+        return mode
+
+    @staticmethod
+    def set_coordinate_display_mode(mode: str):
+        """Persist coordinate display mode."""
+        valid_modes = {
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_LATLON_FIRST,
+            SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_TM65_FIRST,
+        }
+        value = mode if mode in valid_modes else SETTINGS_KEYS.COORDINATE_DISPLAY_MODE_DEFAULT
+        ConfigStore.set(SETTINGS_KEYS.COORDINATE_DISPLAY_MODE, value)
