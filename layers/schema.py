@@ -855,7 +855,7 @@ def get_expected_structure() -> GroupDefinition:
                             LayerDefinition(
                                 layer_id=LayerIds.BREADCRUMBS,
                                 name="Breadcrumbs",
-                                geometry_type="Point",
+                                geometry_type="LineString",
                                 fields=BREADCRUMB_FIELDS,
                                 metadata={"sartracker:type": "breadcrumb"},
                                 auto_create=False

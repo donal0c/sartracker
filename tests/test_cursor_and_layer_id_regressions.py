@@ -225,6 +225,28 @@ def test_get_layer_by_id_resolves_breadcrumbs():
     assert layer_def.auto_create is False
 
 
+def test_tracking_layer_geometry_types():
+    """CURRENT_ACTIVE must be Point, BREADCRUMBS must be LineString.
+
+    Breadcrumbs are polyline trail segments (QgsGeometry.fromPolylineXY).
+    A Point geometry type causes 'geometry type is not compatible' on commit.
+    """
+    from sartracker.layers.schema import get_layer_by_id, LayerIds
+
+    current = get_layer_by_id(LayerIds.CURRENT_ACTIVE)
+    assert current is not None
+    assert current.geometry_type == "Point", (
+        f"CURRENT_ACTIVE geometry_type is '{current.geometry_type}' — must be 'Point'"
+    )
+
+    breadcrumbs = get_layer_by_id(LayerIds.BREADCRUMBS)
+    assert breadcrumbs is not None
+    assert breadcrumbs.geometry_type == "LineString", (
+        f"BREADCRUMBS geometry_type is '{breadcrumbs.geometry_type}' — "
+        "must be 'LineString' (trails are polyline segments)"
+    )
+
+
 def test_current_active_has_correct_fields():
     """CURRENT_ACTIVE definition should carry the expected tracking fields."""
     from sartracker.layers.schema import get_layer_by_id, LayerIds
