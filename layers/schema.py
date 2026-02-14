@@ -835,12 +835,32 @@ def get_expected_structure() -> GroupDefinition:
                     GroupDefinition(
                         name=GroupNames.CURRENT_POSITIONS,
                         parent_path=[GroupNames.ROOT, GroupNames.TRACKING],
-                        position=0
+                        position=0,
+                        layers=[
+                            LayerDefinition(
+                                layer_id=LayerIds.CURRENT_ACTIVE,
+                                name="Current Positions",
+                                geometry_type="Point",
+                                fields=CURRENT_POSITION_FIELDS,
+                                metadata={"sartracker:type": "current_position"},
+                                auto_create=False
+                            )
+                        ]
                     ),
                     GroupDefinition(
                         name=GroupNames.TRACKING_TRAILS,
                         parent_path=[GroupNames.ROOT, GroupNames.TRACKING],
-                        position=1
+                        position=1,
+                        layers=[
+                            LayerDefinition(
+                                layer_id=LayerIds.BREADCRUMBS,
+                                name="Breadcrumbs",
+                                geometry_type="Point",
+                                fields=BREADCRUMB_FIELDS,
+                                metadata={"sartracker:type": "breadcrumb"},
+                                auto_create=False
+                            )
+                        ]
                     ),
                 ]
             ),
@@ -987,7 +1007,9 @@ LEGACY_LAYER_NAMES = {
 # Layer tree placement mapping (used during migrations and when inserting layers)
 # Phase 4: All drawing/marker items now use Map Tools hierarchy
 LAYER_GROUP_PATHS = {
-    # Legacy tracking layers (handled via migration; do not auto-create groups)
+    # Tracking layers (shared fallback; per-device layers created dynamically)
+    "Current Positions": [GroupNames.ROOT, GroupNames.TRACKING, GroupNames.CURRENT_POSITIONS],
+    "Breadcrumbs": [GroupNames.ROOT, GroupNames.TRACKING, GroupNames.TRACKING_TRAILS],
     # Map Tools - Drawing items (per-item layers)
     "Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_LINES],
     "Bearing Lines": [GroupNames.ROOT, GroupNames.MAP_TOOLS, GroupNames.MAP_TOOLS_BEARING_LINES],

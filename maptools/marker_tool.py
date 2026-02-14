@@ -45,6 +45,7 @@ class MarkerMapTool(QgsMapTool):
         self.iface = iface
         self._marker_context = "default"
         self._default_cursor = QCursor(CrossCursor)
+        self._active_cursor = self._default_cursor
         self.setCursor(self._default_cursor)
         self._message_bar = None
         
@@ -144,7 +145,7 @@ class MarkerMapTool(QgsMapTool):
     def activate(self):
         """Called when tool is activated."""
         super().activate()
-        self.canvas.setCursor(self.cursor())
+        self.canvas.setCursor(self._active_cursor)
     
     def deactivate(self):
         """Called when tool is deactivated."""
@@ -207,12 +208,15 @@ class MarkerMapTool(QgsMapTool):
 
     def _set_cursor_with_fallback(self, cursor: Optional[QCursor]):
         """Apply context cursor and gracefully fall back to crosshair."""
+        active = cursor if cursor is not None else self._default_cursor
         try:
-            self.setCursor(cursor if cursor is not None else self._default_cursor)
+            self._active_cursor = active
+            self.setCursor(active)
             if self.canvas:
-                self.canvas.setCursor(self.cursor())
+                self.canvas.setCursor(active)
         except Exception:
             # Qt cursor creation can fail on some platforms/Qt combinations.
+            self._active_cursor = self._default_cursor
             self.setCursor(self._default_cursor)
             if self.canvas:
                 self.canvas.setCursor(self._default_cursor)
