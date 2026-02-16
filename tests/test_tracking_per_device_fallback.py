@@ -164,3 +164,48 @@ def test_breadcrumb_fallback_warning_shown_once_per_session():
     mgr.update_breadcrumbs(positions, time_gap_minutes=5)
 
     assert len(warnings) == 1
+
+
+def test_breadcrumb_pre_mission_warning_suppressed_when_mission_active():
+    mgr = _build_manager()
+    mgr._mission_active_getter = lambda: True
+
+    def _raise_unavailable():
+        raise LayerError("Mission Store Required", title="Mission Store Required")
+
+    mgr._ensure_per_device_ready = _raise_unavailable
+    mgr._get_or_create_breadcrumbs_layer = lambda: _FakeLayer()
+    mgr._apply_breadcrumb_results = lambda *args, **kwargs: None
+
+    warnings = []
+    mgr._notify_warning = lambda title, message, duration=0: warnings.append((title, message, duration))
+
+    positions = [
+        {
+            "device_id": "dev1",
+            "name": "Dev 1",
+            "ts": "2024-01-01T00:00:00Z",
+            "lat": 1.0,
+            "lon": 2.0,
+        },
+        {
+            "device_id": "dev1",
+            "name": "Dev 1",
+            "ts": "2024-01-01T00:05:00Z",
+            "lat": 1.1,
+            "lon": 2.1,
+        },
+    ]
+
+    mgr.update_breadcrumbs(positions, time_gap_minutes=5)
+
+    assert not warnings
+
+
+def test_mission_start_clears_pre_mission_warning_latch():
+    mgr = _build_manager()
+    mgr._pre_mission_breadcrumb_warning_shown = True
+
+    mgr.on_mission_state_changed("idle", "active")
+
+    assert mgr._pre_mission_breadcrumb_warning_shown is False

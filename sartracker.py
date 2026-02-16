@@ -1116,6 +1116,8 @@ class sartracker:
                 layer_manager=self.layer_manager,
                 task_manager=self.task_manager
             )
+            if getattr(self.layers_controller, "tracking", None):
+                self.layers_controller.tracking.set_mission_active_getter(self._is_mission_active)
         except Exception as exc:
             self.layers_controller = None
             self._critical_init_failed = True
@@ -3049,6 +3051,10 @@ class sartracker:
 
         # Keep provider breadcrumb accumulator lifecycle in sync with mission state
         try:
+            if self.layers_controller and getattr(self.layers_controller, "tracking", None):
+                old_state_value = prev_state.value if prev_state else MissionState.IDLE.value
+                new_state_value = state.value if state else None
+                self.layers_controller.tracking.on_mission_state_changed(old_state_value, new_state_value)
             if self.provider_controller:
                 old_state_value = prev_state.value if prev_state else MissionState.IDLE.value
                 new_state_value = state.value if state else None

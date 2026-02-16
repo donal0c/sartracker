@@ -1104,7 +1104,9 @@ class LayerManager(QObject):
             cached_layer = self._layer_cache[layer_def.layer_id]
             # Verify cached layer still exists
             if self._layer_exists(cached_layer):
-                return cached_layer
+                migrated_layer = self._migrate_existing_layer_if_needed(cached_layer, layer_def, group_path)
+                self._layer_cache[layer_def.layer_id] = migrated_layer
+                return migrated_layer
             else:
                 del self._layer_cache[layer_def.layer_id]
 

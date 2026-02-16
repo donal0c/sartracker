@@ -762,6 +762,42 @@ def test_ensure_vector_layer_migrates_existing_memory_layer_when_store_enabled(m
     assert replace_calls == [(existing_layer, migrated_layer, ["SAR Tracker", "Map Tools"], layer_def.position)]
 
 
+def test_ensure_vector_layer_migrates_cached_memory_layer_when_store_enabled(monkeypatch):
+    _ensure_qgis(monkeypatch)
+    manager = _load_manager_module()
+
+    mgr = manager.LayerManager.__new__(manager.LayerManager)
+    mgr._layer_cache = {}
+    mgr._log = lambda *_args, **_kwargs: None
+    mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
+
+    layer_def = manager.LayerDefinition(layer_id="layer_memory", name="Memory Layer", geometry_type="Point")
+
+    class FakeLayer:
+        def providerType(self):
+            return "memory"
+
+    cached_layer = FakeLayer()
+    migrated_layer = object()
+    migrate_calls = []
+    replace_calls = []
+
+    mgr._layer_cache[layer_def.layer_id] = cached_layer
+    mgr._layer_exists = lambda _layer: True
+    mgr._mission_store_enabled = lambda: True
+    mgr.migrate_memory_layer_to_store = lambda layer, definition: (migrate_calls.append((layer, definition)), migrated_layer)[1]
+    mgr._replace_layer_in_project_tree = (
+        lambda old_layer, new_layer, group_path, position: replace_calls.append((old_layer, new_layer, group_path, position))
+    )
+
+    result = manager.LayerManager.ensure_vector_layer(mgr, layer_def, ["SAR Tracker", "Map Tools"])
+
+    assert result is migrated_layer
+    assert mgr._layer_cache[layer_def.layer_id] is migrated_layer
+    assert migrate_calls == [(cached_layer, layer_def)]
+    assert replace_calls == [(cached_layer, migrated_layer, ["SAR Tracker", "Map Tools"], layer_def.position)]
+
+
 @pytest.mark.qgis_required
 def test_create_vector_layer_falls_back_to_memory(monkeypatch):
     _ensure_qgis(monkeypatch)

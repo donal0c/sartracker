@@ -12,7 +12,7 @@ import logging
 import hashlib
 import time
 from contextlib import contextmanager
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Callable
 from datetime import datetime, timedelta, timezone
 import os
 import shutil
@@ -271,6 +271,7 @@ class TrackingLayerManager(BaseLayerManager):
         self._stale_layer_cache_events = 0
         self._last_stale_layer_cache_event: Optional[Dict[str, str]] = None
         self._pre_mission_breadcrumb_warning_shown = False
+        self._mission_active_getter: Optional[Callable[[], bool]] = None
 
     def get_managed_layer_names(self):
         """Return list of fixed layer names this manager handles (legacy only)."""
@@ -333,6 +334,8 @@ class TrackingLayerManager(BaseLayerManager):
 
     def _notify_pre_mission_breadcrumb_mode(self):
         """Notify once per session when breadcrumbs are in pre-mission memory mode."""
+        if self._is_mission_active():
+            return
         if self._pre_mission_breadcrumb_warning_shown:
             return
         self._pre_mission_breadcrumb_warning_shown = True
@@ -341,6 +344,35 @@ class TrackingLayerManager(BaseLayerManager):
             "Showing temporary breadcrumb trails in memory. Start mission to persist trails.",
             duration=8,
         )
+
+    def set_mission_active_getter(self, getter: Optional[Callable[[], bool]]) -> None:
+        """Inject mission-active getter to keep fallback warnings context-aware."""
+        self._mission_active_getter = getter
+
+    def _is_mission_active(self) -> bool:
+        getter = getattr(self, "_mission_active_getter", None)
+        if not getter:
+            return False
+        try:
+            return bool(getter())
+        except Exception:
+            return False
+
+    def on_mission_state_changed(self, old_state: Optional[str], new_state: Optional[str]) -> None:
+        """
+        React to mission lifecycle transitions.
+
+        Clears pre-mission warning state when a mission starts, so fallback
+        notifications remain accurate across mission boundaries.
+        """
+        if not new_state:
+            return
+        old_value = (old_state or "").strip().lower()
+        new_value = str(new_state).strip().lower()
+        if new_value != "active":
+            return
+        if old_value in {"", "idle", "finished"}:
+            self._pre_mission_breadcrumb_warning_shown = False
 
     def _report_validation_warning(self, data_label: str, total: int, skipped: int, last_error: Optional[str]):
         """Aggregate validation skips into user-facing + logged warnings."""
