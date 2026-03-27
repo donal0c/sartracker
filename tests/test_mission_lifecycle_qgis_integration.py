@@ -97,3 +97,47 @@ def test_sync_project_state_ensures_sar_structure_when_mission_store_configured(
         if controller is not None:
             controller.cleanup()
         _reset_project_state(QgsProject.instance())
+
+
+def test_recover_missing_layers_rebuilds_missing_startup_groups():
+    """
+    Real-QGIS check: if the SAR root exists but startup-critical subgroups are
+    missing, recovery should rebuild them without requiring manual Repair.
+    """
+    from qgis.core import QgsProject
+    from sartracker.layers import GroupNames, LayerManager
+    from sartracker import sartracker as sartracker_module
+
+    try:
+        project = QgsProject.instance()
+        _reset_project_state(project)
+
+        root = project.layerTreeRoot()
+        sar_group = root.addGroup(GroupNames.ROOT)
+        sar_group.addGroup(GroupNames.TRACKING)
+
+        layer_manager = LayerManager(_Iface())
+
+        SarTracker = sartracker_module.sartracker
+        tracker = SarTracker.__new__(SarTracker)
+        tracker._should_skip_layer_ops = lambda: False
+        tracker.layer_manager = layer_manager
+        tracker.layers_controller = type(
+            "_LayersController",
+            (),
+            {
+                "ensure_helicopter_layers": staticmethod(lambda: True),
+                "catalog": None,
+            },
+        )()
+        tracker._log_exception = lambda *_args, **_kwargs: None
+
+        SarTracker._recover_missing_layers(tracker)
+
+        restored_root = project.layerTreeRoot().findGroup(GroupNames.ROOT)
+        assert restored_root is not None
+        assert restored_root.findGroup(GroupNames.TRACKING) is not None
+        assert restored_root.findGroup(GroupNames.MAP_TOOLS) is not None
+        assert restored_root.findGroup(GroupNames.HELICOPTERS) is not None
+    finally:
+        _reset_project_state(QgsProject.instance())

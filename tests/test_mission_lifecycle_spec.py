@@ -957,6 +957,85 @@ def test_legacy_sync_project_state_unsaved_non_sar_project_does_not_ensure_struc
     tracker._load_existing_mission_storage_state.assert_called_once_with()
 
 
+def test_recover_missing_layers_rebuilds_when_required_subgroups_are_missing(monkeypatch):
+    """
+    Startup recovery should not stop at the SAR root group if key subgroups are
+    missing. Tracking-only trees should be rebuilt to restore Map Tools and
+    Helicopters without requiring a manual Repair action.
+    """
+    from sartracker import sartracker as sartracker_module
+    from sartracker.layers import GroupNames
+
+    class _Group:
+        def __init__(self, groups=None):
+            self._groups = groups or {}
+
+        def findGroup(self, name):
+            return self._groups.get(name)
+
+    sar_group = _Group(groups={GroupNames.TRACKING: _Group()})
+    root = _Group(groups={GroupNames.ROOT: sar_group})
+    project = SimpleNamespace(layerTreeRoot=lambda: root)
+    monkeypatch.setattr(sartracker_module.QgsProject, "instance", MagicMock(return_value=project))
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._should_skip_layer_ops = MagicMock(return_value=False)
+    tracker.layer_manager = SimpleNamespace(ensure_structure=MagicMock())
+    tracker.layers_controller = SimpleNamespace(
+        ensure_helicopter_layers=MagicMock(return_value=True),
+        catalog=None,
+    )
+    tracker._log_exception = MagicMock()
+
+    SarTracker._recover_missing_layers(tracker)
+
+    tracker.layer_manager.ensure_structure.assert_called_once_with(auto_migrate=False)
+    tracker.layers_controller.ensure_helicopter_layers.assert_called_once_with()
+
+
+def test_recover_missing_layers_noops_when_required_groups_are_present(monkeypatch):
+    """
+    Once Tracking, Map Tools, and Helicopters are present, recovery should not
+    rebuild the structure again.
+    """
+    from sartracker import sartracker as sartracker_module
+    from sartracker.layers import GroupNames
+
+    class _Group:
+        def __init__(self, groups=None):
+            self._groups = groups or {}
+
+        def findGroup(self, name):
+            return self._groups.get(name)
+
+    sar_group = _Group(
+        groups={
+            GroupNames.TRACKING: _Group(),
+            GroupNames.MAP_TOOLS: _Group(),
+            GroupNames.HELICOPTERS: _Group(),
+        }
+    )
+    root = _Group(groups={GroupNames.ROOT: sar_group})
+    project = SimpleNamespace(layerTreeRoot=lambda: root)
+    monkeypatch.setattr(sartracker_module.QgsProject, "instance", MagicMock(return_value=project))
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._should_skip_layer_ops = MagicMock(return_value=False)
+    tracker.layer_manager = SimpleNamespace(ensure_structure=MagicMock())
+    tracker.layers_controller = SimpleNamespace(
+        ensure_helicopter_layers=MagicMock(return_value=True),
+        catalog=None,
+    )
+    tracker._log_exception = MagicMock()
+
+    SarTracker._recover_missing_layers(tracker)
+
+    tracker.layer_manager.ensure_structure.assert_not_called()
+    tracker.layers_controller.ensure_helicopter_layers.assert_not_called()
+
+
 def test_legacy_missing_configured_store_does_not_rebuild_runtime_state(tmp_path):
     """
     Spec: legacy startup should not advertise mission runtime paths when the

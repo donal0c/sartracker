@@ -4206,7 +4206,8 @@ class sartracker:
         Ensure SAR layers are present in the QGIS layer tree.
 
         If the root SAR group is missing (e.g., after a QGIS save/discard prompt
-        clears the project layers), rebuild the structure so layers stay visible.
+        clears the project layers), or if key startup subgroups are missing,
+        rebuild the structure so layers stay visible.
         """
         try:
             if self._should_skip_layer_ops():
@@ -4217,12 +4218,31 @@ class sartracker:
                 return
             root = QgsProject.instance().layerTreeRoot()
             sar_group = root.findGroup(GroupNames.ROOT) if root else None
+            required_groups_missing = False
             if sar_group:
-                return
-            # Group missing – re-ensure structure
+                for group_name in (
+                    GroupNames.TRACKING,
+                    GroupNames.MAP_TOOLS,
+                    GroupNames.HELICOPTERS,
+                ):
+                    if not sar_group.findGroup(group_name):
+                        required_groups_missing = True
+                        break
+                if not required_groups_missing:
+                    return
+
+            # Root or required startup groups missing – re-ensure structure
             if self.layer_manager:
-                print("[SARTRACKER] SAR layer group missing; rebuilding structure")
+                if sar_group and required_groups_missing:
+                    print("[SARTRACKER] SAR root present but required groups missing; rebuilding structure")
+                else:
+                    print("[SARTRACKER] SAR layer group missing; rebuilding structure")
                 self.layer_manager.ensure_structure(auto_migrate=False)
+                if self.layers_controller:
+                    try:
+                        self.layers_controller.ensure_helicopter_layers()
+                    except Exception as exc:
+                        self._log_exception("_recover_missing_layers.helicopters", exc)
                 if self.layers_controller and self.layers_controller.catalog:
                     try:
                         self.layers_controller.catalog._build_cache()
