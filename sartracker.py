@@ -384,6 +384,7 @@ class sartracker:
         self._last_mission_state = None
         self._is_finalizing: bool = False  # Race condition protection
         self._critical_init_failed: bool = False
+        self._startup_activation_pending: bool = True
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -447,6 +448,38 @@ class sartracker:
                 self.sar_panel.set_loading_state(False)
         except Exception as exc:
             self._log_exception("_clear_loading_state", exc)
+
+    def _activate_startup_session(self):
+        """
+        Run deferred startup work after explicit operator activation.
+
+        This keeps normal QGIS startup clean while still preserving the
+        existing startup lifecycle flow once the SAR panel is intentionally
+        shown for the session.
+        """
+        if getattr(self, "_is_unloading", False) or getattr(self, "_app_is_quitting", False):
+            return
+        if not getattr(self, "_startup_activation_pending", False):
+            return
+
+        self._startup_activation_pending = False
+
+        provider_controller = getattr(self, "provider_controller", None)
+        if provider_controller:
+            try:
+                provider_controller.load_config_and_auto_connect()
+            except Exception as exc:
+                self._log_exception("_activate_startup_session.auto_connect", exc)
+
+        self._deferred_sync_project_state("startup")
+
+        paused_check = getattr(self, "_check_for_paused_mission", None)
+        if not callable(paused_check):
+            return
+        try:
+            QTimer.singleShot(1000, paused_check)
+        except Exception:
+            paused_check()
 
     def _stop_sar_panel_timers(self, reason: str):
         """Stop SAR panel timers early to prevent shutdown races."""
@@ -1559,8 +1592,10 @@ class sartracker:
                 pass
             self.sar_panel.refresh_requested.connect(self._on_panel_refresh_requested)
 
-            # Load saved config and auto-connect
-            self.provider_controller.load_config_and_auto_connect()
+            # Defer provider auto-connect until explicit panel activation so a
+            # normal QGIS startup does not immediately start SAR background work.
+            if not getattr(self, "_startup_activation_pending", False):
+                self.provider_controller.load_config_and_auto_connect()
 
             print("[SARTRACKER] Provider controller signals wired and dependencies injected")
         except Exception as e:
@@ -1582,13 +1617,14 @@ class sartracker:
         Phase 4.1: Extracted from initGui for clarity.
         Handles final state setup after all components are initialized.
         """
-        # Defer initial project/storage sync until the event loop has settled so
-        # startup storage prompting flows through one path instead of an
-        # immediate load followed by a second deferred sync.
-        try:
-            QTimer.singleShot(0, lambda: self._deferred_sync_project_state("startup"))
-        except Exception:
-            self._deferred_sync_project_state("startup")
+        # Keep a normal QGIS launch clean by deferring SAR-specific startup
+        # work until the operator explicitly shows the SAR panel.
+        self._startup_activation_pending = bool(self.sar_panel and not self.sar_panel.isVisible())
+        if not self._startup_activation_pending:
+            try:
+                QTimer.singleShot(0, lambda: self._deferred_sync_project_state("startup"))
+            except Exception:
+                self._deferred_sync_project_state("startup")
 
         # Disable drawing tools if registry failed
         if not self.tool_registry:
@@ -1598,8 +1634,10 @@ class sartracker:
         # Initialize coordinate display controller
         self._init_coordinates_controller()
 
-        # Check for paused mission (delayed to let QGIS fully load)
-        QTimer.singleShot(1000, self._check_for_paused_mission)
+        # Check for paused mission (delayed to let QGIS fully load) once SAR
+        # Tracker is explicitly activated for the session.
+        if not self._startup_activation_pending:
+            QTimer.singleShot(1000, self._check_for_paused_mission)
 
         # Check for unclean Focus Mode Plus exit (crash recovery) - SAR-cksi.5
         # Delayed slightly to ensure main window is fully loaded
@@ -3034,6 +3072,7 @@ class sartracker:
             self.sar_panel.hide()
         else:
             self.sar_panel.show()
+            self._activate_startup_session()
 
     def _on_mission_state_changed(self, state, context):
         """Handle mission state transitions from MissionController."""

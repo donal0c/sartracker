@@ -710,10 +710,6 @@ def test_post_init_state_without_controller_uses_single_deferred_startup_sync(mo
     tracker._sync_project_state.assert_called_once_with(reason="startup")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Startup still performs lifecycle sync before explicit operator activation",
-)
 def test_spec_hidden_startup_defers_lifecycle_sync_until_explicit_activation(monkeypatch):
     """
     Spec: when the SAR panel starts hidden, plugin initialization should not
@@ -754,6 +750,117 @@ def test_spec_hidden_startup_defers_lifecycle_sync_until_explicit_activation(mon
 
     tracker.sar_panel.show.assert_called_once_with()
     tracker.mission_lifecycle_controller.sync_project_state.assert_called_once_with(reason="startup")
+
+
+def test_spec_hidden_startup_defers_provider_auto_connect_until_activation():
+    """
+    Spec: provider auto-connect should not start network/provider activity while
+    SAR Tracker is still hidden on startup.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker.sar_panel = MagicMock()
+    tracker.layers_controller = None
+    tracker.layer_manager = MagicMock(
+        set_temp_mission_store=MagicMock(),
+        clear_temp_mission_store=MagicMock(),
+        get_temp_mission_store=MagicMock(return_value=None),
+    )
+    tracker.provider_controller = MagicMock()
+    tracker.provider_controller.status_changed = MagicMock(connect=MagicMock())
+    tracker.provider_controller.provider_connected = MagicMock(connect=MagicMock())
+    tracker.provider_controller.replay_mode_changed = MagicMock(connect=MagicMock())
+    tracker._get_mission_start_iso = MagicMock(return_value=None)
+    tracker._is_mission_active = MagicMock(return_value=False)
+    tracker._on_panel_refresh_requested = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._startup_activation_pending = True
+
+    SarTracker._wire_provider_controller(tracker)
+
+    tracker.provider_controller.load_config_and_auto_connect.assert_not_called()
+
+    tracker._deferred_sync_project_state = MagicMock()
+    tracker._safe_mode_block = MagicMock(return_value=False)
+    tracker.sar_panel.isVisible.return_value = False
+    SarTracker.run(tracker)
+
+    tracker.provider_controller.load_config_and_auto_connect.assert_called_once_with()
+
+
+def test_spec_hidden_startup_defers_paused_mission_prompt_until_activation(monkeypatch):
+    """
+    Spec: paused-mission recovery prompting should wait until the operator has
+    explicitly activated SAR Tracker for this QGIS session.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    callbacks = []
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._is_unloading = False
+    tracker._app_is_quitting = False
+    tracker.tool_registry = object()
+    tracker.sar_panel = MagicMock()
+    tracker.sar_panel.isVisible.return_value = False
+    tracker._init_coordinates_controller = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._check_focus_mode_crash_recovery = MagicMock()
+    tracker._safe_mode_block = MagicMock(return_value=False)
+    tracker._log_exception = MagicMock()
+    tracker.mission_lifecycle_controller = SimpleNamespace(
+        sync_project_state=MagicMock(),
+    )
+
+    def _capture_callback(delay, callback):
+        callbacks.append((delay, callback))
+
+    monkeypatch.setattr(sartracker_module.QTimer, "singleShot", _capture_callback, raising=False)
+
+    SarTracker._post_init_state(tracker)
+
+    assert tracker._check_for_paused_mission.call_count == 0
+    assert all(callback != tracker._check_for_paused_mission for _delay, callback in callbacks)
+
+    SarTracker.run(tracker)
+
+    assert any(callback == tracker._check_for_paused_mission for _delay, callback in callbacks)
+
+
+def test_startup_activation_only_runs_once(monkeypatch):
+    """
+    Once the hidden-startup activation work has run, later hide/show cycles
+    should not re-run startup-only sync and auto-connect behavior.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._safe_mode_block = MagicMock(return_value=False)
+    tracker.sar_panel = MagicMock()
+    tracker.sar_panel.isVisible.side_effect = [False, True, False]
+    tracker.provider_controller = MagicMock()
+    tracker._deferred_sync_project_state = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._startup_activation_pending = True
+
+    monkeypatch.setattr(
+        sartracker_module.QTimer,
+        "singleShot",
+        lambda _delay, callback: callback(),
+        raising=False,
+    )
+
+    SarTracker.run(tracker)
+    SarTracker.run(tracker)
+    SarTracker.run(tracker)
+
+    assert tracker.provider_controller.load_config_and_auto_connect.call_count == 1
+    assert tracker._deferred_sync_project_state.call_count == 1
+    assert tracker._check_for_paused_mission.call_count == 1
 
 
 def test_sync_project_state_ignores_duplicate_signature(monkeypatch):
