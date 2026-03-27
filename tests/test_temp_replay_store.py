@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sartracker.tests.qgis_runtime import require_real_qgis
+
 
 # =============================================================================
 # UNIT TESTS: MissionStorageHelper Temp Store Lifecycle
@@ -151,6 +153,7 @@ class TestCleanupTemporaryReplayStore:
         MissionStorageHelper.cleanup_temp_replay_store(None)
 
 
+@pytest.mark.qgis_required
 class TestGetReplayCacheRoot:
     """Tests for MissionStorageHelper._get_replay_cache_root()"""
 
@@ -162,8 +165,7 @@ class TestGetReplayCacheRoot:
         """
         from sartracker.utils.mission_storage import MissionStorageHelper
 
-        # This test requires QGIS to be available
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         root = MissionStorageHelper._get_replay_cache_root()
 
@@ -176,13 +178,14 @@ class TestGetReplayCacheRoot:
 # UNIT TESTS: LayerManager Temp Store Routing
 # =============================================================================
 
+@pytest.mark.qgis_required
 class TestLayerManagerTempStoreRouting:
     """Tests for LayerManager temp store priority over mission store."""
 
     @pytest.fixture
     def mock_layer_manager(self):
         """Create a minimal mock LayerManager for testing."""
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from unittest.mock import MagicMock
         from qgis.core import QgsProject
@@ -198,7 +201,7 @@ class TestLayerManagerTempStoreRouting:
 
         VALUE: Replay data goes to temp store, not live mission store.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.layers.manager import LayerManager
 
@@ -228,7 +231,7 @@ class TestLayerManagerTempStoreRouting:
 
         VALUE: Normal operations resume after replay ends.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.layers.manager import LayerManager
 
@@ -256,14 +259,18 @@ class TestLayerManagerTempStoreRouting:
 
         VALUE: Layers route to persistent storage during replay.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.layers.manager import LayerManager
 
         iface = MagicMock()
         manager = LayerManager(iface)
 
-        # No stores set
+        # No stores set anywhere, including project-backed mission storage.
+        try:
+            manager.project.setCustomVariables({})
+        except Exception:
+            pass
         manager._mission_store_path = None
         manager._temp_mission_store_path = None
         assert manager._mission_store_enabled() is False
@@ -290,7 +297,7 @@ class TestReplayTempStoreLifecycle:
 
         VALUE: Replay always has storage, even without mission.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.controllers.provider_controller import ProviderController
         from sartracker.utils.mission_storage import MissionStorageHelper
@@ -332,7 +339,7 @@ class TestReplayTempStoreLifecycle:
 
         VALUE: No stale replay data persists.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.controllers.provider_controller import ProviderController
         from sartracker.utils.mission_storage import MissionStorageHelper
@@ -379,7 +386,7 @@ class TestReplayTempStoreLifecycle:
 
         VALUE: Mission data never mixes with replay temp data.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.controllers.provider_controller import ProviderController
         from sartracker.utils.mission_storage import MissionStorageHelper
@@ -424,7 +431,7 @@ class TestReplayTempStoreLifecycle:
 
         VALUE: Live mission data integrity is preserved.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.layers.manager import LayerManager
 
@@ -461,7 +468,7 @@ class TestReplayTempStoreLifecycle:
 
         VALUE: No orphaned temp directories.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.controllers.provider_controller import ProviderController
         from sartracker.utils.mission_storage import MissionStorageHelper
@@ -506,13 +513,14 @@ class TestReplayTempStoreLifecycle:
 class TestTempStoreEdgeCases:
     """Edge cases and error handling for temp store."""
 
+    @pytest.mark.qgis_required
     def test_temp_store_creation_failure_falls_back_to_memory(self, tmp_path):
         """
         If temp store creation fails, layers should fall back to memory.
 
         VALUE: Replay still works even if storage fails.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay temp-store tests require real QGIS runtime")
 
         from sartracker.utils.mission_storage import MissionStorageHelper
 

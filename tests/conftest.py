@@ -98,6 +98,22 @@ class MockQgsTask:
         except Exception:
             self._progress = 0.0
 
+
+class MockQgis:
+    """Minimal qgis.core.Qgis replacement for unit tests."""
+    QGIS_VERSION_INT = 34400
+    QGIS_VERSION = "3.44.0"
+    Info = 0
+    Warning = 1
+    Critical = 2
+    Success = 3
+
+    class MessageLevel:
+        Info = 0
+        Warning = 1
+        Critical = 2
+        Success = 3
+
 class MockQSettings:
     """Mock QSettings for testing."""
     _data = {}
@@ -144,6 +160,12 @@ if not _qgis_available:
     qgis_pyqt_mock = MagicMock()
     qgis_pyqt_qtcore_mock = MagicMock()
 
+    # Sentinel so tests can distinguish fake QGIS from a real runtime.
+    qgis_mock.__sartracker_mock_qgis__ = True
+    qgis_core_mock.__sartracker_mock_qgis__ = True
+    qgis_pyqt_mock.__sartracker_mock_qgis__ = True
+    qgis_pyqt_qtcore_mock.__sartracker_mock_qgis__ = True
+
     # Configure PyQt mocks with our custom classes
     qgis_pyqt_qtcore_mock.QObject = MockQObject
     qgis_pyqt_qtcore_mock.QTimer = MockQTimer
@@ -154,6 +176,7 @@ if not _qgis_available:
     qgis_mock.PyQt = qgis_pyqt_mock
     qgis_mock.core = qgis_core_mock
     qgis_core_mock.QgsTask = MockQgsTask
+    qgis_core_mock.Qgis = MockQgis
 
     sys.modules['qgis'] = qgis_mock
     sys.modules['qgis.core'] = qgis_core_mock
@@ -206,6 +229,9 @@ def pytest_configure(config):
         "markers", "qgis_required: mark test as requiring real QGIS environment"
     )
     config.addinivalue_line(
+        "markers", "mock_qgis_only: mark test as requiring the mock/stub QGIS harness"
+    )
+    config.addinivalue_line(
         "markers", "slow: mark test as slow-running"
     )
     config.addinivalue_line(
@@ -215,26 +241,64 @@ def pytest_configure(config):
 
 def pytest_collection_modifyitems(config, items):
     """Auto-skip qgis_required tests when QGIS is not available."""
-    if _qgis_available:
-        # QGIS is available, don't skip anything
-        return
-
-    skip_qgis = pytest.mark.skip(reason="QGIS not available - install QGIS and pytest-qgis for integration tests")
     for item in items:
-        if "qgis_required" in item.keywords:
-            item.add_marker(skip_qgis)
+        if _qgis_available and "mock_qgis_only" in item.keywords:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="Mock-QGIS test skipped in real QGIS runtime; run with SARTRACKER_FORCE_MOCK_QGIS=1"
+                )
+            )
+        if (not _qgis_available) and "qgis_required" in item.keywords:
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="QGIS not available - install QGIS and pytest-qgis for integration tests"
+                )
+            )
 
 
 # ====================================================================
 # Common Test Fixtures
 # ====================================================================
 
-if not _qgis_available:
-    @pytest.fixture(autouse=True)
-    def _reset_mock_qsettings():
-        """Clear mock QSettings between tests to avoid cross-test leakage."""
+@pytest.fixture(autouse=True)
+def _isolate_sar_qsettings():
+    """Isolate SARTracker QSettings state between tests and restore user settings."""
+    prefixes = ("SARTracker/", "SAR_Tracker/", "sartracker/")
+
+    if not _qgis_available:
         MockQSettings._data.clear()
         yield
+        MockQSettings._data.clear()
+        return
+
+    try:
+        from qgis.PyQt.QtCore import QSettings
+    except Exception:
+        yield
+        return
+
+    settings = QSettings()
+
+    def _sar_keys():
+        try:
+            return [key for key in settings.allKeys() if key.startswith(prefixes)]
+        except Exception:
+            return []
+
+    saved = {}
+    for key in _sar_keys():
+        saved[key] = settings.value(key)
+        settings.remove(key)
+    settings.sync()
+
+    try:
+        yield
+    finally:
+        for key in _sar_keys():
+            settings.remove(key)
+        for key, value in saved.items():
+            settings.setValue(key, value)
+        settings.sync()
 
 # Note: When pytest-qgis is available, it provides the qgis_app fixture.
 # We only define our own when pytest-qgis is NOT available.
@@ -288,6 +352,33 @@ def sample_coordinates():
 if _pytest_qgis_available and _qgis_available:
     # Re-export pytest-qgis fixtures for convenience
     # These will be available when running with real QGIS
+
+    @pytest.fixture(autouse=True)
+    def _isolate_real_qgis_project(request, qgis_new_project):
+        """
+        Give each real-QGIS test a clean project to prevent cross-test leakage.
+
+        This keeps mission-store paths, custom variables, and layers from one
+        qgis_required test from contaminating another.
+        """
+        def _reset_project_state(project):
+            try:
+                project.clear()
+            except Exception:
+                pass
+            try:
+                project.setCustomVariables({})
+            except Exception:
+                pass
+
+        if request.node.get_closest_marker("qgis_required") is None:
+            yield
+            return
+
+        project = qgis_new_project
+        _reset_project_state(project)
+        yield
+        _reset_project_state(project)
 
     @pytest.fixture
     def sar_qgis_project(qgis_new_project):

@@ -1867,8 +1867,11 @@ class LayerManager(QObject):
         for layer_def in self._collect_layer_definitions():
             layer = self.get_layer(layer_def.layer_id)
             if not layer:
-                issues[layer_def.layer_id] = "missing"
-                missing_layers.append(layer_def.layer_id)
+                # Optional/lazy layers (auto_create=False) are expected to be absent
+                # until the corresponding operation is used.
+                if getattr(layer_def, "auto_create", False):
+                    issues[layer_def.layer_id] = "missing"
+                    missing_layers.append(layer_def.layer_id)
                 continue
 
             provider = (layer.providerType() or "").lower()

@@ -10,6 +10,9 @@ import pytest
 from tests.test_layer_manager_resilience import _ensure_qgis
 
 
+pytestmark = pytest.mark.mock_qgis_only
+
+
 class DummySignal:
     def __init__(self):
         self.emitted = []

@@ -26,6 +26,8 @@ from typing import Optional
 
 import pytest
 
+pytestmark = pytest.mark.mock_qgis_only
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Add sartracker root to path

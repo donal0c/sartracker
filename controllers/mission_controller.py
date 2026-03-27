@@ -158,6 +158,12 @@ class MissionController(QObject):
         if not mission_name:
             raise ValueError("Mission name cannot be empty")
 
+        if self._state == MissionState.PAUSED:
+            raise RuntimeError(
+                "Invalid state transition: cannot start a new mission while paused; "
+                "resume or finish the paused mission first"
+            )
+
         # BUG-064 FIX: Use explicit state transition validation
         self._validate_transition(MissionState.ACTIVE)
 

@@ -9,9 +9,13 @@ Run with: ./run_tests.sh tests/test_e2e_scenarios.py -v
 """
 import pytest
 from pathlib import Path
+import gc
 
-# Skip entire module if QGIS not available
-pytest.importorskip("qgis.core", reason="E2E tests require real QGIS")
+from sartracker.tests.qgis_runtime import require_real_qgis
+
+# Skip entire module unless a real QGIS runtime is available.
+require_real_qgis("E2E tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
 
 from qgis.core import (
     QgsProject,
@@ -23,6 +27,59 @@ from qgis.core import (
     QgsField,
 )
 from qgis.PyQt.QtCore import QVariant
+
+
+def _writer_error_and_message(result):
+    """Normalize QGIS writer return signatures across versions."""
+    if isinstance(result, tuple):
+        if len(result) >= 2:
+            return result[0], str(result[1] or "")
+        if len(result) == 1:
+            return result[0], ""
+    return result, ""
+
+
+def _dispose_layer(layer):
+    """Best-effort layer disposal to reduce OGR teardown instability on macOS."""
+    if layer is None:
+        return
+    try:
+        if layer.isEditable():
+            layer.rollBack()
+    except Exception:
+        pass
+    try:
+        layer_id = layer.id()
+        if layer_id:
+            QgsProject.instance().removeMapLayer(layer_id)
+    except Exception:
+        pass
+    layer = None
+    gc.collect()
+
+
+def _provider_add_features(layer, features):
+    """Persist features via the provider for deterministic GeoPackage writes."""
+    add_ok, added_features = layer.dataProvider().addFeatures(features)
+    assert add_ok, "GeoPackage provider insert should succeed"
+    assert len(added_features) == len(features), "Provider should add all requested features"
+    layer.updateExtents()
+    layer.reload()
+
+
+def _persist_single_feature(layer, feature):
+    """Persist a single feature and refresh the layer view."""
+    _provider_add_features(layer, [feature])
+
+
+def _feature_with_attrs(fields, geometry=None, attrs=None):
+    """Build a feature using field names so provider-managed fid columns do not shift data."""
+    feature = QgsFeature(fields)
+    if geometry is not None:
+        feature.setGeometry(geometry)
+    for name, value in (attrs or {}).items():
+        feature.setAttribute(name, value)
+    return feature
 
 
 class TestMemoryLayerOperations:
@@ -300,30 +357,30 @@ class TestGeoPackageFilePersistence:
         source.updateFields()
 
         # Write empty layer to create GeoPackage
-        from qgis.core import QgsVectorFileWriter
-        error, msg, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
             source,
             str(gpkg_path),
             QgsProject.instance().transformContext(),
             options
         )
+        error, msg = _writer_error_and_message(result)
         assert error == QgsVectorFileWriter.NoError, f"Failed to create GPKG: {msg}"
 
         # Open the GeoPackage layer
         gpkg_layer = QgsVectorLayer(uri, "markers", "ogr")
         assert gpkg_layer.isValid(), f"GPKG layer invalid: {gpkg_layer.error().message()}"
 
-        # Add features
-        gpkg_layer.startEditing()
+        # Add features via provider for deterministic GeoPackage persistence
         f = QgsFeature(gpkg_layer.fields())
         f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.693800, 52.140900)))
-        f.setAttributes(["IPP", "ipp_lkp"])
-        gpkg_layer.addFeature(f)
-        commit_ok = gpkg_layer.commitChanges()
-        assert commit_ok, f"Commit failed: {gpkg_layer.commitErrors()}"
+        f.setAttribute("name", "IPP")
+        f.setAttribute("marker_type", "ipp_lkp")
+        add_ok, _ = gpkg_layer.dataProvider().addFeatures([f])
+        assert add_ok, "Feature insert should succeed for GeoPackage layer"
+        gpkg_layer.updateExtents()
 
         # Close and reopen to verify persistence
-        del gpkg_layer
+        _dispose_layer(gpkg_layer)
 
         reopened = QgsVectorLayer(uri, "markers_reopen", "ogr")
         assert reopened.isValid()
@@ -333,6 +390,7 @@ class TestGeoPackageFilePersistence:
         assert feature["name"] == "IPP"
         point = feature.geometry().asPoint()
         assert abs(point.y() - 52.140900) < 0.00001, "Latitude not preserved"
+        _dispose_layer(reopened)
 
     def test_geopackage_survives_layer_close_reopen(self, tmp_path):
         """
@@ -355,18 +413,18 @@ class TestGeoPackageFilePersistence:
         options.driverName = "GPKG"
         options.layerName = "positions"
 
-        from qgis.core import QgsVectorFileWriter
-        error, _, _, _ = QgsVectorFileWriter.writeAsVectorFormatV3(
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
             source, str(gpkg_path),
             QgsProject.instance().transformContext(), options
         )
+        error, _ = _writer_error_and_message(result)
         assert error == QgsVectorFileWriter.NoError
 
         # Add data
         uri = f"{gpkg_path}|layername=positions"
         layer = QgsVectorLayer(uri, "positions", "ogr")
-        layer.startEditing()
 
+        features = []
         for i, (device, lat, lon) in enumerate([
             ("TEAM_01", 52.0, -9.5),
             ("TEAM_02", 52.1, -9.6),
@@ -374,11 +432,14 @@ class TestGeoPackageFilePersistence:
         ]):
             f = QgsFeature(layer.fields())
             f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-            f.setAttributes([device, f"2025-01-01T{10+i}:00:00Z"])
-            layer.addFeature(f)
+            f.setAttribute("device_id", device)
+            f.setAttribute("timestamp", f"2025-01-01T{10+i}:00:00Z")
+            features.append(f)
 
-        layer.commitChanges()
-        del layer  # Close layer completely
+        add_ok, _ = layer.dataProvider().addFeatures(features)
+        assert add_ok, "Batch insert should succeed for GeoPackage layer"
+        layer.updateExtents()
+        _dispose_layer(layer)  # Close layer completely
 
         # Verify with raw SQLite (bypassing QGIS)
         conn = sqlite3.connect(str(gpkg_path))
@@ -496,13 +557,15 @@ class TestNetworkFailureResilience:
 
         test_connection() must return False, not raise exceptions.
         """
-        from providers.traccar_http import TraccarHTTPProvider
+        from sartracker.providers.traccar_http import TraccarHttpProvider
 
         # Create provider with invalid/unreachable URL
-        provider = TraccarHTTPProvider(
-            url="http://192.0.2.1:8082",  # TEST-NET address, guaranteed unreachable
+        provider = TraccarHttpProvider(
+            base_url="http://192.0.2.1:8082",  # TEST-NET address, guaranteed unreachable
+            auth_type="basic",
             username="test",
-            password="test"
+            password="test",
+            timeout_s=1,
         )
 
         # Should return False, not raise
@@ -594,21 +657,23 @@ class TestDataIntegrity:
         # Add original data
         uri = f"{gpkg_path}|layername=test"
         layer = QgsVectorLayer(uri, "test", "ogr")
-        layer.startEditing()
-        f = QgsFeature(layer.fields())
-        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.5, 52.0)))
-        f.setAttributes(["original"])
-        layer.addFeature(f)
-        layer.commitChanges()
+        f = _feature_with_attrs(
+            layer.fields(),
+            QgsGeometry.fromPointXY(QgsPointXY(-9.5, 52.0)),
+            {"status": "original"},
+        )
+        _persist_single_feature(layer, f)
 
         original_count = layer.featureCount()
+        assert original_count == 1, "Seed feature should persist before rollback test"
 
-        # Start editing, make changes, then rollback
+        # Start editing, modify existing data, then rollback.
+        # Provider-level inserts are used for seed data because OGR edit-buffer
+        # inserts are not reliably persisted across current QGIS versions.
         layer.startEditing()
-        f2 = QgsFeature(layer.fields())
-        f2.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.6, 52.1)))
-        f2.setAttributes(["should_not_persist"])
-        layer.addFeature(f2)
+        feature_id = next(layer.getFeatures()).id()
+        status_index = layer.fields().indexOf("status")
+        assert layer.changeAttributeValue(feature_id, status_index, "should_not_persist")
 
         # Rollback instead of commit
         layer.rollBack()
@@ -648,15 +713,15 @@ class TestDataIntegrity:
 
         uri = f"{gpkg_path}|layername=test"
         layer = QgsVectorLayer(uri, "test", "ogr")
-        layer.startEditing()
-
+        features = []
         for i, (lon, lat) in enumerate(test_coords):
-            f = QgsFeature(layer.fields())
-            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
-            f.setAttributes([f"point_{i}"])
-            layer.addFeature(f)
+            features.append(_feature_with_attrs(
+                layer.fields(),
+                QgsGeometry.fromPointXY(QgsPointXY(lon, lat)),
+                {"name": f"point_{i}"},
+            ))
 
-        layer.commitChanges()
+        _provider_add_features(layer, features)
         del layer
 
         # Reload and verify precision
@@ -666,8 +731,10 @@ class TestDataIntegrity:
             pt = feat.geometry().asPoint()
             loaded_coords.append((pt.x(), pt.y()))
 
+        assert len(loaded_coords) == len(test_coords), "All coordinates should reload from GeoPackage"
+
         # Should maintain at least 6 decimal places (sub-meter accuracy)
-        for original, loaded in zip(test_coords, sorted(loaded_coords)):
+        for original, loaded in zip(sorted(test_coords), sorted(loaded_coords)):
             assert abs(original[0] - loaded[0]) < 0.0000001, "Longitude precision lost"
             assert abs(original[1] - loaded[1]) < 0.0000001, "Latitude precision lost"
 
@@ -765,35 +832,34 @@ class TestMissionDataPatterns:
 
         uri = f"{gpkg_path}|layername=markers"
         layer = QgsVectorLayer(uri, "markers", "ogr")
-        layer.startEditing()
 
         # IPP marker (Initial Planning Point)
-        ipp = QgsFeature(layer.fields())
-        ipp.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.6938, 52.1409)))
-        ipp.setAttributes([
-            "Missing Person IPP",
-            "ipp",
-            "Last known location from family interview",
-            "2025-01-02T14:30:00Z",
-            "Team Leader",
-            "V 451234 598765"
-        ])
-        layer.addFeature(ipp)
-
+        ipp = _feature_with_attrs(
+            layer.fields(),
+            QgsGeometry.fromPointXY(QgsPointXY(-9.6938, 52.1409)),
+            {
+                "name": "Missing Person IPP",
+                "marker_type": "ipp",
+                "description": "Last known location from family interview",
+                "created_at": "2025-01-02T14:30:00Z",
+                "created_by": "Team Leader",
+                "grid_ref": "V 451234 598765",
+            },
+        )
         # Clue marker
-        clue = QgsFeature(layer.fields())
-        clue.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.6950, 52.1420)))
-        clue.setAttributes([
-            "Jacket Found",
-            "clue",
-            "Red jacket matching description, found by Team 2",
-            "2025-01-02T15:45:00Z",
-            "Team 2",
-            "V 451100 598900"
-        ])
-        layer.addFeature(clue)
-
-        layer.commitChanges()
+        clue = _feature_with_attrs(
+            layer.fields(),
+            QgsGeometry.fromPointXY(QgsPointXY(-9.6950, 52.1420)),
+            {
+                "name": "Jacket Found",
+                "marker_type": "clue",
+                "description": "Red jacket matching description, found by Team 2",
+                "created_at": "2025-01-02T15:45:00Z",
+                "created_by": "Team 2",
+                "grid_ref": "V 451100 598900",
+            },
+        )
+        _provider_add_features(layer, [ipp, clue])
 
         # Verify all fields preserved
         features = {f["name"]: f for f in layer.getFeatures()}
@@ -834,7 +900,6 @@ class TestMissionDataPatterns:
 
         uri = f"{gpkg_path}|layername=search_areas"
         layer = QgsVectorLayer(uri, "search_areas", "ogr")
-        layer.startEditing()
 
         # Create a polygon (search sector)
         polygon = QgsGeometry.fromPolygonXY([[
@@ -845,17 +910,18 @@ class TestMissionDataPatterns:
             QgsPointXY(-9.70, 52.14),
         ]])
 
-        sector = QgsFeature(layer.fields())
-        sector.setGeometry(polygon)
-        sector.setAttributes([
-            "Sector Alpha",
-            "Kerry MRT Team 1",
-            1,  # High priority
-            "active",
-            50000.0  # ~50,000 sq meters
-        ])
-        layer.addFeature(sector)
-        layer.commitChanges()
+        sector = _feature_with_attrs(
+            layer.fields(),
+            polygon,
+            {
+                "sector_name": "Sector Alpha",
+                "assigned_team": "Kerry MRT Team 1",
+                "priority": 1,
+                "status": "active",
+                "area_sqm": 50000.0,
+            },
+        )
+        _persist_single_feature(layer, sector)
 
         # Verify
         feature = list(layer.getFeatures())[0]
@@ -893,7 +959,6 @@ class TestMissionDataPatterns:
 
         uri = f"{gpkg_path}|layername=tracks"
         layer = QgsVectorLayer(uri, "tracks", "ogr")
-        layer.startEditing()
 
         # Create track with multiple points
         track_points = [
@@ -905,17 +970,18 @@ class TestMissionDataPatterns:
         ]
         line_geom = QgsGeometry.fromPolylineXY(track_points)
 
-        track = QgsFeature(layer.fields())
-        track.setGeometry(line_geom)
-        track.setAttributes([
-            "GPS_001",
-            "Kerry MRT Team 2",
-            "2025-01-02T14:00:00Z",
-            "2025-01-02T16:30:00Z",
-            len(track_points)
-        ])
-        layer.addFeature(track)
-        layer.commitChanges()
+        track = _feature_with_attrs(
+            layer.fields(),
+            line_geom,
+            {
+                "device_id": "GPS_001",
+                "team_name": "Kerry MRT Team 2",
+                "start_time": "2025-01-02T14:00:00Z",
+                "end_time": "2025-01-02T16:30:00Z",
+                "point_count": len(track_points),
+            },
+        )
+        _persist_single_feature(layer, track)
 
         # Verify
         feature = list(layer.getFeatures())[0]
@@ -1082,7 +1148,6 @@ class TestEdgeCases:
 
         uri = f"{gpkg_path}|layername=markers"
         layer = QgsVectorLayer(uri, "markers", "ogr")
-        layer.startEditing()
 
         # Irish place names with fadas
         names = [
@@ -1093,12 +1158,12 @@ class TestEdgeCases:
         ]
 
         for i, name in enumerate(names):
-            f = QgsFeature(layer.fields())
-            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.5 + i*0.01, 52.0)))
-            f.setAttributes([name])
-            layer.addFeature(f)
-
-        layer.commitChanges()
+            f = _feature_with_attrs(
+                layer.fields(),
+                QgsGeometry.fromPointXY(QgsPointXY(-9.5 + i*0.01, 52.0)),
+                {"name": name},
+            )
+            _persist_single_feature(layer, f)
         del layer
 
         # Reload and verify
@@ -1165,7 +1230,6 @@ class TestEdgeCases:
 
         uri = f"{gpkg_path}|layername=markers"
         layer = QgsVectorLayer(uri, "markers", "ogr")
-        layer.startEditing()
 
         # Long description (simulating detailed incident notes)
         long_description = """
@@ -1185,11 +1249,12 @@ class TestEdgeCases:
         - SAR helicopter requested
         """ * 3  # Make it even longer
 
-        f = QgsFeature(layer.fields())
-        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.6938, 52.1409)))
-        f.setAttributes(["Incident Report", long_description])
-        layer.addFeature(f)
-        layer.commitChanges()
+        f = _feature_with_attrs(
+            layer.fields(),
+            QgsGeometry.fromPointXY(QgsPointXY(-9.6938, 52.1409)),
+            {"name": "Incident Report", "description": long_description},
+        )
+        _persist_single_feature(layer, f)
         del layer
 
         # Reload and verify

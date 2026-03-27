@@ -256,6 +256,14 @@ class TestForceVendorRequests:
 
         vendor_dir = tmp_path / "vendor"
         vendor_dir.mkdir()
+        stack_modules = (
+            "requests",
+            "urllib3",
+            "idna",
+            "charset_normalizer",
+            "chardet",
+            "certifi",
+        )
 
         def _make_pkg(name, content=""):
             pkg_dir = vendor_dir / name
@@ -275,11 +283,16 @@ class TestForceVendorRequests:
         )
         (certifi_dir / "cacert.pem").write_text("stub-ca", encoding="utf-8")
 
-        saved_modules = {}
-        for name in ("requests", "urllib3", "idna", "charset_normalizer", "certifi"):
-            saved_modules[name] = sys.modules.get(name)
+        saved_modules = {
+            name: module
+            for name, module in sys.modules.items()
+            if any(name == base or name.startswith(base + ".") for base in stack_modules)
+        }
 
         try:
+            for name in list(saved_modules):
+                sys.modules.pop(name, None)
+
             # Seed system modules to ensure purge logic runs.
             system_root = tmp_path / "system"
             system_root.mkdir()
@@ -306,8 +319,7 @@ class TestForceVendorRequests:
                 vb._vendor_info.clear()
                 vb._vendor_info.update(original_state)
         finally:
-            for name, module in saved_modules.items():
-                if module is None:
+            for name in list(sys.modules):
+                if any(name == base or name.startswith(base + ".") for base in stack_modules):
                     sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = module
+            sys.modules.update(saved_modules)

@@ -18,16 +18,21 @@ These tests work on Linux CI.
 import sys
 import pytest
 
+from sartracker.tests.qgis_runtime import require_real_qgis
+
 # Skip entire module on macOS - Qt widget tests crash Python on macOS/Rosetta
 # due to QApplication initialization race conditions with pytest-qgis.
 # See: https://github.com/pytest-dev/pytest-qt/issues/284
-pytestmark = pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason="Qt widget tests crash on macOS due to Rosetta/Qt initialization issues (SAR-efn7)"
-)
+pytestmark = [
+    pytest.mark.qgis_required,
+    pytest.mark.skipif(
+        sys.platform == "darwin",
+        reason="Qt widget tests crash on macOS due to Rosetta/Qt initialization issues (SAR-efn7)"
+    ),
+]
 
-# Skip if QGIS not available
-pytest.importorskip("qgis.core")
+# Skip unless real QGIS is available.
+require_real_qgis("Devices window tests require real QGIS runtime")
 
 from qgis.PyQt.QtWidgets import QApplication
 from qgis.PyQt.QtCore import QSettings

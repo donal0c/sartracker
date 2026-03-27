@@ -902,6 +902,7 @@ class MissionLifecycleController(QObject):
                 metadata_collected=bool(selected)
             )
         except Exception as exc:
+            selected = []
             warning(
                 self.iface.messageBar(),
                 "Mission Metadata",
@@ -940,6 +941,7 @@ class MissionLifecycleController(QObject):
                         metadata_collected=True
                     )
                 except Exception as exc:
+                    selected = []
                     if self._log_exception:
                         self._log_exception("collect_mission_metadata.fallback", exc)
 
@@ -1062,6 +1064,10 @@ class MissionLifecycleController(QObject):
             metadata_collected=bool(existing_coords),
         )
 
+        # Refresh finalization state from the current project so stale
+        # read-only/finalized flags do not leak across resume transitions.
+        self.check_finalized()
+
         # Emit signals
         if not self._is_shutting_down:
             self.storage_resumed.emit()
@@ -1128,6 +1134,8 @@ class MissionLifecycleController(QObject):
                     return False
 
                 if not self.prepare_new_mission(mission_name):
+                    self._clear_session_state()
+                    self.emit_storage_status()
                     return False
 
                 # Clear any saved mission controller state
@@ -1153,6 +1161,8 @@ class MissionLifecycleController(QObject):
         # User chose resume or no prompt needed - continue loading existing
         if not self._load_resumed_storage(gpkg_path):
             # Storage load failed (e.g., file disappeared)
+            self._clear_session_state()
+            self.emit_storage_status()
             return False
 
         # If no coordinators recorded, prompt for them
@@ -1201,6 +1211,8 @@ class MissionLifecycleController(QObject):
                     "_load_resumed_storage.toctou",
                     FileNotFoundError(f"Mission file disappeared: {gpkg_path}")
                 )
+            self._clear_session_state()
+            self.emit_storage_status()
             return False
 
         mission_dir = gpkg_path.parent
@@ -1373,6 +1385,7 @@ class MissionLifecycleController(QObject):
         try:
             self.load_existing_storage_state()
         except Exception as exc:
+            self._last_project_signature = ""
             if self._log_exception:
                 self._log_exception(f"sync_project_state.load_existing.{reason}", exc)
 

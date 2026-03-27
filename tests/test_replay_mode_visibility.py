@@ -17,6 +17,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from sartracker.tests.qgis_runtime import require_real_qgis
+
 
 # =============================================================================
 # UNIT TESTS: SAR Panel Replay Mode Indicator
@@ -28,7 +30,7 @@ class TestSARPanelReplayModeIndicator:
     @pytest.fixture
     def mock_sar_panel(self):
         """Create a minimal mock SAR panel for testing."""
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -51,7 +53,7 @@ class TestSARPanelReplayModeIndicator:
 
         VALUE: Operators clearly see they're viewing historical data.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -65,7 +67,7 @@ class TestSARPanelReplayModeIndicator:
 
         VALUE: Normal ops don't have confusing warnings.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -78,7 +80,7 @@ class TestSARPanelReplayModeIndicator:
 
         VALUE: Operators know exactly what time period they're viewing.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -97,7 +99,7 @@ class TestSARPanelReplayModeIndicator:
 
         VALUE: High visibility prevents missing the indicator.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -126,7 +128,7 @@ class TestSettingsPanelProviderGating:
 
         VALUE: Feature available where it works.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.settings_panel import SettingsPanel
 
@@ -140,7 +142,7 @@ class TestSettingsPanelProviderGating:
 
         VALUE: Prevents confusion - replay only works with traccar_http.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         # This tests that the provider gating logic exists
         from sartracker.ui.settings_panel import SettingsPanel
@@ -153,7 +155,7 @@ class TestSettingsPanelProviderGating:
 
         VALUE: Only the new optimized provider supports replay properly.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         # Legacy provider doesn't support replay window parameters
         pass  # Implementation will add this check
@@ -164,7 +166,7 @@ class TestSettingsPanelProviderGating:
 
         VALUE: UI stays in sync with provider capabilities.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.settings_panel import SettingsPanel
 
@@ -185,7 +187,7 @@ class TestReplayWarningText:
 
         VALUE: Clear communication that this is not for live ops.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         # Check that the replay group contains warning text
         # This will be verified by checking the UI construction
@@ -206,7 +208,7 @@ class TestReplayModeWiring:
 
         VALUE: Indicator stays in sync with actual replay state.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.controllers.provider_controller import ProviderController
         from sartracker.utils.task_manager import TaskManager
@@ -243,7 +245,7 @@ class TestReplayModeWiring:
 
         VALUE: No stale warnings after replay ends.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -276,7 +278,7 @@ class TestReplayModeWiring:
 
         VALUE: Live mission never shows replay warning.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 
@@ -307,7 +309,7 @@ class TestReplayModeWiring:
 
         VALUE: Immediate visual feedback on settings changes.
         """
-        pytest.importorskip("qgis.core")
+        require_real_qgis("Replay visibility tests require real QGIS runtime")
 
         from sartracker.ui.sar_panel import SARPanel
 

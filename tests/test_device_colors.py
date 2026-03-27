@@ -21,8 +21,11 @@ REQUIRES: Real QGIS for QColor
 import pytest
 import hashlib
 
-# Skip if QGIS not available
-pytest.importorskip("qgis.core")
+from sartracker.tests.qgis_runtime import require_real_qgis
+
+# Real QColor behavior is required here, not the mock harness.
+require_real_qgis("Device color tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
 
 from qgis.core import QgsProject
 from qgis.PyQt.QtGui import QColor

@@ -3230,6 +3230,7 @@ class sartracker:
             return
 
         self._is_finalizing = True
+        archive_started = False
         try:
             # Save project before archiving
             project = QgsProject.instance()
@@ -3248,7 +3249,9 @@ class sartracker:
             uncommitted_layers = self._warn_uncommitted_edits("archive")
 
             # Run archive in background
-            self._start_archive_task(paths, project_path, uncommitted_layers=uncommitted_layers)
+            archive_started = bool(
+                self._start_archive_task(paths, project_path, uncommitted_layers=uncommitted_layers)
+            )
             return
 
         except Exception as exc:
@@ -3257,7 +3260,8 @@ class sartracker:
             import traceback
             traceback.print_exc()
         finally:
-            self._is_finalizing = False
+            if not archive_started:
+                self._is_finalizing = False
 
     def _start_archive_task(
         self,
@@ -3287,6 +3291,8 @@ class sartracker:
             if not started:
                 self._is_finalizing = False
                 self._notify("warning", "Mission Archive", "Archive could not be started.", duration=5)
+                return False
+            return True
         else:
             # Fallback: no controller available, use synchronous method
             print("[SARTRACKER] MissionStorageController not available, using fallback archive")
@@ -3314,8 +3320,10 @@ class sartracker:
                 self._notify("success", "Mission Finalized", f"Archive created: {archive_name}", duration=6)
                 if self.sar_panel:
                     self.sar_panel.set_finalize_button_visible(visible=True, is_finalized=True)
+                return True
             except Exception as exc:
                 self._notify("error", "Mission Archive", f"Archive failed: {exc}", duration=8)
+                return False
             finally:
                 self._is_finalizing = False
 
@@ -3576,6 +3584,7 @@ class sartracker:
             self.layer_manager.set_mission_coordinators(",".join(selected))
             self._mission_coordinators_cache = ",".join(selected)
         except Exception as exc:
+            selected = []
             warning(self.iface.messageBar(), "Mission Metadata", f"Failed to save coordinators: {exc}", duration=6)
             print(f"[SARTRACKER] Warning: Failed to persist mission coordinators: {exc}")
 
@@ -3603,6 +3612,7 @@ class sartracker:
                     self.layer_manager.set_mission_coordinators(",".join(selected))
                     self._mission_coordinators_cache = ",".join(selected)
                 except Exception as exc:
+                    selected = []
                     print(f"[SARTRACKER] Warning: Failed to persist coordinator fallback: {exc}")
 
         # Only treat metadata as collected if we have coordinators recorded; otherwise, suppress re-prompt loop
@@ -3656,6 +3666,13 @@ class sartracker:
                     "Mission Storage",
                     "Mission store path missing; creating a new mission store.",
                     duration=5)
+            self._mission_gpkg_path = None
+            self._mission_directory = None
+            self._mission_folder_name = None
+            self._mission_backup_directory = None
+            self._mission_attachments_dir = None
+            self._mission_coordinators_cache = ""
+            self._metadata_collected = False
             self._prepare_new_mission_storage(mission_name)
             return
 
@@ -3669,6 +3686,13 @@ class sartracker:
                 f"Mission store invalid, starting fresh: {exc}",
                 duration=5
             )
+            self._mission_gpkg_path = None
+            self._mission_directory = None
+            self._mission_folder_name = None
+            self._mission_backup_directory = None
+            self._mission_attachments_dir = None
+            self._mission_coordinators_cache = ""
+            self._metadata_collected = False
             self._prepare_new_mission_storage(mission_name)
             return
 
@@ -3932,6 +3956,7 @@ class sartracker:
             if self.sar_panel:
                 self._load_existing_mission_storage_state()
         except Exception as exc:
+            self._last_project_signature = ""
             self._log_exception(f"_sync_project_state.load_existing.{reason}", exc)
 
     def _load_existing_mission_storage_state(self):
@@ -3939,18 +3964,28 @@ class sartracker:
         if not self.layer_manager:
             return
 
-        store_path = self.layer_manager.get_mission_store()
-        if not store_path:
+        def _clear_runtime_state():
             self._mission_gpkg_path = None
             self._mission_directory = None
             self._mission_folder_name = None
             self._mission_backup_directory = None
             self._mission_attachments_dir = None
+            self._mission_coordinators_cache = ""
+            self._metadata_collected = False
+
+        store_path = self.layer_manager.get_mission_store()
+        if not store_path:
+            _clear_runtime_state()
             self._update_mission_storage_status(active=False)
             return
 
         # Show resume prompt if mission store exists
         gpkg_path = Path(store_path)
+        if not gpkg_path.exists():
+            _clear_runtime_state()
+            self._update_mission_storage_status(active=False)
+            return
+
         if gpkg_path.exists():
             try:
                 should_resume = self._show_resume_mission_prompt(gpkg_path)
@@ -3981,6 +4016,7 @@ class sartracker:
                     )
                     return
 
+                _clear_runtime_state()
                 self._prepare_new_mission_storage(mission_name)
                 try:
                     if self.mission_controller:
@@ -4396,7 +4432,28 @@ class sartracker:
         remaining = len(layer_ids) - preview_limit
         if remaining > 0:
             preview = f"{preview}, +{remaining} more"
-        return f"{len(layer_ids)} layer(s) still in memory during auto-save: {preview}."
+        counts: Dict[str, int] = {}
+        for status in persistence_issues.values():
+            key = str(status or "unknown").strip().lower() or "unknown"
+            counts[key] = counts.get(key, 0) + 1
+
+        memory_count = counts.get("memory", 0)
+        missing_count = counts.get("missing", 0)
+        unknown_count = len(layer_ids) - memory_count - missing_count
+
+        # Preserve legacy wording when all issues are memory-backed layers.
+        if memory_count == len(layer_ids):
+            return f"{len(layer_ids)} layer(s) still in memory during auto-save: {preview}."
+
+        parts = []
+        if memory_count:
+            parts.append(f"{memory_count} in memory")
+        if missing_count:
+            parts.append(f"{missing_count} missing")
+        if unknown_count:
+            parts.append(f"{unknown_count} unknown")
+        summary = ", ".join(parts) if parts else "issue types unavailable"
+        return f"{len(layer_ids)} layer(s) need attention during auto-save ({summary}): {preview}."
 
     def _on_autosave_requested(self):
         """Handle auto-save request from SAR Panel."""
@@ -4549,6 +4606,8 @@ class sartracker:
                             f"Mission '{saved_state['name']}' resumed",
                             duration=3
                         )
+                    else:
+                        self.mission_controller.clear_saved_state()
                 except Exception as restore_error:
                     error(
                         self.iface.messageBar(),
@@ -4562,6 +4621,10 @@ class sartracker:
 
         except Exception as e:
             print(f"Unexpected error in mission resume: {e}")
+            try:
+                self.mission_controller.clear_saved_state()
+            except Exception:
+                pass
             error(
                 self.iface.messageBar(),
                 "SAR Tracker",

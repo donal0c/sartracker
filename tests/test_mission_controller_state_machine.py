@@ -151,24 +151,20 @@ class TestInvalidStateTransitions:
         assert controller.state == MissionState.ACTIVE
         assert controller.mission_name == "First Mission"
 
-    def test_start_from_paused_allows_new_mission(self, controller):
+    def test_start_from_paused_is_rejected(self, controller):
         """
-        PAUSED → ACTIVE (via start): Starting from PAUSED is allowed by state machine.
-
-        NOTE: This resets and starts a new mission. The VALID_TRANSITIONS matrix
-        allows PAUSED → ACTIVE (for resume), so start_mission() doesn't reject it.
-        Operators should use resume_mission() to continue paused missions.
+        PAUSED → ACTIVE (via start): Starting a second mission from PAUSED is
+        rejected so operators cannot silently overwrite a paused mission.
         """
         controller.start_mission("First Mission")
         controller.pause_mission()
         assert controller.state == MissionState.PAUSED
 
-        # This succeeds because PAUSED → ACTIVE is in VALID_TRANSITIONS
-        result = controller.start_mission("Second Mission")
+        with pytest.raises(RuntimeError, match="cannot start a new mission while paused"):
+            controller.start_mission("Second Mission")
 
-        assert result is True
-        assert controller.state == MissionState.ACTIVE
-        assert controller.mission_name == "Second Mission"
+        assert controller.state == MissionState.PAUSED
+        assert controller.mission_name == "First Mission"
 
     def test_pause_from_idle_returns_false(self, controller):
         """

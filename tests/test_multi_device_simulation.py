@@ -26,8 +26,11 @@ import json
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
-# Skip if QGIS not available
-pytest.importorskip("qgis.core")
+from sartracker.tests.qgis_runtime import require_real_qgis
+
+# These scenarios need a real QGIS runtime, not the mock harness.
+require_real_qgis("Multi-device simulation tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
 
 
 # Simple in-memory provider for testing multi-device scenarios

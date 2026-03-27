@@ -9,12 +9,15 @@ import types
 import pytest
 
 
+pytestmark = pytest.mark.mock_qgis_only
+
+
 def _has_real_qgis():
     """Check if real QGIS is loaded (pytest-qgis environment)."""
     try:
         from qgis.core import QgsTask
         return hasattr(QgsTask, 'taskCompleted')
-    except ImportError:
+    except Exception:
         return False
 
 
@@ -38,7 +41,7 @@ def _install_qgis_task_stubs(monkeypatch=None):
         # Real QGIS available - verify it's functional
         if hasattr(QgsTask, 'taskCompleted') and hasattr(QgsApplication, 'taskManager'):
             return  # Use real QGIS, no stubs needed
-    except (ImportError, AttributeError):
+    except Exception:
         pass  # Real QGIS not available, install stubs
 
     # Only clear modules if we're installing stubs (no real QGIS)

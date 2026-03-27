@@ -689,7 +689,7 @@ def test_validate_persistence_reports_layer_ids(monkeypatch):
     mgr._mission_store_enabled = lambda: True
 
     defs = [
-        manager.LayerDefinition(layer_id="layer_missing", name="Missing", geometry_type="Point"),
+        manager.LayerDefinition(layer_id="layer_missing", name="Missing", geometry_type="Point", auto_create=True),
         manager.LayerDefinition(layer_id="layer_memory", name="Memory", geometry_type="Point"),
     ]
     mgr._collect_layer_definitions = lambda: defs
@@ -724,6 +724,42 @@ def test_validate_persistence_reports_layer_ids(monkeypatch):
     assert messages, "warning should surface missing/memory layers"
     assert "layer_missing" in messages[0][1]
     assert "layer_memory" in messages[0][1]
+
+
+@pytest.mark.qgis_required
+def test_validate_persistence_ignores_missing_optional_layers(monkeypatch):
+    _ensure_qgis(monkeypatch)
+    manager = _load_manager_module()
+
+    mgr = manager.LayerManager.__new__(manager.LayerManager)
+    mgr._mission_store_path = "/tmp/mission.gpkg"
+    mgr.iface = types.SimpleNamespace(messageBar=lambda: "bar")
+    mgr._log = lambda *_args, **_kwargs: None
+    mgr._mission_store_enabled = lambda: True
+
+    defs = [
+        manager.LayerDefinition(layer_id="layer_optional_missing", name="Optional Missing", geometry_type="Point", auto_create=False),
+        manager.LayerDefinition(layer_id="layer_memory", name="Memory", geometry_type="Point", auto_create=False),
+    ]
+    mgr._collect_layer_definitions = lambda: defs
+
+    class FakeLayer:
+        def __init__(self, provider):
+            self._provider = provider
+
+        def providerType(self):
+            return self._provider
+
+    def fake_get_layer(layer_id):
+        if layer_id == "layer_optional_missing":
+            return None
+        return FakeLayer("memory")
+
+    mgr.get_layer = fake_get_layer
+
+    issues = manager.LayerManager.validate_persistence(mgr, quiet=True)
+
+    assert issues == {"layer_memory": "memory"}
 
 
 def test_ensure_vector_layer_migrates_existing_memory_layer_when_store_enabled(monkeypatch):

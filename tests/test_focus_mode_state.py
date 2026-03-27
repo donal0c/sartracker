@@ -243,13 +243,14 @@ class TestFocusModePlusStateMainWindowState:
         from utils.focus_mode_state import FocusModePlusState
         from qgis.PyQt.QtWidgets import QMainWindow
 
-        mock_main_window = MagicMock(spec=QMainWindow)
+        mock_main_window = MagicMock()
         mock_main_window.menuBar.return_value = MagicMock(isVisible=MagicMock(return_value=True))
         mock_main_window.statusBar.return_value = MagicMock(isVisible=MagicMock(return_value=True))
         mock_main_window.findChildren.return_value = []
         mock_main_window.saveState.return_value = b"abc"
 
-        with patch('utils.focus_mode_state.sip_isdeleted', return_value=False):
+        with patch('utils.focus_mode_state.sip_isdeleted', return_value=False), \
+             patch.object(FocusModePlusState, '_encode_main_window_state', return_value="YWJj"):
             state = FocusModePlusState()
             state.capture(mock_main_window)
 
@@ -260,7 +261,7 @@ class TestFocusModePlusStateMainWindowState:
         from utils.focus_mode_state import FocusModePlusState
         from qgis.PyQt.QtWidgets import QMainWindow
 
-        mock_main_window = MagicMock(spec=QMainWindow)
+        mock_main_window = MagicMock()
         mock_main_window.menuBar.return_value = MagicMock()
         mock_main_window.statusBar.return_value = MagicMock()
         mock_main_window.restoreState.return_value = True
@@ -413,7 +414,7 @@ class TestFocusModePlusStateWithQGIS:
         from qgis.PyQt.QtWidgets import QMainWindow
 
         # Create a minimal mock
-        main_window = MagicMock(spec=QMainWindow)
+        main_window = MagicMock()
         main_window.menuBar.return_value = MagicMock(isVisible=MagicMock(return_value=True))
         main_window.statusBar.return_value = MagicMock(isVisible=MagicMock(return_value=True))
         main_window.findChildren.return_value = []
@@ -431,7 +432,7 @@ class TestFocusModePlusStateWithQGIS:
         from utils.focus_mode_state import FocusModePlusState
         from qgis.PyQt.QtWidgets import QMainWindow
 
-        main_window = MagicMock(spec=QMainWindow)
+        main_window = MagicMock()
         main_window.menuBar.return_value = MagicMock()
         main_window.statusBar.return_value = MagicMock()
 
@@ -541,7 +542,7 @@ class TestSARPanelFocusModePlusIntegration:
         mock_main_window.statusBar.return_value = mock_status_bar
 
         # Create mock toolbar
-        mock_toolbar = MagicMock(spec=QToolBar)
+        mock_toolbar = MagicMock()
         mock_toolbar.isVisible.return_value = True
         mock_toolbar.objectName.return_value = "TestToolbar"
 
@@ -779,7 +780,7 @@ class TestFocusModePlusStateCrashRecovery:
         from qgis.PyQt.QtWidgets import QDockWidget
 
         # Create mock dock
-        mock_dock = MagicMock(spec=QDockWidget)
+        mock_dock = MagicMock()
         mock_dock.objectName.return_value = "TestDock"
 
         mock_main_window = MagicMock()
@@ -879,7 +880,7 @@ class TestFocusModePlusStateEdgeCases:
         from utils.focus_mode_state import FocusModePlusState
         from qgis.PyQt.QtWidgets import QDockWidget
 
-        mock_dock = MagicMock(spec=QDockWidget)
+        mock_dock = MagicMock()
         mock_dock.objectName.return_value = "DeletedDock"
         mock_dock.isVisible.return_value = True
 
@@ -913,7 +914,7 @@ class TestFocusModePlusStateEdgeCases:
         from qgis.PyQt.QtWidgets import QDockWidget
 
         # Create mock SAR Panel dock
-        mock_sar_dock = MagicMock(spec=QDockWidget)
+        mock_sar_dock = MagicMock()
         mock_sar_dock.objectName.return_value = "SARTrackerDock"
         mock_sar_dock.isVisible.return_value = True
 

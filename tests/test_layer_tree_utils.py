@@ -2,9 +2,13 @@
 """
 Unit tests for layer tree utilities.
 """
+import pytest
 from unittest.mock import MagicMock
 
 from sartracker.layers.utilities import refresh_layer_tree_view
+
+
+pytestmark = pytest.mark.mock_qgis_only
 
 
 def test_refresh_layer_tree_view_no_view_returns_false():

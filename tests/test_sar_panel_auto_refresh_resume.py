@@ -7,9 +7,13 @@ TDD: Failing test added before fix.
 import importlib
 import sys
 import types
+import pytest
 from unittest.mock import MagicMock, patch
 
 from sartracker.controllers.mission_controller import MissionState
+
+
+pytestmark = pytest.mark.mock_qgis_only
 
 
 class FakeTimer:
@@ -55,6 +59,24 @@ def test_auto_refresh_resumes_after_close_and_show():
     def stub_class(name):
         return type(name, (), {})
 
+    class StubLineEdit:
+        Password = 1
+        Normal = 0
+
+        class EchoMode:
+            Password = 1
+            Normal = 0
+
+    class StubAbstractItemView:
+        SelectItems = 1
+        ExtendedSelection = 2
+
+        class SelectionBehavior:
+            SelectItems = 1
+
+        class SelectionMode:
+            ExtendedSelection = 2
+
     qtwidgets_module = types.ModuleType("qgis.PyQt.QtWidgets")
     qtwidgets_module.QDockWidget = StubDockWidget
     qtwidgets_module.QWidget = stub_class("QWidget")
@@ -67,7 +89,8 @@ def test_auto_refresh_resumes_after_close_and_show():
     qtwidgets_module.QListWidgetItem = stub_class("QListWidgetItem")
     qtwidgets_module.QGroupBox = stub_class("QGroupBox")
     qtwidgets_module.QFileDialog = stub_class("QFileDialog")
-    qtwidgets_module.QLineEdit = stub_class("QLineEdit")
+    qtwidgets_module.QLineEdit = StubLineEdit
+    qtwidgets_module.QAbstractItemView = StubAbstractItemView
     qtwidgets_module.QSpinBox = stub_class("QSpinBox")
     qtwidgets_module.QScrollArea = stub_class("QScrollArea")
     qtwidgets_module.QComboBox = stub_class("QComboBox")
@@ -82,20 +105,32 @@ def test_auto_refresh_resumes_after_close_and_show():
     qtgui_module.QIcon = stub_class("QIcon")
 
     qtcore_module = types.ModuleType("qgis.PyQt.QtCore")
-    qtcore_module.Qt = stub_class("Qt")
+    qtcore_module.Qt = MagicMock()
     qtcore_module.QTimer = FakeTimer
     qtcore_module.QSettings = stub_class("QSettings")
     qtcore_module.QObject = stub_class("QObject")
     qtcore_module.pyqtSignal = lambda *args, **kwargs: MagicMock()
+    qt_compat_module = types.ModuleType("sartracker.utils.qt_compat")
+    qt_compat_module.LeftDockWidgetArea = 0x1
+    qt_compat_module.RightDockWidgetArea = 0x2
+    qt_compat_module.AlignRight = 0x4
+    qt_compat_module.ToolButtonTextBesideIcon = 0x8
+    qt_compat_module.PointingHandCursor = 0x10
+    qt_compat_module.MessageBoxYes = 0x20
+    qt_compat_module.MessageBoxNo = 0x40
+    qt_compat_module.push_message = lambda *args, **kwargs: True
 
     sys.modules["qgis.PyQt.QtWidgets"] = qtwidgets_module
     sys.modules["qgis.PyQt.QtGui"] = qtgui_module
     sys.modules["qgis.PyQt.QtCore"] = qtcore_module
+    sys.modules["sartracker.utils.qt_compat"] = qt_compat_module
     if "qgis.PyQt" in sys.modules:
         sys.modules["qgis.PyQt"].QtWidgets = qtwidgets_module
         sys.modules["qgis.PyQt"].QtGui = qtgui_module
         sys.modules["qgis.PyQt"].QtCore = qtcore_module
 
+    if "sartracker.utils.notify" in sys.modules:
+        del sys.modules["sartracker.utils.notify"]
     if "sartracker.ui.sar_panel" in sys.modules:
         del sys.modules["sartracker.ui.sar_panel"]
     sar_panel = importlib.import_module("sartracker.ui.sar_panel")

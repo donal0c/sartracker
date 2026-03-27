@@ -15,25 +15,18 @@ REQUIRES: pytest-qgis (real QGIS runtime for accurate CRS transforms)
 import math
 import pytest
 
-# These tests require real QGIS runtime
-pytest.importorskip("qgis.core")
+from sartracker.tests.qgis_runtime import require_real_qgis
 
-from qgis.core import QgsApplication, QgsProject
+# These tests require real QGIS runtime, not the mock harness.
+require_real_qgis("Coordinate transform tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
+
+from qgis.core import QgsProject
 from utils.coordinates import CoordinateConverter
 
 
-@pytest.fixture(scope="module")
-def qgs_app():
-    """Initialize QGIS application for tests."""
-    # Initialize QGIS application
-    qgs = QgsApplication([], False)
-    qgs.initQgis()
-    yield qgs
-    qgs.exitQgis()
-
-
 @pytest.fixture
-def converter(qgs_app):
+def converter(qgis_app):
     """Create a fresh CoordinateConverter for each test."""
     return CoordinateConverter()
 

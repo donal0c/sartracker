@@ -25,6 +25,12 @@ Phase 3 registry tests:
 import tempfile
 import os
 from pathlib import Path
+import pytest
+
+from sartracker.tests.qgis_runtime import require_real_qgis
+
+require_real_qgis("Per-item layer factory tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
 
 # For running in QGIS console
 try:
@@ -56,6 +62,14 @@ def cleanup_test_layers():
 
     for layer_id in layers_to_remove:
         project.removeMapLayer(layer_id)
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_item_layers_between_tests():
+    """Keep project state isolated so per-item tests do not contaminate each other."""
+    cleanup_test_layers()
+    yield
+    cleanup_test_layers()
 
 
 def test_create_and_identify():
@@ -108,7 +122,6 @@ def test_create_and_identify():
     print(f"  GeoPackage table exists: OK ({info.table_name})")
 
     print("  PASSED")
-    return True
 
 
 def test_rename_persistence():
@@ -159,7 +172,6 @@ def test_rename_persistence():
     print(f"  Table unchanged: OK ({original_table})")
 
     print("  PASSED")
-    return True
 
 
 def test_metadata_persistence():
@@ -209,7 +221,6 @@ def test_metadata_persistence():
 
     print("  All metadata values match: OK")
     print("  PASSED")
-    return True
 
 
 def test_delete_layer():
@@ -262,7 +273,6 @@ def test_delete_layer():
     print("  GeoPackage table removed: OK")
 
     print("  PASSED")
-    return True
 
 
 def test_multiple_items():
@@ -322,7 +332,6 @@ def test_multiple_items():
 
     print("  Type filtering: OK")
     print("  PASSED")
-    return True
 
 
 def test_wal_mode():
@@ -363,7 +372,6 @@ def test_wal_mode():
     print("  WAL mode: OK")
 
     print("  PASSED")
-    return True
 
 
 def test_add_feature_to_layer():
@@ -417,7 +425,6 @@ def test_add_feature_to_layer():
         print(f"  Feature name verified: '{feat['name']}'")
 
     print("  PASSED")
-    return True
 
 
 # =============================================================================
@@ -471,7 +478,6 @@ def test_registry_persistence():
     print("  Item found after factory recreation: OK")
 
     print("  PASSED")
-    return True
 
 
 def test_discover_existing_items():
@@ -526,7 +532,6 @@ def test_discover_existing_items():
     print(f"  Orphaned items found: {len(orphaned)}")
 
     print("  PASSED")
-    return True
 
 
 def test_rebuild_missing_layer():
@@ -599,7 +604,6 @@ def test_rebuild_missing_layer():
     print(f"  Feature count preserved: {rebuilt_layer.featureCount()}")
 
     print("  PASSED")
-    return True
 
 
 def test_soft_delete_and_recovery():
@@ -653,7 +657,6 @@ def test_soft_delete_and_recovery():
     print("  Status is deleted: OK")
 
     print("  PASSED")
-    return True
 
 
 def test_lazy_loading():
@@ -716,7 +719,6 @@ def test_lazy_loading():
     print(f"  All items now active: {len(active)}")
 
     print("  PASSED")
-    return True
 
 
 # =============================================================================
@@ -763,7 +765,6 @@ def test_bulk_visibility():
     print(f"  Bulk show: {result['changed']} changed")
 
     print("  PASSED")
-    return True
 
 
 def test_lock_convention():
@@ -818,7 +819,6 @@ def test_lock_convention():
     print("  Unlock: OK")
 
     print("  PASSED")
-    return True
 
 
 def test_layer_count_guardrails():
@@ -866,7 +866,6 @@ def test_layer_count_guardrails():
     print(f"  Low threshold warning: {warning[:50]}...")
 
     print("  PASSED")
-    return True
 
 
 def test_bulk_delete():
@@ -914,7 +913,6 @@ def test_bulk_delete():
     print("  Locked item preserved: OK")
 
     print("  PASSED")
-    return True
 
 
 def run_all_tests():
@@ -962,7 +960,7 @@ def run_all_tests():
     for name, test_fn in tests:
         try:
             result = test_fn()
-            if result:
+            if result is not False:
                 passed += 1
             else:
                 failed += 1
@@ -1037,7 +1035,6 @@ def test_performance_mode():
     print(f"  Performance mode disabled: {updated} layers updated")
 
     print("  PASSED")
-    return True
 
 
 def test_performance_status():
@@ -1077,7 +1074,6 @@ def test_performance_status():
     print("  Status fields present: OK")
 
     print("  PASSED")
-    return True
 
 
 # Allow running from command line for syntax check

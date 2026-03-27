@@ -23,8 +23,11 @@ from typing import List, Dict, Tuple
 
 import pytest
 
-# Skip entire module if QGIS not available
-pytest.importorskip("qgis.core", reason="Performance tests require real QGIS")
+from sartracker.tests.qgis_runtime import require_real_qgis
+
+# Skip entire module unless a real QGIS runtime is available.
+require_real_qgis("Performance tests require real QGIS runtime")
+pytestmark = pytest.mark.qgis_required
 
 from qgis.core import (
     QgsProject,
@@ -50,6 +53,25 @@ class Thresholds:
     VISIBILITY_TOGGLE_50_MS = 500.0   # Toggle 50 layers <500ms
     FEATURE_UPDATE_100_MS = 100.0     # Single feature update <100ms
     QUERY_100_FEATURES_MS = 50.0      # Query 100 features <50ms
+
+
+def _provider_add_features(layer, features):
+    """Persist features via the provider for deterministic GeoPackage writes."""
+    add_ok, added_features = layer.dataProvider().addFeatures(features)
+    assert add_ok, "GeoPackage provider insert should succeed"
+    assert len(added_features) == len(features), "Provider should add all requested features"
+    layer.updateExtents()
+    layer.reload()
+
+
+def _feature_with_attrs(fields, geometry=None, attrs=None):
+    """Build a feature using field names so provider-managed fid columns do not shift data."""
+    feature = QgsFeature(fields)
+    if geometry is not None:
+        feature.setGeometry(geometry)
+    for name, value in (attrs or {}).items():
+        feature.setAttribute(name, value)
+    return feature
 
 
 # =============================================================================
@@ -326,34 +348,40 @@ class TestLoadSimulation:
                 "lon": -9.5 + random.uniform(-0.1, 0.1),
             })
 
-        # Add initial positions
-        layer.startEditing()
+        # Add initial positions using provider-level writes for deterministic
+        # persistence on OGR-backed GeoPackage layers.
+        features = []
         for dev in devices:
-            f = QgsFeature(layer.fields())
-            f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(dev["lon"], dev["lat"])))
-            f.setAttributes([
-                dev["device_id"],
-                dev["team"],
-                dev["lat"],
-                dev["lon"],
-                "2025-01-02T12:00:00Z",
-                random.uniform(0, 5),
-            ])
-            layer.addFeature(f)
-        layer.commitChanges()
+            features.append(_feature_with_attrs(
+                layer.fields(),
+                QgsGeometry.fromPointXY(QgsPointXY(dev["lon"], dev["lat"])),
+                {
+                    "device_id": dev["device_id"],
+                    "team": dev["team"],
+                    "lat": dev["lat"],
+                    "lon": dev["lon"],
+                    "timestamp": "2025-01-02T12:00:00Z",
+                    "speed": random.uniform(0, 5),
+                },
+            ))
+        _provider_add_features(layer, features)
 
         assert layer.featureCount() == 100
 
         # Simulate 5 update cycles (like 5 polling intervals)
         update_times = []
+        lat_index = layer.fields().indexOf("lat")
+        lon_index = layer.fields().indexOf("lon")
+        timestamp_index = layer.fields().indexOf("timestamp")
         for cycle in range(5):
             start = time.perf_counter()
 
             layer.startEditing()
             for feat in layer.getFeatures():
                 # Simulate movement
-                old_lat = feat["lat"]
-                old_lon = feat["lon"]
+                point = feat.geometry().asPoint()
+                old_lat = point.y()
+                old_lon = point.x()
                 new_lat = old_lat + random.uniform(-0.001, 0.001)
                 new_lon = old_lon + random.uniform(-0.001, 0.001)
 
@@ -361,10 +389,10 @@ class TestLoadSimulation:
                     feat.id(),
                     QgsGeometry.fromPointXY(QgsPointXY(new_lon, new_lat))
                 )
-                layer.changeAttributeValue(feat.id(), 2, new_lat)
-                layer.changeAttributeValue(feat.id(), 3, new_lon)
+                layer.changeAttributeValue(feat.id(), lat_index, new_lat)
+                layer.changeAttributeValue(feat.id(), lon_index, new_lon)
                 layer.changeAttributeValue(
-                    feat.id(), 4,
+                    feat.id(), timestamp_index,
                     f"2025-01-02T12:{cycle:02d}:{random.randint(0,59):02d}Z"
                 )
 
@@ -483,21 +511,21 @@ class TestProviderResilience:
         layer = QgsVectorLayer(uri, "test", "ogr")
 
         # Add initial data
-        layer.startEditing()
-        f = QgsFeature(layer.fields())
-        f.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.5, 52.0)))
-        f.setAttributes([100])
-        layer.addFeature(f)
-        layer.commitChanges()
+        f = _feature_with_attrs(
+            layer.fields(),
+            QgsGeometry.fromPointXY(QgsPointXY(-9.5, 52.0)),
+            {"value": 100},
+        )
+        _provider_add_features(layer, [f])
 
         initial_count = layer.featureCount()
+        assert initial_count == 1, "Seed feature should persist before rollback test"
 
-        # Start edit, make changes, then rollback
+        # Start edit, modify existing data, then rollback.
         layer.startEditing()
-        f2 = QgsFeature(layer.fields())
-        f2.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(-9.6, 52.1)))
-        f2.setAttributes([200])
-        layer.addFeature(f2)
+        feature_id = next(layer.getFeatures()).id()
+        value_index = layer.fields().indexOf("value")
+        assert layer.changeAttributeValue(feature_id, value_index, 200)
 
         # Simulate failure - rollback instead of commit
         layer.rollBack()
