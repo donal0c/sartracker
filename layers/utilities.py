@@ -159,6 +159,9 @@ def refresh_layer_tree_view(iface) -> bool:
         if view:
             model = view.model()
             if model:
+                recursively_emit = getattr(model, "recursivelyEmitDataChanged", None)
+                if callable(recursively_emit):
+                    recursively_emit()
                 model.layoutChanged.emit()
             view.viewport().update()
             did_refresh = True

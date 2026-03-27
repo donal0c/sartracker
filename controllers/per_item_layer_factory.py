@@ -2233,6 +2233,16 @@ class PerItemLayerFactory:
         else:
             root.addLayer(layer)
 
+        # Explicitly mark the new tree node visible. On some Qt6 builds the
+        # legend entry can otherwise lag behind dynamic layer creation until a
+        # later manual refresh/repair.
+        try:
+            node = root.findLayer(layer.id()) if root else None
+            if node and hasattr(node, "setItemVisibilityChecked"):
+                node.setItemVisibilityChecked(True)
+        except Exception:
+            pass
+
     def _extract_table_name(self, layer: QgsVectorLayer) -> str:
         """
         Extract the GeoPackage table name from a layer's data source.
