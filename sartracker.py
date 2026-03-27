@@ -1582,17 +1582,13 @@ class sartracker:
         Phase 4.1: Extracted from initGui for clarity.
         Handles final state setup after all components are initialized.
         """
-        # Initial storage state load
-        if self.mission_lifecycle_controller:
-            self.mission_lifecycle_controller.load_existing_storage_state()
-        else:
-            self._load_existing_mission_storage_state()
-
-        # Defer project state sync
+        # Defer initial project/storage sync until the event loop has settled so
+        # startup storage prompting flows through one path instead of an
+        # immediate load followed by a second deferred sync.
         try:
             QTimer.singleShot(0, lambda: self._deferred_sync_project_state("startup"))
         except Exception:
-            pass
+            self._deferred_sync_project_state("startup")
 
         # Disable drawing tools if registry failed
         if not self.tool_registry:

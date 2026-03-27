@@ -643,6 +643,73 @@ def test_sync_project_state_unsaved_non_sar_project_does_not_ensure_structure(mo
     controller.load_existing_storage_state.assert_called_once_with()
 
 
+def test_post_init_state_with_controller_uses_single_deferred_startup_sync(monkeypatch):
+    """
+    Startup should not load mission storage twice when the lifecycle controller
+    is present. The initial storage prompt/load should flow through the
+    deferred project sync path exactly once.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._is_unloading = False
+    tracker._app_is_quitting = False
+    tracker.tool_registry = object()
+    tracker.sar_panel = MagicMock()
+    tracker._init_coordinates_controller = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._check_focus_mode_crash_recovery = MagicMock()
+    tracker._log_exception = MagicMock()
+    tracker._load_existing_mission_storage_state = MagicMock()
+    tracker.mission_lifecycle_controller = SimpleNamespace(
+        load_existing_storage_state=MagicMock(),
+        sync_project_state=MagicMock(),
+    )
+
+    def _run_immediately(_delay, callback):
+        callback()
+
+    monkeypatch.setattr(sartracker_module.QTimer, "singleShot", _run_immediately, raising=False)
+
+    SarTracker._post_init_state(tracker)
+
+    tracker.mission_lifecycle_controller.load_existing_storage_state.assert_not_called()
+    tracker.mission_lifecycle_controller.sync_project_state.assert_called_once_with(reason="startup")
+    tracker._load_existing_mission_storage_state.assert_not_called()
+
+
+def test_post_init_state_without_controller_uses_single_deferred_startup_sync(monkeypatch):
+    """
+    Legacy startup should also avoid an immediate mission-storage load followed
+    by a second deferred sync load.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._is_unloading = False
+    tracker._app_is_quitting = False
+    tracker.tool_registry = object()
+    tracker.sar_panel = MagicMock()
+    tracker._init_coordinates_controller = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._check_focus_mode_crash_recovery = MagicMock()
+    tracker._load_existing_mission_storage_state = MagicMock()
+    tracker._sync_project_state = MagicMock()
+    tracker.mission_lifecycle_controller = None
+
+    def _run_immediately(_delay, callback):
+        callback()
+
+    monkeypatch.setattr(sartracker_module.QTimer, "singleShot", _run_immediately, raising=False)
+
+    SarTracker._post_init_state(tracker)
+
+    tracker._load_existing_mission_storage_state.assert_not_called()
+    tracker._sync_project_state.assert_called_once_with(reason="startup")
+
+
 def test_sync_project_state_ignores_duplicate_signature(monkeypatch):
     """
     Repeated syncs with the same project/store signature should be skipped to
