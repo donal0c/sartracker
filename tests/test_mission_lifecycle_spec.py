@@ -710,6 +710,52 @@ def test_post_init_state_without_controller_uses_single_deferred_startup_sync(mo
     tracker._sync_project_state.assert_called_once_with(reason="startup")
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="Startup still performs lifecycle sync before explicit operator activation",
+)
+def test_spec_hidden_startup_defers_lifecycle_sync_until_explicit_activation(monkeypatch):
+    """
+    Spec: when the SAR panel starts hidden, plugin initialization should not
+    trigger mission-storage prompting until the operator explicitly activates
+    SAR Tracker.
+    """
+    from sartracker import sartracker as sartracker_module
+
+    callbacks = []
+
+    SarTracker = sartracker_module.sartracker
+    tracker = SarTracker.__new__(SarTracker)
+    tracker._is_unloading = False
+    tracker._app_is_quitting = False
+    tracker.tool_registry = object()
+    tracker.sar_panel = MagicMock()
+    tracker.sar_panel.isVisible.return_value = False
+    tracker._init_coordinates_controller = MagicMock()
+    tracker._check_for_paused_mission = MagicMock()
+    tracker._check_focus_mode_crash_recovery = MagicMock()
+    tracker._safe_mode_block = MagicMock(return_value=False)
+    tracker._log_exception = MagicMock()
+    tracker.mission_lifecycle_controller = SimpleNamespace(
+        sync_project_state=MagicMock(),
+    )
+
+    def _capture_callback(delay, callback):
+        callbacks.append((delay, callback))
+
+    monkeypatch.setattr(sartracker_module.QTimer, "singleShot", _capture_callback, raising=False)
+
+    SarTracker._post_init_state(tracker)
+
+    assert callbacks, "Expected startup to schedule deferred work"
+    tracker.mission_lifecycle_controller.sync_project_state.assert_not_called()
+
+    SarTracker.run(tracker)
+
+    tracker.sar_panel.show.assert_called_once_with()
+    tracker.mission_lifecycle_controller.sync_project_state.assert_called_once_with(reason="startup")
+
+
 def test_sync_project_state_ignores_duplicate_signature(monkeypatch):
     """
     Repeated syncs with the same project/store signature should be skipped to
