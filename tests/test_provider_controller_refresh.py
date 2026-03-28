@@ -196,3 +196,99 @@ def test_invalid_replay_window_cleans_up_temp_store():
     provider.create_refresh_task.assert_not_called()
     assert cleared == ['/tmp/replay-invalid.gpkg']
     assert temp_store_path['value'] is None
+
+
+def test_replay_setup_failure_cleans_up_temp_store_and_clears_signal():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: False)
+
+    temp_store_path = {'value': None}
+    cleared = []
+    signals = []
+
+    def set_temp_store(path):
+        temp_store_path['value'] = path
+
+    def clear_temp_store():
+        cleared.append(temp_store_path['value'])
+        temp_store_path['value'] = None
+
+    def get_temp_store():
+        return temp_store_path['value']
+
+    controller.set_temp_store_handlers(
+        setter=set_temp_store,
+        clearer=clear_temp_store,
+        getter=get_temp_store,
+    )
+    controller.replay_mode_changed.connect(
+        lambda enabled, start, end: signals.append((enabled, start, end))
+    )
+
+    start_iso = format_iso(datetime.now(timezone.utc) - timedelta(hours=2))
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start(start_iso)
+    ConfigStore.set_traccar_test_window_hours(1)
+
+    provider.create_refresh_task.side_effect = RuntimeError("task setup failed")
+
+    with patch(
+        'sartracker.utils.mission_storage.MissionStorageHelper.prepare_temp_replay_store',
+        return_value='/tmp/replay-setup-failed.gpkg',
+    ):
+        started = controller.start_refresh()
+
+    assert started is False
+    assert ConfigStore.get_traccar_test_window_enabled() is True
+    assert cleared == ['/tmp/replay-setup-failed.gpkg']
+    assert temp_store_path['value'] is None
+    assert signals[0][0] is True
+    assert signals[-1] == (False, "", "")
+
+
+def test_replay_task_start_failure_cleans_up_temp_store_and_clears_signal():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: False)
+
+    temp_store_path = {'value': None}
+    cleared = []
+    signals = []
+
+    def set_temp_store(path):
+        temp_store_path['value'] = path
+
+    def clear_temp_store():
+        cleared.append(temp_store_path['value'])
+        temp_store_path['value'] = None
+
+    def get_temp_store():
+        return temp_store_path['value']
+
+    controller.set_temp_store_handlers(
+        setter=set_temp_store,
+        clearer=clear_temp_store,
+        getter=get_temp_store,
+    )
+    controller.replay_mode_changed.connect(
+        lambda enabled, start, end: signals.append((enabled, start, end))
+    )
+
+    start_iso = format_iso(datetime.now(timezone.utc) - timedelta(hours=2))
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start(start_iso)
+    ConfigStore.set_traccar_test_window_hours(1)
+
+    task_manager.start_task.side_effect = RuntimeError("task manager refused task")
+
+    with patch(
+        'sartracker.utils.mission_storage.MissionStorageHelper.prepare_temp_replay_store',
+        return_value='/tmp/replay-start-failed.gpkg',
+    ):
+        started = controller.start_refresh()
+
+    assert started is False
+    assert ConfigStore.get_traccar_test_window_enabled() is True
+    assert cleared == ['/tmp/replay-start-failed.gpkg']
+    assert temp_store_path['value'] is None
+    assert signals[0][0] is True
+    assert signals[-1] == (False, "", "")

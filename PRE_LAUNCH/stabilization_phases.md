@@ -39,6 +39,8 @@ As of 2026-03-28:
     replay indicator signal instead of leaving failure-path residue behind
   - cached refreshes with `cache_age_seconds == 0` now still take the cached /
     offline warning path instead of falling through as if they were live
+  - replay refresh setup failures now also unwind temp-store and replay-signal
+    state instead of leaving replay residue behind after task setup errors
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

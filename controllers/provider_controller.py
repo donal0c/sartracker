@@ -1322,6 +1322,11 @@ class ProviderController(QObject):
             self._refresh_in_progress = False
             self._refresh_started_at = None
             self._clear_loading_state()
+            self._cleanup_replay_temp_store()
+            try:
+                self.replay_mode_changed.emit(False, "", "")
+            except Exception as sig_err:
+                print(f"[PROVIDER_CONTROLLER] Warning: Could not emit replay_mode_changed: {sig_err}")
 
             print(f"[PROVIDER_CONTROLLER] Error starting refresh: {e}")
             import traceback
