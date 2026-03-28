@@ -48,6 +48,8 @@ As of 2026-03-28:
     hooks, exit-blocker unregistration, and defensive mission-controller cleanup
   - `_unload_set_flags()` is now covered for early task/provider shutdown,
     coordinate cleanup, and defensive flag clearing even when cleanup raises
+  - `_unload_cancel_tasks()` is now covered for both active-task cancellation
+    and the no-active-task fast path
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

@@ -197,3 +197,25 @@ def test_unload_set_flags_still_clears_coordinate_flags_when_cleanup_raises():
     assert tracker._coords_updates_enabled is False
     assert tracker._map_canvas_connected is False
     tracker.layer_manager.set_application_closing.assert_called_once_with(True)
+
+
+def test_unload_cancel_tasks_cancels_when_active_tasks_exist():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker.task_manager.get_active_count.return_value = 3
+
+    SarTracker._unload_cancel_tasks(tracker)
+
+    tracker.task_manager.cancel_all.assert_called_once_with(wait_timeout_ms=5000)
+
+
+def test_unload_cancel_tasks_skips_cancel_when_no_active_tasks():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker.task_manager.get_active_count.return_value = 0
+
+    SarTracker._unload_cancel_tasks(tracker)
+
+    tracker.task_manager.cancel_all.assert_not_called()
