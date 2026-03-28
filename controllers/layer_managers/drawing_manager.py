@@ -399,17 +399,18 @@ class DrawingLayerManager(BaseLayerManager):
         symbol.symbolLayer(0).setStrokeWidth(2)
 
     def _style_range_rings_layer(self, layer: QgsVectorLayer):
-        """Style range rings with 'zelda' triangle pattern at 15% opacity.
+        """Style range rings with a high-contrast pattern that stays map-readable.
 
         Pattern structure:
         - Simple Fill (transparent background)
-        - Point Pattern Fill with triangle markers (4.8mm grid, 1.2mm displacement)
+        - Point Pattern Fill with dark triangle markers (4.8mm grid, 1.2mm displacement)
         - Simple Line (orange outline)
 
-        Triangle markers: 4.6mm, orange fill and stroke
-        Layer opacity: 15%
+        Triangle markers: 4.6mm, semi-transparent black fill with dark stroke
+        Layer opacity: 100% (pattern itself stays semi-transparent)
         """
-        orange = QColor(255, 165, 0)
+        orange = QColor("#ff8c00")
+        pattern = QColor(0, 0, 0, 110)
 
         # Create fresh fill symbol
         symbol = QgsFillSymbol()
@@ -437,9 +438,9 @@ class DrawingLayerManager(BaseLayerManager):
         triangle_marker.setShape(QgsSimpleMarkerSymbolLayer.Triangle)
         triangle_marker.setSize(4.6)
         triangle_marker.setSizeUnit(QgsUnitTypes.RenderMillimeters)
-        triangle_marker.setColor(orange)
-        triangle_marker.setStrokeColor(orange)
-        triangle_marker.setStrokeWidth(0.2)
+        triangle_marker.setColor(pattern)
+        triangle_marker.setStrokeColor(QColor(0, 0, 0, 160))
+        triangle_marker.setStrokeWidth(0.35)
         triangle_marker.setStrokeWidthUnit(QgsUnitTypes.RenderMillimeters)
 
         # Create marker symbol and set as sub-symbol
@@ -453,15 +454,16 @@ class DrawingLayerManager(BaseLayerManager):
         # 3. Simple Line - orange outline
         simple_line = QgsSimpleLineSymbolLayer()
         simple_line.setColor(orange)
-        simple_line.setWidth(1.5)
+        simple_line.setWidth(2.0)
         simple_line.setWidthUnit(QgsUnitTypes.RenderMillimeters)
         symbol.appendSymbolLayer(simple_line)
 
         # Apply symbol to layer
         layer.renderer().setSymbol(symbol)
 
-        # Set layer opacity to 15%
-        layer.setOpacity(0.15)
+        # Keep the layer fully opaque; the pattern itself is semi-transparent
+        # so the basemap remains visible while the ring edge stays readable.
+        layer.setOpacity(1.0)
 
     def _style_bearing_lines_layer(self, layer: QgsVectorLayer):
         symbol = QgsLineSymbol.createSimple({'color': 'purple', 'width': '2'})
