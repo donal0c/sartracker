@@ -10,9 +10,19 @@ from qgis.PyQt.QtWidgets import (
     QPushButton, QLineEdit, QTextEdit, QComboBox,
     QLabel, QGroupBox, QRadioButton, QButtonGroup, QFileDialog
 )
+from qgis.core import (
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsProject,
+    QgsPointXY,
+)
 
 from ..utils.dialog_utils import BaseDialog
-from ..utils.coordinates import format_wgs84_degrees
+from ..utils.coordinates import (
+    build_tm65_crs,
+    format_irish_grid_reference,
+    format_wgs84_degrees,
+)
 
 
 class MarkerDialog(BaseDialog):
@@ -88,6 +98,8 @@ class MarkerDialog(BaseDialog):
         self.edit_mode = bool(self.existing_data)
         self.marker_id = self.existing_data.get('id')
         self.marker_type = self.existing_data.get('type', "ipp_lkp")  # or "clue" or "hazard" or "casualty"
+        self.itm = QgsCoordinateReferenceSystem("EPSG:2157")
+        self.tm65 = build_tm65_crs()
 
         self._setup_ui()
         
@@ -165,6 +177,13 @@ class MarkerDialog(BaseDialog):
         else:
             itm_label = QLabel("<i>Not available</i>")
         coords_layout.addRow("Irish Grid (ITM):", itm_label)
+
+        tm65_ref = self._build_tm65_reference()
+        if tm65_ref:
+            self.tm65_label = QLabel(f"<b>{tm65_ref}</b>")
+        else:
+            self.tm65_label = QLabel("<i>Not available</i>")
+        coords_layout.addRow("Irish Grid (TM65):", self.tm65_label)
         
         coords_group.setLayout(coords_layout)
         layout.addWidget(coords_group)
@@ -276,7 +295,7 @@ class MarkerDialog(BaseDialog):
         self.evacuation_priority_label = QLabel("Evacuation Priority:")
         details_layout.addRow(self.evacuation_priority_label, self.evacuation_priority_combo)
 
-        # Found By (only for Casualty)
+        # Found By (for Clue and Casualty)
         self.found_by_input = QLineEdit()
         self.found_by_input.setPlaceholderText("Team member or device ID...")
         self.found_by_label = QLabel("Found By:")
@@ -375,8 +394,8 @@ class MarkerDialog(BaseDialog):
         self.treatment_input.setVisible(is_casualty)
         self.evacuation_priority_label.setVisible(is_casualty)
         self.evacuation_priority_combo.setVisible(is_casualty)
-        self.found_by_label.setVisible(is_casualty)
-        self.found_by_input.setVisible(is_casualty)
+        self.found_by_label.setVisible(is_clue or is_casualty)
+        self.found_by_input.setVisible(is_clue or is_casualty)
         
     def _on_save(self):
         """Validate and save."""
@@ -410,6 +429,7 @@ class MarkerDialog(BaseDialog):
         elif self.marker_type == 'clue':
             data['clue_type'] = self.clue_type_combo.currentText()
             data['confidence'] = self.confidence_combo.currentText()
+            data['found_by'] = self.found_by_input.text().strip()
         elif self.marker_type == 'hazard':
             data['hazard_type'] = self.hazard_type_combo.currentText()
             data['severity'] = self.severity_combo.currentText()
@@ -457,6 +477,7 @@ class MarkerDialog(BaseDialog):
         elif self.marker_type == 'clue':
             clue_type = data.get('clue_type')
             confidence = data.get('confidence')
+            found_by = data.get('found_by')
             if clue_type:
                 idx = self.clue_type_combo.findText(clue_type)
                 if idx != -1:
@@ -465,6 +486,8 @@ class MarkerDialog(BaseDialog):
                 idx = self.confidence_combo.findText(confidence)
                 if idx != -1:
                     self.confidence_combo.setCurrentIndex(idx)
+            if found_by:
+                self.found_by_input.setText(found_by)
         elif self.marker_type == 'hazard':
             hazard_type = data.get('hazard_type')
             severity = data.get('severity')
@@ -493,3 +516,15 @@ class MarkerDialog(BaseDialog):
                 self.treatment_input.setText(treatment)
             if found_by:
                 self.found_by_input.setText(found_by)
+
+    def _build_tm65_reference(self):
+        """Return read-only TM65 grid reference for the current ITM coordinates."""
+        if self.easting is None or self.northing is None or not self.tm65 or not self.tm65.isValid():
+            return None
+
+        try:
+            transform = QgsCoordinateTransform(self.itm, self.tm65, QgsProject.instance())
+            tm65_point = transform.transform(QgsPointXY(self.easting, self.northing))
+            return format_irish_grid_reference(tm65_point.x(), tm65_point.y())
+        except Exception:
+            return None

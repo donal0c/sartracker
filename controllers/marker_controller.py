@@ -358,6 +358,7 @@ class MarkerController:
                 clue_type=marker_data.get('clue_type', ''),
                 confidence=marker_data.get('confidence', 'Possible'),
                 description=marker_data['description'],
+                found_by=marker_data.get('found_by', ''),
                 irish_grid_e=marker_data['easting'],
                 irish_grid_n=marker_data['northing'],
                 coordinator_ids=marker_data.get('coordinator_ids'),
@@ -509,6 +510,7 @@ class MarkerController:
         elif marker_type == "clue":
             updates["clue_type"] = marker_data.get("clue_type", "")
             updates["confidence"] = marker_data.get("confidence", "")
+            updates["found_by"] = marker_data.get("found_by", "")
         elif marker_type == "hazard":
             updates["hazard_type"] = marker_data.get("hazard_type", "")
             updates["severity"] = marker_data.get("severity", "")

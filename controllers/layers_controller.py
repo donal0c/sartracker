@@ -605,7 +605,7 @@ class LayersController:
 
     def add_clue(self, name: str, lat: float, lon: float,
                  clue_type: str = "", confidence: str = "Possible",
-                 description: str = "",
+                 description: str = "", found_by: str = "",
                  irish_grid_e: float = None, irish_grid_n: float = None,
                  coordinator_ids: Optional[str] = None,
                  updated_by: Optional[str] = None,
@@ -620,6 +620,7 @@ class LayersController:
             clue_type: Type (Footprint, Clothing, Equipment, Witness Sighting, etc.)
             confidence: Confidence level (Confirmed, Probable, Possible)
             description: Additional notes
+            found_by: Team member or device ID who found the clue
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
             coordinator_ids: CSV of coordinators responsible for this clue
@@ -633,7 +634,7 @@ class LayersController:
         clue_id = self._execute_manager_call(
             "add clue marker",
             self.markers.add_clue,
-            name, lat, lon, clue_type, confidence, description,
+            name, lat, lon, clue_type, confidence, description, found_by,
             irish_grid_e, irish_grid_n,
             coordinator_ids=coordinator_ids,
             updated_by=updated_by,

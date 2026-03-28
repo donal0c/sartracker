@@ -902,7 +902,7 @@ class MarkerLayerManager(BaseLayerManager):
 
     def add_clue(self, name: str, lat: float, lon: float,
                  clue_type: str = "", confidence: str = "Possible",
-                 description: str = "",
+                 description: str = "", found_by: str = "",
                  irish_grid_e: float = None, irish_grid_n: float = None,
                  coordinator_ids: Optional[str] = None,
                  updated_by: Optional[str] = None,
@@ -920,6 +920,7 @@ class MarkerLayerManager(BaseLayerManager):
             clue_type: Type (Footprint, Clothing, Equipment, Witness Sighting, etc.)
             confidence: Confidence level (Confirmed, Probable, Possible)
             description: Additional notes
+            found_by: Team member or device ID who found the clue
             irish_grid_e: Irish Grid (ITM) Easting (optional)
             irish_grid_n: Irish Grid (ITM) Northing (optional)
 
@@ -964,6 +965,7 @@ class MarkerLayerManager(BaseLayerManager):
             return self._add_clue_per_item(
                 name=name, lat=lat, lon=lon,
                 clue_type=clue_type, confidence=confidence, description=description,
+                found_by=found_by,
                 irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
                 coordinator_ids=coordinator_ids, updated_by=updated_by,
                 attachment_path=attachment_path
@@ -973,6 +975,7 @@ class MarkerLayerManager(BaseLayerManager):
         return self._add_clue_shared_layer(
             name=name, lat=lat, lon=lon,
             clue_type=clue_type, confidence=confidence, description=description,
+            found_by=found_by,
             irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
             coordinator_ids=coordinator_ids, updated_by=updated_by,
             attachment_path=attachment_path
@@ -980,7 +983,7 @@ class MarkerLayerManager(BaseLayerManager):
 
     def _add_clue_shared_layer(
         self, name: str, lat: float, lon: float,
-        clue_type: str, confidence: str, description: str,
+        clue_type: str, confidence: str, description: str, found_by: str,
         irish_grid_e: Optional[float], irish_grid_n: Optional[float],
         coordinator_ids: Optional[str], updated_by: Optional[str],
         attachment_path: Optional[str]
@@ -998,6 +1001,7 @@ class MarkerLayerManager(BaseLayerManager):
             "name": name,
             "clue_type": clue_type,
             "confidence": confidence,
+            "found_by": found_by,
             "description": description,
             "lat": lat,
             "lon": lon,
@@ -1023,7 +1027,7 @@ class MarkerLayerManager(BaseLayerManager):
 
     def _add_clue_per_item(
         self, name: str, lat: float, lon: float,
-        clue_type: str, confidence: str, description: str,
+        clue_type: str, confidence: str, description: str, found_by: str,
         irish_grid_e: Optional[float], irish_grid_n: Optional[float],
         coordinator_ids: Optional[str], updated_by: Optional[str],
         attachment_path: Optional[str]
@@ -1044,6 +1048,7 @@ class MarkerLayerManager(BaseLayerManager):
             return self._add_clue_shared_layer(
                 name=name, lat=lat, lon=lon,
                 clue_type=clue_type, confidence=confidence, description=description,
+                found_by=found_by,
                 irish_grid_e=irish_grid_e, irish_grid_n=irish_grid_n,
                 coordinator_ids=coordinator_ids, updated_by=updated_by,
                 attachment_path=attachment_path
@@ -1058,6 +1063,7 @@ class MarkerLayerManager(BaseLayerManager):
             {"name": "name", "type": "String", "length": 255},
             {"name": "clue_type", "type": "String", "length": 100},
             {"name": "confidence", "type": "String", "length": 50},
+            {"name": "found_by", "type": "String", "length": 255},
             {"name": "description", "type": "String", "length": 1000},
             {"name": "lat", "type": "Double"},
             {"name": "lon", "type": "Double"},
@@ -1100,6 +1106,7 @@ class MarkerLayerManager(BaseLayerManager):
             "name": name,
             "clue_type": clue_type,
             "confidence": confidence,
+            "found_by": found_by,
             "description": description,
             "lat": lat,
             "lon": lon,

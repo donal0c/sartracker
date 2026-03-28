@@ -158,7 +158,7 @@ def test_marker_layer_fields_match_manager():
             "display_order"
         ],
         LayerIds.MARKERS_CLUES: [
-            "id", "name", "clue_type", "confidence",
+            "id", "name", "clue_type", "confidence", "found_by",
             "description", "lat", "lon", "irish_grid_e", "irish_grid_n", "created",
             "created_at", "updated_at", "updated_by", "coordinator_ids", "attachment_path",
             "display_order"

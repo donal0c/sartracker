@@ -40,6 +40,11 @@ class _FakeValidCrs:
         return True
 
 
+class _FakeInvalidCrs:
+    def isValid(self):
+        return False
+
+
 def _make_fake_transform(results):
     class _FakeTransform:
         def __init__(self, *_args, **_kwargs):
@@ -87,6 +92,59 @@ class TestMarkerDialogBaseline:
         assert marker_dialog.marker_type == "hazard"
         assert not marker_dialog.hazard_type_combo.isHidden()
         assert marker_dialog.subject_category_combo.isHidden()
+
+    def test_clue_mode_shows_found_by_and_round_trips_data(self, marker_dialog):
+        marker_dialog.clue_radio.setChecked(True)
+        marker_dialog._on_type_changed()
+
+        assert not marker_dialog.found_by_input.isHidden()
+
+        marker_dialog.found_by_input.setText("Team Alpha")
+        data = marker_dialog.get_marker_data()
+
+        assert data["type"] == "clue"
+        assert data["found_by"] == "Team Alpha"
+
+    def test_edit_mode_clue_loads_found_by(self, qgis_app):
+        dialog = MarkerDialog(
+            52.274681,
+            -9.530912,
+            95553,
+            114716,
+            existing_data={
+                "id": "clue-1",
+                "type": "clue",
+                "name": "Boot print",
+                "found_by": "Team Bravo",
+            },
+        )
+        try:
+            assert dialog.clue_radio.isChecked()
+            assert dialog.found_by_input.text() == "Team Bravo"
+        finally:
+            dialog.close()
+
+    def test_tm65_reference_is_shown_when_available(self, qgis_app, monkeypatch):
+        fake_transform = _make_fake_transform([_FakePoint(99840, 104018)])
+        monkeypatch.setattr(
+            "sartracker.ui.marker_dialog.QgsCoordinateTransform",
+            fake_transform,
+        )
+        monkeypatch.setattr(
+            "sartracker.ui.marker_dialog.format_irish_grid_reference",
+            lambda _e, _n: "Q 99840 04018",
+        )
+        monkeypatch.setattr(
+            "sartracker.ui.marker_dialog.build_tm65_crs",
+            lambda: _FakeValidCrs(),
+        )
+
+        dialog = MarkerDialog(52.274681, -9.530912, 95553, 114716)
+        try:
+            label_texts = [label.text() for label in dialog.findChildren(QLabel)]
+            assert any("Q 99840 04018" in text for text in label_texts)
+        finally:
+            dialog.close()
 
 
 class TestCoordinateConverterDialogBaseline:

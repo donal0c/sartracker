@@ -480,6 +480,7 @@ CLUE_FIELDS = [
     {"name": "name", "type": "String", "length": 120},
     {"name": "clue_type", "type": "String", "length": 60},
     {"name": "confidence", "type": "String", "length": 20},
+    {"name": "found_by", "type": "String", "length": 120},
     {"name": "description", "type": "String", "length": 255},
     *MARKER_COMMON_GEO_FIELDS,
     *MARKER_AUDIT_FIELDS,
