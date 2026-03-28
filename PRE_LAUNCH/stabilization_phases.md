@@ -16,17 +16,27 @@ It is a stabilization and confidence-building roadmap focused on:
 
 ## Current Checkpoint
 
-As of 2026-03-27:
+As of 2026-03-28:
 
 - `Phase 0` is complete enough to use as a reliable development gate
 - `Phase 1A` is largely complete and has produced a working lifecycle spec suite
-- the repo currently has two intentionally quarantined lifecycle findings still
-  open:
-  - autosave truthfulness for async backup completion
-  - clean start-fresh behavior when mission names collide
+- `Phase 1` startup/resume hardening has already delivered:
+  - clean startup with explicit SAR activation
+  - duplicate resume/start-fresh prompt fix
+  - startup layer restoration repair
+- `Phase 2` has now delivered:
+  - truthful autosave status semantics for async backup completion
+  - clean start-fresh workspace reset when mission names collide
+- the remaining known intentional red is now outside this lifecycle slice and
+  lives in the diagnostics area
 
 The rest of the mission lifecycle findings uncovered so far have either been
 converted into passing regressions or explicitly deferred.
+
+Manual QGIS exploratory testing is now also part of the planned workflow,
+paired with log capture and diagnostics review rather than treated as an
+informal afterthought. See
+[manual_qgis_logging_runbook.md](/Users/donalocallaghan/Documents/Qgis/sartracker/PRE_LAUNCH/manual_qgis_logging_runbook.md).
 
 ---
 
@@ -157,6 +167,24 @@ Ensure that saved mission state is actually persisted, recoverable, and truthful
 - persistence warnings are actionable and accurate
 - tests cover failed save, failed backup, and partial-success cases
 
+### Manual-QGIS Companion Track
+
+Phase 2 and Phase 5 both benefit from deliberate exploratory testing in a real
+QGIS session, especially when the team notices something that "feels wrong"
+before we have a clean reproduction.
+
+For this project, manual exploratory work should be treated as structured
+evidence gathering:
+
+- launch QGIS from a terminal when possible so Python/QGIS output is captured
+- enable SAR Tracker debug logging when investigating a specific workflow
+- note the exact click path and operator expectation
+- capture the QGIS Log Messages output for the `SAR Tracker` category
+- convert suspicious behavior into tests before making production changes
+
+This keeps field observations, logs, and TDD working together instead of
+competing with one another.
+
 ---
 
 ## Phase 3: Provider and Tracking Resilience
@@ -286,9 +314,8 @@ Replace outdated docs with a smaller set of accurate pre-launch documents.
 
 ## Immediate Next Step
 
-Start with a concrete Phase 1A task list:
+Current recommended execution order from here:
 
-- define the canonical mission lifecycle in tests
-- write unit and integration tests for startup, start fresh, resume, autosave, and cleanup
-- separate expected behavior from current behavior
-- use failing tests to build the production hardening backlog
+1. continue Phase 3 provider/tracking resilience work
+2. keep the manual-QGIS logging runbook current as new field workflows are exercised
+3. use field reports plus logs to drive the next spec/tests before any broader UI or workflow changes

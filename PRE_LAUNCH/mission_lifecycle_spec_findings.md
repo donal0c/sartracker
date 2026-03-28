@@ -7,32 +7,32 @@ These findings are intentionally tied to executable tests so they stay honest.
 
 ## Current Status
 
-As of 2026-03-27, the lifecycle spec suite in
+As of 2026-03-28, the lifecycle spec suite in
 [tests/test_mission_lifecycle_spec.py](/Users/donalocallaghan/Documents/Qgis/sartracker/tests/test_mission_lifecycle_spec.py)
 contains:
 
-- 52 passing specification tests
-- 2 strict `xfail` tests documenting suspected bugs
+- 62 passing specification tests
+- 0 lifecycle `xfail` tests remaining
 - focused lifecycle verification:
-  `103 passed, 2 xfailed`
+  `110 passed`
 - full-suite verification:
-  `1035 passed, 157 skipped, 3 xfailed`
+  `1049 passed, 159 skipped, 1 xfailed`
 
-## Remaining Open Findings From Spec Tests
+## Lifecycle Findings Burned Down In This Slice
 
-### 1. Autosave reports success before async backup completion is known
+### 1. Autosave no longer reports success before async backup completion is known
 
 - Spec test: `test_spec_autosave_waits_for_backup_completion_before_reporting_success`
-- Risk:
-  operators may get a green autosave indication when backup only started, not
-  when backup actually completed successfully.
+- Resolution:
+  auto-save now enters a pending state after project write success when backup
+  completion is still outstanding, and only turns green on backup completion.
 
-### 2. “Start fresh” with the same mission name does not produce a clean workspace
+### 2. “Start fresh” with the same mission name now produces a clean workspace
 
 - Spec test: `test_spec_start_fresh_with_same_name_removes_stale_attachment_files`
-- Risk:
-  stale attachments and possibly stale mission artifacts remain in place when a
-  supposedly fresh mission reuses an existing folder name.
+- Resolution:
+  starting fresh with a reused mission name now clears stale primary and backup
+  workspace artifacts before recreating the mission store directories.
 
 ## What This Phase Established
 
@@ -63,6 +63,8 @@ Notable lifecycle behaviors now covered by passing tests include:
 - legacy missing-store startup clearing runtime state instead of rebuilding around a dead path
 - unload-time freeze of lifecycle state
 - duplicate project-sync suppression
+- truthful autosave pending/success/warning transitions around async backup
+- same-name start-fresh cleanup of stale primary and backup mission artifacts
 - legacy finalize flow keeping the in-progress guard raised until archive callback
 - extracted finalization flow keeping its in-progress guard raised when archive
   start succeeds
@@ -97,10 +99,10 @@ was narrowed to isolate structure creation from storage loading. That suggests
 the project-sync structure path is healthy, while the storage-loading path may
 deserve separate targeted integration coverage later.
 
-That suggests the highest-risk production fixes are likely to be in:
+That suggests the highest-risk remaining production work is likely to be in:
 
-- legacy mission/finalize/autosave flow in `sartracker.py`
-- mission storage “start fresh” cleanliness when folder names collide
+- provider/tracking resilience under outages or stale responses
+- shutdown/reload races outside the lifecycle paths already covered
 - edge-case bridging between persisted state and runtime state
 
 ## What Likely Needs Human Involvement Later
@@ -108,3 +110,8 @@ That suggests the highest-risk production fixes are likely to be in:
 - validating exact operator expectations for “resume” vs “start fresh”
 - checking whether some currently tolerated behaviors are intentionally relied on
 - confirming the UX wording and operational ergonomics during live workflows
+
+## Remaining Intentional Red Outside This Slice
+
+- one non-lifecycle `xfail` remains in the diagnostics area and is being kept
+  quarantined separately from mission lifecycle hardening

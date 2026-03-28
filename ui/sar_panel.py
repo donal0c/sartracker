@@ -112,7 +112,7 @@ class SARPanel(QDockWidget):
         self.autosave_interval_minutes = SETTINGS_KEYS.AUTO_SAVE_INTERVAL_DEFAULT
         self.last_autosave_time = None
         self._last_autosave_success: Optional[bool] = None
-        self._last_autosave_state: Optional[str] = None  # success | warning | failed
+        self._last_autosave_state: Optional[str] = None  # success | warning | failed | pending
         self.focus_mode_active = False
         self.focus_mode_state = None  # FocusModePlusState for menu/status/toolbar hiding
         self.hidden_panels = []  # Track which panels we hid (legacy, kept for compatibility)
@@ -1109,6 +1109,8 @@ class SARPanel(QDockWidget):
             time_str = self.last_autosave_time.strftime("%H:%M:%S")
             if autosave_state == "success":
                 last_text = f"{time_str} ✓"
+            elif autosave_state == "pending":
+                last_text = f"{time_str} … Pending backup"
             elif autosave_state == "warning":
                 last_text = f"{time_str} ⚠ Warning"
             elif autosave_state == "failed":
@@ -1121,6 +1123,8 @@ class SARPanel(QDockWidget):
         color = "#666"
         if autosave_state == "success":
             color = "#1f8b4d"
+        elif autosave_state == "pending":
+            color = "#2563eb"
         elif autosave_state == "warning":
             color = "#b36b00"
         elif autosave_state == "failed":
@@ -1451,12 +1455,16 @@ class SARPanel(QDockWidget):
         Update auto-save status label.
 
         Args:
-            status: `True` for success, `False` for hard failure, `"warning"` for partial success
+            status: `True` for success, `False` for hard failure, `"warning"` for partial success,
+                `"pending"` while backup completion is still outstanding
         """
         self.last_autosave_time = datetime.now()
         if status is True:
             self._last_autosave_state = "success"
             self._last_autosave_success = True
+        elif isinstance(status, str) and status.lower() == "pending":
+            self._last_autosave_state = "pending"
+            self._last_autosave_success = None
         elif status is False:
             self._last_autosave_state = "failed"
             self._last_autosave_success = False

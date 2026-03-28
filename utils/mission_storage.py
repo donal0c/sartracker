@@ -547,10 +547,19 @@ class MissionStorageHelper:
         sanitized_name = self.sanitize_mission_name(mission_name)
         mission_dir = primary_root / sanitized_name
         attachments_dir = mission_dir / "attachments"
+
+        # "Start Fresh" must mean a clean mission workspace, even when the user
+        # intentionally reuses a previous mission name.
+        if mission_dir.exists():
+            shutil.rmtree(mission_dir, ignore_errors=False)
         mission_dir.mkdir(parents=True, exist_ok=True)
         attachments_dir.mkdir(parents=True, exist_ok=True)
 
         gpkg_path = mission_dir / f"{sanitized_name}.gpkg"
+        if backup_root:
+            backup_dir_path = backup_root / sanitized_name
+            if backup_dir_path.exists():
+                shutil.rmtree(backup_dir_path, ignore_errors=False)
         backup_dir = self.ensure_backup_directory(sanitized_name, backup_root, create=True)
 
         # Persist to layer manager and ensure schema

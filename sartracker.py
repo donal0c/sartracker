@@ -385,6 +385,7 @@ class sartracker:
         self._is_finalizing: bool = False  # Race condition protection
         self._critical_init_failed: bool = False
         self._startup_activation_pending: bool = True
+        self._autosave_backup_pending: bool = False
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -1211,10 +1212,10 @@ class sartracker:
                     lambda msg: error(self.iface.messageBar(), "Mission Archive", f"Archive failed: {msg}", duration=8)
                 )
                 self.mission_storage_controller.backup_completed.connect(
-                    lambda: success(self.iface.messageBar(), "Mission Backup", "Mission backup completed.", duration=2)
+                    self._handle_backup_completed
                 )
                 self.mission_storage_controller.backup_failed.connect(
-                    lambda msg: warning(self.iface.messageBar(), "Mission Backup", f"Backup failed: {msg}", duration=5)
+                    self._handle_backup_failed
                 )
             except Exception as e:
                 print(f"[SARTRACKER] ERROR initializing MissionStorageController: {e}")
@@ -4329,6 +4330,57 @@ class sartracker:
             )
             return False
 
+    def _backup_runs_async(self) -> bool:
+        """Return True when mission backup completion will be reported later via callback."""
+        if not getattr(self, "mission_storage", None):
+            return False
+        current_paths = getattr(self, "_current_mission_paths", None)
+        if current_paths is None:
+            return False
+        paths = current_paths()
+        if not paths:
+            return False
+        return bool(getattr(self, "mission_storage_controller", None) or getattr(self, "task_manager", None))
+
+    def _handle_backup_completed(self):
+        """Notify mission-backup success and complete any pending autosave state."""
+        if getattr(self, "_is_unloading", False) or getattr(self, "_app_is_quitting", False):
+            return
+
+        panel = getattr(self, "sar_panel", None)
+        if panel and self._is_qt_deleted(panel):
+            panel = None
+
+        if getattr(self, "_autosave_backup_pending", False):
+            self._autosave_backup_pending = False
+            if panel:
+                panel.update_autosave_status(True)
+            if getattr(self, "_logger", None):
+                self._logger.info("Auto-save backup completed; marking pending auto-save as successful")
+
+        success(self.iface.messageBar(), "Mission Backup", "Mission backup completed.", duration=2)
+
+    def _handle_backup_failed(self, message: str):
+        """Notify mission-backup failure and degrade any pending autosave to warning."""
+        if getattr(self, "_is_unloading", False) or getattr(self, "_app_is_quitting", False):
+            return
+
+        panel = getattr(self, "sar_panel", None)
+        if panel and self._is_qt_deleted(panel):
+            panel = None
+
+        if getattr(self, "_autosave_backup_pending", False):
+            self._autosave_backup_pending = False
+            if panel:
+                panel.update_autosave_status("warning")
+            if getattr(self, "_logger", None):
+                self._logger.warning(
+                    "Auto-save backup failed after project save; leaving auto-save status in warning state: %s",
+                    message,
+                )
+
+        warning(self.iface.messageBar(), "Mission Backup", f"Backup failed: {message}", duration=5)
+
     def _start_backup_task(self, paths: MissionPaths, *, uncommitted_layers: Optional[list] = None):
         """
         Run backup sync in background to avoid UI blocking.
@@ -4387,14 +4439,14 @@ class sartracker:
     def _on_backup_complete(self, task):
         """Fallback handler for legacy backup task path."""
         if getattr(task, "error_message", None):
-            self._notify("warning", "Mission Backup", f"Backup completed with warnings: {task.error_message}", duration=4)
+            self._handle_backup_failed(task.error_message)
             return
-        self._notify("success", "Mission Backup", "Mission backup completed.", duration=2)
+        self._handle_backup_completed()
 
     def _on_backup_error(self, task):
         """Fallback handler for legacy backup task path."""
         msg = getattr(task, "error_message", None) or "Backup task failed."
-        self._notify("warning", "Mission Backup", msg, duration=5)
+        self._handle_backup_failed(msg)
 
     def _update_mission_storage_status(self, active: bool):
         """Update SAR Panel storage badge with current mission store info."""
@@ -4533,6 +4585,7 @@ class sartracker:
                     persistence_issues = self.layer_manager.validate_persistence(quiet=True) if self.layer_manager else {}
                     persistence_ok = not persistence_issues
                     backup_ok = self._sync_mission_backup(async_run=True)
+                    backup_pending = bool(backup_ok and persistence_ok and self._backup_runs_async())
                     if not persistence_ok:
                         persistence_message = self._format_persistence_issue_message(persistence_issues)
                         warning(
@@ -4549,12 +4602,15 @@ class sartracker:
                             duration=4
                         )
                     if panel:
-                        if persistence_ok and backup_ok:
+                        if backup_pending:
+                            self._autosave_backup_pending = True
+                            panel.update_autosave_status("pending")
+                        elif persistence_ok and backup_ok:
                             panel.update_autosave_status(True)
                         else:
                             # Partial success: project save worked, but follow-up persistence checks/backup warned.
                             panel.update_autosave_status("warning")
-                    if persistence_ok and backup_ok:
+                    if persistence_ok and backup_ok and not backup_pending:
                         success(
                             self.iface.messageBar(),
                             "SAR Tracker",
@@ -4586,6 +4642,7 @@ class sartracker:
                         persistence_issues = self.layer_manager.validate_persistence(quiet=True) if self.layer_manager else {}
                         persistence_ok = not persistence_issues
                         backup_ok = self._sync_mission_backup(async_run=True)
+                        backup_pending = bool(backup_ok and persistence_ok and self._backup_runs_async())
                         if not persistence_ok:
                             persistence_message = self._format_persistence_issue_message(persistence_issues)
                             warning(
@@ -4602,12 +4659,15 @@ class sartracker:
                                 duration=4
                             )
                         if panel:
-                            if persistence_ok and backup_ok:
+                            if backup_pending:
+                                self._autosave_backup_pending = True
+                                panel.update_autosave_status("pending")
+                            elif persistence_ok and backup_ok:
                                 panel.update_autosave_status(True)
                             else:
                                 # Partial success: project save worked, but follow-up persistence checks/backup warned.
                                 panel.update_autosave_status("warning")
-                        if persistence_ok and backup_ok:
+                        if persistence_ok and backup_ok and not backup_pending:
                             success(
                                 self.iface.messageBar(),
                                 "SAR Tracker",

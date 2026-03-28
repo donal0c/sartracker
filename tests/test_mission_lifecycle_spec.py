@@ -1197,10 +1197,6 @@ def test_sync_project_state_retries_after_failed_storage_load(monkeypatch):
     assert controller.load_existing_storage_state.call_count == 2
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="prepare_new_mission() reuses existing mission directories and leaves stale files behind when mission names collide",
-)
 def test_spec_start_fresh_with_same_name_removes_stale_attachment_files(tmp_path):
     """
     Spec: starting fresh with an existing mission name should produce a clean
@@ -1235,12 +1231,22 @@ def test_spec_start_fresh_with_same_name_removes_stale_attachment_files(tmp_path
     stale_dir.mkdir(parents=True)
     stale_file = stale_dir / "stale.txt"
     stale_file.write_text("old mission artifact")
+    stale_note = tmp_path / "primary" / "Mission_Alpha" / "mission_notes.txt"
+    stale_note.write_text("leftover note")
+    stale_backup_dir = tmp_path / "backup" / "Mission_Alpha"
+    stale_backup_dir.mkdir(parents=True)
+    stale_backup_file = stale_backup_dir / "backup.txt"
+    stale_backup_file.write_text("old backup artifact")
 
     helper = MissionStorageHelper(layer_manager=_LayerManager(), config_store=_Config())
     paths = helper.prepare_new_mission("Mission Alpha")
 
     assert paths.attachments_dir.exists()
     assert list(paths.attachments_dir.iterdir()) == []
+    assert stale_note.exists() is False
+    assert paths.backup_dir is not None
+    assert stale_backup_file.exists() is False
+    assert (paths.backup_dir / "attachments").exists()
 
 
 def test_finalize_request_rejects_active_mission_before_archive_start(monkeypatch):
@@ -1936,10 +1942,6 @@ def test_starting_new_mission_from_paused_state_is_rejected():
         controller.start_mission("Replacement Mission")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Auto-save currently reports success when async backup merely starts rather than completes",
-)
 def test_spec_autosave_waits_for_backup_completion_before_reporting_success(monkeypatch):
     """
     Spec: project-save success is not the same as mission-backup success.
@@ -1956,6 +1958,11 @@ def test_spec_autosave_waits_for_backup_completion_before_reporting_success(monk
     tracker.iface = MagicMock()
     tracker.sar_panel = MagicMock()
     tracker.layer_manager = MagicMock(validate_persistence=MagicMock(return_value={}))
+    tracker.mission_storage = object()
+    tracker.mission_storage_controller = object()
+    tracker.task_manager = None
+    tracker._current_mission_paths = MagicMock(return_value=object())
+    tracker._autosave_backup_pending = False
 
     # In current code this boolean is treated as "backup succeeded", but in the
     # async path it really means "backup task accepted/started".
@@ -1977,7 +1984,8 @@ def test_spec_autosave_waits_for_backup_completion_before_reporting_success(monk
     SarTracker._on_autosave_requested(tracker)
 
     assert success_calls == []
-    tracker.sar_panel.update_autosave_status.assert_not_called()
+    tracker.sar_panel.update_autosave_status.assert_called_once_with("pending")
+    assert tracker._autosave_backup_pending is True
 
 
 def test_finalize_request_keeps_in_progress_guard_until_archive_callback(monkeypatch):
