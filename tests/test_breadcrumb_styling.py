@@ -57,7 +57,7 @@ def _make_breadcrumb_layer():
     return layer
 
 
-def test_per_device_trail_defaults_to_dash(sar_iface, sar_qgis_project):
+def test_per_device_trail_defaults_to_dot(sar_iface, sar_qgis_project):
     manager = TrackingLayerManager(sar_iface)
     layer = QgsVectorLayer("LineString?crs=EPSG:4326", "Trail", "memory")
 
@@ -65,11 +65,11 @@ def test_per_device_trail_defaults_to_dash(sar_iface, sar_qgis_project):
 
     renderer = layer.renderer()
     assert renderer is not None
-    assert _line_style(renderer.symbol()) == "dash"
+    assert _line_style(renderer.symbol()) == "dot"
     assert _line_width(renderer.symbol()) == pytest.approx(1.5)
 
 
-def test_shared_breadcrumbs_default_to_dash(sar_iface, sar_qgis_project):
+def test_shared_breadcrumbs_default_to_dot(sar_iface, sar_qgis_project):
     manager = TrackingLayerManager(sar_iface)
     layer = _make_breadcrumb_layer()
 
@@ -78,5 +78,5 @@ def test_shared_breadcrumbs_default_to_dash(sar_iface, sar_qgis_project):
     renderer = layer.renderer()
     assert isinstance(renderer, QgsCategorizedSymbolRenderer)
     for category in renderer.categories():
-        assert _line_style(category.symbol()) == "dash"
+        assert _line_style(category.symbol()) == "dot"
         assert _line_width(category.symbol()) == pytest.approx(1.5)
