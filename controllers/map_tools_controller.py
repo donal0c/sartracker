@@ -27,7 +27,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, TYPE_CHECKING
 
-from qgis.PyQt.QtCore import QObject, pyqtSignal
+from qgis.PyQt.QtCore import QObject, pyqtSignal, QTimer
 from qgis.PyQt.QtWidgets import QMessageBox
 
 from qgis.core import (
@@ -144,6 +144,7 @@ class MapToolsController(QObject):
 
         # Shutdown flag for async callbacks
         self._is_shutting_down = False
+        self._location_target_marker = None
 
         # Tool instances - initialized by init()
         self.marker_tool = None
@@ -940,6 +941,46 @@ class MapToolsController(QObject):
 
         self.iface.mapCanvas().setExtent(extent)
         self.iface.mapCanvas().refresh()
+        self._show_location_target(point)
+
+    def _build_location_target_marker(self, canvas, point):
+        """Create a temporary crosshair marker highlighting a converted point."""
+        from qgis.gui import QgsVertexMarker
+
+        marker = QgsVertexMarker(canvas)
+        marker.setCenter(point)
+        marker.setColor(QColor(255, 0, 0))
+        marker.setIconSize(16)
+        marker.setIconType(QgsVertexMarker.ICON_CROSS)
+        marker.setPenWidth(3)
+        return marker
+
+    def _clear_location_target(self):
+        """Remove any temporary coordinate-converter target marker."""
+        marker = self._location_target_marker
+        self._location_target_marker = None
+
+        if not marker or not self.iface:
+            return
+
+        try:
+            canvas = self.iface.mapCanvas()
+            canvas.scene().removeItem(marker)
+        except Exception:
+            pass
+
+    def _show_location_target(self, point):
+        """Show a temporary crosshair target for coordinate-converter navigation."""
+        if self._should_skip_callback():
+            return
+
+        try:
+            canvas = self.iface.mapCanvas()
+            self._clear_location_target()
+            self._location_target_marker = self._build_location_target_marker(canvas, point)
+            QTimer.singleShot(60000, self._clear_location_target)
+        except Exception as exc:
+            print(f"[MapToolsController] Warning: Could not show location target: {exc}")
 
     # ------------------------------------------------------------------
     # Drawing Tool Request Handlers
@@ -1578,6 +1619,8 @@ class MapToolsController(QObject):
 
         cleanup_reason = reason or "controller cleanup"
         print(f"[MapToolsController] cleanup started: {cleanup_reason}")
+
+        self._clear_location_target()
 
         # Deactivate current tool in registry
         if self.tool_registry:
