@@ -41,6 +41,9 @@ As of 2026-03-28:
     offline warning path instead of falling through as if they were live
   - replay refresh setup failures now also unwind temp-store and replay-signal
     state instead of leaving replay residue behind after task setup errors
+- `Phase 4` has now started with early shutdown coverage:
+  - `aboutToQuit` early cleanup is now covered for flag-setting, task/provider
+    shutdown, and defensive nulling of controllers even when cleanup raises
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 
