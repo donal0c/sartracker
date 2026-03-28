@@ -43,6 +43,8 @@ As of 2026-03-28:
     state instead of leaving replay residue behind after task setup errors
   - mission-active replay disable is now covered for config reset, temp-store
     cleanup, and replay-indicator clearing before live refresh proceeds
+  - breadcrumb-only cached refreshes now correctly surface cached/offline state
+    instead of being misclassified as live data
 - `Phase 4` has now started with early shutdown coverage:
   - `aboutToQuit` early cleanup is now covered for flag-setting, task/provider
     shutdown, and defensive nulling of controllers even when cleanup raises

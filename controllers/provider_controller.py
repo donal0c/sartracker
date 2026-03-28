@@ -1591,12 +1591,14 @@ class ProviderController(QObject):
             # Detect cached data for warning
             was_cached = False
             cache_age_seconds = None
-            cache_positions = []  # Initialize outside if block for scope safety
+            cache_entries = []  # Initialize outside if block for scope safety
             if current:
-                cache_positions = [p for p in current if p.get('data_origin') == 'cache']
-                if cache_positions:
-                    was_cached = True
-                    cache_age_seconds = max(p.get('cache_age_seconds', 0) for p in cache_positions)
+                cache_entries.extend(p for p in current if p.get('data_origin') == 'cache')
+            if breadcrumbs:
+                cache_entries.extend(bc for bc in breadcrumbs if bc.get('data_origin') == 'cache')
+            if cache_entries:
+                was_cached = True
+                cache_age_seconds = max(item.get('cache_age_seconds', 0) for item in cache_entries)
             if was_cached:
                 self._last_data_state = 'cached'
                 self._last_cache_age_seconds = cache_age_seconds
@@ -1637,7 +1639,7 @@ class ProviderController(QObject):
                 else:
                     age_display = f"{age_minutes:.0f} minutes"
 
-                device_cache_stale = any(p.get('device_cache_stale') for p in current)
+                device_cache_stale = any(item.get('device_cache_stale') for item in cache_entries)
                 roster_warning = " Team roster may have changed!" if device_cache_stale else ""
 
                 safe_error(
@@ -1646,7 +1648,7 @@ class ProviderController(QObject):
                     f"Showing CACHED positions ({age_display} old) - Network unavailable!{roster_warning}",
                     duration=10
                 )
-                print(f"[PROVIDER_CONTROLLER] SAR-fhd: Serving {len(cache_positions)} cached positions")
+                print(f"[PROVIDER_CONTROLLER] SAR-fhd: Serving {len(cache_entries)} cached positions")
 
             elif was_in_outage and outage_duration is not None:
                 # SAR-la0: Show connection restored notification

@@ -685,6 +685,38 @@ class TestProviderOutageAndCacheState:
         mock_safe_error.assert_called_once()
         assert mock_safe_error.call_args[0][1] == "OFFLINE MODE"
 
+    def test_cached_breadcrumb_only_refresh_still_warns_offline_mode(self):
+        controller, _, _ = _build_controller()
+        controller._layers_controller = MagicMock()
+
+        mock_task = MagicMock()
+        mock_task.isCanceled.return_value = False
+        mock_task.results = {
+            'current': [],
+            'breadcrumbs': [{
+                'device_id': 'dev1',
+                'name': 'Device 1',
+                'lat': 52.0,
+                'lon': -9.5,
+                'ts': '2024-01-01T10:00:00Z',
+                'data_origin': 'cache',
+                'cache_age_seconds': 120,
+                'device_cache_stale': True,
+            }],
+            'devices': [{'device_id': 'dev1', 'name': 'Device 1', 'status': 'online'}],
+        }
+
+        with patch('sartracker.controllers.provider_controller.safe_error') as mock_safe_error:
+            controller._on_refresh_task_complete(mock_task)
+
+        assert controller._last_data_state == 'cached'
+        assert controller._last_cache_age_seconds == 120
+        status = controller.status_snapshot()
+        assert status['data_state'] == 'cached'
+        assert status['cache_age_seconds'] == 120
+        mock_safe_error.assert_called_once()
+        assert mock_safe_error.call_args[0][1] == "OFFLINE MODE"
+
     def test_first_live_success_after_outage_emits_connection_restored(self):
         controller, _, _ = _build_controller()
         controller._layers_controller = MagicMock()
