@@ -46,6 +46,8 @@ As of 2026-03-28:
     shutdown, and defensive nulling of controllers even when cleanup raises
   - unload-time signal disconnection is now covered for application/project
     hooks, exit-blocker unregistration, and defensive mission-controller cleanup
+  - `_unload_set_flags()` is now covered for early task/provider shutdown,
+    coordinate cleanup, and defensive flag clearing even when cleanup raises
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

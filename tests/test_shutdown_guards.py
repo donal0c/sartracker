@@ -158,3 +158,42 @@ def test_unload_disconnect_signals_disconnects_app_and_project_hooks(monkeypatch
     assert tracker._map_canvas_connected is False
     assert tracker._exit_blocker_registered is False
     assert tracker.mission_controller is None
+
+
+def test_unload_set_flags_starts_shutdown_and_protects_callbacks():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker.error_handler = MagicMock()
+
+    SarTracker._unload_set_flags(tracker)
+
+    assert tracker._is_unloading is True
+    assert tracker._skip_layer_ops is True
+    tracker.error_handler.set_unloading.assert_called_once_with(True)
+    tracker._stop_sar_panel_timers.assert_called_once_with("plugin unload (early)")
+    tracker.task_manager.begin_shutdown.assert_called_once_with()
+    tracker._shutdown_provider_controller.assert_called_once_with(
+        "plugin unload (early)"
+    )
+    tracker.coordinates_controller.cleanup.assert_called_once_with(
+        "plugin unload (early cleanup)"
+    )
+    tracker.layer_manager.set_application_closing.assert_called_once_with(True)
+    assert tracker._coords_updates_enabled is False
+    assert tracker._map_canvas_connected is False
+
+
+def test_unload_set_flags_still_clears_coordinate_flags_when_cleanup_raises():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker.coordinates_controller.cleanup.side_effect = RuntimeError("boom")
+
+    SarTracker._unload_set_flags(tracker)
+
+    assert tracker._is_unloading is True
+    assert tracker._skip_layer_ops is True
+    assert tracker._coords_updates_enabled is False
+    assert tracker._map_canvas_connected is False
+    tracker.layer_manager.set_application_closing.assert_called_once_with(True)
