@@ -219,3 +219,48 @@ def test_unload_cancel_tasks_skips_cancel_when_no_active_tasks():
     SarTracker._unload_cancel_tasks(tracker)
 
     tracker.task_manager.cancel_all.assert_not_called()
+
+
+def test_unload_remove_actions_cleans_toolbar_menu_and_context_action():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker.tr = lambda text: text
+    tracker.actions = [MagicMock(), MagicMock()]
+    edit_marker_action = MagicMock()
+    tracker._edit_marker_action = edit_marker_action
+    tracker.iface = MagicMock(
+        removePluginMenu=MagicMock(),
+        removeToolBarIcon=MagicMock(),
+        removeCustomActionForLayerType=MagicMock(),
+    )
+
+    SarTracker._unload_remove_actions(tracker)
+
+    assert tracker.iface.removePluginMenu.call_count == 2
+    assert tracker.iface.removeToolBarIcon.call_count == 2
+    tracker.iface.removeCustomActionForLayerType.assert_called_once_with(
+        edit_marker_action
+    )
+    assert tracker._edit_marker_action is None
+
+
+def test_unload_remove_actions_skips_deleted_actions():
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    valid_action = MagicMock()
+    deleted_action = MagicMock()
+    tracker.tr = lambda text: text
+    tracker.actions = [valid_action, deleted_action]
+    tracker._edit_marker_action = None
+    tracker.iface = MagicMock(
+        removePluginMenu=MagicMock(),
+        removeToolBarIcon=MagicMock(),
+    )
+    tracker._is_qt_deleted.side_effect = lambda obj: obj is deleted_action
+
+    SarTracker._unload_remove_actions(tracker)
+
+    tracker.iface.removePluginMenu.assert_called_once_with("&sartracker", valid_action)
+    tracker.iface.removeToolBarIcon.assert_called_once_with(valid_action)

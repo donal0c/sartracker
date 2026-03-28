@@ -52,6 +52,8 @@ As of 2026-03-28:
     coordinate cleanup, and defensive flag clearing even when cleanup raises
   - `_unload_cancel_tasks()` is now covered for both active-task cancellation
     and the no-active-task fast path
+  - `_unload_remove_actions()` is now covered for menu/toolbar cleanup and
+    edit-marker context action removal, including deleted-action guarding
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 
