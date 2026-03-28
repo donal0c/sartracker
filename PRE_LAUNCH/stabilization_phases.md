@@ -31,6 +31,8 @@ As of 2026-03-28:
   - empty provider refreshes preserve existing tracking layers and no longer claim they were cleared
   - outage/cached-data controller behavior is covered by new regression tests
   - previously skipped provider-controller tests have been revived and are passing
+  - active-device layer filtering now has direct controller-level regression coverage
+    for online, offline, stale-unknown, and recent-unknown device states
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

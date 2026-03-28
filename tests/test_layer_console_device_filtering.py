@@ -19,6 +19,8 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import Mock, MagicMock, patch, call
 
+from sartracker.controllers.provider_controller import ProviderController
+
 
 # =============================================================================
 # UNIT TESTS: Position filtering logic (no Qt/QGIS required)
@@ -163,6 +165,19 @@ class TestProviderControllerLayerFiltering:
             'iface': Mock(),
         }
 
+    def _build_controller(self, mock_dependencies):
+        iface = mock_dependencies['iface']
+        iface.messageBar.return_value = Mock()
+        task_manager = Mock()
+        task_manager.is_shutting_down.return_value = False
+        controller = ProviderController(
+            iface=iface,
+            task_manager=task_manager,
+            parent=None,
+        )
+        controller._layers_controller = mock_dependencies['layers_controller']
+        return controller
+
     def test_online_device_positions_sent_to_layers(self, mock_dependencies):
         """
         Positions from online devices should be sent to layers_controller.
@@ -175,17 +190,34 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev1', 'name': 'Team Alpha', 'status': 'online', 'last_update': '2026-01-03T12:00:00Z'},
         ]
         positions = [
-            {'device_id': 'dev1', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T12:00:00Z'},
+            {'device_id': 'dev1', 'name': 'Team Alpha', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T12:00:00Z'},
         ]
 
-        # This test will FAIL until we implement the filtering
-        # The assertion documents the expected behavior
+        controller = self._build_controller(mock_dependencies)
+        task = MagicMock()
+        task.isCanceled.return_value = False
+        task.results = {
+            'current': positions,
+            'breadcrumbs': [],
+            'devices': devices,
+        }
 
-        # After implementation, when refresh completes:
-        # - layers_controller.update_current_positions should receive the position
-        # - because dev1 is online (active)
+        controller._on_refresh_task_complete(task)
 
-        pytest.skip("Implementation pending - TDD Red phase")
+        mock_dependencies['layers_controller'].update_current_positions.assert_called_once()
+        filtered_positions = (
+            mock_dependencies['layers_controller']
+            .update_current_positions
+            .call_args
+            .args[0]
+        )
+        assert len(filtered_positions) == 1
+        filtered_position = filtered_positions[0]
+        assert filtered_position['device_id'] == 'dev1'
+        assert filtered_position['name'] == 'Team Alpha'
+        assert filtered_position['lat'] == 52.0
+        assert filtered_position['lon'] == -9.0
+        assert isinstance(filtered_position['ts'], str)
 
     def test_offline_device_positions_not_sent_to_layers(self, mock_dependencies):
         """
@@ -199,15 +231,21 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev1', 'name': 'Team Alpha', 'status': 'offline', 'last_update': '2026-01-03T12:00:00Z'},
         ]
         positions = [
-            {'device_id': 'dev1', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T12:00:00Z'},
+            {'device_id': 'dev1', 'name': 'Team Alpha', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T12:00:00Z'},
         ]
 
-        # This test will FAIL until we implement the filtering
-        # After implementation:
-        # - layers_controller.update_current_positions should NOT receive the position
-        # - OR should receive an empty list
+        controller = self._build_controller(mock_dependencies)
+        task = MagicMock()
+        task.isCanceled.return_value = False
+        task.results = {
+            'current': positions,
+            'breadcrumbs': [],
+            'devices': devices,
+        }
 
-        pytest.skip("Implementation pending - TDD Red phase")
+        controller._on_refresh_task_complete(task)
+
+        mock_dependencies['layers_controller'].update_current_positions.assert_not_called()
 
     def test_stale_unknown_device_positions_not_sent_to_layers(self, mock_dependencies):
         """
@@ -222,10 +260,21 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev1', 'name': 'Team Alpha', 'status': 'unknown', 'last_update': stale_time},
         ]
         positions = [
-            {'device_id': 'dev1', 'lat': 52.0, 'lon': -9.0, 'ts': stale_time},
+            {'device_id': 'dev1', 'name': 'Team Alpha', 'lat': 52.0, 'lon': -9.0, 'ts': stale_time},
         ]
 
-        pytest.skip("Implementation pending - TDD Red phase")
+        controller = self._build_controller(mock_dependencies)
+        task = MagicMock()
+        task.isCanceled.return_value = False
+        task.results = {
+            'current': positions,
+            'breadcrumbs': [],
+            'devices': devices,
+        }
+
+        controller._on_refresh_task_complete(task)
+
+        mock_dependencies['layers_controller'].update_current_positions.assert_not_called()
 
     def test_recent_unknown_device_positions_sent_to_layers(self, mock_dependencies):
         """
@@ -240,10 +289,34 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev1', 'name': 'Team Alpha', 'status': 'unknown', 'last_update': recent_time},
         ]
         positions = [
-            {'device_id': 'dev1', 'lat': 52.0, 'lon': -9.0, 'ts': recent_time},
+            {'device_id': 'dev1', 'name': 'Team Alpha', 'lat': 52.0, 'lon': -9.0, 'ts': recent_time},
         ]
 
-        pytest.skip("Implementation pending - TDD Red phase")
+        controller = self._build_controller(mock_dependencies)
+        task = MagicMock()
+        task.isCanceled.return_value = False
+        task.results = {
+            'current': positions,
+            'breadcrumbs': [],
+            'devices': devices,
+        }
+
+        controller._on_refresh_task_complete(task)
+
+        mock_dependencies['layers_controller'].update_current_positions.assert_called_once()
+        filtered_positions = (
+            mock_dependencies['layers_controller']
+            .update_current_positions
+            .call_args
+            .args[0]
+        )
+        assert len(filtered_positions) == 1
+        filtered_position = filtered_positions[0]
+        assert filtered_position['device_id'] == 'dev1'
+        assert filtered_position['name'] == 'Team Alpha'
+        assert filtered_position['lat'] == 52.0
+        assert filtered_position['lon'] == -9.0
+        assert isinstance(filtered_position['ts'], str)
 
     def test_all_devices_sent_to_sar_panel_unfiltered(self, mock_dependencies):
         """
@@ -259,11 +332,11 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev3', 'name': 'Unknown', 'status': 'unknown', 'last_update': '2026-01-03T12:00:00Z'},
         ]
 
-        # After implementation:
-        # - sar_panel.update_devices should receive ALL 3 devices
-        # - No filtering applied to device list
-
-        pytest.skip("Implementation pending - TDD Red phase")
+        # Current architecture no longer pushes the device list directly into
+        # the SAR panel from ProviderController; DevicesController subscribes
+        # to refresh_complete instead. Keep this scenario as a placeholder until
+        # that path is exercised through the dedicated controller tests.
+        pytest.skip("Current device-list path is owned by DevicesController, not ProviderController")
 
     def test_breadcrumbs_also_filtered_by_active_devices(self, mock_dependencies):
         """
@@ -278,9 +351,9 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev2', 'name': 'Inactive', 'status': 'offline', 'last_update': '2026-01-03T12:00:00Z'},
         ]
         breadcrumbs = [
-            {'device_id': 'dev1', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T11:00:00Z'},
-            {'device_id': 'dev1', 'lat': 52.1, 'lon': -9.1, 'ts': '2026-01-03T12:00:00Z'},
-            {'device_id': 'dev2', 'lat': 53.0, 'lon': -8.0, 'ts': '2026-01-03T12:00:00Z'},  # Should be filtered
+            {'device_id': 'dev1', 'name': 'Active', 'lat': 52.0, 'lon': -9.0, 'ts': '2026-01-03T11:00:00Z'},
+            {'device_id': 'dev1', 'name': 'Active', 'lat': 52.1, 'lon': -9.1, 'ts': '2026-01-03T12:00:00Z'},
+            {'device_id': 'dev2', 'name': 'Inactive', 'lat': 53.0, 'lon': -8.0, 'ts': '2026-01-03T12:00:00Z'},  # Should be filtered
         ]
 
         # After implementation:
