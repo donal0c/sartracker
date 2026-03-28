@@ -73,6 +73,8 @@ plugin_upload.py
 # Test output files
 test_results.txt
 test_summary.txt
+.coverage
+crash.txt
 
 # Build artifacts
 VERSION.txt
@@ -80,12 +82,10 @@ VERSION.txt
 # Other files
 cleanup.sh
 
-# Documentation files (keep only README.md under version control)
+# Documentation and planning (moved to OLD_DOCS)
+OLD_DOCS/
 archive/
 issues/
-docs/**
-!docs/
-!docs/compatibility_and_best_practices.md
 research/*.md
 
 
