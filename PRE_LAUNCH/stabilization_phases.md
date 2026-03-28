@@ -44,6 +44,8 @@ As of 2026-03-28:
 - `Phase 4` has now started with early shutdown coverage:
   - `aboutToQuit` early cleanup is now covered for flag-setting, task/provider
     shutdown, and defensive nulling of controllers even when cleanup raises
+  - unload-time signal disconnection is now covered for application/project
+    hooks, exit-blocker unregistration, and defensive mission-controller cleanup
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

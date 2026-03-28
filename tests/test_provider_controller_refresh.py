@@ -4,12 +4,25 @@ Unit tests for ProviderController refresh filtering behavior.
 
 These tests run without a QGIS runtime using mocked interfaces.
 """
+import pytest
 from unittest.mock import MagicMock, patch
 
 from sartracker.controllers.provider_controller import ProviderController
 from sartracker.config.keys import ConfigStore
 from sartracker.utils.timeparse import parse_iso, format_iso
 from datetime import datetime, timezone, timedelta
+
+
+@pytest.fixture(autouse=True)
+def _reset_replay_settings():
+    """Keep replay-window config from leaking between branch-matrix tests."""
+    ConfigStore.set_traccar_test_window_enabled(False)
+    ConfigStore.set_traccar_test_window_start("")
+    ConfigStore.set_traccar_test_window_hours(3)
+    yield
+    ConfigStore.set_traccar_test_window_enabled(False)
+    ConfigStore.set_traccar_test_window_start("")
+    ConfigStore.set_traccar_test_window_hours(3)
 
 
 def _build_controller(provider_name: str):

@@ -104,3 +104,57 @@ def test_about_to_quit_skips_task_cancellation_when_no_active_tasks():
     SarTracker._on_app_about_to_quit(tracker)
 
     tracker.task_manager.cancel_all.assert_not_called()
+
+
+def test_unload_disconnect_signals_disconnects_app_and_project_hooks(monkeypatch):
+    from sartracker import sartracker as sartracker_module
+
+    tracker, SarTracker = _build_tracker()
+    tracker._map_canvas_connected = True
+    tracker._exit_blocker_registered = True
+    tracker._focus_mode_exit_blocker = object()
+    tracker._on_project_read = MagicMock()
+    tracker._on_new_project_created = MagicMock()
+    tracker._on_mission_state_changed = MagicMock()
+    tracker._on_mission_timing_update = MagicMock()
+    tracker._safe_disconnect = MagicMock()
+
+    project_read = SimpleNamespace(disconnect=MagicMock())
+    new_project = SimpleNamespace(disconnect=MagicMock())
+    tracker.iface = MagicMock(
+        projectRead=project_read,
+        newProjectCreated=new_project,
+        unregisterApplicationExitBlocker=MagicMock(),
+    )
+    mission_controller = MagicMock(
+        mission_state_changed=MagicMock(),
+        mission_timing_updated=MagicMock(),
+        cleanup=MagicMock(),
+    )
+    tracker.mission_controller = mission_controller
+
+    app = SimpleNamespace(aboutToQuit=SimpleNamespace(disconnect=MagicMock()))
+    monkeypatch.setattr(sartracker_module.QCoreApplication, "instance", MagicMock(return_value=app))
+
+    SarTracker._unload_disconnect_signals(tracker)
+
+    app.aboutToQuit.disconnect.assert_called_once_with(tracker._on_app_about_to_quit)
+    project_read.disconnect.assert_called_once_with(tracker._on_project_read)
+    new_project.disconnect.assert_called_once_with(tracker._on_new_project_created)
+    tracker.iface.unregisterApplicationExitBlocker.assert_called_once_with(
+        tracker._focus_mode_exit_blocker
+    )
+    tracker._safe_disconnect.assert_any_call(
+        mission_controller.mission_state_changed,
+        tracker._on_mission_state_changed,
+        "mission_state_changed",
+    )
+    tracker._safe_disconnect.assert_any_call(
+        mission_controller.mission_timing_updated,
+        tracker._on_mission_timing_update,
+        "mission_timing_updated",
+    )
+    mission_controller.cleanup.assert_called_once_with()
+    assert tracker._map_canvas_connected is False
+    assert tracker._exit_blocker_registered is False
+    assert tracker.mission_controller is None
