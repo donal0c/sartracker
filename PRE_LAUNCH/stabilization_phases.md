@@ -35,6 +35,10 @@ As of 2026-03-28:
     for online, offline, stale-unknown, and recent-unknown device states
   - the filtered-layers vs unfiltered-device-list contract is now covered
     explicitly across `ProviderController` and `DevicesController`
+  - invalid replay settings now unwind replay temp-store state and clear the
+    replay indicator signal instead of leaving failure-path residue behind
+  - cached refreshes with `cache_age_seconds == 0` now still take the cached /
+    offline warning path instead of falling through as if they were live
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

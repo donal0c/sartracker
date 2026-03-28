@@ -4,7 +4,7 @@ Unit tests for ProviderController refresh filtering behavior.
 
 These tests run without a QGIS runtime using mocked interfaces.
 """
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from sartracker.controllers.provider_controller import ProviderController
 from sartracker.config.keys import ConfigStore
@@ -135,3 +135,64 @@ def test_replay_hours_out_of_range_blocks_refresh():
 
     assert started is False
     provider.create_refresh_task.assert_not_called()
+
+
+def test_invalid_replay_window_emits_disabled_signal():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: False)
+
+    signals = []
+    controller.replay_mode_changed.connect(
+        lambda enabled, start, end: signals.append((enabled, start, end))
+    )
+
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start("2999-01-01T00:00:00Z")
+    ConfigStore.set_traccar_test_window_hours(3)
+
+    started = controller.start_refresh()
+
+    assert started is False
+    assert ConfigStore.get_traccar_test_window_enabled() is False
+    provider.create_refresh_task.assert_not_called()
+    assert signals[-1] == (False, "", "")
+
+
+def test_invalid_replay_window_cleans_up_temp_store():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: False)
+
+    temp_store_path = {'value': None}
+    cleared = []
+
+    def set_temp_store(path):
+        temp_store_path['value'] = path
+
+    def clear_temp_store():
+        cleared.append(temp_store_path['value'])
+        temp_store_path['value'] = None
+
+    def get_temp_store():
+        return temp_store_path['value']
+
+    controller.set_temp_store_handlers(
+        setter=set_temp_store,
+        clearer=clear_temp_store,
+        getter=get_temp_store,
+    )
+
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start("2999-01-01T00:00:00Z")
+    ConfigStore.set_traccar_test_window_hours(3)
+
+    with patch(
+        'sartracker.utils.mission_storage.MissionStorageHelper.prepare_temp_replay_store',
+        return_value='/tmp/replay-invalid.gpkg',
+    ):
+        started = controller.start_refresh()
+
+    assert started is False
+    assert ConfigStore.get_traccar_test_window_enabled() is False
+    provider.create_refresh_task.assert_not_called()
+    assert cleared == ['/tmp/replay-invalid.gpkg']
+    assert temp_store_path['value'] is None

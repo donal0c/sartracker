@@ -1263,6 +1263,11 @@ class ProviderController(QObject):
                         ConfigStore.set_traccar_test_window_enabled(False)
                     except Exception as disable_error:
                         print(f"[PROVIDER_CONTROLLER] Warning: Could not disable replay after invalid settings: {disable_error}")
+                    self._cleanup_replay_temp_store()
+                    try:
+                        self.replay_mode_changed.emit(False, "", "")
+                    except Exception as sig_err:
+                        print(f"[PROVIDER_CONTROLLER] Warning: Could not emit replay_mode_changed: {sig_err}")
                     safe_warning(
                         self.iface,
                         "Replay Window Invalid",
@@ -1620,7 +1625,7 @@ class ProviderController(QObject):
                 self._emit_status('ok', f'Last refresh: {total_count} devices')
 
             # Show user feedback based on cache/outage state
-            if was_cached and cache_age_seconds:
+            if was_cached and cache_age_seconds is not None:
                 age_minutes = cache_age_seconds / 60
                 if age_minutes >= 60:
                     age_display = f"{age_minutes / 60:.1f} hours"
