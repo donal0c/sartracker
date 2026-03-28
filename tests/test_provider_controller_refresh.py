@@ -122,6 +122,47 @@ def test_replay_disabled_when_mission_active():
     assert kwargs.get('until_iso') is None
 
 
+def test_replay_disabled_when_mission_active_clears_temp_store_and_signal():
+    controller, provider, task_manager = _build_controller('traccar_http')
+    controller.set_mission_active_getter(lambda: True)
+    controller.set_mission_start_getter(lambda: "2026-01-03T10:14:18Z")
+
+    temp_store_path = {'value': '/tmp/replay-live.gpkg'}
+    cleared = []
+    signals = []
+
+    def set_temp_store(path):
+        temp_store_path['value'] = path
+
+    def clear_temp_store():
+        cleared.append(temp_store_path['value'])
+        temp_store_path['value'] = None
+
+    def get_temp_store():
+        return temp_store_path['value']
+
+    controller.set_temp_store_handlers(
+        setter=set_temp_store,
+        clearer=clear_temp_store,
+        getter=get_temp_store,
+    )
+    controller.replay_mode_changed.connect(
+        lambda enabled, start, end: signals.append((enabled, start, end))
+    )
+
+    ConfigStore.set_traccar_test_window_enabled(True)
+    ConfigStore.set_traccar_test_window_start("2026-01-04T08:00:00Z")
+    ConfigStore.set_traccar_test_window_hours(3)
+
+    started = controller.start_refresh()
+
+    assert started is True
+    assert ConfigStore.get_traccar_test_window_enabled() is False
+    assert cleared == ['/tmp/replay-live.gpkg']
+    assert temp_store_path['value'] is None
+    assert signals[-1] == (False, "", "")
+
+
 def test_replay_start_future_blocks_refresh():
     controller, provider, task_manager = _build_controller('traccar_http')
     controller.set_mission_active_getter(lambda: False)
