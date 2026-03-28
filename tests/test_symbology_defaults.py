@@ -72,8 +72,8 @@ def test_casualties_symbol_defaults(sar_iface, sar_qgis_project):
 
     symbol = _marker_symbol(layer)
     props = symbol.symbolLayer(0).properties()
-    assert props.get("name") == "cross2"
-    assert symbol.size() == pytest.approx(12.0, abs=0.01)
+    assert props.get("name") == "star"
+    assert symbol.size() == pytest.approx(16.0, abs=0.01)
     assert _property_color_name(props, "color") == QColor("#ff0000").name()
 
 

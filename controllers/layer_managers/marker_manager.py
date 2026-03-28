@@ -610,11 +610,11 @@ class MarkerLayerManager(BaseLayerManager):
 
     def _style_casualties_layer(self, layer: QgsVectorLayer):
         symbol = QgsMarkerSymbol.createSimple({
-            'name': 'cross2',
+            'name': 'star',
             'color': '#FF0000',
-            'size': '12',
+            'size': '16',
             'outline_color': 'black',
-            'outline_width': '0.8'
+            'outline_width': '1.0'
         })
         # Add drop shadow effect for visual prominence (life-safety critical marker)
         shadow = QgsDropShadowEffect()
