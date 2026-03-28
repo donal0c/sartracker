@@ -73,6 +73,7 @@ class SARPanel(QDockWidget):
     """
     
     refresh_requested = pyqtSignal()
+    add_marker_requested = pyqtSignal()
     add_poi_requested = pyqtSignal()
     add_clue_requested = pyqtSignal()
     add_casualty_requested = pyqtSignal()
@@ -546,44 +547,13 @@ class SARPanel(QDockWidget):
         markers_group = QGroupBox("Markers & Clues")
         markers_layout = QVBoxLayout()
 
-        # Use grid layout for compact 2-column arrangement
-        markers_grid = QGridLayout()
-
-        self.add_ipp_lkp_button = QPushButton("IPP/LKP")
-        self.add_ipp_lkp_button.setToolTip(
-            "Add Initial Planning Point / Last Known Position\n"
-            "The starting point for search planning where the\n"
-            "subject was last reliably seen or located."
+        self.add_marker_button = QPushButton("Marker / Clues")
+        self.add_marker_button.setToolTip(
+            "Click on the map, then choose marker type in the normal marker form.\n"
+            "Use this for IPP/LKP, clues, hazards, and casualties."
         )
-        self.add_ipp_lkp_button.clicked.connect(self._on_add_poi)
-        markers_grid.addWidget(self.add_ipp_lkp_button, 0, 0)
-
-        self.add_clue_button = QPushButton("Clue")
-        self.add_clue_button.setToolTip(
-            "Add evidence or clues found during search:\n"
-            "Footprints, clothing, equipment, witness sightings, etc."
-        )
-        self.add_clue_button.clicked.connect(self._on_add_clue)
-        markers_grid.addWidget(self.add_clue_button, 0, 1)
-
-        self.add_hazard_button = QPushButton("Hazard")
-        self.add_hazard_button.setToolTip(
-            "Mark safety hazards on the map:\n"
-            "Cliffs, water hazards, bogs, dense vegetation, etc."
-        )
-        self.add_hazard_button.clicked.connect(self._on_add_hazard)
-        markers_grid.addWidget(self.add_hazard_button, 1, 0)
-
-        self.add_casualty_button = QPushButton("Casualty")
-        self.add_casualty_button.setToolTip(
-            "Add found injured or deceased person:\n"
-            "CRITICAL: Use for actual casualties requiring medical response,\n"
-            "evacuation, and legal documentation. NOT for evidence/clues."
-        )
-        self.add_casualty_button.clicked.connect(self._on_add_casualty)
-        markers_grid.addWidget(self.add_casualty_button, 1, 1)
-
-        markers_layout.addLayout(markers_grid)
+        self.add_marker_button.clicked.connect(self._on_add_marker)
+        markers_layout.addWidget(self.add_marker_button)
 
         self.add_marker_by_grid_button = QPushButton("Marker at GR")
         self.add_marker_by_grid_button.setToolTip(
@@ -1212,6 +1182,10 @@ class SARPanel(QDockWidget):
     def _on_add_poi(self):
         """Handle Add POI button click."""
         self.add_poi_requested.emit()
+
+    def _on_add_marker(self):
+        """Handle generic Marker / Clues button click."""
+        self.add_marker_requested.emit()
 
     def _on_add_clue(self):
         """Handle Add Clue button click."""

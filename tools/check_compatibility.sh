@@ -259,6 +259,7 @@ DEPRECATED_CRS=$(grep -rE "(EPSG:29903|[=(]29903[)]?)" . --include="*.py" \
     --exclude-dir=".git" \
     --exclude-dir="__pycache__" \
     --exclude-dir=".pytest_cache" \
+    --exclude-dir="tests" \
     --exclude-dir="archive" \
     --exclude-dir="From_Eamon" \
     --exclude-dir="FINDINGS" \

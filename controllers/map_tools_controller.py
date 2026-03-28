@@ -444,6 +444,29 @@ class MapToolsController(QObject):
                 duration=4
             )
 
+    def on_add_marker_requested(self):
+        """Handle generic Marker / Clues button click from SAR Panel."""
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        self.current_marker_type = None
+        if self.marker_tool:
+            self.marker_tool.set_marker_context(None)
+            self.iface.mapCanvas().setMapTool(self.marker_tool)
+            info(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Click on map to add a marker, clue, hazard, or casualty",
+                duration=4
+            )
+        else:
+            warning(
+                self.iface.messageBar(),
+                "SAR Tracker",
+                "Marker tool not available",
+                duration=4
+            )
+
     def on_add_clue_requested(self):
         """Handle Add Clue button click from SAR Panel."""
         if self.tool_registry:
@@ -478,7 +501,7 @@ class MapToolsController(QObject):
             self.iface.mapCanvas().setMapTool(self.marker_tool)
             info(
                 self.iface.messageBar(),
-                "SAR Tracker - CRITICAL",
+                "SAR Tracker",
                 "Click on map to add Casualty location (found injured/deceased person)",
                 duration=5
             )

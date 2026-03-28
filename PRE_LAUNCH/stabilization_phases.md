@@ -56,6 +56,13 @@ As of 2026-03-28:
   - a new TM65-first `Marker at GR` workflow now lets operators enter a grid
     reference, convert it safely, and continue into the normal marker dialog
     with coordinates pre-filled
+  - the casualty placement prompt no longer brands a normal map-click workflow
+    as `CRITICAL`, reducing field-noise confusion
+  - a ranked runtime warning triage note now separates likely Qt/QGIS noise
+    from real plugin-side hardening work
+  - the Qt compatibility guard now passes on the current repository again after
+    fixing stale documentation expectations and excluding test-only EPSG
+    references from the deprecated-CRS scan
 - `Phase 4` has now started with early shutdown coverage:
   - `aboutToQuit` early cleanup is now covered for flag-setting, task/provider
     shutdown, and defensive nulling of controllers even when cleanup raises
@@ -286,7 +293,7 @@ Prevent crashes, race conditions, and inconsistent state during unload, project 
 - `4` dedicated KMRT toolbar: tracked, not started
 - `5` Traccar client bootstrap / registration flow: tracked, not started
 - `6` simplify Marker/Clues controls and improve narrow-width panel layout:
-  tracked, not started
+  done
 - `7` trail visual preferences: first-pass trail dot styling done, optional
   direction-arrow work still open
 
@@ -301,6 +308,17 @@ Prevent crashes, race conditions, and inconsistent state during unload, project 
 - `6` Clue form expansion: done
 - `7` Range ring styling: done
 - `8` Search Area / Text Label completion: deferred pending fuller team detail
+
+### Eamonn bug / nuisance items
+
+- startup interference with normal QGIS launch: done
+- duplicate Resume/Fresh prompt: done
+- startup layer restoration / Repair issue: done
+- panel-width / Marker-Clues usability issue: done in first-pass cleanup
+- current-QGIS compatibility complaint: investigated; no concrete runtime
+  incompatibility reproduced on the current codebase, guard/tooling repaired
+- runtime warnings / diagnostics bundle: triaged in
+  [runtime_warning_triage.md](/Users/donalocallaghan/Documents/Qgis/sartracker/PRE_LAUNCH/runtime_warning_triage.md)
 - shutdown ordering is documented and tested
 
 ---

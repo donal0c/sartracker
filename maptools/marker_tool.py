@@ -230,6 +230,9 @@ class MarkerMapTool(QgsMapTool):
             pixmap.fill(QColor(0, 0, 0, 0))
 
             painter = QPainter(pixmap)
+            is_active = getattr(painter, "isActive", None)
+            if callable(is_active) and not is_active():
+                return None
             antialias_hint = getattr(QPainter, "Antialiasing", None)
             if antialias_hint is None and hasattr(QPainter, "RenderHint"):
                 antialias_hint = QPainter.RenderHint.Antialiasing

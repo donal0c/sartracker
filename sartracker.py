@@ -634,6 +634,7 @@ class sartracker:
             self.map_tools_controller.set_sar_panel(self.sar_panel)
 
             # Marker tool signals
+            self.sar_panel.add_marker_requested.connect(self.map_tools_controller.on_add_marker_requested)
             self.sar_panel.add_poi_requested.connect(self.map_tools_controller.on_add_poi_requested)
             self.sar_panel.add_clue_requested.connect(self.map_tools_controller.on_add_clue_requested)
             self.sar_panel.add_casualty_requested.connect(self.map_tools_controller.on_add_casualty_requested)
