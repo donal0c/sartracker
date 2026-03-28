@@ -45,6 +45,17 @@ As of 2026-03-28:
     cleanup, and replay-indicator clearing before live refresh proceeds
   - breadcrumb-only cached refreshes now correctly surface cached/offline state
     instead of being misclassified as live data
+  - casualty markers now use a much more prominent default symbol
+  - range rings now use a stronger patterned fill and outline for upland
+    visibility without fully hiding the basemap
+  - coordinate-converter `Go to Location on Map` now shows a temporary target
+    marker so the destination point is visually obvious
+  - breadcrumb trails now use dot styling instead of dash styling
+  - clue markers now capture `Found by`, and marker dialogs now show a TM65
+    Irish Grid reference when available
+  - a new TM65-first `Marker at GR` workflow now lets operators enter a grid
+    reference, convert it safely, and continue into the normal marker dialog
+    with coordinates pre-filled
 - `Phase 4` has now started with early shutdown coverage:
   - `aboutToQuit` early cleanup is now covered for flag-setting, task/provider
     shutdown, and defensive nulling of controllers even when cleanup raises
@@ -58,6 +69,9 @@ As of 2026-03-28:
     edit-marker context action removal, including deleted-action guarding
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
+- the main remaining team-feedback item awaiting clarification is the broader
+  scope of `Irish Grid Reference 65` display across marker surfaces, which is
+  tracked separately from the completed `Marker at GR` workflow
 
 The rest of the mission lifecycle findings uncovered so far have either been
 converted into passing regressions or explicitly deferred.
@@ -236,6 +250,7 @@ Make live tracking refresh behavior resilient to outages, stale data, replay mod
 - stale data is clearly identified
 - replay cannot contaminate live mission data
 - last-known positions are preserved safely during transient failures
+- visual tracking defaults are clearer for operators under field conditions
 
 ---
 
@@ -258,6 +273,34 @@ Prevent crashes, race conditions, and inconsistent state during unload, project 
 - clean unload without late callbacks mutating torn-down UI
 - reduced risk of shutdown crashes
 - project switching behaves cleanly
+
+---
+
+## Team Feedback Status Snapshot
+
+### Seán items
+
+- `1` clean startup / explicit activation: done
+- `2` duplicate Resume/Fresh prompt: done
+- `3` startup layer restoration / Repair issue: done
+- `4` dedicated KMRT toolbar: tracked, not started
+- `5` Traccar client bootstrap / registration flow: tracked, not started
+- `6` simplify Marker/Clues controls and improve narrow-width panel layout:
+  tracked, not started
+- `7` trail visual preferences: first-pass trail dot styling done, optional
+  direction-arrow work still open
+
+### Eamonn requests
+
+- `1` Marker at GR: done
+- `2` Coordinate converter visible target: done
+- `3` Trail dot styling: done
+- `4` Casualty marker prominence: done
+- `5` Irish Grid Reference 65 in markers: partially addressed in dialog display,
+  awaiting scope clarification before closure
+- `6` Clue form expansion: done
+- `7` Range ring styling: done
+- `8` Search Area / Text Label completion: deferred pending fuller team detail
 - shutdown ordering is documented and tested
 
 ---

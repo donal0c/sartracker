@@ -16,7 +16,7 @@ contains:
 - focused lifecycle verification:
   `110 passed`
 - full-suite verification:
-  `1049 passed, 159 skipped, 1 xfailed`
+  `1088 passed, 158 skipped, 1 xfailed`
 
 ## Lifecycle Findings Burned Down In This Slice
 
