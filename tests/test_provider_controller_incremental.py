@@ -9,6 +9,7 @@ TDD: Tests written BEFORE implementation per CLAUDE.md guidelines.
 """
 
 import pytest
+from datetime import datetime, timedelta
 from unittest.mock import Mock, MagicMock, patch
 
 from sartracker.controllers.provider_controller import ProviderController
@@ -95,6 +96,34 @@ class TestBreadcrumbAccumulatorIntegration:
 
         # After refresh with breadcrumbs, accumulator should be initialized
         assert controller._breadcrumb_accumulator is not None
+
+    def test_empty_refresh_preserves_layers_and_does_not_claim_clear(self):
+        """
+        Empty refresh results should preserve existing layer state and avoid
+        misleading operator messaging about layers being cleared.
+        """
+        controller, _, _ = _build_controller()
+
+        mock_layers = MagicMock()
+        controller._layers_controller = mock_layers
+
+        mock_task = MagicMock()
+        mock_task.isCanceled.return_value = False
+        mock_task.results = {
+            'current': [],
+            'breadcrumbs': [],
+            'devices': [],
+        }
+
+        with patch('sartracker.controllers.provider_controller.safe_info') as mock_safe_info:
+            controller._on_refresh_task_complete(mock_task)
+
+        mock_layers.update_current_positions.assert_not_called()
+        mock_layers.update_breadcrumbs.assert_not_called()
+        mock_safe_info.assert_called_once()
+        message = mock_safe_info.call_args[0][2]
+        assert "layers cleared" not in message.lower()
+        assert "preserv" in message.lower()
 
     def test_accumulator_reset_on_new_mission(self):
         """Accumulator should be reset when a new mission starts."""
@@ -569,3 +598,89 @@ class TestTraccarRefreshTaskDeviceTimestamps:
 
         # Verify get_breadcrumbs was called (with None for device_timestamps)
         mock_provider.get_breadcrumbs.assert_called_once()
+
+
+class TestProviderOutageAndCacheState:
+    """Regression coverage for outage/cached-data operator messaging."""
+
+    def test_refresh_error_sets_outage_state(self):
+        controller, _, _ = _build_controller()
+
+        mock_task = MagicMock()
+        mock_task.error_message = "timeout"
+
+        with patch('sartracker.controllers.provider_controller.safe_error') as mock_safe_error:
+            controller._on_refresh_task_error(mock_task)
+
+        assert controller._consecutive_refresh_failures == 1
+        assert controller._first_failure_time is not None
+        assert controller._last_data_state == 'outage'
+        status = controller.status_snapshot()
+        assert status['data_state'] == 'outage'
+        mock_safe_error.assert_called_once()
+
+    def test_cached_refresh_emits_offline_mode_warning_and_cached_status(self):
+        controller, _, _ = _build_controller()
+        controller._layers_controller = MagicMock()
+
+        mock_task = MagicMock()
+        mock_task.isCanceled.return_value = False
+        mock_task.results = {
+            'current': [{
+                'device_id': 'dev1',
+                'name': 'Device 1',
+                'lat': 52.0,
+                'lon': -9.5,
+                'ts': '2024-01-01T10:00:00Z',
+                'data_origin': 'cache',
+                'cache_age_seconds': 600,
+                'device_cache_stale': True,
+            }],
+            'breadcrumbs': [],
+            'devices': [{'device_id': 'dev1', 'name': 'Device 1', 'status': 'online'}],
+        }
+
+        with patch('sartracker.controllers.provider_controller.safe_error') as mock_safe_error:
+            controller._on_refresh_task_complete(mock_task)
+
+        assert controller._last_data_state == 'cached'
+        assert controller._last_cache_age_seconds == 600
+        status = controller.status_snapshot()
+        assert status['data_state'] == 'cached'
+        assert status['cache_age_seconds'] == 600
+        mock_safe_error.assert_called_once()
+        assert mock_safe_error.call_args[0][1] == "OFFLINE MODE"
+        assert "cached positions" in mock_safe_error.call_args[0][2].lower()
+        assert "team roster may have changed" in mock_safe_error.call_args[0][2].lower()
+
+    def test_first_live_success_after_outage_emits_connection_restored(self):
+        controller, _, _ = _build_controller()
+        controller._layers_controller = MagicMock()
+        controller._consecutive_refresh_failures = 2
+        controller._first_failure_time = datetime.now() - timedelta(minutes=3)
+
+        mock_task = MagicMock()
+        mock_task.isCanceled.return_value = False
+        mock_task.results = {
+            'current': [{
+                'device_id': 'dev1',
+                'name': 'Device 1',
+                'lat': 52.0,
+                'lon': -9.5,
+                'ts': '2024-01-01T10:00:00Z',
+            }],
+            'breadcrumbs': [],
+            'devices': [{'device_id': 'dev1', 'name': 'Device 1', 'status': 'online'}],
+        }
+
+        with patch('sartracker.controllers.provider_controller.safe_success') as mock_safe_success:
+            controller._on_refresh_task_complete(mock_task)
+
+        assert controller._consecutive_refresh_failures == 0
+        assert controller._first_failure_time is None
+        assert controller._last_data_state == 'live'
+        status = controller.status_snapshot()
+        assert status['data_state'] == 'live'
+        mock_safe_success.assert_called_once()
+        assert mock_safe_success.call_args[0][1] == "CONNECTION RESTORED"
+        assert "positions now live" in mock_safe_success.call_args[0][2].lower()

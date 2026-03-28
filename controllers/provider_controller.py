@@ -1668,7 +1668,7 @@ class ProviderController(QObject):
                 safe_info(
                     self.iface,
                     "SAR Tracker",
-                    "Refresh completed but no tracking data was returned; layers cleared.",
+                    "Refresh completed but no tracking data was returned; preserving existing map data.",
                     duration=3
                 )
 

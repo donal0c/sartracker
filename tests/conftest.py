@@ -19,6 +19,7 @@ To skip integration tests:
 import os
 import sys
 import types
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -350,6 +351,35 @@ def sample_coordinates():
 # ====================================================================
 
 if _pytest_qgis_available and _qgis_available:
+    @pytest.fixture(autouse=True, scope="session")
+    def qgis_app(request):
+        """
+        Wrap pytest-qgis qgis_app teardown with a defensive disconnect guard.
+
+        pytest-qgis unconditionally disconnects QgsProject.legendLayersAdded
+        from _APP.processEvents at session teardown. In our mixed real-QGIS
+        suite that connection can already be gone by teardown time, which
+        raises a TypeError and masks otherwise green runs.
+        """
+        from pytest_qgis import pytest_qgis as pytest_qgis_module
+
+        yield pytest_qgis_module._APP if not request.config._plugin_settings.qgis_init_disabled else None
+
+        if not request.config._plugin_settings.qgis_init_disabled:
+            app = pytest_qgis_module._APP
+            canvas = pytest_qgis_module._CANVAS
+            qgis_config_path = pytest_qgis_module._QGIS_CONFIG_PATH
+            assert app
+            with contextlib.suppress(TypeError, RuntimeError):
+                pytest_qgis_module.QgsProject.instance().legendLayersAdded.disconnect(app.processEvents)
+            if canvas is not None and not pytest_qgis_module.sip.isdeleted(canvas):
+                canvas.deleteLater()
+            app.exitQgis()
+            if qgis_config_path and qgis_config_path.exists():
+                with contextlib.suppress(PermissionError):
+                    import shutil
+                    shutil.rmtree(qgis_config_path)
+
     # Re-export pytest-qgis fixtures for convenience
     # These will be available when running with real QGIS
 

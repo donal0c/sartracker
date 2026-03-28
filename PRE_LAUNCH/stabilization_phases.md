@@ -27,6 +27,10 @@ As of 2026-03-28:
 - `Phase 2` has now delivered:
   - truthful autosave status semantics for async backup completion
   - clean start-fresh workspace reset when mission names collide
+- `Phase 3` is now underway with early hardening already landed:
+  - empty provider refreshes preserve existing tracking layers and no longer claim they were cleared
+  - outage/cached-data controller behavior is covered by new regression tests
+  - previously skipped provider-controller tests have been revived and are passing
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 
