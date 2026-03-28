@@ -77,6 +77,7 @@ class SARPanel(QDockWidget):
     add_clue_requested = pyqtSignal()
     add_casualty_requested = pyqtSignal()
     add_hazard_requested = pyqtSignal()
+    add_marker_by_grid_requested = pyqtSignal()
     line_tool_requested = pyqtSignal()
     polygon_tool_requested = pyqtSignal()
     range_rings_tool_requested = pyqtSignal()
@@ -583,6 +584,15 @@ class SARPanel(QDockWidget):
         markers_grid.addWidget(self.add_casualty_button, 1, 1)
 
         markers_layout.addLayout(markers_grid)
+
+        self.add_marker_by_grid_button = QPushButton("Marker at GR")
+        self.add_marker_by_grid_button.setToolTip(
+            "Enter a TM65 Irish Grid reference and continue into the normal\n"
+            "marker form with coordinates pre-filled."
+        )
+        self.add_marker_by_grid_button.clicked.connect(self._on_add_marker_by_grid)
+        markers_layout.addWidget(self.add_marker_by_grid_button)
+
         markers_group.setLayout(markers_layout)
         layout.addWidget(markers_group)
 
@@ -1214,6 +1224,10 @@ class SARPanel(QDockWidget):
     def _on_add_hazard(self):
         """Handle Add Hazard button click."""
         self.add_hazard_requested.emit()
+
+    def _on_add_marker_by_grid(self):
+        """Handle Marker at Grid Reference button click."""
+        self.add_marker_by_grid_requested.emit()
 
     def _on_coordinate_converter(self):
         """Handle Coordinate Converter button click."""

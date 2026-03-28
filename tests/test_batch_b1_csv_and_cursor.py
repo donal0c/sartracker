@@ -25,6 +25,18 @@ def test_sar_panel_no_csv_load_signal():
     assert hasattr(SARPanel, "csv_load_requested") is False
 
 
+def test_sar_panel_exposes_marker_by_grid_reference_signal():
+    """SAR panel should expose explicit marker-by-grid-reference workflow."""
+    import os
+
+    root = os.path.dirname(os.path.dirname(__file__))
+    source_path = os.path.join(root, "ui", "sar_panel.py")
+    with open(source_path, "r", encoding="utf-8") as handle:
+        source = handle.read()
+
+    assert "add_marker_by_grid_requested = pyqtSignal()" in source
+
+
 
 def test_plugin_no_load_csv_handler():
     """Plugin should not maintain legacy _on_load_csv wiring endpoint."""
@@ -81,3 +93,10 @@ def test_add_casualty_sets_marker_cursor_context():
 
     marker_tool.set_marker_context.assert_called_once_with("casualty")
     iface.mapCanvas.return_value.setMapTool.assert_called_once_with(marker_tool)
+
+
+def test_map_tools_controller_exposes_marker_by_grid_reference_handler():
+    """Map tools controller should offer explicit marker-by-grid entry path."""
+    from sartracker.controllers.map_tools_controller import MapToolsController
+
+    assert hasattr(MapToolsController, "on_add_marker_by_grid_requested") is True

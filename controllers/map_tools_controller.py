@@ -36,6 +36,7 @@ from qgis.core import (
     QgsCoordinateTransform,
     QgsProject,
     QgsRectangle,
+    QgsCsException,
 )
 
 from ..utils.qt_compat import (
@@ -43,6 +44,7 @@ from ..utils.qt_compat import (
     MessageBoxYes, MessageBoxNo,
 )
 from ..utils.notify import info, warning, error, success
+from ..utils.coordinates import parse_irish_grid_reference, build_tm65_crs
 
 # sip.isdeleted import pattern (Qt5/Qt6 compatible)
 try:
@@ -510,6 +512,97 @@ class MapToolsController(QObject):
                 "Marker tool not available",
                 duration=4
             )
+
+    def on_add_marker_by_grid_requested(self):
+        """Handle explicit Marker at Grid Reference workflow."""
+        if self.tool_registry:
+            self.tool_registry.deactivate_current()
+
+        if not self.marker_controller:
+            warning(
+                self.iface.messageBar(),
+                "Marker at GR",
+                "Marker controller unavailable.",
+                duration=4,
+            )
+            return
+
+        dialog = self._create_marker_grid_dialog()
+        if dialog_exec(dialog) != DialogAccepted:
+            return
+
+        marker_type, grid_ref = dialog.get_marker_request()
+        try:
+            lat, lon, easting, northing = self._convert_grid_reference_marker_coordinates(grid_ref)
+        except ValueError as exc:
+            warning(
+                self.iface.messageBar(),
+                "Marker at GR",
+                str(exc),
+                duration=5,
+            )
+            return
+
+        marker_id = self.marker_controller.handle_new_marker(
+            marker_type,
+            lat,
+            lon,
+            easting,
+            northing,
+        )
+        if marker_id:
+            self.marker_placed.emit()
+
+    def _create_marker_grid_dialog(self):
+        """Create the TM65 marker placement prompt."""
+        from ..ui.marker_grid_dialog import MarkerGridDialog
+
+        return MarkerGridDialog(self.iface.mainWindow())
+
+    def _convert_grid_reference_marker_coordinates(self, grid_ref: str):
+        """
+        Convert a TM65 Irish Grid reference into WGS84 and ITM marker coordinates.
+
+        Returns:
+            tuple: (lat, lon, itm_easting, itm_northing)
+
+        Raises:
+            ValueError: if the grid reference or transform is invalid.
+        """
+        tm65 = build_tm65_crs()
+        if not tm65 or not tm65.isValid():
+            raise ValueError("TM65 coordinate system is unavailable in this QGIS build.")
+
+        tm65_easting, tm65_northing = parse_irish_grid_reference(grid_ref)
+        tm65_point = QgsPointXY(tm65_easting, tm65_northing)
+
+        try:
+            wgs84_point = QgsCoordinateTransform(
+                tm65,
+                self.wgs84,
+                QgsProject.instance(),
+            ).transform(tm65_point)
+            itm_point = QgsCoordinateTransform(
+                tm65,
+                self.itm,
+                QgsProject.instance(),
+            ).transform(tm65_point)
+        except (QgsCsException, RuntimeError) as exc:
+            raise ValueError(f"Coordinate transformation failed: {exc}") from exc
+
+        if (
+            not self._valid_latlon(wgs84_point.y(), wgs84_point.x())
+            or not self._is_number(itm_point.x())
+            or not self._is_number(itm_point.y())
+        ):
+            raise ValueError("Transformation produced invalid coordinates.")
+
+        return (
+            float(wgs84_point.y()),
+            float(wgs84_point.x()),
+            float(itm_point.x()),
+            float(itm_point.y()),
+        )
 
     def _on_marker_clicked(self, lat, lon, easting, northing):
         """

@@ -638,6 +638,9 @@ class sartracker:
             self.sar_panel.add_clue_requested.connect(self.map_tools_controller.on_add_clue_requested)
             self.sar_panel.add_casualty_requested.connect(self.map_tools_controller.on_add_casualty_requested)
             self.sar_panel.add_hazard_requested.connect(self.map_tools_controller.on_add_hazard_requested)
+            self.sar_panel.add_marker_by_grid_requested.connect(
+                self.map_tools_controller.on_add_marker_by_grid_requested
+            )
 
             # Drawing tool signals
             self.sar_panel.line_tool_requested.connect(self.map_tools_controller.on_line_tool_requested)

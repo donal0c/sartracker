@@ -19,6 +19,7 @@ pytestmark = [
 
 from sartracker.ui import coordinate_converter_dialog as converter_module
 from sartracker.ui.coordinate_converter_dialog import CoordinateConverterDialog
+from sartracker.ui.marker_grid_dialog import MarkerGridDialog
 from sartracker.ui.marker_dialog import MarkerDialog
 from qgis.PyQt.QtWidgets import QLabel
 
@@ -216,3 +217,32 @@ class TestCoordinateConverterDialogBaseline:
         converter_dialog._on_convert()
 
         assert "Invalid number format" in converter_dialog.result_label.text()
+
+
+class TestMarkerGridDialogBaseline:
+    def test_dialog_defaults_to_ipp_lkp_and_trims_grid_reference(self, qgis_app):
+        dialog = MarkerGridDialog()
+        try:
+            dialog.grid_ref_input.setText("  Q 99840 04018  ")
+
+            marker_type, grid_ref = dialog.get_marker_request()
+
+            assert marker_type == "ipp_lkp"
+            assert grid_ref == "Q 99840 04018"
+        finally:
+            dialog.close()
+
+    def test_dialog_allows_switching_marker_type(self, qgis_app):
+        dialog = MarkerGridDialog()
+        try:
+            dialog.marker_type_combo.setCurrentIndex(
+                dialog.marker_type_combo.findData("casualty")
+            )
+            dialog.grid_ref_input.setText("Q9984004018")
+
+            marker_type, grid_ref = dialog.get_marker_request()
+
+            assert marker_type == "casualty"
+            assert grid_ref == "Q9984004018"
+        finally:
+            dialog.close()
