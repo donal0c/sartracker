@@ -12,7 +12,7 @@ Some tests require real QGIS, others can run with mocks.
 """
 
 import pytest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, patch
 
 # Import from sartracker package
 from sartracker.controllers.devices_controller import DevicesController
@@ -149,6 +149,26 @@ class TestDataHandling:
         controller._on_refresh_complete({'devices': devices})
 
         assert controller._last_devices == devices
+
+    def test_on_refresh_complete_updates_window_with_unfiltered_devices(self):
+        """Devices window should receive the full device list without layer filtering."""
+        mock_iface = Mock()
+        mock_iface.mainWindow.return_value = None
+
+        controller = DevicesController(iface=mock_iface)
+        controller._window = Mock()
+
+        devices = [
+            {'device_id': 'dev1', 'name': 'Team 1', 'status': 'online'},
+            {'device_id': 'dev2', 'name': 'Team 2', 'status': 'offline'},
+            {'device_id': 'dev3', 'name': 'Team 3', 'status': 'unknown'},
+        ]
+
+        with patch('sartracker.controllers.devices_controller.sip_isdeleted', return_value=False):
+            controller._on_refresh_complete({'devices': devices})
+
+        assert controller._last_devices == devices
+        controller._window.update_devices.assert_called_once_with(devices)
 
     def test_on_refresh_complete_handles_missing_devices_key(self):
         """_on_refresh_complete handles result without devices key."""

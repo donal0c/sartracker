@@ -33,6 +33,8 @@ As of 2026-03-28:
   - previously skipped provider-controller tests have been revived and are passing
   - active-device layer filtering now has direct controller-level regression coverage
     for online, offline, stale-unknown, and recent-unknown device states
+  - the filtered-layers vs unfiltered-device-list contract is now covered
+    explicitly across `ProviderController` and `DevicesController`
 - the remaining known intentional red is now outside this lifecycle slice and
   lives in the diagnostics area
 

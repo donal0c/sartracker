@@ -356,11 +356,27 @@ class TestProviderControllerLayerFiltering:
             {'device_id': 'dev2', 'name': 'Inactive', 'lat': 53.0, 'lon': -8.0, 'ts': '2026-01-03T12:00:00Z'},  # Should be filtered
         ]
 
-        # After implementation:
-        # - Only dev1's breadcrumbs should be sent to layers_controller
-        # - dev2's breadcrumbs should be filtered out
+        controller = self._build_controller(mock_dependencies)
+        task = MagicMock()
+        task.isCanceled.return_value = False
+        task.results = {
+            'current': [],
+            'breadcrumbs': breadcrumbs,
+            'devices': devices,
+        }
 
-        pytest.skip("Implementation pending - TDD Red phase")
+        controller._on_refresh_task_complete(task)
+
+        mock_dependencies['layers_controller'].update_breadcrumbs.assert_called_once()
+        filtered_breadcrumbs = (
+            mock_dependencies['layers_controller']
+            .update_breadcrumbs
+            .call_args
+            .args[0]
+        )
+        assert len(filtered_breadcrumbs) == 2
+        assert {bc['device_id'] for bc in filtered_breadcrumbs} == {'dev1'}
+        assert all(bc['name'] == 'Active' for bc in filtered_breadcrumbs)
 
 
 class TestInactiveDeviceLayerCleanup:
