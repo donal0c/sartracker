@@ -1553,7 +1553,14 @@ class ProviderController(QObject):
                         self._layers_controller.update_current_positions(filtered_current)
                     elif current:
                         # Had positions but all were filtered (all inactive devices)
-                        # SAFETY: Do NOT clear - preserves last known positions
+                        # SAFETY TRADEOFF (SAR-5c6):
+                        # Do NOT clear here. The current design intentionally preserves
+                        # last-known layers for explicitly inactive devices because an
+                        # empty active set can also occur during unstable field
+                        # conditions, and silently removing teams from the map is
+                        # considered the more dangerous failure mode. If this policy is
+                        # revisited, see SAR-ctpz and add fresh-roster cleanup tests
+                        # before changing behavior.
                         print("[PROVIDER_CONTROLLER] All positions filtered (no active devices) - PRESERVING existing layer data")
                     else:
                         # SAFETY: Do NOT clear existing positions on empty response
@@ -1575,7 +1582,11 @@ class ProviderController(QObject):
                         )
                     elif breadcrumbs:
                         # Had breadcrumbs but all were filtered (all inactive devices)
-                        # SAFETY: Do NOT clear - preserves last known data
+                        # SAFETY TRADEOFF (SAR-5c6):
+                        # This mirrors current-position preservation above. It is
+                        # intentional, not an accidental omission, and avoids erasing
+                        # last-known trail context unless we have an explicit cleanup
+                        # policy backed by regression coverage.
                         print("[PROVIDER_CONTROLLER] All breadcrumbs filtered (no active devices) - PRESERVING existing layer data")
                     else:
                         # SAFETY: Do NOT clear existing breadcrumbs on empty response

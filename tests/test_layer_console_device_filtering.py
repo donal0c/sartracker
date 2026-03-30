@@ -13,6 +13,14 @@ Active device definition (from SAR-qvn):
 
 This filters POSITIONS before they reach the tracking layer manager,
 not devices in the SAR Panel.
+
+Important design note:
+- Existing layers for newly inactive devices are currently preserved on purpose.
+- That behavior was an explicit SAR-5c6 safety tradeoff to avoid losing
+  last-known teams during outages or partial refresh failures.
+- Automatic cleanup of definitively inactive layers is tracked separately in
+  SAR-ctpz and should not be treated as an accidental regression without
+  fresh-roster cleanup rules and dedicated tests.
 """
 
 import pytest
@@ -385,6 +393,10 @@ class TestInactiveDeviceLayerCleanup:
 
     When a device that previously had layers becomes inactive (offline or
     stale unknown), its tracking layers should be removed from the Layer Console.
+
+    These tests remain intentionally skipped until SAR-ctpz defines the exact
+    cleanup policy. Current production behavior preserves inactive layers as a
+    deliberate safety tradeoff, not because the scenario was overlooked.
     """
 
     def test_device_goes_offline_layers_removed(self):
