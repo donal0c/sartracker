@@ -344,7 +344,11 @@ class BaseLayerManager(ABC):
             LayerError: If no mission store is configured
         """
         layer_manager = self._require_layer_manager()
-        store_path = layer_manager.get_mission_store()
+        effective_getter = getattr(layer_manager, "get_effective_store_path", None)
+        if callable(effective_getter):
+            store_path = effective_getter()
+        else:
+            store_path = layer_manager.get_mission_store()
         if store_path:
             return store_path
 

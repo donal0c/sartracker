@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 from qgis.core import (
     QgsVectorLayer, QgsFeature, QgsGeometry, QgsField,
@@ -272,6 +273,8 @@ class TrackingLayerManager(BaseLayerManager):
         self._last_stale_layer_cache_event: Optional[Dict[str, str]] = None
         self._pre_mission_breadcrumb_warning_shown = False
         self._mission_active_getter: Optional[Callable[[], bool]] = None
+        self._store_change_signal = None
+        self._connect_store_change_signal()
 
     def get_managed_layer_names(self):
         """Return list of fixed layer names this manager handles (legacy only)."""
@@ -311,10 +314,87 @@ class TrackingLayerManager(BaseLayerManager):
 
     def cleanup(self):
         """Ensure background tasks are cancelled before teardown."""
+        self._disconnect_store_change_signal()
         self._cancel_breadcrumb_task()
         # BUG-060 fix: Clean up temp export directories
         self._cleanup_temp_dirs()
         super().cleanup()
+
+    def _connect_store_change_signal(self) -> None:
+        """Listen for effective mission-store changes that invalidate caches."""
+        layer_manager = getattr(self, "layer_manager", None)
+        signal = getattr(layer_manager, "mission_store_changed", None)
+        if not signal:
+            return
+        try:
+            signal.connect(self._on_store_path_changed)
+            self._store_change_signal = signal
+        except Exception:
+            self._store_change_signal = None
+
+    def _disconnect_store_change_signal(self) -> None:
+        """Best-effort disconnect for store-change signal wiring."""
+        signal = getattr(self, "_store_change_signal", None)
+        if not signal:
+            return
+        try:
+            signal.disconnect(self._on_store_path_changed)
+        except Exception:
+            pass
+        self._store_change_signal = None
+
+    def _on_store_path_changed(self, _new_path: str) -> None:
+        """
+        Clear per-device caches when the effective persistence target changes.
+
+        Replay temp-store toggles must never keep using live-backed layer caches
+        or a factory that was built against a previous GeoPackage path.
+        """
+        self._per_device_factory = None
+        self._per_device_migration_checked = False
+        self._per_device_layout_normalized = False
+        self._device_position_layers.clear()
+        self._device_trail_layers.clear()
+
+    def _get_effective_tracking_store_path(self) -> Optional[str]:
+        """Return the store path that per-device tracking should currently use."""
+        layer_manager = getattr(self, "layer_manager", None)
+        if not layer_manager:
+            return None
+
+        getter = getattr(layer_manager, "get_effective_store_path", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+
+        getter = getattr(layer_manager, "get_mission_store", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+
+        return None
+
+    def _layer_matches_effective_store(self, layer: Optional[QgsVectorLayer]) -> bool:
+        """Return True only when the layer belongs to the current effective store."""
+        effective_path = self._get_effective_tracking_store_path()
+        if not effective_path or layer is None:
+            return True
+
+        try:
+            source = layer.source()
+        except Exception:
+            return False
+
+        if not source:
+            return False
+
+        normalized_path = str(Path(effective_path).expanduser()).replace("\\", "/")
+        normalized_source = str(source).replace("\\", "/")
+        return normalized_path in normalized_source
 
     def _log_tracking_event(self, layer: QgsVectorLayer, layer_type: str, action: str, **extra):
         """Emit diagnostics for tracking layers when enabled."""
@@ -1590,6 +1670,8 @@ class TrackingLayerManager(BaseLayerManager):
 
             layer_device_id = layer.customProperty(self.DEVICE_ID_PROP)
             if layer_device_id != device_id:
+                continue
+            if not self._layer_matches_effective_store(layer):
                 continue
 
             item_type = layer.customProperty(SAR_ITEM_TYPE)

@@ -221,12 +221,16 @@ class LayerManager(QObject):
             old = self._mission_store_path
             self._mission_store_path = new_path
             if emit_signal:
-                try:
-                    self.mission_store_changed.emit(new_path or "")
-                except Exception:
-                    pass
+                self._emit_store_path_changed()
             self._log("INFO", f"Mission store updated: {old} → {new_path}")
         return self._mission_store_path
+
+    def _emit_store_path_changed(self) -> None:
+        """Emit the effective store path currently backing managed layers."""
+        try:
+            self.mission_store_changed.emit(self.get_effective_store_path() or "")
+        except Exception:
+            pass
 
     def on_project_read(self):
         """
@@ -362,7 +366,7 @@ class LayerManager(QObject):
         # HIGH-7: Emit signal if path changed
         if old_path != normalized:
             print(f"[LayerManager] Mission store changed: {old_path} → {normalized}")
-            self.mission_store_changed.emit(normalized)
+            self._emit_store_path_changed()
 
     def get_mission_store(self) -> Optional[str]:
         """Return the configured mission store path, if any (refreshing from project)."""
@@ -413,6 +417,7 @@ class LayerManager(QObject):
             self._layer_provider_uris.clear()
             self._layer_cache.clear()
             self._log("INFO", f"Temp mission store set: {normalized}")
+            self._emit_store_path_changed()
 
     def clear_temp_mission_store(self) -> None:
         """
@@ -427,6 +432,7 @@ class LayerManager(QObject):
         self._temp_mission_store_path = None
         self._layer_provider_uris.clear()
         self._layer_cache.clear()
+        self._emit_store_path_changed()
 
     def get_temp_mission_store(self) -> Optional[str]:
         """Return the current temp mission store path, if any."""
@@ -448,6 +454,10 @@ class LayerManager(QObject):
             return self._temp_mission_store_path
         # Use cached value for efficiency; project sync happens via refresh calls
         return self._mission_store_path
+
+    def get_effective_store_path(self) -> Optional[str]:
+        """Return the currently effective store path for managed layer writes."""
+        return self._get_effective_store_path()
 
     def set_mission_finalized(self, finalized: bool, finalized_by: str = "", finalized_at: Optional[str] = None):
         """
