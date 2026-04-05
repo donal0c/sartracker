@@ -24,6 +24,7 @@ NC='\033[0m' # No Color
 # Get the script directory and project root
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+METADATA_FILE="$PROJECT_ROOT/metadata.txt"
 
 # Change to project root
 cd "$PROJECT_ROOT"
@@ -242,6 +243,38 @@ else
     echo "  safe_error(self.iface, 'Title', 'Message', is_unloading=self._is_unloading)"
     echo ""
     echo "  This is a WARNING - migration to safe_* functions is in progress"
+fi
+
+echo ""
+
+# ============================================================================
+# Check 5.7: QGIS 4 metadata compatibility
+# ============================================================================
+echo "Check 5.7: Plugin metadata compatibility..."
+echo "  Verifying: qgisMaximumVersion=4.99 and obsolete supportsQt6 removed"
+echo ""
+
+METADATA_ERRORS=0
+
+if grep -q "^qgisMaximumVersion=4.99$" "$METADATA_FILE"; then
+    echo -e "  ${GREEN}✅ PASS${NC} - Plugin metadata declares QGIS 4 compatibility"
+else
+    echo -e "  ${RED}❌ FAIL${NC} - metadata.txt must declare qgisMaximumVersion=4.99"
+    METADATA_ERRORS=1
+fi
+
+if grep -q "^supportsQt6=" "$METADATA_FILE"; then
+    echo -e "  ${RED}❌ FAIL${NC} - metadata.txt still declares obsolete supportsQt6 flag"
+    METADATA_ERRORS=1
+else
+    echo -e "  ${GREEN}✅ PASS${NC} - metadata.txt does not use obsolete supportsQt6 flag"
+fi
+
+if [ $METADATA_ERRORS -ne 0 ]; then
+    echo ""
+    echo "  ⚠️  QGIS 4 requires an explicit version range in metadata.txt."
+    echo "  Set qgisMaximumVersion=4.99 and remove supportsQt6."
+    FAILED=1
 fi
 
 echo ""

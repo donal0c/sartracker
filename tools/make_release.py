@@ -11,6 +11,7 @@ import sys
 import zipfile
 import subprocess
 import argparse
+import configparser
 from datetime import datetime
 from fnmatch import fnmatch
 from pathlib import Path
@@ -146,6 +147,43 @@ CRITICAL_VENDOR_FILES = [
 ]
 
 
+def validate_plugin_metadata(plugin_dir):
+    """
+    Validate plugin metadata required for QGIS 4 compatibility.
+
+    Args:
+        plugin_dir: Path to plugin directory
+
+    Returns:
+        tuple[bool, list[str]]: Whether metadata is valid and validation errors.
+    """
+    metadata_path = Path(plugin_dir) / "metadata.txt"
+    if not metadata_path.exists():
+        return False, [f"Missing metadata file: {metadata_path}"]
+
+    parser = configparser.ConfigParser()
+    parser.optionxform = str
+    parser.read(metadata_path, encoding="utf-8")
+
+    if not parser.has_section("general"):
+        return False, ["metadata.txt is missing the [general] section"]
+
+    general = parser["general"]
+    errors = []
+
+    if general.get("qgisMaximumVersion") != "4.99":
+        errors.append(
+            "QGIS 4 compatibility requires metadata.txt to declare qgisMaximumVersion=4.99."
+        )
+
+    if "supportsQt6" in general:
+        errors.append(
+            "supportsQt6 is obsolete for QGIS 4 compatibility and should be removed from metadata.txt."
+        )
+
+    return len(errors) == 0, errors
+
+
 def _should_skip_file(filename: str) -> bool:
     return any(fnmatch(filename, pattern) for pattern in EXCLUDED_FILE_PATTERNS)
 
@@ -168,6 +206,8 @@ def create_release_zip(plugin_dir, version, output_dir=None):
         output_dir = plugin_dir.parent
     else:
         output_dir = Path(output_dir).resolve()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     # Create ZIP filename
     date_str = datetime.now().strftime("%Y-%m-%d")
@@ -260,6 +300,19 @@ def main():
             return 1
         else:
             print("✓ No forbidden imports found")
+
+        metadata_valid, metadata_errors = validate_plugin_metadata(plugin_dir)
+        if not metadata_valid:
+            print("❌ ERROR: Plugin metadata is not QGIS 4 compatible:")
+            print()
+            for error in metadata_errors:
+                print(f"   - {error}")
+            print()
+            print("⚠️  Update metadata.txt before packaging a release.")
+            print("   Run with --force to skip this check.")
+            return 1
+        else:
+            print("✓ Plugin metadata is QGIS 4 compatible")
 
     # Create VERSION.txt
     create_version_file(plugin_dir, args.version)

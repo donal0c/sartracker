@@ -15,7 +15,7 @@ This software is used by rescue coordinators during active search and rescue ope
 **Type:** QGIS Plugin (Python)
 **Version:** 0.3.1
 **Team:** Kerry Mountain Rescue Team, Ireland
-**QGIS Compatibility:** 3.28+ (Qt5 and Qt6)
+**QGIS Compatibility:** 3.28 - 4.99 (Qt5 on QGIS 3.x, Qt6 on QGIS 3.40+ / 4.x)
 **Python:** 3.8+
 
 ### Core Purpose

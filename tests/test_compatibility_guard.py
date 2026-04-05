@@ -19,3 +19,4 @@ def test_compatibility_guard_passes_for_current_repository():
     assert result.returncode == 0, output
     assert "No deprecated EPSG:29903" in output
     assert "Compatibility documentation exists" in output
+    assert "Plugin metadata declares QGIS 4 compatibility" in output
